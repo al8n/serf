@@ -1,4 +1,4 @@
-name: net 
+name: quinn
 
 on:
   push:
@@ -24,7 +24,7 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }} - ${{ matrix.runtime }} - ${{ matrix.stream_layer }}
+    name: ${{ matrix.os }} - ${{ matrix.runtime }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,10 +34,6 @@ jobs:
           # - macos-latest,
           # - windows-latest
         runtime: [tokio, async-std, smol]
-        stream_layer: 
-          # - tls
-          # - native-tls
-          - tcp
     steps:
       - uses: actions/checkout@v4
 
@@ -64,16 +60,11 @@ jobs:
       - name: Setup loopback interface (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: ci/setup_subnet_ubuntu.sh
-
-      - name: Run Unit Tests for core
+      
+      - name: Run Unit Tests for serf based on quinn transport
         run: |
-          cargo test --no-default-features --features "test,encryption,serde"
-        working-directory: core
-
-      - name: Run Unit Tests for types
-        run: |
-          cargo test --no-default-features --features "metrics,encryption,serde"
-        working-directory: types
+          cargo test --no-default-features --features "test,encryption,quinn,metrics,${{ matrix.runtime }}" -- --test-threads=1
+        working-directory: serf
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -82,4 +73,4 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.runtime }}-${{ matrix.stream_layer }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.runtime }}-quinn
