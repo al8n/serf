@@ -78,5 +78,6 @@ jobs:
         with:
           directory: reports
           fail_ci_if_error: false
+          slug: ${{ github.repository }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
