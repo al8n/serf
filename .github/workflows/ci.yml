@@ -1,4 +1,4 @@
-name: net 
+name: ci
 
 on:
   push:

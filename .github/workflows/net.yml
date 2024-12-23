@@ -65,24 +65,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: ci/setup_subnet_ubuntu.sh
 
-      - name: Run Unit Tests for core
-        run: |
-          cargo test --no-default-features --features "test,encryption,serde"
-        working-directory: core
-
-      - name: Run Unit Tests for types
-        run: |
-          cargo test --no-default-features --features "metrics,encryption,serde"
-        working-directory: types
-
       - name: Run Unit Tests for serf based on net transport
         run: |
           cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }}" -- --test-threads=1
-        working-directory: serf
-      
-      - name: Run Unit Tests for serf based on quic transport
-        run: |
-          cargo test --no-default-features --features "test,encryption,quinn,metrics,${{ matrix.runtime }}" -- --test-threads=1
         working-directory: serf
 
       - name: Cache Cargo registry
