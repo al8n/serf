@@ -3,7 +3,7 @@ use memberlist_core::{
   transport::{Id, Node, Transformable},
   CheapClone,
 };
-use ruserf_types::{
+use serf_types::{
   FilterTransformError, JoinMessage, LeaveMessage, Member, MessageType, NodeTransformError,
   PushPullMessage, QueryMessage, QueryResponseMessage, SerfMessageTransformError,
   TagsTransformError, UserEventMessage,
@@ -87,9 +87,9 @@ pub trait TransformDelegate: Send + Sync + 'static {
   /// **NOTE**:
   ///
   /// 1. The buffer must be large enough to hold the encoded message.
-  /// The length of the buffer can be obtained by calling [`TransformDelegate::message_encoded_len`].
+  ///    The length of the buffer can be obtained by calling [`TransformDelegate::message_encoded_len`].
   /// 2. A message type byte will be automatically prepended to the buffer,
-  /// so users do not need to encode the message type byte by themselves.
+  ///    so users do not need to encode the message type byte by themselves.
   fn encode_message(
     msg: impl AsMessageRef<Self::Id, Self::Address>,
     dst: impl AsMut<[u8]>,
@@ -252,7 +252,7 @@ where
 
   fn message_encoded_len(msg: impl AsMessageRef<Self::Id, Self::Address>) -> usize {
     let msg = msg.as_message_ref();
-    ruserf_types::Encodable::encoded_len(&msg)
+    serf_types::Encodable::encoded_len(&msg)
   }
 
   fn encode_message(
@@ -260,7 +260,7 @@ where
     mut dst: impl AsMut<[u8]>,
   ) -> Result<usize, Self::Error> {
     let msg = msg.as_message_ref();
-    ruserf_types::Encodable::encode(&msg, dst.as_mut()).map_err(Into::into)
+    serf_types::Encodable::encode(&msg, dst.as_mut()).map_err(Into::into)
   }
 
   fn decode_message(
@@ -291,11 +291,11 @@ where
         .map_err(|e| Self::Error::Message(e.into())),
       MessageType::Relay => Err(Self::Error::UnexpectedRelayMessage),
       #[cfg(feature = "encryption")]
-      MessageType::KeyRequest => ruserf_types::KeyRequestMessage::decode(bytes.as_ref())
+      MessageType::KeyRequest => serf_types::KeyRequestMessage::decode(bytes.as_ref())
         .map(|(n, m)| (n, SerfMessage::KeyRequest(m)))
         .map_err(|e| Self::Error::Message(e.into())),
       #[cfg(feature = "encryption")]
-      MessageType::KeyResponse => ruserf_types::KeyResponseMessage::decode(bytes.as_ref())
+      MessageType::KeyResponse => serf_types::KeyResponseMessage::decode(bytes.as_ref())
         .map(|(n, m)| (n, SerfMessage::KeyResponse(m)))
         .map_err(|e| Self::Error::Message(e.into())),
       _ => unreachable!(),

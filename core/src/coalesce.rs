@@ -86,7 +86,7 @@ async fn coalesce_loop<C: Coalescer>(
         // Ignore any non handled events
         if !c.handle(&ev) {
           if let Err(e) = out_tx.send(ev).await {
-            tracing::error!(err=%e, "ruserf: fail send event to out channel in {} coalesce thread", c.name());
+            tracing::error!(err=%e, "serf: fail send event to out channel in {} coalesce thread", c.name());
             return;
           }
           continue;
@@ -112,7 +112,7 @@ async fn coalesce_loop<C: Coalescer>(
       }.fuse() => {
         // Flush the coalesced events
         if c.flush(&out_tx).await.is_err() {
-          tracing::error!(err="closed channel", "ruserf: fail send event to out channel in {} coalesce thread", c.name());
+          tracing::error!(err="closed channel", "serf: fail send event to out channel in {} coalesce thread", c.name());
           return;
         }
 
@@ -134,7 +134,7 @@ async fn coalesce_loop<C: Coalescer>(
       }.fuse() => {
         // Flush the coalesced events
         if c.flush(&out_tx).await.is_err() {
-          tracing::error!(err="closed channel", "ruserf: fail send event to out channel in {} coalesce thread", c.name());
+          tracing::error!(err="closed channel", "serf: fail send event to out channel in {} coalesce thread", c.name());
           return;
         }
 

@@ -1,5 +1,5 @@
 #![doc = include_str!("../../README.md")]
-#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/ruserf/main/art/logo_72x72.png")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/serf/main/art/logo_72x72.png")]
 #![forbid(unsafe_code)]
 #![deny(warnings, missing_docs)]
 #![allow(clippy::type_complexity)]
@@ -16,7 +16,7 @@ pub mod coordinate;
 /// Events for [`Serf`]
 pub mod event;
 
-/// Errors for `ruserf`.
+/// Errors for `serf`.
 pub mod error;
 
 /// Delegate traits and its implementations.
@@ -25,7 +25,7 @@ pub mod delegate;
 mod options;
 pub use options::*;
 
-/// The types used in `ruserf`.
+/// The types used in `serf`.
 pub mod types;
 
 /// Secret key management.
@@ -61,7 +61,7 @@ pub mod tests {
   macro_rules! unit_tests {
     ($runtime:ty => $run:ident($($fn:ident), +$(,)?)) => {
       $(
-        ::ruserf_core::tests::paste::paste! {
+        ::serf_core::tests::paste::paste! {
           #[test]
           fn [< test_ $fn >] () {
             $run($fn::<$runtime>());
@@ -81,7 +81,7 @@ pub mod tests {
       $fn:ident( $expr:expr )
     ), +$(,)?)) => {
       $(
-        ::ruserf_core::tests::paste::paste! {
+        ::serf_core::tests::paste::paste! {
           #[test]
           $(#[$outer])*
           fn [< test_ $fn >] () {
@@ -100,7 +100,7 @@ pub mod tests {
     static TRACE: Once = Once::new();
     TRACE.call_once(|| {
       let filter = std::env::var("RUSERF_TESTING_LOG")
-        .unwrap_or_else(|_| "ruserf_core=info,memberlist_core=debug".to_owned());
+        .unwrap_or_else(|_| "serf_core=info,memberlist_core=debug".to_owned());
       memberlist_core::tracing::subscriber::set_global_default(
         tracing_subscriber::fmt::fmt()
           .without_time()

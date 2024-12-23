@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memberlist_core::{tests::AnyError, transport::Id};
 
-use ruserf_types::{Member, MemberStatus, Tags};
+use serf_types::{Member, MemberStatus, Tags};
 
 use crate::{event::EventProducer, types::MemberState};
 

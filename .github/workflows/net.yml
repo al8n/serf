@@ -1,0 +1,80 @@
+name: net 
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE*'
+      - '**.md'
+      - '**.txt'
+      - 'art'
+  workflow_dispatch:
+  schedule: [cron: "40 1 * * *"]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} - ${{ matrix.runtime }} - ${{ matrix.stream_layer }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: 
+          - ubuntu-latest
+          # - macos-latest,
+          # - windows-latest
+        runtime: [tokio, async-std, smol]
+        stream_layer: 
+          - tls
+          - native-tls
+          - tcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup update stable && rustup default stable
+          rustup component add clippy
+          rustup component add rustfmt
+
+      - name: Install OpenSSL (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          vcpkg install openssl:x64-windows-static-md
+
+      - name: Setup loopback interface (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ci\setup_subnet_windows.ps1
+      - name: Setup loopback interface (MacOS)
+        if: matrix.os == 'macos-latest'
+        run: ci/setup_subnet_macos.sh
+      - name: Setup loopback interface (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: ci/setup_subnet_ubuntu.sh
+
+      - name: Run Unit Tests for serf based on net transport
+        run: |
+          cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }}" -- --test-threads=1
+        working-directory: serf
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.runtime }}-${{ matrix.stream_layer }}

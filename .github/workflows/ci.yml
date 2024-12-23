@@ -1,4 +1,4 @@
-name: net 
+name: ci
 
 on:
   push:
@@ -20,6 +20,7 @@ on:
       - '**.txt'
       - 'art'
   workflow_dispatch:
+  schedule: [cron: "40 1 * * *"]
 
 jobs:
   test:
@@ -38,7 +39,7 @@ jobs:
           # - native-tls
           - tcp
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
@@ -74,13 +75,8 @@ jobs:
           cargo test --no-default-features --features "metrics,encryption,serde"
         working-directory: types
 
-      - name: Run Unit Tests for ruserf based on net transport
-        run: |
-          cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }}" -- --test-threads=1
-        working-directory: ruserf
-
       - name: Cache Cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry

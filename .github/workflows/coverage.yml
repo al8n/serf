@@ -33,15 +33,15 @@ jobs:
         include:
           - crate: core
             features: "test,metrics"
-            name: "ruserf-core"
+            name: "serf-core"
           - crate: types 
             features: "metrics,encryption"
-            name: "ruserf-types"
-          - crate: ruserf
+            name: "serf-types"
+          - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
-            name: "ruserf-tcp-encryption"
+            name: "serf-tcp-encryption"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install latest nightly
         uses: actions-rs/toolchain@v1
         with:
@@ -57,7 +57,7 @@ jobs:
         working-directory: ${{ matrix.crate }}
         continue-on-error: true
       - name: Upload Coverage Report as Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.crate }}/cobertura.xml
@@ -66,17 +66,18 @@ jobs:
     needs: coverage-report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Download all coverage reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: reports/
       - name: List contents of the reports directory
         run: ls -a reports
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           directory: reports
           fail_ci_if_error: false
+          slug: ${{ github.repository }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -277,33 +277,33 @@ impl<I, A> QueryResponse<I, A> {
       if c.acks.contains(&resp.from) {
         #[cfg(feature = "metrics")]
         {
-          metrics::counter!("ruserf.query.duplicate_acks", metrics_labels.iter()).increment(1);
+          metrics::counter!("serf.query.duplicate_acks", metrics_labels.iter()).increment(1);
         }
         return;
       }
 
       #[cfg(feature = "metrics")]
       {
-        metrics::counter!("ruserf.query.acks", metrics_labels.iter()).increment(1);
+        metrics::counter!("serf.query.acks", metrics_labels.iter()).increment(1);
       }
 
       drop(c);
       if let Err(e) = self.send_ack::<T, D>(&resp).await {
-        tracing::warn!("ruserf: {}", e);
+        tracing::warn!("serf: {}", e);
       }
     } else {
       // Exit early if this is a duplicate response
       if c.responses.contains(&resp.from) {
         #[cfg(feature = "metrics")]
         {
-          metrics::counter!("ruserf.query.duplicate_responses", metrics_labels.iter()).increment(1);
+          metrics::counter!("serf.query.duplicate_responses", metrics_labels.iter()).increment(1);
         }
         return;
       }
 
       #[cfg(feature = "metrics")]
       {
-        metrics::counter!("ruserf.query.responses", metrics_labels.iter()).increment(1);
+        metrics::counter!("serf.query.responses", metrics_labels.iter()).increment(1);
       }
       drop(c);
 
@@ -314,7 +314,7 @@ impl<I, A> QueryResponse<I, A> {
         })
         .await
       {
-        tracing::warn!("ruserf: {}", e);
+        tracing::warn!("serf: {}", e);
       }
     }
   }
@@ -456,20 +456,20 @@ where
   pub(crate) fn should_process_query(&self, filters: &[Bytes]) -> bool {
     for filter in filters.iter() {
       if filter.is_empty() {
-        tracing::warn!("ruserf: empty filter");
+        tracing::warn!("serf: empty filter");
         return false;
       }
 
       // Decode the filter
       let filter = match <D as TransformDelegate>::decode_filter(filter) {
         Ok((read, filter)) => {
-          tracing::trace!(read=%read, filter=?filter, "ruserf: decoded filter successully");
+          tracing::trace!(read=%read, filter=?filter, "serf: decoded filter successully");
           filter
         }
         Err(err) => {
           tracing::warn!(
             err = %err,
-            "ruserf: failed to decode filter"
+            "serf: failed to decode filter"
           );
           return false;
         }
@@ -495,7 +495,7 @@ where
                   }
                 }
                 Err(err) => {
-                  tracing::warn!(err=%err, "ruserf: failed to compile filter regex ({})", fexpr);
+                  tracing::warn!(err=%err, "serf: failed to compile filter regex ({})", fexpr);
                   return false;
                 }
               }

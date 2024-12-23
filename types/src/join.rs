@@ -1,5 +1,5 @@
 use byteorder::{ByteOrder, NetworkEndian};
-use transformable::utils::*;
+use transformable::utils::encoded_u64_varint_len;
 
 use crate::LamportTimeTransformError;
 
@@ -104,7 +104,7 @@ where
   }
 
   fn encoded_len(&self) -> usize {
-    4 + encoded_len_varint(self.ltime.0) + self.id.encoded_len()
+    4 + encoded_u64_varint_len(self.ltime.0) + self.id.encoded_len()
   }
 
   fn decode(src: &[u8]) -> Result<(usize, Self), Self::Error>

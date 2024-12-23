@@ -1,0 +1,92 @@
+[package]
+name = "serf"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
+
+tokio = ["memberlist/tokio"]
+async-std = ["memberlist/async-std"]
+smol = ["memberlist/smol"]
+
+serde = [
+  "memberlist/serde",
+  "serf-core/serde",
+]
+
+metrics = [
+  "memberlist/metrics",
+  "serf-core/metrics",
+]
+
+compression = ["memberlist/compression"]
+
+encryption = ["memberlist/encryption", "serf-core/encryption"]
+
+quic = ["memberlist/quic"]
+quinn = ["memberlist/quinn", "quic"]
+s2n = ["memberlist/s2n", "quic"]
+
+net = ["memberlist/net"]
+tcp = ["net"]
+tls = ["memberlist/tls", "net"]
+native-tls = ["memberlist/native-tls", "net"]
+
+# enable DNS node address resolver
+dns = ["memberlist/dns"]
+dns-over-quic = [
+  "memberlist/dns-over-quic",
+]
+dns-over-h3 = ["memberlist/dns-over-h3"]
+dns-over-https-rustls = [
+  "memberlist/dns-over-https-rustls",
+]
+dns-over-rustls = [
+  "memberlist/dns-over-rustls",
+]
+dns-over-openssl = [
+  "memberlist/dns-over-openssl",
+]
+dns-over-native-tls = [
+  "memberlist/dns-over-native-tls",
+]
+dns-webpki-roots = [
+  "memberlist/dns-webpki-roots",
+]
+dns-native-certs = [
+  "memberlist/dns-native-certs",
+]
+dnssec-openssl = [
+  "memberlist/dnssec-openssl",
+]
+dnssec-ring = ["memberlist/dnssec-ring"]
+dnssec = ["memberlist/dnssec"]
+
+test = ["memberlist/test", "serf-core/test"]
+
+[dependencies]
+memberlist.workspace = true
+serf-core = { workspace = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+smol_str = "0.3"
+paste = "1"
+
+[[test]]
+name = "main"
+path = "test/main.rs"
+required-features = ["test"]

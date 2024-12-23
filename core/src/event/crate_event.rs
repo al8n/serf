@@ -1,4 +1,4 @@
-use ruserf_types::QueryMessage;
+use serf_types::QueryMessage;
 
 use super::*;
 
@@ -12,7 +12,7 @@ impl<I, A> QueryMessageExt for QueryMessage<I, A> {
   fn decode_internal_query<T: TransformDelegate>(
     &self,
   ) -> Option<Result<InternalQueryEvent<T::Id>, T::Error>> {
-    return Some(Ok(match self.name().as_str() {
+    Some(Ok(match self.name().as_str() {
       INTERNAL_PING => InternalQueryEvent::Ping,
       INTERNAL_CONFLICT => {
         return Some(T::decode_id(&self.payload).map(|(_, id)| InternalQueryEvent::Conflict(id)));
@@ -26,20 +26,20 @@ impl<I, A> QueryMessageExt for QueryMessage<I, A> {
       #[cfg(feature = "encryption")]
       INTERNAL_LIST_KEYS => InternalQueryEvent::ListKey,
       _ => return None,
-    }));
+    }))
   }
 }
 
-const INTERNAL_PING: &str = "_ruserf_ping";
-const INTERNAL_CONFLICT: &str = "_ruserf_conflict";
+const INTERNAL_PING: &str = "_serf_ping";
+const INTERNAL_CONFLICT: &str = "_serf_conflict";
 #[cfg(feature = "encryption")]
-pub(crate) const INTERNAL_INSTALL_KEY: &str = "_ruserf_install_key";
+pub(crate) const INTERNAL_INSTALL_KEY: &str = "_serf_install_key";
 #[cfg(feature = "encryption")]
-pub(crate) const INTERNAL_USE_KEY: &str = "_ruserf_use_key";
+pub(crate) const INTERNAL_USE_KEY: &str = "_serf_use_key";
 #[cfg(feature = "encryption")]
-pub(crate) const INTERNAL_REMOVE_KEY: &str = "_ruserf_remove_key";
+pub(crate) const INTERNAL_REMOVE_KEY: &str = "_serf_remove_key";
 #[cfg(feature = "encryption")]
-pub(crate) const INTERNAL_LIST_KEYS: &str = "_ruserf_list_keys";
+pub(crate) const INTERNAL_LIST_KEYS: &str = "_serf_list_keys";
 
 #[cfg(feature = "test")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

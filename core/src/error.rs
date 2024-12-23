@@ -72,7 +72,7 @@ where
   }
 }
 
-/// Error type for the ruserf crate.
+/// Error type for the serf crate.
 #[derive(thiserror::Error)]
 pub enum Error<T, D>
 where
@@ -292,28 +292,28 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum SerfError {
   /// Returned when the user event exceeds the configured limit.
-  #[error("ruserf: user event exceeds configured limit of {0} bytes before encoding")]
+  #[error("serf: user event exceeds configured limit of {0} bytes before encoding")]
   UserEventLimitTooLarge(usize),
   /// Returned when the user event exceeds the sane limit.
-  #[error("ruserf: user event exceeds sane limit of {0} bytes before encoding")]
+  #[error("serf: user event exceeds sane limit of {0} bytes before encoding")]
   UserEventTooLarge(usize),
   /// Returned when the join status is bad.
-  #[error("ruserf: join called on {0} statues")]
+  #[error("serf: join called on {0} statues")]
   BadJoinStatus(SerfState),
   /// Returned when the leave status is bad.
-  #[error("ruserf: leave called on {0} statues")]
+  #[error("serf: leave called on {0} statues")]
   BadLeaveStatus(SerfState),
   /// Returned when the encoded user event exceeds the sane limit after encoding.
-  #[error("ruserf: user event exceeds sane limit of {0} bytes after encoding")]
+  #[error("serf: user event exceeds sane limit of {0} bytes after encoding")]
   RawUserEventTooLarge(usize),
   /// Returned when the query size exceeds the configured limit.
-  #[error("ruserf: query exceeds limit of {0} bytes")]
+  #[error("serf: query exceeds limit of {0} bytes")]
   QueryTooLarge(usize),
   /// Returned when the query is timeout.
-  #[error("ruserf: query response is past the deadline")]
+  #[error("serf: query response is past the deadline")]
   QueryTimeout,
   /// Returned when the query response is too large.
-  #[error("ruserf: query response ({got} bytes) exceeds limit of {limit} bytes")]
+  #[error("serf: query response ({got} bytes) exceeds limit of {limit} bytes")]
   QueryResponseTooLarge {
     /// The query response size limit.
     limit: usize,
@@ -321,31 +321,31 @@ pub enum SerfError {
     got: usize,
   },
   /// Returned when the query has already been responded.
-  #[error("ruserf: query response already sent")]
+  #[error("serf: query response already sent")]
   QueryAlreadyResponsed,
   /// Returned when failed to truncate response so that it fits into message.
-  #[error("ruserf: failed to truncate response so that it fits into message")]
+  #[error("serf: failed to truncate response so that it fits into message")]
   FailTruncateResponse,
   /// Returned when the tags too large.
-  #[error("ruserf: encoded length of tags exceeds limit of {0} bytes")]
+  #[error("serf: encoded length of tags exceeds limit of {0} bytes")]
   TagsTooLarge(usize),
   /// Returned when the relayed response is too large.
-  #[error("ruserf: relayed response exceeds limit of {0} bytes")]
+  #[error("serf: relayed response exceeds limit of {0} bytes")]
   RelayedResponseTooLarge(usize),
   /// Returned when failed to deliver query response, dropping.
-  #[error("ruserf: failed to deliver query response, dropping")]
+  #[error("serf: failed to deliver query response, dropping")]
   QueryResponseDeliveryFailed,
   /// Returned when the coordinates are disabled.
-  #[error("ruserf: coordinates are disabled")]
+  #[error("serf: coordinates are disabled")]
   CoordinatesDisabled,
   /// Returned when snapshot error.
-  #[error("ruserf: {0}")]
+  #[error("serf: {0}")]
   Snapshot(#[from] SnapshotError),
   /// Returned when timed out broadcasting node removal.
-  #[error("ruserf: timed out broadcasting node removal")]
+  #[error("serf: timed out broadcasting node removal")]
   RemovalBroadcastTimeout,
   /// Returned when the timed out broadcasting channel closed.
-  #[error("ruserf: timed out broadcasting channel closed")]
+  #[error("serf: timed out broadcasting channel closed")]
   BroadcastChannelClosed,
 }
 

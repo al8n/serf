@@ -108,21 +108,21 @@ pub struct Member<I, A> {
   )]
   memberlist_delegate_version: MemberlistDelegateVersion,
 
-  /// The ruserf protocol version
+  /// The serf protocol version
   #[viewit(
-    getter(const, attrs(doc = "Returns the ruserf protocol version")),
+    getter(const, attrs(doc = "Returns the serf protocol version")),
     setter(
       const,
-      attrs(doc = "Sets the ruserf protocol version (Builder pattern)")
+      attrs(doc = "Sets the serf protocol version (Builder pattern)")
     )
   )]
   protocol_version: ProtocolVersion,
-  /// The ruserf delegate version
+  /// The serf delegate version
   #[viewit(
-    getter(const, attrs(doc = "Returns the ruserf delegate version")),
+    getter(const, attrs(doc = "Returns the serf delegate version")),
     setter(
       const,
-      attrs(doc = "Sets the ruserf delegate version (Builder pattern)")
+      attrs(doc = "Sets the serf delegate version (Builder pattern)")
     )
   )]
   delegate_version: DelegateVersion,

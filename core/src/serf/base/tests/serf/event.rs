@@ -1,4 +1,4 @@
-use ruserf_types::{Filter, FilterType};
+use serf_types::{Filter, FilterType};
 
 use super::*;
 

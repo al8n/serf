@@ -26,7 +26,7 @@ use memberlist_core::{
   types::{Meta, NodeState, SmallVec, State, TinyVec},
   CheapClone, META_MAX_SIZE,
 };
-use ruserf_types::Tags;
+use serf_types::Tags;
 
 // PingVersion is an internal version for the ping message, above the normal
 // versioning we get from the protocol version. This enables small updates
@@ -145,7 +145,7 @@ where
             role_bytes.try_into().unwrap()
           }
           Err(e) => {
-            tracing::error!(err=%e, "ruserf: failed to encode tags");
+            tracing::error!(err=%e, "serf: failed to encode tags");
             Meta::empty()
           }
         }
@@ -163,7 +163,7 @@ where
     #[cfg(feature = "metrics")]
     {
       metrics::histogram!(
-        "ruserf.messages.received",
+        "serf.messages.received",
         self
           .this()
           .inner
@@ -193,50 +193,50 @@ where
           MessageType::Leave => match <D as TransformDelegate>::decode_message(ty, &msg[1..]) {
             Ok((_, l)) => {
               if let SerfMessage::Leave(l) = &l {
-                tracing::debug!("ruserf: leave message: {}", l.id());
+                tracing::debug!("serf: leave message: {}", l.id());
                 rebroadcast = this.handle_node_leave_intent(l).await.then(|| msg.clone());
               } else {
-                tracing::warn!("ruserf: receive unexpected message: {}", l.ty().as_str());
+                tracing::warn!("serf: receive unexpected message: {}", l.ty().as_str());
               }
             }
             Err(e) => {
-              tracing::warn!(err=%e, "ruserf: failed to decode message");
+              tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
           MessageType::Join => match <D as TransformDelegate>::decode_message(ty, &msg[1..]) {
             Ok((_, j)) => {
               if let SerfMessage::Join(j) = &j {
-                tracing::debug!("ruserf: join message: {}", j.id());
+                tracing::debug!("serf: join message: {}", j.id());
                 rebroadcast = this.handle_node_join_intent(j).await.then(|| msg.clone());
               } else {
-                tracing::warn!("ruserf: receive unexpected message: {}", j.ty().as_str());
+                tracing::warn!("serf: receive unexpected message: {}", j.ty().as_str());
               }
             }
             Err(e) => {
-              tracing::warn!(err=%e, "ruserf: failed to decode message");
+              tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
           MessageType::UserEvent => match <D as TransformDelegate>::decode_message(ty, &msg[1..]) {
             Ok((_, ue)) => {
               if let SerfMessage::UserEvent(ue) = ue {
-                tracing::debug!("ruserf: user event message: {}", ue.name);
+                tracing::debug!("serf: user event message: {}", ue.name);
                 rebroadcast = this.handle_user_event(ue).await.then(|| msg.clone());
                 rebroadcast_queue = &this.inner.event_broadcasts;
               } else {
-                tracing::warn!("ruserf: receive unexpected message: {}", ue.ty().as_str());
+                tracing::warn!("serf: receive unexpected message: {}", ue.ty().as_str());
               }
             }
             Err(e) => {
-              tracing::warn!(err=%e, "ruserf: failed to decode message");
+              tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
           MessageType::Query => match <D as TransformDelegate>::decode_message(ty, &msg[1..]) {
             Ok((_, q)) => {
               if let SerfMessage::Query(q) = q {
-                tracing::debug!("ruserf: query message: {}", q.name);
+                tracing::debug!("serf: query message: {}", q.name);
                 match q.decode_internal_query::<D>() {
                   Some(Err(e)) => {
-                    tracing::warn!(err=%e, "ruserf: failed to decode message");
+                    tracing::warn!(err=%e, "serf: failed to decode message");
                   }
                   Some(Ok(res)) => {
                     rebroadcast = this.handle_query(q, Some(res)).await.then(|| msg.clone());
@@ -248,49 +248,49 @@ where
                   }
                 };
               } else {
-                tracing::warn!("ruserf: receive unexpected message: {}", q.ty().as_str());
+                tracing::warn!("serf: receive unexpected message: {}", q.ty().as_str());
               }
             }
             Err(e) => {
-              tracing::warn!(err=%e, "ruserf: failed to decode message");
+              tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
           MessageType::QueryResponse => {
             match <D as TransformDelegate>::decode_message(ty, &msg[1..]) {
               Ok((_, qr)) => {
                 if let SerfMessage::QueryResponse(qr) = qr {
-                  tracing::debug!("ruserf: query response message: {}", qr.from);
+                  tracing::debug!("serf: query response message: {}", qr.from);
                   this.handle_query_response(qr).await;
                 } else {
-                  tracing::warn!("ruserf: receive unexpected message: {}", qr.ty().as_str());
+                  tracing::warn!("serf: receive unexpected message: {}", qr.ty().as_str());
                 }
               }
               Err(e) => {
-                tracing::warn!(err=%e, "ruserf: failed to decode message");
+                tracing::warn!(err=%e, "serf: failed to decode message");
               }
             }
           }
           MessageType::Relay => match <D as TransformDelegate>::decode_node(&msg[1..]) {
             Ok((consumed, n)) => {
-              tracing::debug!("ruserf: relay message",);
-              tracing::debug!("ruserf: relaying response to node: {}", n);
+              tracing::debug!("serf: relay message",);
+              tracing::debug!("serf: relaying response to node: {}", n);
               // + 1 for the message type byte
               msg.advance(consumed + 1);
               if let Err(e) = this.inner.memberlist.send(n.address(), msg.clone()).await {
-                tracing::error!(err=%e, "ruserf: failed to forwarding message to {}", n);
+                tracing::error!(err=%e, "serf: failed to forwarding message to {}", n);
               }
             }
             Err(e) => {
-              tracing::warn!(err=%e, "ruserf: failed to decode relay destination");
+              tracing::warn!(err=%e, "serf: failed to decode relay destination");
             }
           },
           ty => {
-            tracing::warn!("ruserf: receive unexpected message: {}", ty.as_str());
+            tracing::warn!("serf: receive unexpected message: {}", ty.as_str());
           }
         }
       }
       Err(e) => {
-        tracing::warn!(err=%e, "ruserf: receive unknown message type");
+        tracing::warn!(err=%e, "serf: receive unknown message type");
       }
     }
 
@@ -324,7 +324,7 @@ where
       #[cfg(feature = "metrics")]
       {
         metrics::histogram!(
-          "ruserf.messages.sent",
+          "serf.messages.sent",
           this.inner.opts.memberlist_options.metric_labels.iter()
         )
         .record(encoded_len as f64);
@@ -343,7 +343,7 @@ where
       #[cfg(feature = "metrics")]
       {
         metrics::histogram!(
-          "ruserf.messages.sent",
+          "serf.messages.sent",
           this.inner.opts.memberlist_options.metric_labels.iter()
         )
         .record(encoded_len as f64);
@@ -362,7 +362,7 @@ where
       #[cfg(feature = "metrics")]
       {
         metrics::histogram!(
-          "ruserf.messages.sent",
+          "serf.messages.sent",
           this.inner.opts.memberlist_options.metric_labels.iter()
         )
         .record(encoded_len as f64);
@@ -413,7 +413,7 @@ where
         buf.freeze()
       }
       Err(e) => {
-        tracing::error!(err=%e, "ruserf: failed to encode local state");
+        tracing::error!(err=%e, "serf: failed to encode local state");
         Bytes::new()
       }
     }
@@ -421,13 +421,13 @@ where
 
   async fn merge_remote_state(&self, buf: Bytes, is_join: bool) {
     if buf.is_empty() {
-      tracing::error!("ruserf: remote state is zero bytes");
+      tracing::error!("serf: remote state is zero bytes");
       return;
     }
 
     // Check the message type
     let Ok(ty) = MessageType::try_from(buf[0]) else {
-      tracing::error!("ruserf: remote state has bad type prefix {}", buf[0]);
+      tracing::error!("serf: remote state has bad type prefix {}", buf[0]);
       return;
     };
 
@@ -451,7 +451,7 @@ where
       MessageType::PushPull => {
         match <D as TransformDelegate>::decode_message(ty, &buf[1..]) {
           Err(e) => {
-            tracing::error!(err=%e, "ruserf: failed to decode remote state");
+            tracing::error!(err=%e, "serf: failed to decode remote state");
           }
           Ok((_, msg)) => {
             match msg {
@@ -491,7 +491,7 @@ where
                       .await;
                   } else {
                     tracing::error!(
-                      "ruserf: {} is in left members, but cannot find the lamport time for it in status",
+                      "serf: {} is in left members, but cannot find the lamport time for it in status",
                       node
                     );
                   }
@@ -541,14 +541,14 @@ where
                 }
               }
               msg => {
-                tracing::error!("ruserf: remote state has bad type {}", msg.ty().as_str());
+                tracing::error!("serf: remote state has bad type {}", msg.ty().as_str());
               }
             }
           }
         }
       }
       ty => {
-        tracing::error!("ruserf: remote state has bad type {}", ty.as_str());
+        tracing::error!("serf: remote state has bad type {}", ty.as_str());
       }
     }
   }
@@ -693,7 +693,7 @@ where
       buf.resize(encoded_len, 0);
 
       if let Err(e) = <D as TransformDelegate>::encode_coordinate(&coord, &mut buf[1..]) {
-        tracing::error!(err=%e, "ruserf: failed to encode coordinate");
+        tracing::error!(err=%e, "serf: failed to encode coordinate");
       }
       buf.into()
     } else {
@@ -716,18 +716,18 @@ where
     if let Some(ref c) = this.inner.coord_core {
       // Verify ping version in the header.
       if payload[0] != PING_VERSION {
-        tracing::error!("ruserf: unsupported ping version: {}", payload[0]);
+        tracing::error!("serf: unsupported ping version: {}", payload[0]);
         return;
       }
 
       // Process the remainder of the message as a coordinate.
       let coord = match <D as TransformDelegate>::decode_coordinate(&payload[1..]) {
         Ok((readed, c)) => {
-          tracing::trace!(read=%readed, coordinate=?c, "ruserf: decode coordinate successfully");
+          tracing::trace!(read=%readed, coordinate=?c, "serf: decode coordinate successfully");
           c
         }
         Err(e) => {
-          tracing::error!(err=%e, "ruserf: failed to decode coordinate from ping");
+          tracing::error!(err=%e, "serf: failed to decode coordinate from ping");
           return;
         }
       };
@@ -743,7 +743,7 @@ where
             // adjusting each time we update.
             let d = before.distance_to(&_after).as_secs_f64() * 1.0e3;
             metrics::histogram!(
-              "ruserf.coordinate.adjustment-ms",
+              "serf.coordinate.adjustment-ms",
               this.inner.opts.memberlist_options.metric_labels.iter()
             )
             .record(d);
@@ -766,13 +766,13 @@ where
           #[cfg(feature = "metrics")]
           {
             metrics::counter!(
-              "ruserf.coordinate.rejected",
+              "serf.coordinate.rejected",
               this.inner.opts.memberlist_options.metric_labels.iter()
             )
             .increment(1);
           }
 
-          tracing::error!(err=%e, "ruserf: rejected coordinate from {}", node.id());
+          tracing::error!(err=%e, "serf: rejected coordinate from {}", node.id());
         }
       }
     }
@@ -817,7 +817,7 @@ where
     tags: if !node.meta().is_empty() {
       <D as TransformDelegate>::decode_tags(node.meta())
         .map(|(read, tags)| {
-          tracing::trace!(read=%read, tags=?tags, "ruserf: decode tags successfully");
+          tracing::trace!(read=%read, tags=?tags, "serf: decode tags successfully");
           Arc::new(tags)
         })
         .map_err(SerfDelegateError::transform)?

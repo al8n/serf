@@ -142,15 +142,15 @@ pub enum SerfMessageRef<'a, I, A> {
   KeyResponse(&'a KeyResponseMessage),
 }
 
-impl<'a, I, A> Clone for SerfMessageRef<'a, I, A> {
+impl<I, A> Clone for SerfMessageRef<'_, I, A> {
   fn clone(&self) -> Self {
     *self
   }
 }
 
-impl<'a, I, A> Copy for SerfMessageRef<'a, I, A> {}
+impl<I, A> Copy for SerfMessageRef<'_, I, A> {}
 
-impl<'a, I, A> AsMessageRef<I, A> for SerfMessageRef<'a, I, A> {
+impl<I, A> AsMessageRef<I, A> for SerfMessageRef<'_, I, A> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     *self
   }
@@ -224,31 +224,31 @@ impl<I, A> AsMessageRef<I, A> for UserEventMessage {
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a QueryMessage<I, A> {
+impl<I, A> AsMessageRef<I, A> for &QueryMessage<I, A> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::Query(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a QueryResponseMessage<I, A> {
+impl<I, A> AsMessageRef<I, A> for &QueryResponseMessage<I, A> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::QueryResponse(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a JoinMessage<I> {
+impl<I, A> AsMessageRef<I, A> for &JoinMessage<I> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::Join(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for PushPullMessageRef<'a, I> {
+impl<I, A> AsMessageRef<I, A> for PushPullMessageRef<'_, I> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::PushPull(*self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a PushPullMessage<I> {
+impl<I, A> AsMessageRef<I, A> for &PushPullMessage<I> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::PushPull(PushPullMessageRef {
       ltime: self.ltime,
@@ -261,39 +261,39 @@ impl<'a, I, A> AsMessageRef<I, A> for &'a PushPullMessage<I> {
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a UserEventMessage {
+impl<I, A> AsMessageRef<I, A> for &UserEventMessage {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::UserEvent(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a LeaveMessage<I> {
+impl<I, A> AsMessageRef<I, A> for &LeaveMessage<I> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::Leave(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a Member<I, A> {
+impl<I, A> AsMessageRef<I, A> for &Member<I, A> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::ConflictResponse(self)
   }
 }
 
-impl<'a, I, A> AsMessageRef<I, A> for &'a Arc<Member<I, A>> {
+impl<I, A> AsMessageRef<I, A> for &Arc<Member<I, A>> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::ConflictResponse(self)
   }
 }
 
 #[cfg(feature = "encryption")]
-impl<'a, I, A> AsMessageRef<I, A> for &'a KeyRequestMessage {
+impl<I, A> AsMessageRef<I, A> for &KeyRequestMessage {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::KeyRequest(self)
   }
 }
 
 #[cfg(feature = "encryption")]
-impl<'a, I, A> AsMessageRef<I, A> for &'a KeyResponseMessage {
+impl<I, A> AsMessageRef<I, A> for &KeyResponseMessage {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     SerfMessageRef::KeyResponse(self)
   }
@@ -324,7 +324,7 @@ impl<I, A> AsMessageRef<I, A> for SerfMessage<I, A> {
   }
 }
 
-impl<'b, I, A> AsMessageRef<I, A> for &'b SerfMessage<I, A> {
+impl<I, A> AsMessageRef<I, A> for &SerfMessage<I, A> {
   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
     match self {
       SerfMessage::Leave(l) => SerfMessageRef::Leave(l),
@@ -423,7 +423,7 @@ where
   }
 }
 
-impl<'a, I, A> Encodable for SerfMessageRef<'a, I, A>
+impl<I, A> Encodable for SerfMessageRef<'_, I, A>
 where
   I: Transformable + core::hash::Hash + Eq,
   A: Transformable + core::hash::Hash + Eq,

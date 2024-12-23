@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use memberlist_core::CheapClone;
 use parking_lot::RwLock;
 use rand::Rng;
-use ruserf_types::Transformable;
+use serf_types::Transformable;
 use smallvec::SmallVec;
 
 /// Used to convert float seconds to nanoseconds.
@@ -482,7 +482,7 @@ where
 
     #[cfg(feature = "metrics")]
     if rtt.is_zero() {
-      metrics::counter!("ruserf.coordinate.zero-rtt", l.opts.metric_labels.iter()).increment(1);
+      metrics::counter!("serf.coordinate.zero-rtt", l.opts.metric_labels.iter()).increment(1);
     }
 
     let rtt_seconds = l.latency_filter(node, rtt.as_secs_f64());

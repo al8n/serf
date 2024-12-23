@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use indexmap::IndexMap;
 use memberlist_core::types::TinyVec;
-use ruserf_types::UserEventMessage;
+use serf_types::UserEventMessage;
 use smol_str::SmolStr;
 
 use crate::types::LamportTime;
