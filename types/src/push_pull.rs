@@ -108,13 +108,13 @@ pub struct PushPullMessageRef<'a, I> {
   query_ltime: LamportTime,
 }
 
-impl<'a, I> Clone for PushPullMessageRef<'a, I> {
+impl<I> Clone for PushPullMessageRef<'_, I> {
   fn clone(&self) -> Self {
     *self
   }
 }
 
-impl<'a, I> Copy for PushPullMessageRef<'a, I> {}
+impl<I> Copy for PushPullMessageRef<'_, I> {}
 
 impl<'a, I> From<&'a PushPullMessage<I>> for PushPullMessageRef<'a, I> {
   #[inline]
@@ -144,7 +144,7 @@ impl<'a, I> From<&'a mut PushPullMessage<I>> for PushPullMessageRef<'a, I> {
   }
 }
 
-impl<'a, I> super::Encodable for PushPullMessageRef<'a, I>
+impl<I> super::Encodable for PushPullMessageRef<'_, I>
 where
   I: Transformable,
 {

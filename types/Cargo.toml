@@ -1,12 +1,12 @@
 [package]
-name = "ruserf-types"
+name = "serf-types"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 repository.workspace = true
 homepage.workspace = true
 license.workspace = true
-description = "Types for the `ruserf` crate"
+description = "Types for the `serf` crate"
 
 [features]
 encryption = ["memberlist-types/encryption", "futures"]
@@ -22,7 +22,7 @@ futures = { workspace = true, optional = true, features = ["alloc"] }
 indexmap.workspace = true
 memberlist-types.workspace = true
 smol_str.workspace = true
-transformable = { version = "0.1", features = ["async"] }
+transformable = { version = "0.2", features = ["async"] }
 thiserror.workspace = true
 viewit.workspace = true
 

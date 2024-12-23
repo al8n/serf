@@ -1,5 +1,5 @@
 use core::future::Future;
-use ruserf_core::tests::run as run_unit_test;
+use serf_core::tests::run as run_unit_test;
 
 #[cfg(feature = "net")]
 #[path = "./main/net.rs"]
@@ -17,12 +17,12 @@ fn tokio_run(fut: impl Future<Output = ()>) {
 
 #[cfg(feature = "smol")]
 fn smol_run(fut: impl Future<Output = ()>) {
-  use ruserf::agnostic::{smol::SmolRuntime, RuntimeLite};
+  use serf::agnostic::{smol::SmolRuntime, RuntimeLite};
   run_unit_test(SmolRuntime::block_on, fut);
 }
 
 #[cfg(feature = "async-std")]
 fn async_std_run(fut: impl Future<Output = ()>) {
-  use ruserf::agnostic::{async_std::AsyncStdRuntime, RuntimeLite};
+  use serf::agnostic::{async_std::AsyncStdRuntime, RuntimeLite};
   run_unit_test(AsyncStdRuntime::block_on, fut);
 }

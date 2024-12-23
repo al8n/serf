@@ -8,7 +8,7 @@ use memberlist_core::{
   transport::MaybeResolvedAddress,
   types::{OneOrMore, TinyVec},
 };
-use ruserf_types::{
+use serf_types::{
   MessageType, Node, PushPullMessage, QueryFlag, QueryMessage, SerfMessage, UserEvent,
   UserEventMessage,
 };
@@ -340,7 +340,7 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
   T: Transport,
 {
   use memberlist_core::types::SecretKey;
-  use ruserf_types::KeyResponseMessage;
+  use serf_types::KeyResponseMessage;
 
   let size_limit = opts.query_response_size_limit() * 10;
   let opts = opts.with_query_response_size_limit(size_limit);
@@ -400,7 +400,7 @@ where
   T: Transport,
 {
   use memberlist_core::types::SecretKey;
-  use ruserf_types::{Encodable, KeyResponseMessage};
+  use serf_types::{Encodable, KeyResponseMessage};
 
   let opts = opts.with_query_response_size_limit(1024);
   let s = Serf::<T>::new(transport_opts, opts).await.unwrap();

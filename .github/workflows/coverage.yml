@@ -33,13 +33,13 @@ jobs:
         include:
           - crate: core
             features: "test,metrics"
-            name: "ruserf-core"
+            name: "serf-core"
           - crate: types 
             features: "metrics,encryption"
-            name: "ruserf-types"
-          - crate: ruserf
+            name: "serf-types"
+          - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
-            name: "ruserf-tcp-encryption"
+            name: "serf-tcp-encryption"
     steps:
       - uses: actions/checkout@v3
       - name: Install latest nightly

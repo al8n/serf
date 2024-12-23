@@ -52,7 +52,7 @@ jobs:
             await github.rest.gists.update({
               gist_id: gistId,
               files: {
-                "ruserf": {
+                "serf": {
                   content: output
                 }
               }

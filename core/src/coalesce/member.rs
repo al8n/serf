@@ -128,7 +128,7 @@ mod tests {
     agnostic_lite::{tokio::TokioRuntime, RuntimeLite},
     transport::{resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport, Lpe},
   };
-  use ruserf_types::{MemberStatus, UserEventMessage};
+  use serf_types::{MemberStatus, UserEventMessage};
   use smol_str::SmolStr;
 
   use crate::{

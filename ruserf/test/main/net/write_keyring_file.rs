@@ -5,7 +5,7 @@ macro_rules! test_mod {
         use std::net::SocketAddr;
 
         use crate::[< $rt:snake _run >];
-        use ruserf::{
+        use serf::{
           net::{
             resolver::socket_addr::SocketAddrResolver, stream_layer::tcp::Tcp, NetTransport,
             NetTransportOptions,
@@ -13,7 +13,7 @@ macro_rules! test_mod {
           [< $rt:snake >]::[< $rt:camel Runtime >],
           transport::Lpe,
         };
-        use ruserf_core::tests::{serf_write_keyring_file, next_socket_addr_v4, next_socket_addr_v6};
+        use serf_core::tests::{serf_write_keyring_file, next_socket_addr_v4, next_socket_addr_v6};
         use smol_str::SmolStr;
 
         #[test]
@@ -30,7 +30,7 @@ macro_rules! test_mod {
               Lpe<SmolStr, SocketAddr>,
               [< $rt:camel Runtime >],
             >,
-          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(ruserf::net::security::EncryptionAlgo::default()))));
+          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(serf::net::security::EncryptionAlgo::default()))));
         }
 
         #[test]
@@ -47,7 +47,7 @@ macro_rules! test_mod {
               Lpe<SmolStr, SocketAddr>,
               [< $rt:camel Runtime >],
             >,
-          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(ruserf::net::security::EncryptionAlgo::default()))));
+          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(serf::net::security::EncryptionAlgo::default()))));
         }
       }
     }

@@ -12,7 +12,7 @@ pub use memberlist::agnostic::tokio::TokioRuntime;
     not(target_family = "wasm")
   )))
 )]
-pub type TokioTcpSerf<I, A, W, D> = ruserf_core::Serf<
+pub type TokioTcpSerf<I, A, W, D> = serf_core::Serf<
   memberlist::net::NetTransport<
     I,
     A,
@@ -26,7 +26,7 @@ pub type TokioTcpSerf<I, A, W, D> = ruserf_core::Serf<
 /// [`Serf`](super::Serf) type alias for using [`NetTransport`](memberlist::net::NetTransport) and [`Tls`](memberlist::net::stream_layer::tls::Tls) stream layer with `tokio` runtime.
 #[cfg(all(feature = "tls", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "tls", not(target_family = "wasm")))))]
-pub type TokioTlsSerf<I, A, W, D> = ruserf_core::Serf<
+pub type TokioTlsSerf<I, A, W, D> = serf_core::Serf<
   memberlist::net::NetTransport<
     I,
     A,
@@ -43,7 +43,7 @@ pub type TokioTlsSerf<I, A, W, D> = ruserf_core::Serf<
   docsrs,
   doc(cfg(all(feature = "native-tls", not(target_family = "wasm"))))
 )]
-pub type TokioNativeTlsSerf<I, A, W, D> = ruserf_core::Serf<
+pub type TokioNativeTlsSerf<I, A, W, D> = serf_core::Serf<
   memberlist::net::NetTransport<
     I,
     A,
@@ -57,7 +57,7 @@ pub type TokioNativeTlsSerf<I, A, W, D> = ruserf_core::Serf<
 /// [`Serf`](super::Serf) type alias for using [`QuicTransport`](memberlist::quic::QuicTransport) and [`Quinn`](memberlist::quic::stream_layer::quinn::Quinn) stream layer with `tokio` runtime.
 #[cfg(all(feature = "quinn", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "quinn", not(target_family = "wasm")))))]
-pub type TokioQuicSerf<I, A, W, D> = ruserf_core::Serf<
+pub type TokioQuicSerf<I, A, W, D> = serf_core::Serf<
   memberlist::quic::QuicTransport<
     I,
     A,
@@ -71,7 +71,7 @@ pub type TokioQuicSerf<I, A, W, D> = ruserf_core::Serf<
 /// [`Serf`](super::Serf) type alias for using [`QuicTransport`](memberlist::quic::QuicTransport) and [`S2n`](memberlist::quic::stream_layer::s2n::S2n) stream layer with `tokio` runtime.
 #[cfg(all(feature = "s2n", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "s2n", not(target_family = "wasm")))))]
-pub type TokioS2nSerf<I, A, W, D> = ruserf_core::Serf<
+pub type TokioS2nSerf<I, A, W, D> = serf_core::Serf<
   memberlist::quic::QuicTransport<
     I,
     A,

@@ -515,7 +515,7 @@ where
           // We got a response, so we are done
         }
         _ = <T::Runtime as RuntimeLite>::sleep(self.inner.opts.broadcast_timeout).fuse() => {
-          tracing::warn!("ruserf: timeout while waiting for graceful leave");
+          tracing::warn!("serf: timeout while waiting for graceful leave");
         }
       }
     }
@@ -527,7 +527,7 @@ where
       .leave(self.inner.opts.broadcast_timeout)
       .await
     {
-      tracing::warn!("ruserf: timeout waiting for leave broadcast: {}", e);
+      tracing::warn!("serf: timeout waiting for leave broadcast: {}", e);
     }
 
     // Wait for the leave to propagate through the cluster. The broadcast
@@ -581,7 +581,7 @@ where
         SerfState::Shutdown => return Ok(()),
         SerfState::Left => {}
         _ => {
-          tracing::warn!("ruserf: shutdown without a leave");
+          tracing::warn!("serf: shutdown without a leave");
         }
       }
 

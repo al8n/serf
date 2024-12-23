@@ -1,5 +1,5 @@
 use memberlist_core::types::OneOrMore;
-use ruserf_types::Member;
+use serf_types::Member;
 
 use std::collections::HashMap;
 

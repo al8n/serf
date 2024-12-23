@@ -1,4 +1,4 @@
-pub use ruserf_types::*;
+pub use serf_types::*;
 
 mod member;
 pub(crate) use member::*;

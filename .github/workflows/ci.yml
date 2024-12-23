@@ -74,10 +74,10 @@ jobs:
           cargo test --no-default-features --features "metrics,encryption,serde"
         working-directory: types
 
-      - name: Run Unit Tests for ruserf based on net transport
+      - name: Run Unit Tests for serf based on net transport
         run: |
           cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }}" -- --test-threads=1
-        working-directory: ruserf
+        working-directory: serf
 
       - name: Cache Cargo registry
         uses: actions/cache@v3

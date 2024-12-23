@@ -23,7 +23,7 @@ use memberlist_core::{
   CheapClone,
 };
 use rand::seq::SliceRandom;
-use ruserf_types::UserEventMessage;
+use serf_types::UserEventMessage;
 
 use crate::{
   delegate::{Delegate, TransformDelegate},
@@ -188,7 +188,7 @@ macro_rules! encode {
   }};
 }
 
-impl<'a, I, A> SnapshotRecord<'a, I, A>
+impl<I, A> SnapshotRecord<'_, I, A>
 where
   I: Id,
   A: CheapClone + Send + Sync + 'static,
@@ -324,7 +324,7 @@ pub(crate) fn open_and_replay_snapshot<
       SnapshotRecordType::Leave => {
         // Ignore a leave if we plan on re-joining
         if rejoin_after_leave {
-          tracing::info!("ruserf: ignoring previous leave in snapshot");
+          tracing::info!("serf: ignoring previous leave in snapshot");
           continue;
         }
         alive_nodes.clear();
@@ -562,7 +562,7 @@ where
         default => break,
       }
     }
-    tracing::debug!("ruserf: snapshotter tee stream exits");
+    tracing::debug!("serf: snapshotter tee stream exits");
   }
 
   fn handle_leave(&mut self) {
@@ -575,11 +575,11 @@ where
     self.try_append(SnapshotRecord::Leave);
     if let Some(fh) = self.fh.as_mut() {
       if let Err(e) = fh.flush() {
-        tracing::error!(target="ruserf", err=%SnapshotError::Flush(e), "failed to flush leave to snapshot");
+        tracing::error!(target="serf", err=%SnapshotError::Flush(e), "failed to flush leave to snapshot");
       }
 
       if let Err(e) = fh.get_mut().sync_all() {
-        tracing::error!(target="ruserf", err=%SnapshotError::Sync(e), "failed to sync leave to snapshot");
+        tracing::error!(target="serf", err=%SnapshotError::Sync(e), "failed to sync leave to snapshot");
       }
     }
   }
@@ -646,17 +646,17 @@ where
 
     if let Some(fh) = self.fh.as_mut() {
       if let Err(e) = fh.flush() {
-        tracing::error!(target="ruserf", err=%SnapshotError::Flush(e), "failed to flush leave to snapshot");
+        tracing::error!(target="serf", err=%SnapshotError::Flush(e), "failed to flush leave to snapshot");
       }
 
       if let Err(e) = fh.get_mut().sync_all() {
-        tracing::error!(target="ruserf", err=%SnapshotError::Sync(e), "failed to sync leave to snapshot");
+        tracing::error!(target="serf", err=%SnapshotError::Sync(e), "failed to sync leave to snapshot");
       }
     }
 
     self.wait_tx.close();
     tee_handle.await;
-    tracing::debug!("ruserf: snapshotter stream exits");
+    tracing::debug!("serf: snapshotter stream exits");
   }
 
   /// Used to handle a single user event
@@ -724,14 +724,14 @@ where
     l: SnapshotRecord<'_, T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
   ) {
     if let Err(e) = self.append_line(l) {
-      tracing::error!(err = %e, "ruserf: failed to update snapshot");
+      tracing::error!(err = %e, "serf: failed to update snapshot");
       if self.last_attempted_compaction.elapsed() > SNAPSHOT_ERROR_RECOVERY_INTERVAL {
         self.last_attempted_compaction = Epoch::now();
-        tracing::info!("ruserf: attempting compaction to recover from error...");
+        tracing::info!("serf: attempting compaction to recover from error...");
         if let Err(e) = self.compact() {
-          tracing::error!(err = %e, "ruserf: compaction failed, will reattempt after {}s", SNAPSHOT_ERROR_RECOVERY_INTERVAL.as_secs());
+          tracing::error!(err = %e, "serf: compaction failed, will reattempt after {}s", SNAPSHOT_ERROR_RECOVERY_INTERVAL.as_secs());
         } else {
-          tracing::info!("ruserf: finished compaction, successfully recovered from error state");
+          tracing::info!("serf: finished compaction, successfully recovered from error state");
         }
       }
     }
@@ -748,7 +748,7 @@ where
     let metric_labels = self.metric_labels.clone();
     #[cfg(feature = "metrics")]
     scopeguard::defer!(
-      metrics::histogram!("ruserf.snapshot.append_line", metric_labels.iter())
+      metrics::histogram!("serf.snapshot.append_line", metric_labels.iter())
         .record(start.elapsed().as_millis() as f64)
     );
 
@@ -791,7 +791,7 @@ where
     let metric_labels = self.metric_labels.clone();
     #[cfg(feature = "metrics")]
     scopeguard::defer!(
-      metrics::histogram!("ruserf.snapshot.compact", metric_labels.iter())
+      metrics::histogram!("serf.snapshot.compact", metric_labels.iter())
         .record(start.elapsed().as_millis() as f64)
     );
 

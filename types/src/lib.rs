@@ -1,8 +1,8 @@
-//! Types used by the [`ruserf`](https://crates.io/crates/ruserf) crate.
+//! Types used by the [`serf`](https://crates.io/crates/serf) crate.
 #![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/memberlist/main/art/logo_72x72.png")]
 #![forbid(unsafe_code)]
 #![deny(warnings, missing_docs)]
-#![allow(clippy::type_complexity)]
+#![allow(clippy::type_complexity, unexpected_cfgs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 

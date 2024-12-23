@@ -5,7 +5,7 @@ macro_rules! test_mod {
         use std::net::SocketAddr;
 
         use crate::[< $rt:snake _run >];
-        use ruserf::{
+        use serf::{
           net::{
             resolver::socket_addr::SocketAddrResolver, stream_layer::tcp::Tcp, NetTransport,
             NetTransportOptions,
@@ -13,7 +13,7 @@ macro_rules! test_mod {
           [< $rt:snake >]::[< $rt:camel Runtime >],
           transport::Lpe,
         };
-        use ruserf_core::tests::{join::serf_join_leave_join, next_socket_addr_v4, next_socket_addr_v6};
+        use serf_core::tests::{join::serf_join_leave_join, next_socket_addr_v4, next_socket_addr_v6};
         use smol_str::SmolStr;
 
         #[test]

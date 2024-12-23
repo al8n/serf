@@ -4,7 +4,7 @@ codecov:
 ignore:
   - core/src/serf/base/tests
   - core/src/serf/base/tests.rs
-  - ruserf/test
+  - serf/test
 
 coverage:
   status:

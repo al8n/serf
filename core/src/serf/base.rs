@@ -304,7 +304,7 @@ where
     handles.push(h);
 
     let h = QueueChecker {
-      name: "ruserf.queue.intent",
+      name: "serf.queue.intent",
       queue: this.inner.broadcasts.clone(),
       members: this.inner.members.clone(),
       opts: this.inner.opts.queue_opts(),
@@ -314,7 +314,7 @@ where
     handles.push(h);
 
     let h = QueueChecker {
-      name: "ruserf.queue.event",
+      name: "serf.queue.event",
       queue: this.inner.event_broadcasts.clone(),
       members: this.inner.members.clone(),
       opts: this.inner.opts.queue_opts(),
@@ -324,7 +324,7 @@ where
     handles.push(h);
 
     let h = QueueChecker {
-      name: "ruserf.queue.query",
+      name: "serf.queue.query",
       queue: this.inner.query_broadcasts.clone(),
       members: this.inner.members.clone(),
       opts: this.inner.opts.queue_opts(),
@@ -404,7 +404,7 @@ where
     let msg = SerfMessage::Join(msg);
     // Start broadcasting the update
     if let Err(e) = self.broadcast(msg, None).await {
-      tracing::warn!(err=%e, "ruserf: failed to broadcast join intent");
+      tracing::warn!(err=%e, "serf: failed to broadcast join intent");
       return Err(e);
     }
 
@@ -565,7 +565,7 @@ macro_rules! reap {
 
       // Delete from members and send out event
       let id = m.member.node.id();
-      tracing::info!("ruserf: event member reap: {} reaps {}", $local_id, id);
+      tracing::info!("serf: event member reap: {} reaps {}", $local_id, id);
 
       erase_node!($tx <- $coord($members[id].m));
     }
@@ -597,7 +597,7 @@ where
         }
       }
     }
-    tracing::debug!("ruserf: reaper exits");
+    tracing::debug!("serf: reaper exits");
   }
 
   fn spawn(self) -> <<T::Runtime as RuntimeLite>::Spawner as AsyncSpawner>::JoinHandle<()> {
@@ -671,7 +671,7 @@ where
             let prob = num_failed as f32 / num_alive as f32;
             let r: f32 = rng.gen();
             if r > prob {
-              tracing::debug!("ruserf: forgoing reconnect for random throttling");
+              tracing::debug!("serf: forgoing reconnect for random throttling");
               continue;
             }
 
@@ -681,12 +681,12 @@ where
 
             let (id, address) = member.member.node().cheap_clone().into_components();
             drop(mu); // release read lock
-            tracing::info!("ruserf: attempting to reconnect to {}", id);
+            tracing::info!("serf: attempting to reconnect to {}", id);
             // Attempt to join at the memberlist level
             if let Err(e) = self.memberlist.join(Node::new(id.cheap_clone(), MaybeResolvedAddress::resolved(address))).await {
-              tracing::warn!("ruserf: failed to reconnect {}: {}", id, e);
+              tracing::warn!("serf: failed to reconnect {}: {}", id, e);
             } else {
-              tracing::info!("ruserf: successfully reconnected to {}", id);
+              tracing::info!("serf: successfully reconnected to {}", id);
             }
           }
           _ = self.shutdown_rx.recv().fuse() => {
@@ -695,7 +695,7 @@ where
         }
       }
 
-      tracing::debug!("ruserf: reconnector exits");
+      tracing::debug!("serf: reconnector exits");
     })
   }
 }
@@ -726,12 +726,12 @@ where
               metrics::gauge!(self.name, self.opts.metric_labels.iter()).set(numq as f64);
             }
             if numq >= self.opts.depth_warning {
-              tracing::warn!("ruserf: queue {} depth: {}", self.name, numq);
+              tracing::warn!("serf: queue {} depth: {}", self.name, numq);
             }
 
             let max = self.get_queue_max().await;
             if numq >= max {
-              tracing::warn!("ruserf: {} queue depth ({}) exceeds limit ({}), dropping messages!", self.name, numq, max);
+              tracing::warn!("serf: {} queue depth ({}) exceeds limit ({}), dropping messages!", self.name, numq, max);
               self.queue.prune(max).await;
             }
           }
@@ -741,7 +741,7 @@ where
         }
       }
 
-      tracing::debug!("ruserf: {} queue checker exits", self.name);
+      tracing::debug!("serf: {} queue checker exits", self.name);
     })
   }
 
@@ -783,7 +783,7 @@ where
     let cur_time = self.inner.event_clock.time();
     if cur_time > bltime && msg.ltime < cur_time - bltime {
       tracing::warn!(
-        "ruserf: received old event {} from time {} (current: {})",
+        "serf: received old event {} from time {} (current: {})",
         msg.name,
         msg.ltime,
         cur_time
@@ -815,13 +815,13 @@ where
     #[cfg(feature = "metrics")]
     {
       metrics::counter!(
-        "ruserf.events",
+        "serf.events",
         self.inner.opts.memberlist_options.metric_labels().iter()
       )
       .increment(1);
 
       // TODO: how to avoid allocating here?
-      let named = format!("ruserf.events.{}", msg.name);
+      let named = format!("serf.events.{}", msg.name);
       metrics::counter!(
         named,
         self.inner.opts.memberlist_options.metric_labels().iter()
@@ -830,7 +830,7 @@ where
     }
 
     if let Err(e) = self.inner.event_tx.send(msg.into()).await {
-      tracing::error!("ruserf: failed to send user event: {}", e);
+      tracing::error!("serf: failed to send user event: {}", e);
     }
 
     true
@@ -998,7 +998,7 @@ where
     let q_time = LamportTime::new(query.buffer.len() as u64);
     if cur_time > q_time && q_time < cur_time - q_time {
       tracing::warn!(
-        "ruserf: received old query {} from time {} (current: {})",
+        "serf: received old query {} from time {} (current: {})",
         q.name,
         q.ltime,
         cur_time
@@ -1030,13 +1030,13 @@ where
     #[cfg(feature = "metrics")]
     {
       metrics::counter!(
-        "ruserf.queries",
+        "serf.queries",
         self.inner.opts.memberlist_options.metric_labels().iter()
       )
       .increment(1);
 
       // TODO: how to avoid allocating here?
-      let named = format!("ruserf.queries.{}", q.name);
+      let named = format!("serf.queries.{}", q.name);
       metrics::counter!(
         named,
         self.inner.opts.memberlist_options.metric_labels().iter()
@@ -1085,18 +1085,18 @@ where
             .send(q.from().address(), raw.freeze())
             .await
           {
-            tracing::error!(err=%e, "ruserf: failed to send ack");
+            tracing::error!(err=%e, "serf: failed to send ack");
           }
 
           if let Err(e) = self
             .relay_response(q.relay_factor, q.from.clone(), ack)
             .await
           {
-            tracing::error!(err=%e, "ruserf: failed to relay ack");
+            tracing::error!(err=%e, "serf: failed to relay ack");
           }
         }
         Err(e) => {
-          tracing::error!(err=%e, "ruserf: failed to format ack");
+          tracing::error!(err=%e, "serf: failed to format ack");
         }
       }
     }
@@ -1112,7 +1112,7 @@ where
       })
       .await
     {
-      tracing::error!(err=%e, "ruserf: failed to send query");
+      tracing::error!(err=%e, "serf: failed to send query");
     }
 
     rebroadcast
@@ -1137,7 +1137,7 @@ where
       // Verify the ID matches
       if query.id != resp.id {
         tracing::warn!(
-          "ruserf: query reply ID mismatch (local: {}, response: {})",
+          "serf: query reply ID mismatch (local: {}, response: {})",
           query.id,
           resp.id
         );
@@ -1154,7 +1154,7 @@ where
         .await;
     } else {
       tracing::warn!(
-        "ruserf: reply for non-running query (LTime: {}, ID: {}) From: {}",
+        "serf: reply for non-running query (LTime: {}, ID: {}) From: {}",
         resp.ltime,
         resp.id,
         resp.from
@@ -1183,11 +1183,11 @@ where
     let tags = if !n.meta().is_empty() {
       match <D as TransformDelegate>::decode_tags(n.meta()) {
         Ok((readed, tags)) => {
-          tracing::trace!(read = %readed, tags=?tags, "ruserf: decode tags successfully");
+          tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
           tags
         }
         Err(e) => {
-          tracing::error!(err=%e, "ruserf: failed to decode tags");
+          tracing::error!(err=%e, "serf: failed to decode tags");
           return;
         }
       }
@@ -1204,7 +1204,7 @@ where
         if let Some(dead_time) = dead_time {
           if dead_time < self.inner.opts.flap_timeout {
             metrics::counter!(
-              "ruserf.member.flap",
+              "serf.member.flap",
               self.inner.opts.memberlist_options.metric_labels().iter()
             )
             .increment(1);
@@ -1286,14 +1286,14 @@ where
     // update some metrics
     #[cfg(feature = "metrics")]
     metrics::counter!(
-      "ruserf.member.join",
+      "serf.member.join",
       self.inner.opts.memberlist_options.metric_labels().iter()
     )
     .increment(1);
 
-    tracing::info!("ruserf: member join: {}", node);
+    tracing::info!("serf: member join: {}", node);
     if let Err(e) = fut.await {
-      tracing::error!(err=%e, "ruserf: failed to send member event");
+      tracing::error!(err=%e, "serf: failed to send member event");
     }
   }
 
@@ -1368,7 +1368,7 @@ where
         member
       }
       _ => {
-        tracing::warn!("ruserf: bad state when leave: {}", ms);
+        tracing::warn!("serf: bad state when leave: {}", ms);
         return;
       }
     };
@@ -1383,12 +1383,12 @@ where
     // Update some metrics
     #[cfg(feature = "metrics")]
     metrics::counter!(
-      "ruserf.member.leave",
+      "serf.member.leave",
       self.inner.opts.memberlist_options.metric_labels().iter()
     )
     .increment(1);
 
-    tracing::info!("ruserf: {}: {}", ty.as_str(), member.node());
+    tracing::info!("serf: {}: {}", ty.as_str(), member.node());
 
     if let Err(e) = self
       .inner
@@ -1402,7 +1402,7 @@ where
       )
       .await
     {
-      tracing::error!(err=%e, "ruserf: failed to send member event: {}", e);
+      tracing::error!(err=%e, "serf: failed to send member event: {}", e);
     }
   }
 
@@ -1435,12 +1435,12 @@ where
     // Refute us leaving if we are in the alive state
     // Must be done in another goroutine since we have the memberLock
     if msg.id().eq(self.inner.memberlist.local_id()) && state == SerfState::Alive {
-      tracing::debug!("ruserf: refuting an older leave intent");
+      tracing::debug!("serf: refuting an older leave intent");
       let this = self.clone();
       let ltime = self.inner.clock.time();
       <T::Runtime as RuntimeLite>::spawn_detach(async move {
         if let Err(e) = this.broadcast_join(ltime).await {
-          tracing::error!(err=%e, "ruserf: failed to broadcast join");
+          tracing::error!(err=%e, "serf: failed to broadcast join");
         }
       });
       return false;
@@ -1501,7 +1501,7 @@ where
         // We must push a message indicating the node has now
         // left to allow higher-level applications to handle the
         // graceful leave.
-        tracing::info!("ruserf: EventMemberLeave (forced): {}", owned.member.node);
+        tracing::info!("serf: EventMemberLeave (forced): {}", owned.member.node);
 
         if let Err(e) = self
           .inner
@@ -1515,7 +1515,7 @@ where
           )
           .await
         {
-          tracing::error!(err=%e, "ruserf: failed to send member event");
+          tracing::error!(err=%e, "serf: failed to send member event");
         }
 
         if msg.prune {
@@ -1535,11 +1535,11 @@ where
   ) {
     let tags = match <D as TransformDelegate>::decode_tags(n.meta()) {
       Ok((readed, tags)) => {
-        tracing::trace!(read = %readed, tags=?tags, "ruserf: decode tags successfully");
+        tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
         tags
       }
       Err(e) => {
-        tracing::error!(err=%e, "ruserf: failed to decode tags");
+        tracing::error!(err=%e, "serf: failed to decode tags");
         return;
       }
     };
@@ -1559,12 +1559,12 @@ where
 
       #[cfg(feature = "metrics")]
       metrics::counter!(
-        "ruserf.member.update",
+        "serf.member.update",
         self.inner.opts.memberlist_options.metric_labels().iter()
       )
       .increment(1);
 
-      tracing::info!("ruserf: member update: {}", id);
+      tracing::info!("serf: member update: {}", id);
       if let Err(e) = self
         .inner
         .event_tx
@@ -1577,7 +1577,7 @@ where
         )
         .await
       {
-        tracing::error!(err=%e, "ruserf: failed to send member event");
+        tracing::error!(err=%e, "serf: failed to send member event");
       }
     }
   }
@@ -1599,7 +1599,7 @@ where
 
     let node = member.member.node();
     let id = node.id();
-    tracing::info!("ruserf: EventMemberReap (forced): {}", node);
+    tracing::info!("serf: EventMemberReap (forced): {}", node);
 
     // If we are leaving or left we may be in that list of members
     if matches!(ms, MemberStatus::Leaving | MemberStatus::Left) {
@@ -1622,7 +1622,7 @@ where
     // Log a basic warning if the node is not us...
     if existing.id() != self.inner.memberlist.local_id() {
       tracing::warn!(
-        "ruserf: node conflict detected between {}({}) and {}({})",
+        "serf: node conflict detected between {}({}) and {}({})",
         existing.id(),
         existing.address(),
         other.id(),
@@ -1633,7 +1633,7 @@ where
 
     // The current node is conflicting! This is an error
     tracing::error!(
-      "ruserf: node id conflicts with another node at {}. node id must be unique! (resolution enabled: {})",
+      "serf: node id conflicts with another node at {}. node id must be unique! (resolution enabled: {})",
       other.id(),
       self.inner.opts.enable_id_conflict_resolution
     );
@@ -1655,7 +1655,7 @@ where
     let mut payload = vec![0u8; encoded_id_len];
 
     if let Err(e) = <D as TransformDelegate>::encode_id(local_id, &mut payload) {
-      tracing::error!(err=%e, "ruserf: failed to encode local id");
+      tracing::error!(err=%e, "serf: failed to encode local id");
       return;
     }
 
@@ -1667,7 +1667,7 @@ where
     {
       Ok(resp) => resp,
       Err(e) => {
-        tracing::error!(err=%e, "ruserf: failed to start node id resolution query");
+        tracing::error!(err=%e, "serf: failed to start node id resolution query");
         return;
       }
     };
@@ -1682,7 +1682,7 @@ where
       // Decode the response
       if r.payload.is_empty() || r.payload[0] != MessageType::ConflictResponse as u8 {
         tracing::warn!(
-          "ruserf: invalid conflict query response type: {:?}",
+          "serf: invalid conflict query response type: {:?}",
           r.payload.as_ref()
         );
         continue;
@@ -1701,7 +1701,7 @@ where
             }
             msg => {
               tracing::warn!(
-                "ruserf: invalid conflict query response type: {}",
+                "serf: invalid conflict query response type: {}",
                 msg.ty().as_str()
               );
               continue;
@@ -1709,7 +1709,7 @@ where
           }
         }
         Err(e) => {
-          tracing::error!(err=%e, "ruserf: failed to decode conflict query response");
+          tracing::error!(err=%e, "serf: failed to decode conflict query response");
           continue;
         }
       }
@@ -1719,7 +1719,7 @@ where
     let majority = (responses / 2) + 1;
     if matching >= majority {
       tracing::info!(
-        "ruserf: majority in node id conflict resolution [{} / {}]",
+        "serf: majority in node id conflict resolution [{} / {}]",
         matching,
         responses
       );
@@ -1728,13 +1728,13 @@ where
 
     // Since we lost the vote, we need to exit
     tracing::warn!(
-      "ruserf: minority in name conflict resolution, quiting [{} / {}]",
+      "serf: minority in name conflict resolution, quiting [{} / {}]",
       matching,
       responses
     );
 
     if let Err(e) = self.shutdown().await {
-      tracing::error!(err=%e, "ruserf: failed to shutdown");
+      tracing::error!(err=%e, "serf: failed to shutdown");
     }
   }
 
@@ -1750,22 +1750,22 @@ where
         }
 
         tracing::info!(
-          "ruserf: attempting re-join to previously known node {}",
+          "serf: attempting re-join to previously known node {}",
           prev
         );
         if let Err(e) = memberlist.join(prev.cheap_clone()).await {
           tracing::warn!(
-            "ruserf: failed to re-join to previously known node {}: {}",
+            "serf: failed to re-join to previously known node {}: {}",
             prev,
             e
           );
         } else {
-          tracing::info!("ruserf: re-joined to previously known node: {}", prev);
+          tracing::info!("serf: re-joined to previously known node: {}", prev);
           return;
         }
       }
 
-      tracing::warn!("ruserf: failed to re-join to any previously known node");
+      tracing::warn!("serf: failed to re-join to any previously known node");
     });
   }
 }

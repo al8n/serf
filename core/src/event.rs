@@ -20,7 +20,7 @@ use memberlist_core::{
   types::TinyVec,
   CheapClone,
 };
-use ruserf_types::{
+use serf_types::{
   LamportTime, Member, MessageType, Node, QueryFlag, QueryResponseMessage, UserEventMessage,
 };
 use smol_str::SmolStr;

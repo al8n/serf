@@ -1,5 +1,5 @@
 [package]
-name = "ruserf"
+name = "serf"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
@@ -24,17 +24,17 @@ smol = ["memberlist/smol"]
 
 serde = [
   "memberlist/serde",
-  "ruserf-core/serde",
+  "serf-core/serde",
 ]
 
 metrics = [
   "memberlist/metrics",
-  "ruserf-core/metrics",
+  "serf-core/metrics",
 ]
 
 compression = ["memberlist/compression"]
 
-encryption = ["memberlist/encryption", "ruserf-core/encryption"]
+encryption = ["memberlist/encryption", "serf-core/encryption"]
 
 quic = ["memberlist/quic"]
 quinn = ["memberlist/quinn", "quic"]
@@ -75,15 +75,15 @@ dnssec-openssl = [
 dnssec-ring = ["memberlist/dnssec-ring"]
 dnssec = ["memberlist/dnssec"]
 
-test = ["memberlist/test", "ruserf-core/test"]
+test = ["memberlist/test", "serf-core/test"]
 
 [dependencies]
 memberlist.workspace = true
-ruserf-core = { workspace = true, default-features = false }
+serf-core = { workspace = true, default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-smol_str = "0.2"
+smol_str = "0.3"
 paste = "1"
 
 [[test]]

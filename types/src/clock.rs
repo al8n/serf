@@ -3,10 +3,7 @@ use std::sync::{
   Arc,
 };
 
-use transformable::{
-  utils::{decode_varint, encode_varint, encoded_len_varint, DecodeVarintError, EncodeVarintError},
-  Transformable,
-};
+use transformable::{utils::*, Transformable};
 
 /// A lamport time is a simple u64 that represents a point in time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -100,7 +97,7 @@ impl core::ops::Rem<Self> for LamportTime {
 pub enum LamportTimeTransformError {
   /// Encode varint error
   #[error(transparent)]
-  Encode(#[from] EncodeVarintError),
+  Encode(#[from] InsufficientBuffer),
   /// Decode varint error
   #[error(transparent)]
   Decode(#[from] DecodeVarintError),
@@ -110,18 +107,18 @@ impl Transformable for LamportTime {
   type Error = LamportTimeTransformError;
 
   fn encode(&self, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    encode_varint(self.0, dst).map_err(Into::into)
+    encode_u64_varint(self.0, dst).map_err(Into::into)
   }
 
   fn encoded_len(&self) -> usize {
-    encoded_len_varint(self.0)
+    encoded_u64_varint_len(self.0)
   }
 
   fn decode(src: &[u8]) -> Result<(usize, Self), Self::Error>
   where
     Self: Sized,
   {
-    decode_varint(src)
+    decode_u64_varint(src)
       .map(|(n, time)| (n, Self(time)))
       .map_err(Into::into)
   }

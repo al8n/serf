@@ -3,7 +3,7 @@ use memberlist_core::{
   types::TinyVec,
   CheapClone,
 };
-use ruserf_types::MessageType;
+use serf_types::MessageType;
 
 use crate::{
   coordinate::Coordinate,
