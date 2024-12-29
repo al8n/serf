@@ -13,6 +13,7 @@ use super::{
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, bytemuck::NoUninit)]
 #[repr(u8)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum MemberStatus {
   /// None status
   None = 0,

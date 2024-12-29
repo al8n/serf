@@ -18,6 +18,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
 
+cli = ["dep:clap", "regex", "serf-core/clap", "humantime"]
+
 tokio = ["memberlist/tokio"]
 async-std = ["memberlist/async-std"]
 smol = ["memberlist/smol"]
@@ -80,6 +82,10 @@ test = ["memberlist/test", "serf-core/test"]
 [dependencies]
 memberlist.workspace = true
 serf-core = { workspace = true, default-features = false }
+
+clap = { version = "4.5", optional = true, features = ["derive", "env"] }
+regex = { workspace = true, optional = true }
+humantime = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

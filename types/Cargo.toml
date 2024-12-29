@@ -17,6 +17,7 @@ metrics = ["memberlist-types/metrics"]
 bitflags = "2"
 byteorder.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
+clap = { workspace = true, optional = true, default-features = false, features = ["derive"] }
 derive_more.workspace = true
 futures = { workspace = true, optional = true, features = ["alloc"] }
 indexmap.workspace = true

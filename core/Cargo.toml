@@ -17,6 +17,7 @@ metrics = ["memberlist-core/metrics", "dep:metrics", "serf-types/metrics"]
 encryption = ["memberlist-core/encryption", "serf-types/encryption", "base64", "serde"]
 async-graphql = ["dep:async-graphql"]
 
+clap = ["dep:clap", "serf-types/clap"]
 serde = [
   "dep:serde",
   "dep:humantime-serde",
@@ -37,16 +38,16 @@ async-lock = "3"
 async-channel = "2"
 async-graphql = { version = "7", optional = true }
 byteorder.workspace = true
+clap = { workspace = true, optional = true, default-features = false, features = ["derive"] }
 crossbeam-queue = "0.3"
 derive_more.workspace = true
 futures = { workspace = true, features = ["default"] }
 either = "1"
 indexmap.workspace = true
-once_cell = "1" # remove this dependency when [feature(lazy_cell)] is stabilized
 parking_lot = { version = "0.12", features = ["send_guard"] }
 pin-project = "1"
 rand.workspace = true
-regex = "1"
+regex.workspace = true
 scopeguard = "1"
 smol_str.workspace = true
 smallvec.workspace = true
