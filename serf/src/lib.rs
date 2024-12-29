@@ -30,3 +30,8 @@ pub mod async_std;
 #[cfg(feature = "smol")]
 #[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
 pub mod smol;
+
+/// Bultin command line tool for `Serf`.
+#[cfg(feature = "cli")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cli")))]
+pub mod cli;

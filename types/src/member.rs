@@ -13,6 +13,7 @@ use super::{
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, bytemuck::NoUninit)]
 #[repr(u8)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum MemberStatus {
   /// None status
   None = 0,
@@ -111,19 +112,13 @@ pub struct Member<I, A> {
   /// The serf protocol version
   #[viewit(
     getter(const, attrs(doc = "Returns the serf protocol version")),
-    setter(
-      const,
-      attrs(doc = "Sets the serf protocol version (Builder pattern)")
-    )
+    setter(const, attrs(doc = "Sets the serf protocol version (Builder pattern)"))
   )]
   protocol_version: ProtocolVersion,
   /// The serf delegate version
   #[viewit(
     getter(const, attrs(doc = "Returns the serf delegate version")),
-    setter(
-      const,
-      attrs(doc = "Sets the serf delegate version (Builder pattern)")
-    )
+    setter(const, attrs(doc = "Sets the serf delegate version (Builder pattern)"))
   )]
   delegate_version: DelegateVersion,
 }

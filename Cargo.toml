@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "A decentralized solution for service discovery and orchestration that is lightweight, highly available, and fault tolerant."
@@ -20,6 +20,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 byteorder = "1"
+clap = "4.5"
 derive_more = { version = "1", features = ["full"] }
 futures = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -33,10 +34,11 @@ viewit = "0.1.5"
 smol_str = "0.3"
 smallvec = "1"
 rand = "0.8"
+regex = "1"
 
 # memberlist-types = { version = "0.3", path = "../memberlist/types", default-features = false }
 # memberlist-core = { version = "0.3", path = "../memberlist/core", default-features = false }
 # memberlist = { version = "0.3", path = "../memberlist/memberlist", default-features = false }
 
-serf-core = { path = "core", version = "0.2.0", default-features = false }
-serf-types = { path = "types", version = "0.2.0", default-features = false }
+serf-core = { path = "core", version = "0.3", default-features = false }
+serf-types = { path = "types", version = "0.3", default-features = false }
