@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::RpcArgs;
 
-
 /// Tells a running Serf agent (with "serf agent") to join the cluster
 /// by specifying at least one existing member.
 #[derive(Args, Debug)]

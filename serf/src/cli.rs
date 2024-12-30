@@ -104,8 +104,9 @@ pub struct Cli {
 
 /// Commands for interacting with `Serf`.
 #[derive(Debug, Subcommand)]
-#[allow(missing_docs)]
+#[allow(missing_docs, clippy::large_enum_variant)]
 pub enum Commands {
+  Agent(AgentArgs),
   Info(InfoArgs),
   Event(EventArgs),
   Join(JoinArgs),
@@ -122,16 +123,15 @@ pub enum Commands {
 }
 
 /// Parse a single key-value pair
-fn parse_key_val<T, U>(_: &str) -> Result<(T, U), Box<dyn Error + Send + Sync + 'static>>
+fn parse_key_val<T, U>(src: &str) -> Result<(T, U), Box<dyn Error + Send + Sync + 'static>>
 where
-    T: std::str::FromStr,
-    T::Err: Error + Send + Sync + 'static,
-    U: std::str::FromStr,
-    U::Err: Error + Send + Sync + 'static,
+  T: std::str::FromStr,
+  T::Err: Error + Send + Sync + 'static,
+  U: std::str::FromStr,
+  U::Err: Error + Send + Sync + 'static,
 {
-  // let pos = s
-  //       .find('=')
-  //       .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
-  //  Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
-  todo!()
+  let pos = src
+    .find('=')
+    .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{src}`"))?;
+  Ok((src[..pos].parse()?, src[pos + 1..].parse()?))
 }

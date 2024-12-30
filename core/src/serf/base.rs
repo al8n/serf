@@ -1749,10 +1749,7 @@ where
           continue;
         }
 
-        tracing::info!(
-          "serf: attempting re-join to previously known node {}",
-          prev
-        );
+        tracing::info!("serf: attempting re-join to previously known node {}", prev);
         if let Err(e) = memberlist.join(prev.cheap_clone()).await {
           tracing::warn!(
             "serf: failed to re-join to previously known node {}: {}",

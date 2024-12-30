@@ -1,4 +1,5 @@
 use clap::Parser;
+
 use serf::cli::{Cli, Commands};
 
 fn main() {

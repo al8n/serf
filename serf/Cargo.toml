@@ -18,15 +18,17 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
 
-cli = ["dep:clap", "regex", "serf-core/clap", "humantime"]
+cli = ["dep:clap", "serde_json", "serde", "tracing", "regex", "serf-core/clap", "humantime", "humantime-serde"]
 
 tokio = ["memberlist/tokio"]
 async-std = ["memberlist/async-std"]
 smol = ["memberlist/smol"]
 
 serde = [
+  "dep:serde",
   "memberlist/serde",
   "serf-core/serde",
+  "humantime-serde",
 ]
 
 metrics = [
@@ -84,8 +86,12 @@ memberlist.workspace = true
 serf-core = { workspace = true, default-features = false }
 
 clap = { version = "4.5", optional = true, features = ["derive", "env"] }
-regex = { workspace = true, optional = true }
 humantime = { version = "2", optional = true }
+humantime-serde = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+tracing = { version = "0.1", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

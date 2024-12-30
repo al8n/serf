@@ -1,8 +1,6 @@
 use clap::Args;
 
-use super::{RpcArgs, Format};
-
-
+use super::{Format, RpcArgs};
 
 /// Provides debugging information for operators
 #[derive(Args, Debug)]

@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::{parse_key_val, Format, Regex, RpcArgs};
 
-
 /// Outputs the members of a running Serf agent.
 #[derive(Args, Debug)]
 pub struct MembersArgs {

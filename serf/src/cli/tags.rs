@@ -1,8 +1,6 @@
-
 use clap::Args;
 
 use super::{parse_key_val, RpcArgs};
-
 
 /// Modifies tags on a running `Serf` agent.
 #[derive(Args, Debug)]
@@ -19,4 +17,3 @@ pub struct TagsArgs {
   #[command(flatten)]
   pub rpc: RpcArgs,
 }
-

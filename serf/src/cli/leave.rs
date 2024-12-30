@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::RpcArgs;
 
-
 /// Causes the agent to gracefully leave the Serf cluster and shutdown.
 #[derive(Args, Debug)]
 pub struct LeaveArgs {

@@ -1,8 +1,6 @@
-
 use clap::Args;
 
 use super::RpcArgs;
-
 
 /// Tests the network reachability of this node
 #[derive(Args, Debug)]

@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::RpcArgs;
 
-
 /// Dispatches a custom event across the Serf cluster.
 #[derive(Args, Debug)]
 pub struct EventArgs {
@@ -22,4 +21,3 @@ pub struct EventArgs {
   #[command(flatten)]
   pub rpc: RpcArgs,
 }
-

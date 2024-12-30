@@ -1,10 +1,8 @@
-
 use std::time::Duration;
 
 use clap::Args;
 
 use super::{Format, Regex, RpcArgs};
-
 
 /// Dispatches a query to the `Serf` cluster.
 #[derive(Args, Debug)]
@@ -49,5 +47,3 @@ pub struct QueryArgs {
   #[command(flatten)]
   pub rpc: RpcArgs,
 }
-
-

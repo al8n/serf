@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::RpcArgs;
 
-
 /// Forces a member of a Serf cluster to enter the "left" state. Note
 /// that if the member is still actually alive, it will eventually rejoin
 /// the cluster. This command is most useful for cleaning out "failed" nodes
@@ -21,4 +20,3 @@ pub struct ForceLeaveArgs {
   #[command(flatten)]
   pub rpc: RpcArgs,
 }
-

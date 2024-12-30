@@ -2,7 +2,6 @@ use clap::Args;
 
 use super::RpcArgs;
 
-
 /// Manage the internal encryption keyring used by Serf. Modifications made by
 /// this command will be broadcasted to all members in the cluster and applied
 /// locally on each member. Operations of this command are idempotent.
@@ -13,7 +12,7 @@ use super::RpcArgs;
 ///
 /// All variations of this command will return 0 if all nodes reply and report
 /// no errors. If any node fails to respond or reports failure, we return 1.
-/// 
+///
 /// WARNING: Running with multiple encryption keys enabled is recommended as a
 /// transition state only. Performance may be impacted by using multiple keys.
 #[derive(Debug, Args)]

@@ -1,8 +1,6 @@
-
 use clap::Args;
 
 use super::RpcArgs;
-
 
 /// Estimates the round trip time between two nodes using `Serf`'s network
 /// coordinate model of the cluster.
