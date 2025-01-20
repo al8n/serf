@@ -5,9 +5,10 @@ use std::{
 };
 
 use clap::Args;
-use serf_core::types::ProtocolVersion;
+use memberlist::net::{AddressResolver, Transport};
+use serf_core::{delegate::Delegate, types::ProtocolVersion};
 
-use super::{super::parse_key_val, Profile, TraceLevel};
+use super::{super::parse_key_val, Config, Profile, TraceLevel};
 
 /// Starts the `Serf` agent and runs until an interrupt is received. The
 /// agent represents a single node in a cluster.
@@ -145,4 +146,27 @@ pub struct AgentArgs {
   /// leave and force remove messages.
   #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
   pub broadcast_timeout: Duration,
+}
+
+impl TryFrom<AgentArgs> for Config {
+  type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+  fn try_from(args: AgentArgs) -> Result<Self, Self::Error> {
+    let mut config = Config::default();
+
+    for conf in args.config_files {}
+
+    todo!()
+  }
+}
+
+impl AgentArgs {
+  /// Builds the agent from the arguments.
+  pub async fn build<T, D>(self) -> std::io::Result<super::Agent<T, D>>
+  where
+    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    T: Transport,
+  {
+    todo!()
+  }
 }

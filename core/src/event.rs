@@ -365,11 +365,13 @@ impl<I, A> core::fmt::Display for MemberEvent<I, A> {
 
 impl<I, A> MemberEvent<I, A> {
   /// Returns the event type of this member event
-  pub fn ty(&self) -> MemberEventType {
+  #[inline]
+  pub const fn ty(&self) -> MemberEventType {
     self.ty
   }
 
   /// Returns the members of this event
+  #[inline]
   pub fn members(&self) -> &[Member<I, A>] {
     &self.members
   }
@@ -378,6 +380,78 @@ impl<I, A> MemberEvent<I, A> {
 impl<I, A> From<MemberEvent<I, A>> for (MemberEventType, Arc<TinyVec<Member<I, A>>>) {
   fn from(event: MemberEvent<I, A>) -> Self {
     (event.ty, event.members)
+  }
+}
+
+/// The event type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EventType {
+  /// User event
+  User,
+  /// Query event
+  Query,
+  /// Member event
+  Member(MemberEventType),
+}
+
+impl EventType {
+  /// Returns the string representation of the event type.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      EventType::User => "user",
+      EventType::Query => "query",
+      EventType::Member(member_event_type) => member_event_type.as_str(),
+    }
+  }
+
+  /// Returns true if the event is member join event
+  #[inline]
+  pub const fn is_member_join(&self) -> bool {
+    matches!(self, Self::Member(MemberEventType::Join))
+  }
+
+  /// Returns true if the event is member leave event
+  #[inline]
+  pub const fn is_member_leave(&self) -> bool {
+    matches!(self, Self::Member(MemberEventType::Leave))
+  }
+
+  /// Returns true if the event is member failed event
+  #[inline]
+  pub const fn is_member_failed(&self) -> bool {
+    matches!(self, Self::Member(MemberEventType::Failed))
+  }
+
+  /// Returns true if the event is member update event
+  #[inline]
+  pub const fn is_member_update(&self) -> bool {
+    matches!(self, Self::Member(MemberEventType::Update))
+  }
+
+  /// Returns true if the event is member reap event
+  #[inline]
+  pub const fn is_member_reap(&self) -> bool {
+    matches!(self, Self::Member(MemberEventType::Reap))
+  }
+
+  /// Returns true if the event is user event
+  #[inline]
+  pub const fn is_user(&self) -> bool {
+    matches!(self, Self::User)
+  }
+
+  /// Returns true if the event is query event
+  #[inline]
+  pub const fn is_query(&self) -> bool {
+    matches!(self, Self::Query)
+  }
+
+  /// Returns true if the event is member event
+  #[inline]
+  pub const fn is_member(&self) -> bool {
+    matches!(self, Self::Member(_))
   }
 }
 
@@ -406,6 +480,57 @@ where
       Self::Member(e) => Self::Member(e.cheap_clone()),
       Self::User(e) => Self::User(e.cheap_clone()),
       Self::Query(e) => Self::Query(e.clone()),
+    }
+  }
+}
+
+impl<D, T> Event<T, D>
+where
+  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  T: Transport,
+{
+  /// Returns the event type of this event
+  pub const fn ty(&self) -> EventType {
+    match self {
+      Self::Member(e) => EventType::Member(e.ty()),
+      Self::User(_) => EventType::User,
+      Self::Query(_) => EventType::Query,
+    }
+  }
+
+  /// Returns the name of the event
+  #[inline]
+  pub fn name(&self) -> &str {
+    match self {
+      Self::Member(e) => e.ty().as_str(),
+      Self::User(e) => e.name(),
+      Self::Query(e) => e.name(),
+    }
+  }
+
+  /// Returns the member event if the event is member event
+  pub fn as_member(
+    &self,
+  ) -> Option<&MemberEvent<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>> {
+    match self {
+      Self::Member(e) => Some(e),
+      _ => None,
+    }
+  }
+
+  /// Returns the user event if the event is user event
+  pub fn as_user(&self) -> Option<&UserEventMessage> {
+    match self {
+      Self::User(e) => Some(e),
+      _ => None,
+    }
+  }
+
+  /// Returns the query event if the event is query event
+  pub fn as_query(&self) -> Option<&QueryEvent<T, D>> {
+    match self {
+      Self::Query(e) => Some(e),
+      _ => None,
     }
   }
 }

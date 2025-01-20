@@ -1,4 +1,4 @@
-use std::{error::Error, str::FromStr};
+use std::{error::Error, path::Path, str::FromStr};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -31,6 +31,24 @@ mod query;
 mod reachability;
 mod rtt;
 mod tags;
+
+/// Convert to a bunch of paths.
+pub trait ToPaths {
+  /// Convert to a path.
+  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>>;
+}
+
+impl<P: AsRef<Path>> ToPaths for P {
+  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+    std::iter::once(self)
+  }
+}
+
+impl<P: AsRef<Path>> ToPaths for [P] {
+  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+    self.iter()
+  }
+}
 
 /// A regular expression wrapper can be used as a command line argument.
 #[derive(Debug, Clone)]
