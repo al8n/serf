@@ -1,11 +1,64 @@
-use std::sync::Arc;
-
+use futures::lock::Mutex;
 use memberlist::net::{AddressResolver, Transport};
 use serf_core::{
   delegate::Delegate,
   event::{Event, MemberEventType},
+  Serf,
 };
 use smol_str::{SmolStr, ToSmolStr};
+use std::{future::Future, sync::Arc};
+
+/// A handler that does things when events happen
+pub trait EventHandler<T, D> {
+  /// Called when an event occurs
+  fn handle(&self, event: &Event<T, D>) -> impl Future<Output = ()>
+  where
+    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    T: Transport;
+}
+
+struct ScriptEventHandlerInner {
+  scripts: Arc<[EventScript]>,
+  new_scripts: Arc<[EventScript]>,
+}
+
+/// Invokes scripts for the events that it receives.
+pub struct ScriptEventHandler<T, D>
+where
+  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  T: Transport,
+{
+  inner: Mutex<ScriptEventHandlerInner>,
+  serf: Serf<T, D>,
+}
+
+impl<T, D> EventHandler<T, D> for ScriptEventHandler<T, D> {
+  async fn handle(&self, event: &Event<T, D>)
+  where
+    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    T: Transport,
+  {
+    // Swap in the new scripts if any
+    let scripts = {
+      let mut inner = self.inner.lock().await;
+      if !inner.new_scripts.is_empty() {
+        inner.scripts = inner.new_scripts.clone();
+        inner.new_scripts = Arc::default();
+      }
+
+      inner.scripts.clone()
+    };
+
+    let member = self.serf.local_member().await;
+    for script in scripts.iter() {
+      if !script.invoke(event) {
+        continue;
+      }
+
+      if Err(err) = invoke_event_script().await {}
+    }
+  }
+}
 
 /// The kind of event that is being processed
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -173,23 +226,22 @@ pub fn parse_event_script(v: &str) -> Arc<[EventScript]> {
 pub fn parse_event_filter(v: &str) -> impl Iterator<Item = EventFilter> + '_ {
   let v = if v.is_empty() { "*" } else { v };
 
-  v.split(',')
-    .map(|event| {
-      let (event, name) = if let Some(name) = event.strip_prefix("user:") {
-        (EventKind::User, name.to_smolstr())
-      } else if let Some(name) = event.strip_prefix("query:") {
-        (EventKind::Query, name.to_smolstr())
-      } else if event.eq("*") {
-        (EventKind::Unspecified, SmolStr::default())
+  v.split(',').map(|event| {
+    let (event, name) = if let Some(name) = event.strip_prefix("user:") {
+      (EventKind::User, name.to_smolstr())
+    } else if let Some(name) = event.strip_prefix("query:") {
+      (EventKind::Query, name.to_smolstr())
+    } else if event.eq("*") {
+      (EventKind::Unspecified, SmolStr::default())
+    } else {
+      let knd = EventKind::from_str(event);
+      if let EventKind::Custom(name) = knd {
+        (EventKind::Custom(name), SmolStr::default())
       } else {
-        let knd = EventKind::from_str(event);
-        if let EventKind::Custom(name) = knd {
-          (EventKind::Custom(name), SmolStr::default())
-        } else {
-          (knd, SmolStr::default())
-        }
-      };
+        (knd, SmolStr::default())
+      }
+    };
 
-      EventFilter { kind: event, name }
-    })
+    EventFilter { kind: event, name }
+  })
 }
