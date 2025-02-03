@@ -32,7 +32,7 @@ thiserror = "2"
 viewit = "0.1.5"
 smol_str = "0.3"
 smallvec = "1"
-rand = "0.8"
+rand = "0.9"
 
 # memberlist-types = { version = "0.3", path = "../memberlist/types", default-features = false }
 # memberlist-core = { version = "0.3", path = "../memberlist/core", default-features = false }
