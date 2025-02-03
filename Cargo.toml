@@ -26,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 humantime-serde = "1"
 indexmap = "2"
 memberlist-types = { version = "0.3", default-features = false }
-memberlist-core = { version = "0.3", default-features = false }
+memberlist-core = { version = "0.5", default-features = false }
 memberlist = { version = "0.3", default-features = false }
 thiserror = "2"
 viewit = "0.1.5"
