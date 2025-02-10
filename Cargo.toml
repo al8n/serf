@@ -20,7 +20,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 byteorder = "1"
-derive_more = { version = "1", features = ["full"] }
+derive_more = { version = "2", features = ["full"] }
 futures = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 humantime-serde = "1"
