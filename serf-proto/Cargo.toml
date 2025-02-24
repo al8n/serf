@@ -1,0 +1,42 @@
+[package]
+name = "serf-proto"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "Types for the `serf` crate"
+
+[features]
+encryption = ["memberlist-proto/encryption", "futures"]
+serde = ["dep:serde", "indexmap/serde", "memberlist-proto/serde", "smol_str/serde", "bitflags/serde"]
+metrics = ["memberlist-proto/metrics"]
+
+arbitrary = ["dep:arbitrary", "memberlist-proto/arbitrary", "smol_str/arbitrary"]
+quickcheck = ["dep:quickcheck", "memberlist-proto/quickcheck"]
+
+[dependencies]
+bitflags = "2"
+byteorder.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+derive_more = { workspace = true, features = ["is_variant", "display"] }
+futures = { workspace = true, optional = true, features = ["alloc"] }
+indexmap.workspace = true
+memberlist-proto.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+viewit.workspace = true
+
+serde = { workspace = true, optional = true }
+
+arbitrary = { version = "1", optional = true, default-features = false, features = ["derive"] }
+quickcheck = { version = "1", optional = true, default-features = false }
+
+[dev-dependencies]
+rand.workspace = true
+futures = { workspace = true, features = ["executor"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

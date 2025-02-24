@@ -36,7 +36,7 @@ jobs:
             name: "serf-core"
           - crate: types 
             features: "metrics,encryption"
-            name: "serf-types"
+            name: "serf-proto"
           - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
             name: "serf-tcp-encryption"
