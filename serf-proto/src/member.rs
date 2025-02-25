@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use memberlist_proto::CheapClone;
+use memberlist_proto::{
+  CheapClone, Data, DataRef, EncodeError, WireType,
+  utils::{merge, skip, split},
+};
+
+use crate::TagsRef;
 
 use super::{
   DelegateVersion, MemberlistDelegateVersion, MemberlistProtocolVersion, Node, ProtocolVersion,
@@ -19,7 +24,6 @@ const MEMBER_STATUS_FAILED: u8 = 4;
 )]
 #[repr(u8)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub enum MemberStatus {
   /// None status
@@ -183,5 +187,288 @@ impl<I: CheapClone, A: CheapClone> CheapClone for Member<I, A> {
       protocol_version: self.protocol_version,
       delegate_version: self.delegate_version,
     }
+  }
+}
+
+const NODE_TAG: u8 = 1;
+const TAGS_TAG: u8 = 2;
+const STATUS_TAG: u8 = 3;
+const MEMBERLIST_PROTOCOL_VERSION_TAG: u8 = 4;
+const MEMBERLIST_DELEGATE_VERSION_TAG: u8 = 5;
+const PROTOCOL_VERSION_TAG: u8 = 6;
+const DELEGATE_VERSION_TAG: u8 = 7;
+
+const NODE_BYTE: u8 = merge(WireType::LengthDelimited, NODE_TAG);
+const TAGS_BYTE: u8 = merge(WireType::LengthDelimited, TAGS_TAG);
+const STATUS_BYTE: u8 = merge(WireType::Byte, STATUS_TAG);
+const MEMBERLIST_PROTOCOL_VERSION_BYTE: u8 = merge(WireType::Byte, MEMBERLIST_PROTOCOL_VERSION_TAG);
+const MEMBERLIST_DELEGATE_VERSION_BYTE: u8 = merge(WireType::Byte, MEMBERLIST_DELEGATE_VERSION_TAG);
+const PROTOCOL_VERSION_BYTE: u8 = merge(WireType::Byte, PROTOCOL_VERSION_TAG);
+const DELEGATE_VERSION_BYTE: u8 = merge(WireType::Byte, DELEGATE_VERSION_TAG);
+
+/// A reference type to [`Member`]
+#[viewit::viewit(vis_all = "", getters(vis_all = "pub"), setters(skip))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemberRef<'a, I, A> {
+  /// The node
+  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the node")))]
+  node: Node<I, A>,
+  /// The tags
+  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the tags")))]
+  tags: TagsRef<'a>,
+  /// The status
+  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the status")))]
+  status: MemberStatus,
+  /// The memberlist protocol version
+  #[viewit(getter(const, attrs(doc = "Returns the memberlist protocol version")))]
+  memberlist_protocol_version: MemberlistProtocolVersion,
+  /// The memberlist delegate version
+  #[viewit(getter(const, attrs(doc = "Returns the memberlist delegate version")))]
+  memberlist_delegate_version: MemberlistDelegateVersion,
+  /// The serf protocol version
+  #[viewit(getter(const, attrs(doc = "Returns the serf protocol version")))]
+  protocol_version: ProtocolVersion,
+  /// The serf delegate version
+  #[viewit(getter(const, attrs(doc = "Returns the serf delegate version")))]
+  delegate_version: DelegateVersion,
+}
+
+impl<'a, I, A> DataRef<'a, Member<I, A>> for MemberRef<'a, I::Ref<'a>, A::Ref<'a>>
+where
+  I: Data,
+  A: Data,
+{
+  fn decode(buf: &'a [u8]) -> Result<(usize, Self), memberlist_proto::DecodeError>
+  where
+    Self: Sized,
+  {
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    let mut node = None;
+    let mut tags = None;
+    let mut status = None;
+    let mut memberlist_protocol_version = None;
+    let mut memberlist_delegate_version = None;
+    let mut protocol_version = None;
+    let mut delegate_version = None;
+
+    while offset < buf_len {
+      match buf[offset] {
+        NODE_BYTE => {
+          if node.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member", "node", NODE_TAG,
+            ));
+          }
+          offset += 1;
+          let (size, val) =
+            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(
+              &buf[offset..],
+            )?;
+          node = Some(val);
+          offset += size;
+        }
+        TAGS_BYTE => {
+          if tags.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member", "tags", TAGS_TAG,
+            ));
+          }
+          offset += 1;
+          let (size, val) =
+            <TagsRef<'_> as DataRef<'_, Tags>>::decode_length_delimited(&buf[offset..])?;
+          tags = Some(val);
+          offset += size;
+        }
+        STATUS_BYTE => {
+          if status.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member", "status", STATUS_TAG,
+            ));
+          }
+          offset += 1;
+          status = Some(buf[offset].into());
+          offset += 1;
+        }
+        MEMBERLIST_PROTOCOL_VERSION_BYTE => {
+          if memberlist_protocol_version.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member",
+              "memberlist_protocol_version",
+              MEMBERLIST_PROTOCOL_VERSION_TAG,
+            ));
+          }
+          offset += 1;
+          memberlist_protocol_version = Some(buf[offset].into());
+          offset += 1;
+        }
+        MEMBERLIST_DELEGATE_VERSION_BYTE => {
+          if memberlist_delegate_version.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member",
+              "memberlist_delegate_version",
+              MEMBERLIST_DELEGATE_VERSION_TAG,
+            ));
+          }
+          offset += 1;
+          memberlist_delegate_version = Some(buf[offset].into());
+          offset += 1;
+        }
+        PROTOCOL_VERSION_BYTE => {
+          if protocol_version.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member",
+              "protocol_version",
+              PROTOCOL_VERSION_TAG,
+            ));
+          }
+          offset += 1;
+          protocol_version = Some(buf[offset].into());
+          offset += 1;
+        }
+        DELEGATE_VERSION_BYTE => {
+          if delegate_version.is_some() {
+            return Err(memberlist_proto::DecodeError::duplicate_field(
+              "Member",
+              "delegate_version",
+              DELEGATE_VERSION_TAG,
+            ));
+          }
+          offset += 1;
+          delegate_version = Some(buf[offset].into());
+          offset += 1;
+        }
+        other => {
+          offset += 1;
+
+          let (wire_type, _) = split(other);
+          let wire_type = WireType::try_from(wire_type)
+            .map_err(memberlist_proto::DecodeError::unknown_wire_type)?;
+          offset += skip(wire_type, &buf[offset..])?;
+        }
+      }
+    }
+
+    Ok((
+      offset,
+      Self {
+        node: node.ok_or_else(|| memberlist_proto::DecodeError::missing_field("Member", "node"))?,
+        tags: tags.ok_or_else(|| memberlist_proto::DecodeError::missing_field("Member", "tags"))?,
+        status: status
+          .ok_or_else(|| memberlist_proto::DecodeError::missing_field("Member", "status"))?,
+        memberlist_protocol_version: memberlist_protocol_version.ok_or_else(|| {
+          memberlist_proto::DecodeError::missing_field("Member", "memberlist_protocol_version")
+        })?,
+        memberlist_delegate_version: memberlist_delegate_version.ok_or_else(|| {
+          memberlist_proto::DecodeError::missing_field("Member", "memberlist_delegate_version")
+        })?,
+        protocol_version: protocol_version.ok_or_else(|| {
+          memberlist_proto::DecodeError::missing_field("Member", "protocol_version")
+        })?,
+        delegate_version: delegate_version.ok_or_else(|| {
+          memberlist_proto::DecodeError::missing_field("Member", "delegate_version")
+        })?,
+      },
+    ))
+  }
+}
+
+impl<I, A> Data for Member<I, A>
+where
+  I: Data,
+  A: Data,
+{
+  type Ref<'a> = MemberRef<'a, I::Ref<'a>, A::Ref<'a>>;
+
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, memberlist_proto::DecodeError>
+  where
+    Self: Sized,
+  {
+    Ok(Self {
+      node: Node::from_ref(val.node)?,
+      tags: Tags::from_ref(val.tags)?.into(),
+      status: val.status,
+      memberlist_protocol_version: val.memberlist_protocol_version,
+      memberlist_delegate_version: val.memberlist_delegate_version,
+      protocol_version: val.protocol_version,
+      delegate_version: val.delegate_version,
+    })
+  }
+
+  fn encoded_len(&self) -> usize {
+    let mut len = 0;
+    len += 1 + self.node.encoded_len_with_length_delimited();
+    len += 1 + self.tags.encoded_len_with_length_delimited();
+    len += 1 + 1; // status
+    len += 1 + 1; // memberlist_protocol_version
+    len += 1 + 1; // memberlist_delegate_version
+    len += 1 + 1; // protocol_version
+    len += 1 + 1; // delegate_version
+    len
+  }
+
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    macro_rules! bail {
+      ($this:ident($offset:expr, $len:ident)) => {
+        if $offset >= $len {
+          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
+        }
+      };
+    }
+
+    let buf_len = buf.len();
+    let mut offset = 0;
+    bail!(self(offset, buf_len));
+
+    buf[offset] = NODE_BYTE;
+    offset += 1;
+    offset += self.node.encode_length_delimited(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = TAGS_BYTE;
+    offset += 1;
+    offset += self.tags.encode_length_delimited(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = STATUS_BYTE;
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = self.status.into();
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = MEMBERLIST_PROTOCOL_VERSION_BYTE;
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = self.memberlist_protocol_version.into();
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = MEMBERLIST_DELEGATE_VERSION_BYTE;
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = self.memberlist_delegate_version.into();
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = PROTOCOL_VERSION_BYTE;
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = self.protocol_version.into();
+    offset += 1;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = DELEGATE_VERSION_BYTE;
+    offset += 1;
+
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, self.encoded_len());
+
+    Ok(offset)
   }
 }

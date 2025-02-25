@@ -20,10 +20,11 @@ quickcheck = ["dep:quickcheck", "memberlist-proto/quickcheck"]
 bitflags = "2"
 byteorder.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
-derive_more = { workspace = true, features = ["is_variant", "display"] }
+derive_more = { workspace = true, features = ["is_variant", "display", "unwrap", "try_unwrap"] }
 futures = { workspace = true, optional = true, features = ["alloc"] }
 indexmap.workspace = true
 memberlist-proto.workspace = true
+regex.workspace = true
 smol_str.workspace = true
 thiserror.workspace = true
 viewit.workspace = true

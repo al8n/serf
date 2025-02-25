@@ -52,3 +52,21 @@ mod key;
 #[cfg(feature = "encryption")]
 #[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]
 pub use key::*;
+
+#[cfg(debug_assertions)]
+#[inline]
+fn debug_assert_write_eq(actual: usize, expected: usize) {
+  debug_assert_eq!(
+    actual, expected,
+    "expect writting {expected} bytes, but actual write {actual} bytes"
+  );
+}
+
+// #[cfg(debug_assertions)]
+// #[inline]
+// fn debug_assert_read_eq(actual: usize, expected: usize) {
+//   debug_assert_eq!(
+//     actual, expected,
+//     "expect reading {expected} bytes, but actual read {actual} bytes"
+//   );
+// }

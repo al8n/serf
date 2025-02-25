@@ -3,6 +3,8 @@ use std::{
   hash::Hash,
 };
 
+use crate::TagFilter;
+
 use super::Filter;
 use arbitrary::{Arbitrary, Unstructured};
 use indexmap::{IndexMap, IndexSet};
@@ -46,10 +48,70 @@ where
     Ok(if kind {
       Filter::Id(into::<Vec<I>, TinyVec<_>>(u)?)
     } else {
-      Filter::Tag {
-        tag: u.arbitrary()?,
-        expr: u.arbitrary()?,
-      }
+      Filter::Tag(
+        TagFilter::new()
+          .with_tag(u.arbitrary()?)
+          .maybe_expr(if u.arbitrary()? {
+            let complexity = u.int_in_range(1..=5)?;
+            let mut patterns = Vec::new();
+
+            // Basic character classes and quantifiers
+            let character_classes = vec![
+              r"\d",
+              r"\w",
+              r"\s",
+              r"[a-z]",
+              r"[A-Z]",
+              r"[0-9]",
+              r"[a-zA-Z]",
+              r"[a-zA-Z0-9]",
+              r".",
+            ];
+
+            let quantifiers = vec!["", "*", "+", "?", "{1,3}", "{2,5}"];
+
+            // Add more complex patterns for higher complexity
+            let mut extended_classes = character_classes.clone();
+            if complexity > 1 {
+              extended_classes.extend(vec![r"[^a-z]", r"[^0-9]", r"\D", r"\W", r"\S"]);
+            }
+
+            if complexity > 2 {
+              // Add a group with random content
+              let char_class = u.choose(&extended_classes)?;
+              let quantifier = u.choose(&quantifiers)?;
+              patterns.push(format!("({}{})", char_class, quantifier));
+            }
+
+            // Generate random pattern parts
+            for _ in 0..complexity {
+              let char_class = u.choose(&extended_classes)?;
+              let quantifier = u.choose(&quantifiers)?;
+              patterns.push(format!("{}{}", char_class, quantifier));
+            }
+
+            // Maybe add anchors for higher complexity
+            if complexity > 2 && u.ratio(7, 10)? {
+              if u.arbitrary()? {
+                patterns.insert(0, "^".to_string());
+              }
+              if u.arbitrary()? {
+                patterns.push("$".to_string());
+              }
+            }
+
+            // Add alternation for even higher complexity
+            if complexity > 3 && u.ratio(6, 10)? {
+              let char_class = u.choose(&extended_classes)?;
+              let quantifier = u.choose(&quantifiers)?;
+              patterns.push(format!("|{}{}", char_class, quantifier));
+            }
+
+            Some(patterns.join("").try_into().unwrap())
+          } else {
+            None
+          }),
+      )
     })
   }
 }
@@ -61,6 +123,24 @@ impl<'a> Arbitrary<'a> for super::QueryFlag {
     } else {
       Self::ACK
     })
+  }
+}
+
+impl<'a> Arbitrary<'a> for super::ProtocolVersion {
+  fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+    u.arbitrary::<u8>().map(Into::into)
+  }
+}
+
+impl<'a> Arbitrary<'a> for super::DelegateVersion {
+  fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+    u.arbitrary::<u8>().map(Into::into)
+  }
+}
+
+impl<'a> Arbitrary<'a> for super::MemberStatus {
+  fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+    u.arbitrary::<u8>().map(Into::into)
   }
 }
 

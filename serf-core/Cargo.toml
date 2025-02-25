@@ -44,7 +44,7 @@ once_cell = "1" # remove this dependency when [feature(lazy_cell)] is stabilized
 parking_lot = { version = "0.12", features = ["send_guard"] }
 pin-project = "1"
 rand.workspace = true
-regex = "1"
+regex.workspace = true
 scopeguard = "1"
 smol_str.workspace = true
 smallvec.workspace = true

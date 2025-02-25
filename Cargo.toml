@@ -30,6 +30,7 @@ indexmap = "2"
 # memberlist = { version = "0.3", default-features = false }
 thiserror = { version = "2", default-features = false }
 viewit = "0.1.5"
+regex = "1"
 smol_str = "0.3"
 smallvec = "1"
 rand = "0.9"
