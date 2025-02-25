@@ -7,8 +7,8 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 
 pub use memberlist_proto::{
-  DelegateVersion as MemberlistDelegateVersion, Node, NodeId, HostAddr, ParseDomainError, ParseHostAddrError, Domain,
-  ProtocolVersion as MemberlistProtocolVersion,
+  DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr, Node, NodeId, ParseDomainError,
+  ParseHostAddrError, ProtocolVersion as MemberlistProtocolVersion,
 };
 
 #[cfg(feature = "arbitrary")]

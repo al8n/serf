@@ -1,7 +1,6 @@
 use indexmap::{IndexMap, IndexSet};
 use memberlist_proto::TinyVec;
 
-
 use super::{LamportTime, UserEvents};
 
 /// Used when doing a state exchange. This
@@ -17,6 +16,10 @@ use super::{LamportTime, UserEvents};
   ))
 )]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(
+  feature = "arbitrary",
+  arbitrary(bound = "I: arbitrary::Arbitrary<'arbitrary> + core::cmp::Eq + core::hash::Hash")
+)]
 pub struct PushPullMessage<I> {
   /// Current node lamport time
   #[viewit(
@@ -60,6 +63,7 @@ pub struct PushPullMessage<I> {
     getter(const, style = "ref", attrs(doc = "Returns the recent events")),
     setter(attrs(doc = "Sets the recent events (Builder pattern)"))
   )]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<Option<UserEvents>>, TinyVec<Option<UserEvents>>>))]
   events: TinyVec<Option<UserEvents>>,
   /// Lamport time for query clock
   #[viewit(

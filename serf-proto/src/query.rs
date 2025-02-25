@@ -1,11 +1,10 @@
 use smol_str::SmolStr;
 
-
 use std::time::Duration;
 
 use memberlist_proto::{Node, TinyVec, bytes::Bytes};
 
-use super::LamportTime;
+use super::{Filter, LamportTime};
 
 bitflags::bitflags! {
   /// Flags for query message
@@ -50,8 +49,8 @@ pub struct QueryMessage<I, A> {
     getter(const, attrs(doc = "Returns the potential query filters")),
     setter(attrs(doc = "Sets the potential query filters (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<Bytes>, TinyVec<Bytes>>))]
-  filters: TinyVec<Bytes>,
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<Filter<I>>, TinyVec<Filter<I>>>))]
+  filters: TinyVec<Filter<I>>,
   /// Used to provide various flags
   #[viewit(
     getter(const, style = "move", attrs(doc = "Returns the flags")),
@@ -111,6 +110,7 @@ impl<I, A> QueryMessage<I, A> {
 #[viewit::viewit(getters(style = "ref"), setters(prefix = "with"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct QueryResponseMessage<I, A> {
   /// Event lamport time
   #[viewit(
@@ -144,6 +144,7 @@ pub struct QueryResponseMessage<I, A> {
     getter(const, style = "ref", attrs(doc = "Returns the payload")),
     setter(attrs(doc = "Sets the payload (Builder pattern)"))
   )]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<u8>, Bytes>))]
   payload: Bytes,
 }
 

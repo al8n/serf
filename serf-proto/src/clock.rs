@@ -94,21 +94,22 @@ impl core::ops::Rem<Self> for LamportTime {
 }
 
 impl Data for LamportTime {
-    type Ref<'a> = Self;
+  type Ref<'a> = Self;
 
-    fn from_ref(val: Self::Ref<'_>) -> Result<Self, memberlist_proto::DecodeError>
-      where
-        Self: Sized {
-      Ok(val)
-    }
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, memberlist_proto::DecodeError>
+  where
+    Self: Sized,
+  {
+    Ok(val)
+  }
 
-    fn encoded_len(&self) -> usize {
-      <u64 as Data>::encoded_len(&self.0)
-    }
+  fn encoded_len(&self) -> usize {
+    <u64 as Data>::encoded_len(&self.0)
+  }
 
-    fn encode(&self, buf: &mut [u8]) -> Result<usize, memberlist_proto::EncodeError> {
-      <u64 as Data>::encode(&self.0, buf)
-    }
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, memberlist_proto::EncodeError> {
+    <u64 as Data>::encode(&self.0, buf)
+  }
 }
 
 impl<'a> DataRef<'a, LamportTime> for LamportTime {

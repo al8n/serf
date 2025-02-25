@@ -77,4 +77,3 @@ impl<I> Filter<I> {
     }
   }
 }
-

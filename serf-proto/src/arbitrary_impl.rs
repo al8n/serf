@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash};
+use std::{
+  collections::{HashMap, HashSet},
+  hash::Hash,
+};
 
 use super::Filter;
 use arbitrary::{Arbitrary, Unstructured};
@@ -13,7 +16,9 @@ where
   u.arbitrary::<F>().map(Into::into)
 }
 
-pub(super) fn arbitrary_indexmap<'a, K, V>(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<IndexMap<K, V>>
+pub(super) fn arbitrary_indexmap<'a, K, V>(
+  u: &mut arbitrary::Unstructured<'a>,
+) -> arbitrary::Result<IndexMap<K, V>>
 where
   K: Arbitrary<'a> + Hash + Eq,
   V: Arbitrary<'a>,
@@ -22,14 +27,15 @@ where
   Ok(IndexMap::from_iter(map))
 }
 
-pub(super) fn arbitrary_indexset<'a, K>(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<IndexSet<K>>
+pub(super) fn arbitrary_indexset<'a, K>(
+  u: &mut arbitrary::Unstructured<'a>,
+) -> arbitrary::Result<IndexSet<K>>
 where
   K: Arbitrary<'a> + Hash + Eq,
 {
   let map = u.arbitrary::<HashSet<K>>()?;
   Ok(IndexSet::from_iter(map))
 }
-
 
 impl<'a, I> Arbitrary<'a> for Filter<I>
 where
@@ -40,7 +46,10 @@ where
     Ok(if kind {
       Filter::Id(into::<Vec<I>, TinyVec<_>>(u)?)
     } else {
-      Filter::Tag { tag: u.arbitrary()?, expr: u.arbitrary()? }
+      Filter::Tag {
+        tag: u.arbitrary()?,
+        expr: u.arbitrary()?,
+      }
     })
   }
 }

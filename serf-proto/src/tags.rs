@@ -1,7 +1,6 @@
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 
-
 /// Tags of a node
 #[derive(
   Debug,
@@ -16,7 +15,10 @@ use smol_str::SmolStr;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-pub struct Tags(#[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::arbitrary_indexmap))] IndexMap<SmolStr, SmolStr>);
+pub struct Tags(
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::arbitrary_indexmap))]
+  IndexMap<SmolStr, SmolStr>,
+);
 
 impl IntoIterator for Tags {
   type Item = (SmolStr, SmolStr);

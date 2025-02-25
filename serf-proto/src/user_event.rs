@@ -1,4 +1,4 @@
-use memberlist_proto::{bytes::Bytes, CheapClone, OneOrMore};
+use memberlist_proto::{CheapClone, OneOrMore, bytes::Bytes};
 use smol_str::SmolStr;
 
 use super::LamportTime;
@@ -106,4 +106,3 @@ impl CheapClone for UserEventMessage {
     }
   }
 }
-

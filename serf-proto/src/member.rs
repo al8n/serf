@@ -3,8 +3,8 @@ use std::sync::Arc;
 use memberlist_proto::CheapClone;
 
 use super::{
-  DelegateVersion, MemberlistDelegateVersion, MemberlistProtocolVersion, Node,
-  ProtocolVersion, Tags,
+  DelegateVersion, MemberlistDelegateVersion, MemberlistProtocolVersion, Node, ProtocolVersion,
+  Tags,
 };
 
 const MEMBER_STATUS_NONE: u8 = 0;
@@ -13,9 +13,10 @@ const MEMBER_STATUS_LEAVING: u8 = 2;
 const MEMBER_STATUS_LEFT: u8 = 3;
 const MEMBER_STATUS_FAILED: u8 = 4;
 
-
 /// The member status.
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash, derive_more::IsVariant, derive_more::Display)]
+#[derive(
+  Debug, Default, Copy, Clone, Eq, PartialEq, Hash, derive_more::IsVariant, derive_more::Display,
+)]
 #[repr(u8)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -82,7 +83,6 @@ impl MemberStatus {
     })
   }
 }
-
 
 /// A single member of the Serf cluster.
 #[viewit::viewit(setters(prefix = "with"))]

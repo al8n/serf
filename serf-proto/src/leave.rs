@@ -30,4 +30,3 @@ pub struct LeaveMessage<I> {
   )]
   prune: bool,
 }
-
