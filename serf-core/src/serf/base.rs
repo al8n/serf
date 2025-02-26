@@ -17,7 +17,7 @@ use crate::{
   QueueOptions,
   coalesce::{MemberEventCoalescer, UserEventCoalescer, coalesced_event},
   coordinate::CoordinateOptions,
-  delegate::TransformDelegate,
+  delegate::,
   error::Error,
   event::{InternalQueryEvent, MemberEvent, MemberEventType, QueryContext, QueryEvent},
   snapshot::{Snapshot, open_and_replay_snapshot},
@@ -74,7 +74,7 @@ where
     {
       let tags = opts.tags.load();
       if !tags.as_ref().is_empty() {
-        let len = <D as TransformDelegate>::tags_encoded_len(&tags);
+        let len = <D as >::tags_encoded_len(&tags);
         if len > Meta::MAX_SIZE {
           return Err(Error::tags_too_large(len));
         }
@@ -366,11 +366,11 @@ where
     notify_tx: Option<async_channel::Sender<()>>,
   ) -> Result<(), Error<T, D>> {
     let ty = MessageType::from(&msg);
-    let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&msg);
+    let expected_encoded_len = <D as >::message_encoded_len(&msg);
     let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // + 1 for message type byte
     raw.put_u8(ty as u8);
     raw.resize(expected_encoded_len + 1, 0);
-    let len = <D as TransformDelegate>::encode_message(&msg, &mut raw[1..])
+    let len = <D as >::encode_message(&msg, &mut raw[1..])
       .map_err(Error::transform_delegate)?;
     debug_assert_eq!(
       len, expected_encoded_len,
@@ -913,7 +913,7 @@ where
     };
 
     // Encode the query
-    let len = <D as TransformDelegate>::message_encoded_len(&q);
+    let len = <D as >::message_encoded_len(&q);
 
     // Check the size
     if len > self.inner.opts.query_size_limit {
@@ -923,7 +923,7 @@ where
     let mut raw = BytesMut::with_capacity(len + 1); // + 1 for message type byte
     raw.put_u8(MessageType::Query as u8);
     raw.resize(len + 1, 0);
-    let actual_encoded_len = <D as TransformDelegate>::encode_message(&q, &mut raw[1..])
+    let actual_encoded_len = <D as >::encode_message(&q, &mut raw[1..])
       .map_err(Error::transform_delegate)?;
     debug_assert_eq!(
       actual_encoded_len, len,
@@ -1067,12 +1067,12 @@ where
         payload: Bytes::new(),
       };
 
-      let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&ack);
+      let expected_encoded_len = <D as >::message_encoded_len(&ack);
       let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // + 1 for message type byte
       raw.put_u8(MessageType::QueryResponse as u8);
       raw.resize(expected_encoded_len + 1, 0);
 
-      match <D as TransformDelegate>::encode_message(&ack, &mut raw[1..]) {
+      match <D as >::encode_message(&ack, &mut raw[1..]) {
         Ok(len) => {
           debug_assert_eq!(
             len, expected_encoded_len,
@@ -1181,7 +1181,7 @@ where
 
     let node = n.node();
     let tags = if !n.meta().is_empty() {
-      match <D as TransformDelegate>::decode_tags(n.meta()) {
+      match <D as >::decode_tags(n.meta()) {
         Ok((readed, tags)) => {
           tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
           tags
@@ -1544,7 +1544,7 @@ where
     &self,
     n: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
   ) {
-    let tags = match <D as TransformDelegate>::decode_tags(n.meta()) {
+    let tags = match <D as >::decode_tags(n.meta()) {
       Ok((readed, tags)) => {
         tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
         tags
@@ -1662,10 +1662,10 @@ where
     // Get the local node
     let local_id = self.inner.memberlist.local_id();
     let local_advertise_addr = self.inner.memberlist.advertise_address();
-    let encoded_id_len = <D as TransformDelegate>::id_encoded_len(local_id);
+    let encoded_id_len = <D as >::id_encoded_len(local_id);
     let mut payload = vec![0u8; encoded_id_len];
 
-    if let Err(e) = <D as TransformDelegate>::encode_id(local_id, &mut payload) {
+    if let Err(e) = <D as >::encode_id(local_id, &mut payload) {
       tracing::error!(err=%e, "serf: failed to encode local id");
       return;
     }
@@ -1699,7 +1699,7 @@ where
         continue;
       }
 
-      match <D as TransformDelegate>::decode_message(MessageType::ConflictResponse, &r.payload[1..])
+      match <D as >::decode_message(MessageType::ConflictResponse, &r.payload[1..])
       {
         Ok((_, decoded)) => {
           match decoded {

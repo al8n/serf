@@ -293,7 +293,7 @@ pub async fn join_pending_intent<T>(
     id: "test".into(),
     addr,
     meta: Meta::empty(),
-    state: memberlist_core::types::State::Alive,
+    state: memberlist_core::proto::State::Alive,
     protocol_version: serf_proto::MemberlistProtocolVersion::V1,
     delegate_version: serf_proto::MemberlistDelegateVersion::V1,
   }))
@@ -340,7 +340,7 @@ pub async fn join_pending_intents<T>(
     id: "test".into(),
     addr,
     meta: Meta::empty(),
-    state: memberlist_core::types::State::Alive,
+    state: memberlist_core::proto::State::Alive,
     protocol_version: serf_proto::MemberlistProtocolVersion::V1,
     delegate_version: serf_proto::MemberlistDelegateVersion::V1,
   }))

@@ -16,7 +16,7 @@ use memberlist_core::{
 };
 
 use crate::{
-  delegate::{Delegate, TransformDelegate},
+  delegate::{Delegate, },
   error::Error,
   types::{
     Filter, LamportTime, Member, MemberStatus, MessageType, QueryMessage, QueryResponseMessage,
@@ -90,23 +90,6 @@ pub struct QueryParam<I> {
   )]
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   timeout: Duration,
-}
-
-impl<I> QueryParam<I>
-where
-  I: Id,
-{
-  /// Used to convert the filters into the wire format
-  pub(crate) fn encode_filters<W: TransformDelegate<Id = I>>(
-    &self,
-  ) -> Result<TinyVec<Bytes>, W::Error> {
-    let mut filters = TinyVec::with_capacity(self.filters.len());
-    for filter in self.filters.iter() {
-      filters.push(W::encode_filter(filter)?);
-    }
-
-    Ok(filters)
-  }
 }
 
 struct QueryResponseChannel<I, A> {
@@ -258,7 +241,7 @@ impl<I, A> QueryResponse<I, A> {
     &self,
     resp: QueryResponseMessage<I, A>,
     _local: &T::Id,
-    #[cfg(feature = "metrics")] metrics_labels: &memberlist_core::types::MetricLabels,
+    #[cfg(feature = "metrics")] metrics_labels: &memberlist_core::proto::MetricLabels,
   ) where
     I: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
     A: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
@@ -461,7 +444,7 @@ where
       }
 
       // Decode the filter
-      let filter = match <D as TransformDelegate>::decode_filter(filter) {
+      let filter = match <D as >::decode_filter(filter) {
         Ok((read, filter)) => {
           tracing::trace!(read=%read, filter=?filter, "serf: decoded filter successully");
           filter
@@ -549,9 +532,9 @@ where
     // Prep the relay message, which is a wrapped version of the original.
     // let relay_msg = SerfRelayMessage::new(node, SerfMessage::QueryResponse(resp));
     let expected_encoded_len = 1
-      + <D as TransformDelegate>::node_encoded_len(&node)
+      + <D as >::node_encoded_len(&node)
       + 1
-      + <D as TransformDelegate>::message_encoded_len(&resp); // +1 for relay message type byte, +1 for the message type
+      + <D as >::message_encoded_len(&resp); // +1 for relay message type byte, +1 for the message type
     if expected_encoded_len > self.inner.opts.query_response_size_limit {
       return Err(Error::relayed_response_too_large(
         self.inner.opts.query_response_size_limit,
@@ -562,11 +545,11 @@ where
     raw.put_u8(MessageType::Relay as u8);
     raw.resize(expected_encoded_len + 1 + 1, 0);
     let mut encoded = 1;
-    encoded += <D as TransformDelegate>::encode_node(&node, &mut raw[encoded..])
+    encoded += <D as >::encode_node(&node, &mut raw[encoded..])
       .map_err(Error::transform_delegate)?;
     raw[encoded] = MessageType::QueryResponse as u8;
     encoded += 1;
-    encoded += <D as TransformDelegate>::encode_message(&resp, &mut raw[encoded..])
+    encoded += <D as >::encode_message(&resp, &mut raw[encoded..])
       .map_err(Error::transform_delegate)?;
 
     debug_assert_eq!(

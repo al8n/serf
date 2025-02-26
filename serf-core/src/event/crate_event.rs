@@ -3,13 +3,13 @@ use serf_proto::QueryMessage;
 use super::*;
 
 pub(crate) trait QueryMessageExt {
-  fn decode_internal_query<T: TransformDelegate>(
+  fn decode_internal_query<T: >(
     &self,
   ) -> Option<Result<InternalQueryEvent<T::Id>, T::Error>>;
 }
 
 impl<I, A> QueryMessageExt for QueryMessage<I, A> {
-  fn decode_internal_query<T: TransformDelegate>(
+  fn decode_internal_query<T: >(
     &self,
   ) -> Option<Result<InternalQueryEvent<T::Id>, T::Error>> {
     Some(Ok(match self.name().as_str() {

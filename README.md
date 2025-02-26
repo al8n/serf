@@ -87,7 +87,7 @@ Here are the layers:
 
       Used to involve a client in a potential cluster merge operation. Namely, when a node does a promised push/pull (as part of a join), the delegate is involved and allowed to cancel the join based on custom logic. The merge delegate is NOT invoked as part of the push-pull anti-entropy.
 
-    - **`TransformDelegate`**
+    - **``**
 
       A delegate for encoding and decoding. Used to control how `serf` should encode/decode messages.
 
@@ -118,7 +118,7 @@ serf = "0.2"
 
 - ***Does Rust's serf implemenetation compatible to Go's serf?***
 
-  No but yes! By default, it is not compatible. But the secret is the serialize/deserilize layer, Go's serf use the msgpack as the serialization/deserialization framework, so in theory, if you can implement a [`TransformDelegate`](https://docs.rs/serf-core/transport/trait.TransformDelegate.html) trait which compat to Go's serf, then it becomes compatible.
+  No but yes! By default, it is not compatible. But the secret is the serialize/deserilize layer, Go's serf use the msgpack as the serialization/deserialization framework, so in theory, if you can implement a [``](https://docs.rs/serf-core/transport/trait..html) trait which compat to Go's serf, then it becomes compatible.
 
 - ***If Go's serf adds more functionalities, will this project also support?***
   

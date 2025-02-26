@@ -19,7 +19,7 @@ use crate::event::{
 
 use super::{
   Serf,
-  delegate::{Delegate, TransformDelegate},
+  delegate::{Delegate, },
   error::Error,
   serf::{NodeResponse, QueryResponse},
   types::{KeyRequestMessage, MessageType, SerfMessage},
@@ -186,12 +186,12 @@ where
     event: InternalQueryEvent<T::Id>,
   ) -> Result<KeyResponse<T::Id>, Error<T, D>> {
     let kr = KeyRequestMessage { key };
-    let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&kr);
+    let expected_encoded_len = <D as >::message_encoded_len(&kr);
     let mut buf = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
     buf.put_u8(MessageType::KeyRequest as u8);
     buf.resize(expected_encoded_len + 1, 0);
     // Encode the query request
-    let len = <D as TransformDelegate>::encode_message(&kr, &mut buf[1..])
+    let len = <D as >::encode_message(&kr, &mut buf[1..])
       .map_err(Error::transform_delegate)?;
 
     debug_assert_eq!(
@@ -266,7 +266,7 @@ where
       }
 
       let node_response =
-        match <D as TransformDelegate>::decode_message(MessageType::KeyResponse, &r.payload[1..]) {
+        match <D as >::decode_message(MessageType::KeyResponse, &r.payload[1..]) {
           Ok((_, nr)) => match nr {
             SerfMessage::KeyResponse(kr) => kr,
             msg => {

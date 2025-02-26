@@ -1,76 +1,17 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::collections::HashMap;
 
 use memberlist_core::{
-  delegate::DelegateError as MemberlistDelegateError,
   transport::{AddressResolver, MaybeResolvedAddress, Node, Transport},
-  types::{SmallVec, TinyVec},
+  proto::{SmallVec, TinyVec},
 };
-use smol_str::SmolStr;
 
 use crate::{
-  delegate::{Delegate, MergeDelegate, TransformDelegate},
+  delegate::Delegate,
   serf::{SerfDelegate, SerfState},
   types::Member,
 };
 
 pub use crate::snapshot::SnapshotError;
-
-/// Error trait for [`Delegate`]
-#[derive(thiserror::Error)]
-pub enum SerfDelegateError<D: Delegate> {
-  /// Serf error
-  #[error(transparent)]
-  Serf(#[from] SerfError),
-  /// [`TransformDelegate`] error
-  #[error(transparent)]
-  TransformDelegate(<D as TransformDelegate>::Error),
-  /// [`MergeDelegate`] error
-  #[error(transparent)]
-  MergeDelegate(<D as MergeDelegate>::Error),
-}
-
-impl<D: Delegate> core::fmt::Debug for SerfDelegateError<D> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::TransformDelegate(err) => write!(f, "{err:?}"),
-      Self::MergeDelegate(err) => write!(f, "{err:?}"),
-      Self::Serf(err) => write!(f, "{err:?}"),
-    }
-  }
-}
-
-impl<D: Delegate> SerfDelegateError<D> {
-  /// Create a delegate error from an alive delegate error.
-  #[inline]
-  pub const fn transform(err: <D as TransformDelegate>::Error) -> Self {
-    Self::TransformDelegate(err)
-  }
-
-  /// Create a delegate error from a merge delegate error.
-  #[inline]
-  pub const fn merge(err: <D as MergeDelegate>::Error) -> Self {
-    Self::MergeDelegate(err)
-  }
-
-  /// Create a delegate error from a serf error.
-  #[inline]
-  pub const fn serf(err: crate::error::SerfError) -> Self {
-    Self::Serf(err)
-  }
-}
-
-impl<T, D> From<MemberlistDelegateError<SerfDelegate<T, D>>> for SerfDelegateError<D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  fn from(value: MemberlistDelegateError<SerfDelegate<T, D>>) -> Self {
-    match value {
-      MemberlistDelegateError::AliveDelegate(e) => e,
-      MemberlistDelegateError::MergeDelegate(e) => e,
-    }
-  }
-}
 
 /// Error type for the serf crate.
 #[derive(thiserror::Error)]
@@ -81,51 +22,13 @@ where
 {
   /// Returned when the underlyhing memberlist error
   #[error(transparent)]
-  Memberlist(#[from] MemberlistError<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>),
+  Memberlist(#[from] memberlist_core::error::Error<T, SerfDelegate<T, D>>),
   /// Returned when the serf error
   #[error(transparent)]
   Serf(#[from] SerfError),
-  /// Returned when the transport error
-  #[error(transparent)]
-  Transport(T::Error),
-  /// Returned when the delegate error
-  #[error(transparent)]
-  Delegate(#[from] SerfDelegateError<D>),
   /// Returned when the relay error
   #[error(transparent)]
   Relay(#[from] RelayError<T, D>),
-}
-
-impl<T, D> From<memberlist_core::error::Error<T, SerfDelegate<T, D>>> for Error<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  fn from(value: memberlist_core::error::Error<T, SerfDelegate<T, D>>) -> Self {
-    match value {
-      memberlist_core::error::Error::NotRunning => Self::Memberlist(MemberlistError::NotRunning),
-      memberlist_core::error::Error::UpdateTimeout => {
-        Self::Memberlist(MemberlistError::UpdateTimeout)
-      }
-      memberlist_core::error::Error::LeaveTimeout => {
-        Self::Memberlist(MemberlistError::LeaveTimeout)
-      }
-      memberlist_core::error::Error::Lost(n) => Self::Memberlist(MemberlistError::Lost(n)),
-      memberlist_core::error::Error::Delegate(e) => match e.into() {
-        SerfDelegateError::Serf(e) => Self::Serf(e),
-        e => Self::Delegate(e),
-      },
-      memberlist_core::error::Error::Transport(e) => Self::Transport(e),
-      memberlist_core::error::Error::UnexpectedMessage { expected, got } => {
-        Self::Memberlist(MemberlistError::UnexpectedMessage { expected, got })
-      }
-      memberlist_core::error::Error::SequenceNumberMismatch { ping, ack } => {
-        Self::Memberlist(MemberlistError::SequenceNumberMismatch { ping, ack })
-      }
-      memberlist_core::error::Error::Remote(e) => Self::Memberlist(MemberlistError::Remote(e)),
-      memberlist_core::error::Error::Other(e) => Self::Memberlist(MemberlistError::Other(e)),
-    }
-  }
 }
 
 impl<T, D> core::fmt::Debug for Error<T, D>
@@ -137,8 +40,6 @@ where
     match self {
       Self::Memberlist(e) => write!(f, "{e:?}"),
       Self::Serf(e) => write!(f, "{e:?}"),
-      Self::Transport(e) => write!(f, "{e:?}"),
-      Self::Delegate(e) => write!(f, "{e:?}"),
       Self::Relay(e) => write!(f, "{e:?}"),
     }
   }
@@ -159,18 +60,6 @@ where
   D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
   T: Transport,
 {
-  /// Create error from a transform error
-  #[inline]
-  pub fn transform_delegate(err: <D as TransformDelegate>::Error) -> Self {
-    Self::Delegate(SerfDelegateError::TransformDelegate(err))
-  }
-
-  /// Create a merge delegate error
-  #[inline]
-  pub const fn merge_delegate(err: <D as MergeDelegate>::Error) -> Self {
-    Self::Delegate(SerfDelegateError::MergeDelegate(err))
-  }
-
   /// Create a query response too large error
   #[inline]
   pub const fn query_response_too_large(limit: usize, got: usize) -> Self {
@@ -261,14 +150,6 @@ where
     Self::Serf(SerfError::Snapshot(err))
   }
 
-  /// Create a memberlist error
-  #[inline]
-  pub const fn memberlist(
-    err: MemberlistError<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-  ) -> Self {
-    Self::Memberlist(err)
-  }
-
   /// Create a bad leave status error
   #[inline]
   pub const fn bad_leave_status(status: SerfState) -> Self {
@@ -347,46 +228,6 @@ pub enum SerfError {
   /// Returned when the timed out broadcasting channel closed.
   #[error("serf: timed out broadcasting channel closed")]
   BroadcastChannelClosed,
-}
-
-/// Error type for [`Memberlist`](memberlist_core::Memberlist).
-#[derive(Debug, thiserror::Error)]
-pub enum MemberlistError<I, A> {
-  /// Returns when the node is not running.
-  #[error("memberlist: node is not running, please bootstrap first")]
-  NotRunning,
-  /// Returns when timeout waiting for update broadcast.
-  #[error("memberlist: timeout waiting for update broadcast")]
-  UpdateTimeout,
-  /// Returns when timeout waiting for leave broadcast.
-  #[error("memberlist: timeout waiting for leave broadcast")]
-  LeaveTimeout,
-  /// Returns when lost connection with a peer.
-  #[error("memberlist: no response from node {0}")]
-  Lost(Node<I, A>),
-  /// Returned when a message is received with an unexpected type.
-  #[error("memberlist: unexpected message: expected {expected}, got {got}")]
-  UnexpectedMessage {
-    /// The expected message type.
-    expected: &'static str,
-    /// The actual message type.
-    got: &'static str,
-  },
-  /// Returned when the sequence number of [`Ack`](crate::types::Ack) is not
-  /// match the sequence number of [`Ping`](crate::types::Ping).
-  #[error("memberlist: sequence number mismatch: ping({ping}), ack({ack})")]
-  SequenceNumberMismatch {
-    /// The sequence number of [`Ping`](crate::types::Ping).
-    ping: u32,
-    /// The sequence number of [`Ack`](crate::types::Ack).
-    ack: u32,
-  },
-  /// Returned when a remote error is received.
-  #[error("memberlist: remote error: {0}")]
-  Remote(SmolStr),
-  /// Returned when a custom error is created by users.
-  #[error("memberlist: {0}")]
-  Other(Cow<'static, str>),
 }
 
 /// Relay error from remote nodes.

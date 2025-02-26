@@ -15,7 +15,7 @@ use serf_proto::{
 use smol_str::SmolStr;
 
 use crate::{
-  delegate::TransformDelegate,
+  delegate::,
   event::{CrateEvent, CrateEventType, MemberEvent, MemberEventType},
   types::Epoch,
 };
@@ -339,7 +339,7 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
 ) where
   T: Transport,
 {
-  use memberlist_core::types::SecretKey;
+  use memberlist_core::proto::SecretKey;
   use serf_proto::KeyResponseMessage;
 
   let size_limit = opts.query_response_size_limit() * 10;
@@ -364,14 +364,14 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
 
   let mut found = 0;
   for i in (0..=resp.keys.len()).rev() {
-    let encoded_len = <DefaultDelegate<T> as TransformDelegate>::message_encoded_len(&resp);
+    let encoded_len = <DefaultDelegate<T> as >::message_encoded_len(&resp);
     let mut dst = vec![0; encoded_len];
-    <DefaultDelegate<T> as TransformDelegate>::encode_message(&resp, &mut dst).unwrap();
+    <DefaultDelegate<T> as >::encode_message(&resp, &mut dst).unwrap();
 
     let qresp = query.create_response(dst.into());
-    let encoded_len = <DefaultDelegate<T> as TransformDelegate>::message_encoded_len(&qresp);
+    let encoded_len = <DefaultDelegate<T> as >::message_encoded_len(&qresp);
     let mut dst = vec![0; encoded_len];
-    <DefaultDelegate<T> as TransformDelegate>::encode_message(&qresp, &mut dst).unwrap();
+    <DefaultDelegate<T> as >::encode_message(&qresp, &mut dst).unwrap();
 
     if query.check_response_size(&dst).is_err() {
       resp.keys.truncate(i);
@@ -399,7 +399,7 @@ pub async fn key_list_key_response_with_correct_size<T>(transport_opts: T::Optio
 where
   T: Transport,
 {
-  use memberlist_core::types::SecretKey;
+  use memberlist_core::proto::SecretKey;
   use serf_proto::{Encodable, KeyResponseMessage};
 
   let opts = opts.with_query_response_size_limit(1024);

@@ -11,7 +11,7 @@ use memberlist_core::{
   agnostic_lite::{AsyncSpawner, RuntimeLite},
   queue::TransmitLimitedQueue,
   transport::{AddressResolver, Transport},
-  types::MediumVec,
+  proto::MediumVec,
 };
 
 use super::{

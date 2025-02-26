@@ -14,7 +14,7 @@ where
   .unwrap();
   let meta = s.inner.memberlist.delegate().unwrap().node_meta(32).await;
 
-  let (_, tags) = <DefaultDelegate<T> as TransformDelegate>::decode_tags(&meta).unwrap();
+  let (_, tags) = <DefaultDelegate<T> as >::decode_tags(&meta).unwrap();
   assert_eq!(tags.get("role"), Some(&SmolStr::new("test")));
 
   s.shutdown().await.unwrap();
@@ -82,7 +82,7 @@ where
 
   // Attempt a decode
   let (_, pp) =
-    <DefaultDelegate<T> as TransformDelegate>::decode_message(MessageType::PushPull, &buf[1..])
+    <DefaultDelegate<T> as >::decode_message(MessageType::PushPull, &buf[1..])
       .unwrap();
 
   let SerfMessage::PushPull(pp) = pp else {
@@ -147,9 +147,9 @@ where
     query_ltime: 100.into(),
   };
 
-  let mut buf = vec![0; <DefaultDelegate<T> as TransformDelegate>::message_encoded_len(&pp) + 1];
+  let mut buf = vec![0; <DefaultDelegate<T> as >::message_encoded_len(&pp) + 1];
   buf[0] = MessageType::PushPull as u8;
-  <DefaultDelegate<T> as TransformDelegate>::encode_message(&pp, &mut buf[1..]).unwrap();
+  <DefaultDelegate<T> as >::encode_message(&pp, &mut buf[1..]).unwrap();
 
   // Merge in fake state
   d.merge_remote_state(buf.into(), false).await;

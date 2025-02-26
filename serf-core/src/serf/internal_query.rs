@@ -8,7 +8,7 @@ use memberlist_core::{
 };
 
 use crate::{
-  delegate::{Delegate, TransformDelegate},
+  delegate::{Delegate, },
   event::{CrateEvent, InternalQueryEvent, QueryEvent},
   types::MessageType,
 };
@@ -152,11 +152,11 @@ where
     match out {
       Some(state) => {
         let member = state.member();
-        let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(member);
+        let expected_encoded_len = <D as >::message_encoded_len(member);
         let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
         raw.put_u8(MessageType::ConflictResponse as u8);
         raw.resize(expected_encoded_len + 1, 0);
-        match <D as TransformDelegate>::encode_message(member, &mut raw[1..]) {
+        match <D as >::encode_message(member, &mut raw[1..]) {
           Ok(len) => {
             debug_assert_eq!(
               len, expected_encoded_len,
@@ -193,7 +193,7 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
     let req =
-      match <D as TransformDelegate>::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
         Ok((_, msg)) => match msg {
           SerfMessage::KeyRequest(req) => req,
           msg => {
@@ -257,7 +257,7 @@ where
     let mut response = KeyResponseMessage::default();
 
     let req =
-      match <D as TransformDelegate>::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
         Ok((_, msg)) => match msg {
           SerfMessage::KeyRequest(req) => req,
           msg => {
@@ -327,7 +327,7 @@ where
     let mut response = KeyResponseMessage::default();
 
     let req =
-      match <D as TransformDelegate>::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
         Ok((_, msg)) => match msg {
           SerfMessage::KeyRequest(req) => req,
           msg => {
@@ -450,12 +450,12 @@ where
       (q.ctx.this.inner.opts.query_response_size_limit / MIN_ENCODED_KEY_LENGTH).min(actual);
 
     for i in (0..=max_list_keys).rev() {
-      let expected_k_encoded_len = <D as TransformDelegate>::message_encoded_len(&*resp);
+      let expected_k_encoded_len = <D as >::message_encoded_len(&*resp);
       let mut raw = BytesMut::with_capacity(expected_k_encoded_len + 1); // +1 for the message type
       raw.put_u8(MessageType::KeyResponse as u8);
       raw.resize(expected_k_encoded_len + 1, 0);
 
-      let len = <D as TransformDelegate>::encode_message(&*resp, &mut raw[1..])
+      let len = <D as >::encode_message(&*resp, &mut raw[1..])
         .map_err(Error::transform_delegate)?;
 
       debug_assert_eq!(
@@ -469,12 +469,12 @@ where
       let qresp = q.create_response(kraw.clone());
 
       // encode response
-      let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&qresp);
+      let expected_encoded_len = <D as >::message_encoded_len(&qresp);
       let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
       raw.put_u8(MessageType::QueryResponse as u8);
       raw.resize(expected_encoded_len + 1, 0);
 
-      let len = <D as TransformDelegate>::encode_message(&qresp, &mut raw[1..])
+      let len = <D as >::encode_message(&qresp, &mut raw[1..])
         .map_err(Error::transform_delegate)?;
 
       debug_assert_eq!(
@@ -520,11 +520,11 @@ where
         }
       }
       _ => {
-        let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&*resp);
+        let expected_encoded_len = <D as >::message_encoded_len(&*resp);
         let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
         raw.put_u8(MessageType::KeyResponse as u8);
         raw.resize(expected_encoded_len + 1, 0);
-        match <D as TransformDelegate>::encode_message(&*resp, &mut raw[1..]) {
+        match <D as >::encode_message(&*resp, &mut raw[1..]) {
           Ok(len) => {
             debug_assert_eq!(
               len, expected_encoded_len,

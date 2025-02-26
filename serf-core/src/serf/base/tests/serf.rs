@@ -782,7 +782,7 @@ where
 /// Unit test for serf write keying file
 #[cfg(feature = "encryption")]
 pub async fn serf_write_keyring_file<T>(
-  get_transport_opts: impl FnOnce(memberlist_core::types::SecretKey) -> T::Options,
+  get_transport_opts: impl FnOnce(memberlist_core::proto::SecretKey) -> T::Options,
 ) where
   T: Transport,
 {
@@ -798,7 +798,7 @@ pub async fn serf_write_keyring_file<T>(
   p.set_extension("json");
 
   let existing_bytes = general_purpose::STANDARD.decode(EXISTING).unwrap();
-  let sk = memberlist_core::types::SecretKey::try_from(existing_bytes.as_slice()).unwrap();
+  let sk = memberlist_core::proto::SecretKey::try_from(existing_bytes.as_slice()).unwrap();
 
   let serf = Serf::<T>::new(
     get_transport_opts(sk),
@@ -813,7 +813,7 @@ pub async fn serf_write_keyring_file<T>(
 
   let manager = serf.key_manager();
   let new_key = general_purpose::STANDARD.decode(NEW_KEY).unwrap();
-  let new_sk = memberlist_core::types::SecretKey::try_from(new_key.as_slice()).unwrap();
+  let new_sk = memberlist_core::proto::SecretKey::try_from(new_key.as_slice()).unwrap();
   manager.install_key(new_sk, None).await.unwrap();
 
   let mut keyring_file = std::fs::File::open(&p).unwrap();

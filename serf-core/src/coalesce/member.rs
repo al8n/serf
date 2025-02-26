@@ -4,7 +4,7 @@ use async_channel::Sender;
 use memberlist_core::{
   CheapClone,
   transport::{AddressResolver, Node, Transport},
-  types::TinyVec,
+  proto::TinyVec,
 };
 
 use crate::{
@@ -126,7 +126,7 @@ mod tests {
   use futures::FutureExt;
   use memberlist_core::{
     agnostic_lite::{RuntimeLite, tokio::TokioRuntime},
-    transport::{Lpe, resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport},
+    transport::resolver::socket_addr::SocketAddrResolver,
   };
   use serf_proto::{MemberStatus, UserEventMessage};
   use smol_str::SmolStr;

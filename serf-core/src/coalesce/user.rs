@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use indexmap::IndexMap;
-use memberlist_core::types::TinyVec;
+use memberlist_core::proto::TinyVec;
 use serf_proto::UserEventMessage;
 use smol_str::SmolStr;
 
@@ -102,9 +102,7 @@ mod tests {
   use std::net::SocketAddr;
 
   use agnostic_lite::tokio::TokioRuntime;
-  use memberlist_core::transport::{
-    Lpe, resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport,
-  };
+  use memberlist_core::transport::resolver::socket_addr::SocketAddrResolver;
 
   use crate::{
     DefaultDelegate,

@@ -4,11 +4,9 @@ use std::{
   time::Duration,
 };
 
-use byteorder::{ByteOrder, NetworkEndian};
 use memberlist_core::CheapClone;
 use parking_lot::RwLock;
 use rand::Rng;
-use serf_proto::Transformable;
 use smallvec::SmallVec;
 
 /// Used to convert float seconds to nanoseconds.
@@ -184,7 +182,7 @@ pub struct CoordinateOptions {
       doc = "Sets the metric labels used to identify the metrics for this coordinate client."
     ))
   )]
-  metric_labels: std::sync::Arc<memberlist_core::types::MetricLabels>,
+  metric_labels: std::sync::Arc<memberlist_core::proto::MetricLabels>,
 }
 
 impl Default for CoordinateOptions {
@@ -208,7 +206,7 @@ impl CoordinateOptions {
       latency_filter_size: 3,
       gravity_rho: 150.0,
       #[cfg(feature = "metrics")]
-      metric_labels: std::sync::Arc::new(memberlist_core::types::MetricLabels::default()),
+      metric_labels: std::sync::Arc::new(memberlist_core::proto::MetricLabels::default()),
     }
   }
 }
@@ -649,101 +647,6 @@ impl Coordinate {
   }
 }
 
-/// The error when encoding or decoding a coordinate.
-#[derive(Debug, thiserror::Error)]
-pub enum CoordinateTransformError {
-  /// Returned when the buffer is too small to encode the coordinate.
-  #[error("encode buffer too small")]
-  BufferTooSmall,
-  /// Returned when there are not enough bytes to decode the coordinate.
-  #[error("not enough bytes to decode")]
-  NotEnoughBytes,
-}
-
-impl Transformable for Coordinate {
-  type Error = CoordinateTransformError;
-
-  fn encode(&self, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    let encoded_len = self.encoded_len();
-    if dst.len() < encoded_len {
-      return Err(Self::Error::BufferTooSmall);
-    }
-
-    let mut offset = 0;
-    NetworkEndian::write_u32(&mut dst[offset..], encoded_len as u32);
-    offset += 4;
-    NetworkEndian::write_f64(&mut dst[offset..], self.error);
-    offset += 8;
-    NetworkEndian::write_f64(&mut dst[offset..], self.adjustment);
-    offset += 8;
-    NetworkEndian::write_f64(&mut dst[offset..], self.height);
-    offset += 8;
-    for f in &self.portion {
-      NetworkEndian::write_f64(&mut dst[offset..], *f);
-      offset += 8;
-    }
-
-    debug_assert_eq!(
-      offset, encoded_len,
-      "expect write {} bytes, but actual write {} bytes",
-      encoded_len, offset
-    );
-
-    Ok(offset)
-  }
-
-  fn encoded_len(&self) -> usize {
-    4 + 8 * self.portion.len() + 8 * 3
-  }
-
-  fn decode(src: &[u8]) -> Result<(usize, Self), Self::Error>
-  where
-    Self: Sized,
-  {
-    let src_len = src.len();
-    if src_len < 4 + 3 * 8 {
-      return Err(Self::Error::NotEnoughBytes);
-    }
-
-    let len = NetworkEndian::read_u32(&src[0..4]) as usize;
-    if src_len < len {
-      return Err(Self::Error::NotEnoughBytes);
-    }
-
-    let mut offset = 4;
-    let error = NetworkEndian::read_f64(&src[offset..]);
-    offset += 8;
-    let adjustment = NetworkEndian::read_f64(&src[offset..]);
-    offset += 8;
-    let height = NetworkEndian::read_f64(&src[offset..]);
-    offset += 8;
-
-    let num_portion = (len - 4 - 3 * 8) / 8;
-    let mut portion = SmallVec::with_capacity(num_portion);
-
-    for _ in 0..num_portion {
-      portion.push(NetworkEndian::read_f64(&src[offset..]));
-      offset += 8;
-    }
-
-    debug_assert_eq!(
-      offset, len,
-      "expect read {} bytes, but actual read {} bytes",
-      len, offset
-    );
-
-    Ok((
-      len,
-      Self {
-        portion,
-        error,
-        adjustment,
-        height,
-      },
-    ))
-  }
-}
-
 #[inline]
 fn add_in_place(vec1: &mut [f64], vec2: &[f64]) {
   for (x, y) in vec1.iter_mut().zip(vec2.iter()) {
@@ -810,9 +713,9 @@ fn unit_vector_at(vec1: &[f64], vec2: &[f64]) -> (SmallVec<[f64; DEFAULT_DIMENSI
 }
 
 fn rand_f64() -> f64 {
-  let mut rng = rand::thread_rng();
+  let mut rng = rand::rng();
   loop {
-    let f = (rng.gen_range::<u64, _>(0..(1u64 << 63u64)) as f64) / ((1u64 << 63u64) as f64);
+    let f = (rng.random_range::<u64, _>(0..(1u64 << 63u64)) as f64) / ((1u64 << 63u64) as f64);
     if f == 1.0 {
       continue;
     }
@@ -839,47 +742,6 @@ mod tests {
 
     for (v1, v2) in vec1.iter().zip(vec2.iter()) {
       verify_equal_floats(*v1, *v2);
-    }
-  }
-
-  impl Coordinate {
-    fn random(size: usize) -> Self {
-      let mut portion = SmallVec::with_capacity(size);
-      for _ in 0..size {
-        portion.push(rand_f64());
-      }
-      Self {
-        portion,
-        error: rand_f64(),
-        adjustment: rand_f64(),
-        height: rand_f64(),
-      }
-    }
-  }
-
-  #[tokio::test]
-  async fn test_transform_encode_decode() {
-    for i in 0..100 {
-      let filter = Coordinate::random(i);
-      let mut buf = vec![0; filter.encoded_len()];
-      let encoded_len = filter.encode(&mut buf).unwrap();
-      assert_eq!(encoded_len, filter.encoded_len());
-
-      let (decoded_len, decoded) = Coordinate::decode(&buf).unwrap();
-      assert_eq!(decoded_len, encoded_len);
-      assert_eq!(decoded, filter);
-
-      let (decoded_len, decoded) =
-        Coordinate::decode_from_reader(&mut std::io::Cursor::new(&buf)).unwrap();
-      assert_eq!(decoded_len, encoded_len);
-      assert_eq!(decoded, filter);
-
-      let (decoded_len, decoded) =
-        Coordinate::decode_from_async_reader(&mut futures::io::Cursor::new(&buf))
-          .await
-          .unwrap();
-      assert_eq!(decoded_len, encoded_len);
-      assert_eq!(decoded, filter);
     }
   }
 

@@ -559,7 +559,7 @@ pub(crate) struct QueueOptions {
   pub(crate) check_interval: Duration,
   pub(crate) depth_warning: usize,
   #[cfg(feature = "metrics")]
-  pub(crate) metric_labels: Arc<memberlist_core::types::MetricLabels>,
+  pub(crate) metric_labels: Arc<memberlist_core::proto::MetricLabels>,
 }
 
 #[cfg(feature = "serde")]

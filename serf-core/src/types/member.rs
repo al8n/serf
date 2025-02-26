@@ -1,9 +1,9 @@
-use memberlist_core::types::OneOrMore;
+use memberlist_core::proto::OneOrMore;
 use serf_proto::Member;
 
 use std::collections::HashMap;
 
-use super::{Epoch, LamportTime, MessageType};
+use super::{Epoch, LamportTime};
 
 /// Used to track members that are no longer active due to
 /// leaving, failing, partitioning, etc. It tracks the member along with

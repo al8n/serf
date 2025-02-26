@@ -1,4 +1,4 @@
-use memberlist_core::{CheapClone, transport::Id, types::TinyVec};
+use memberlist_core::{CheapClone, transport::Id, proto::TinyVec};
 use std::future::Future;
 
 use crate::types::Member;

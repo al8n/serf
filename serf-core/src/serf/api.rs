@@ -2,16 +2,12 @@ use std::sync::atomic::Ordering;
 
 use futures::{FutureExt, StreamExt};
 use memberlist_core::{
-  CheapClone,
-  bytes::{BufMut, Bytes, BytesMut},
-  tracing,
-  transport::{MaybeResolvedAddress, Node},
-  types::{Meta, OneOrMore, SmallVec},
+  bytes::{BufMut, Bytes, BytesMut}, proto::Data, tracing, transport::{MaybeResolvedAddress, Node}, types::{Meta, OneOrMore, SmallVec}, CheapClone
 };
 use smol_str::SmolStr;
 
 use crate::{
-  delegate::TransformDelegate,
+  delegate::,
   error::{Error, JoinError},
   event::EventProducer,
   types::{LeaveMessage, Member, MessageType, SerfMessage, Tags, UserEventMessage},
@@ -224,7 +220,7 @@ where
   #[inline]
   pub async fn set_tags(&self, tags: Tags) -> Result<(), Error<T, D>> {
     // Check that the meta data length is okay
-    let tags_encoded_len = <D as TransformDelegate>::tags_encoded_len(&tags);
+    let tags_encoded_len = tags.encoded_len_with_length_delimited();
     if tags_encoded_len > Meta::MAX_SIZE {
       return Err(Error::tags_too_large(tags_encoded_len));
     }
@@ -274,7 +270,7 @@ where
     };
 
     // Start broadcasting the event
-    let len = <D as TransformDelegate>::message_encoded_len(&msg);
+    let len = <D as >::message_encoded_len(&msg);
 
     // Check the size after encoding to be sure again that
     // we're not attempting to send over the specified size limit.
@@ -290,7 +286,7 @@ where
     raw.put_u8(MessageType::UserEvent as u8);
     raw.resize(len + 1, 0);
 
-    let actual_encoded_len = <D as TransformDelegate>::encode_message(&msg, &mut raw[1..])
+    let actual_encoded_len = <D as >::encode_message(&msg, &mut raw[1..])
       .map_err(Error::transform_delegate)?;
     debug_assert_eq!(
       actual_encoded_len, len,

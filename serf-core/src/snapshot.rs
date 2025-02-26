@@ -20,13 +20,13 @@ use memberlist_core::{
   bytes::{BufMut, BytesMut},
   tracing,
   transport::{AddressResolver, Id, MaybeResolvedAddress, Node, Transport},
-  types::TinyVec,
+  proto::TinyVec,
 };
 use rand::seq::SliceRandom;
 use serf_proto::UserEventMessage;
 
 use crate::{
-  delegate::{Delegate, TransformDelegate},
+  delegate::Delegate,
   event::{CrateEvent, MemberEvent, MemberEventType},
   invalid_data_io_error,
   types::{Epoch, LamportClock, LamportTime},
@@ -200,7 +200,7 @@ where
   const LEAVE: u8 = 6;
   const COMMENT: u8 = 7;
 
-  fn encode<T: TransformDelegate<Id = I, Address = A>, W: Write>(
+  fn encode<W: Write>(
     &self,
     w: &mut W,
   ) -> std::io::Result<usize> {
@@ -231,7 +231,6 @@ pub(crate) struct ReplayResult<I, A> {
 pub(crate) fn open_and_replay_snapshot<
   I: Id,
   A: CheapClone + core::hash::Hash + Eq + Send + Sync + 'static,
-  T: TransformDelegate<Id = I, Address = A>,
   P: AsRef<std::path::Path>,
 >(
   p: &P,
@@ -397,7 +396,7 @@ where
   wait_tx: Sender<()>,
   last_attempted_compaction: Epoch,
   #[cfg(feature = "metrics")]
-  metric_labels: std::sync::Arc<memberlist_core::types::MetricLabels>,
+  metric_labels: std::sync::Arc<memberlist_core::proto::MetricLabels>,
 }
 
 // flushEvent is used to handle writing out an event
@@ -446,7 +445,7 @@ where
     clock: LamportClock,
     out_tx: Sender<CrateEvent<T, D>>,
     shutdown_rx: Receiver<()>,
-    #[cfg(feature = "metrics")] metric_labels: std::sync::Arc<memberlist_core::types::MetricLabels>,
+    #[cfg(feature = "metrics")] metric_labels: std::sync::Arc<memberlist_core::proto::MetricLabels>,
   ) -> Result<
     (
       Sender<CrateEvent<T, D>>,
@@ -502,7 +501,7 @@ where
         Node::new(id, MaybeResolvedAddress::resolved(addr))
       })
       .collect::<TinyVec<_>>();
-    alive_nodes.shuffle(&mut rand::thread_rng());
+    alive_nodes.shuffle(&mut rand::rng());
 
     // Start handling new commands
     let handle = <T::Runtime as RuntimeLite>::spawn(Self::tee_stream(

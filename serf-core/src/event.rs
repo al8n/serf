@@ -1,7 +1,5 @@
 use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
 
-use crate::delegate::TransformDelegate;
-
 use self::error::Error;
 
 use super::{delegate::Delegate, types::Epoch, *};
@@ -18,7 +16,7 @@ use memberlist_core::{
   CheapClone,
   bytes::{BufMut, Bytes, BytesMut},
   transport::{AddressResolver, Transport},
-  types::TinyVec,
+  proto::TinyVec,
 };
 use serf_proto::{
   LamportTime, Member, MessageType, Node, QueryFlag, QueryResponseMessage, UserEventMessage,
@@ -101,11 +99,11 @@ where
       flags: QueryFlag::empty(),
       payload: msg,
     };
-    let expected_encoded_len = <D as TransformDelegate>::message_encoded_len(&resp);
+    let expected_encoded_len = <D as >::message_encoded_len(&resp);
     let mut buf = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type byte
     buf.put_u8(MessageType::QueryResponse as u8);
     buf.resize(expected_encoded_len + 1, 0);
-    let len = <D as TransformDelegate>::encode_message(&resp, &mut buf[1..])
+    let len = <D as >::encode_message(&resp, &mut buf[1..])
       .map_err(Error::transform_delegate)?;
     debug_assert_eq!(
       len, expected_encoded_len,
