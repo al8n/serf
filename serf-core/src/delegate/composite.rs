@@ -23,11 +23,9 @@ pub struct CompositeDelegate<
   A,
   M = DefaultMergeDelegate<I, A>,
   R = NoopReconnectDelegate<I, A>,
-  T = LpeTransfromDelegate<I, A>,
 > {
   merge: M,
   reconnect: R,
-  transform: T,
   _m: std::marker::PhantomData<(I, A)>,
 }
 
@@ -43,13 +41,12 @@ impl<I, A> CompositeDelegate<I, A> {
     Self {
       merge: Default::default(),
       reconnect: Default::default(),
-      transform: Default::default(),
       _m: std::marker::PhantomData,
     }
   }
 }
 
-impl<I, A, M, R, T> CompositeDelegate<I, A, M, R, T>
+impl<I, A, M, R> CompositeDelegate<I, A, M, R>
 where
   M: MergeDelegate<Id = I, Address = A>,
 {
@@ -58,43 +55,28 @@ where
     CompositeDelegate {
       merge,
       reconnect: self.reconnect,
-      transform: self.transform,
       _m: std::marker::PhantomData,
     }
   }
 }
 
-impl<I, A, M, R, T> CompositeDelegate<I, A, M, R, T> {
+impl<I, A, M, R> CompositeDelegate<I, A, M, R> {
   /// Set the [`ReconnectDelegate`] for the `CompositeDelegate`.
   pub fn with_reconnect_delegate<NR>(self, reconnect: NR) -> CompositeDelegate<I, A, M, NR, T> {
     CompositeDelegate {
       reconnect,
       merge: self.merge,
-      transform: self.transform,
       _m: std::marker::PhantomData,
     }
   }
 }
 
-impl<I, A, M, R, T> CompositeDelegate<I, A, M, R, T> {
-  /// Set the [`TransformDelegate`] for the `CompositeDelegate`.
-  pub fn with_transform_delegate<NT>(self, transform: NT) -> CompositeDelegate<I, A, M, R, NT> {
-    CompositeDelegate {
-      transform,
-      merge: self.merge,
-      reconnect: self.reconnect,
-      _m: std::marker::PhantomData,
-    }
-  }
-}
-
-impl<I, A, M, R, T> MergeDelegate for CompositeDelegate<I, A, M, R, T>
+impl<I, A, M, R> MergeDelegate for CompositeDelegate<I, A, M, R>
 where
   I: Id,
   A: CheapClone + Send + Sync + 'static,
   M: MergeDelegate<Id = I, Address = A>,
   R: Send + Sync + 'static,
-  T: Send + Sync + 'static,
 {
   type Error = M::Error;
 
@@ -110,13 +92,12 @@ where
   }
 }
 
-impl<I, A, M, R, T> ReconnectDelegate for CompositeDelegate<I, A, M, R, T>
+impl<I, A, M, R> ReconnectDelegate for CompositeDelegate<I, A, M, R>
 where
   I: Id,
   A: CheapClone + Send + Sync + 'static,
   M: Send + Sync + 'static,
   R: ReconnectDelegate<Id = I, Address = A>,
-  T: Send + Sync + 'static,
 {
   type Id = R::Id;
 
@@ -131,121 +112,12 @@ where
   }
 }
 
-impl<I, A, M, R, T> TransformDelegate for CompositeDelegate<I, A, M, R, T>
-where
-  I: Id,
-  A: CheapClone + Send + Sync + 'static,
-  M: Send + Sync + 'static,
-  R: Send + Sync + 'static,
-  T: TransformDelegate<Id = I, Address = A>,
-{
-  type Error = T::Error;
-
-  type Id = T::Id;
-
-  type Address = T::Address;
-
-  fn encode_filter(
-    filter: &Filter<Self::Id>,
-  ) -> Result<memberlist_core::bytes::Bytes, Self::Error> {
-    T::encode_filter(filter)
-  }
-
-  fn decode_filter(bytes: &[u8]) -> Result<(usize, Filter<Self::Id>), Self::Error> {
-    T::decode_filter(bytes)
-  }
-
-  fn node_encoded_len(node: &Node<Self::Id, Self::Address>) -> usize {
-    T::node_encoded_len(node)
-  }
-
-  fn encode_node(
-    node: &Node<Self::Id, Self::Address>,
-    dst: &mut [u8],
-  ) -> Result<usize, Self::Error> {
-    T::encode_node(node, dst)
-  }
-
-  fn decode_node(
-    bytes: impl AsRef<[u8]>,
-  ) -> Result<(usize, Node<Self::Id, Self::Address>), Self::Error> {
-    T::decode_node(bytes)
-  }
-
-  fn id_encoded_len(id: &Self::Id) -> usize {
-    T::id_encoded_len(id)
-  }
-
-  fn encode_id(id: &Self::Id, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    T::encode_id(id, dst)
-  }
-
-  fn decode_id(bytes: &[u8]) -> Result<(usize, Self::Id), Self::Error> {
-    T::decode_id(bytes)
-  }
-
-  fn address_encoded_len(address: &Self::Address) -> usize {
-    T::address_encoded_len(address)
-  }
-
-  fn encode_address(address: &Self::Address, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    T::encode_address(address, dst)
-  }
-
-  fn decode_address(bytes: &[u8]) -> Result<(usize, Self::Address), Self::Error> {
-    T::decode_address(bytes)
-  }
-
-  fn coordinate_encoded_len(coordinate: &Coordinate) -> usize {
-    T::coordinate_encoded_len(coordinate)
-  }
-
-  fn encode_coordinate(coordinate: &Coordinate, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    T::encode_coordinate(coordinate, dst)
-  }
-
-  fn decode_coordinate(bytes: &[u8]) -> Result<(usize, Coordinate), Self::Error> {
-    T::decode_coordinate(bytes)
-  }
-
-  fn tags_encoded_len(tags: &Tags) -> usize {
-    T::tags_encoded_len(tags)
-  }
-
-  fn encode_tags(tags: &Tags, dst: &mut [u8]) -> Result<usize, Self::Error> {
-    T::encode_tags(tags, dst)
-  }
-
-  fn decode_tags(bytes: &[u8]) -> Result<(usize, Tags), Self::Error> {
-    T::decode_tags(bytes)
-  }
-
-  fn message_encoded_len(msg: impl AsMessageRef<Self::Id, Self::Address>) -> usize {
-    T::message_encoded_len(msg)
-  }
-
-  fn encode_message(
-    msg: impl AsMessageRef<Self::Id, Self::Address>,
-    dst: impl AsMut<[u8]>,
-  ) -> Result<usize, Self::Error> {
-    T::encode_message(msg, dst)
-  }
-
-  fn decode_message(
-    ty: MessageType,
-    bytes: impl AsRef<[u8]>,
-  ) -> Result<(usize, SerfMessage<Self::Id, Self::Address>), Self::Error> {
-    T::decode_message(ty, bytes)
-  }
-}
-
-impl<I, A, M, R, T> Delegate for CompositeDelegate<I, A, M, R, T>
+impl<I, A, M, R> Delegate for CompositeDelegate<I, A, M, R>
 where
   I: Id,
   A: CheapClone + Send + Sync + 'static,
   M: MergeDelegate<Id = I, Address = A>,
   R: ReconnectDelegate<Id = I, Address = A>,
-  T: TransformDelegate<Id = I, Address = A>,
 {
   type Id = I;
 

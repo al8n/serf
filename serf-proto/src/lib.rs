@@ -26,8 +26,8 @@ pub use leave::*;
 mod member;
 pub use member::*;
 
-mod message;
-pub use message::*;
+// mod message;
+// pub use message::*;
 
 mod join;
 pub use join::*;

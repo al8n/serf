@@ -1,5 +1,8 @@
 use indexmap::{IndexMap, IndexSet};
-use memberlist_proto::TinyVec;
+use memberlist_proto::{
+  Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TinyVec, TupleEncoder, WireType,
+  utils::{merge, skip, split},
+};
 
 use super::{LamportTime, UserEvents};
 
@@ -63,8 +66,8 @@ pub struct PushPullMessage<I> {
     getter(const, style = "ref", attrs(doc = "Returns the recent events")),
     setter(attrs(doc = "Sets the recent events (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<Option<UserEvents>>, TinyVec<Option<UserEvents>>>))]
-  events: TinyVec<Option<UserEvents>>,
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<UserEvents>, TinyVec<UserEvents>>))]
+  events: TinyVec<UserEvents>,
   /// Lamport time for query clock
   #[viewit(
     getter(
@@ -94,24 +97,57 @@ where
   }
 }
 
+const LTIME_TAG: u8 = 1;
+const STATUS_LTIMES_TAG: u8 = 2;
+const LEFT_MEMBERS_TAG: u8 = 3;
+const EVENT_LTIME_TAG: u8 = 4;
+const EVENTS_TAG: u8 = 5;
+const QUERY_LTIME_TAG: u8 = 6;
+
+const LTIME_BYTE: u8 = merge(WireType::Varint, LTIME_TAG);
+const STATUS_LTIMES_BYTE: u8 = merge(WireType::LengthDelimited, STATUS_LTIMES_TAG);
+const LEFT_MEMBERS_BYTE: u8 = merge(WireType::LengthDelimited, LEFT_MEMBERS_TAG);
+const EVENT_LTIME_BYTE: u8 = merge(WireType::Varint, EVENT_LTIME_TAG);
+const EVENTS_BYTE: u8 = merge(WireType::LengthDelimited, EVENTS_TAG);
+const QUERY_LTIME_BYTE: u8 = merge(WireType::Varint, QUERY_LTIME_TAG);
+
 /// Used when doing a state exchange. This
 /// is a relatively large message, but is sent infrequently
-#[viewit::viewit(getters(skip), setters(skip))]
+#[viewit::viewit(vis_all = "", getters(vis_all = "pub"), setters(skip))]
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PushPullMessageRef<'a, I> {
   /// Current node lamport time
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the lamport time")))]
   ltime: LamportTime,
   /// Maps the node to its status time
-  status_ltimes: &'a IndexMap<I, LamportTime>,
+  #[viewit(getter(
+    const,
+    style = "ref",
+    attrs(doc = "Returns the maps the node to its status time")
+  ))]
+  status_ltimes: RepeatedDecoder<'a>,
   /// List of left nodes
-  left_members: &'a IndexSet<I>,
+  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the list of left nodes")))]
+  left_members: RepeatedDecoder<'a>,
   /// Lamport time for event clock
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns the lamport time for event clock")
+  ))]
   event_ltime: LamportTime,
   /// Recent events
-  events: &'a [Option<UserEvents>],
+  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the recent events")))]
+  events: RepeatedDecoder<'a>,
   /// Lamport time for query clock
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns the lamport time for query clock")
+  ))]
   query_ltime: LamportTime,
+  #[viewit(getter(skip))]
+  _m: core::marker::PhantomData<I>,
 }
 
 impl<I> Clone for PushPullMessageRef<'_, I> {
@@ -122,30 +158,300 @@ impl<I> Clone for PushPullMessageRef<'_, I> {
 
 impl<I> Copy for PushPullMessageRef<'_, I> {}
 
-impl<'a, I> From<&'a PushPullMessage<I>> for PushPullMessageRef<'a, I> {
-  #[inline]
-  fn from(msg: &'a PushPullMessage<I>) -> Self {
-    Self {
-      ltime: msg.ltime,
-      status_ltimes: &msg.status_ltimes,
-      left_members: &msg.left_members,
-      event_ltime: msg.event_ltime,
-      events: &msg.events,
-      query_ltime: msg.query_ltime,
+impl<'a, I> DataRef<'a, PushPullMessage<I>> for PushPullMessageRef<'a, I::Ref<'a>>
+where
+  I: Data + Eq + core::hash::Hash,
+{
+  fn decode(buf: &'a [u8]) -> Result<(usize, Self), DecodeError>
+  where
+    Self: Sized,
+  {
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    let mut ltime = None;
+    let mut status_ltimes_offsets = None;
+    let mut num_status_ltimes = 0;
+    let mut left_members_offsets = None;
+    let mut num_left_members = 0;
+    let mut event_ltime = None;
+    let mut events_offsets = None;
+    let mut num_events = 0;
+    let mut query_ltime = None;
+
+    while offset < buf_len {
+      match buf[offset] {
+        LTIME_BYTE => {
+          if ltime.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "PushPullMessage",
+              "ltime",
+              LTIME_TAG,
+            ));
+          }
+
+          offset += 1;
+          let (o, v) = <LamportTime as DataRef<'_, LamportTime>>::decode(&buf[offset..])?;
+          offset += o;
+          ltime = Some(v);
+        }
+        STATUS_LTIMES_BYTE => {
+          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = status_ltimes_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
+
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            status_ltimes_offsets = Some((offset - 1, offset + readed));
+          }
+          num_status_ltimes += 1;
+          offset += readed;
+        }
+        LEFT_MEMBERS_BYTE => {
+          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = left_members_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
+
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            left_members_offsets = Some((offset - 1, offset + readed));
+          }
+          num_left_members += 1;
+          offset += readed;
+        }
+        EVENT_LTIME_BYTE => {
+          if event_ltime.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "PushPullMessage",
+              "event_ltime",
+              EVENT_LTIME_TAG,
+            ));
+          }
+
+          offset += 1;
+          let (o, v) = <LamportTime as DataRef<'_, LamportTime>>::decode(&buf[offset..])?;
+          offset += o;
+          event_ltime = Some(v);
+        }
+        EVENTS_BYTE => {
+          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = events_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
+
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            events_offsets = Some((offset - 1, offset + readed));
+          }
+          num_events += 1;
+          offset += readed;
+        }
+        QUERY_LTIME_BYTE => {
+          if query_ltime.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "PushPullMessage",
+              "query_ltime",
+              QUERY_LTIME_TAG,
+            ));
+          }
+
+          offset += 1;
+          let (o, v) = <LamportTime as DataRef<'_, LamportTime>>::decode(&buf[offset..])?;
+          offset += o;
+          query_ltime = Some(v);
+        }
+        other => {
+          offset += 1;
+
+          let (wire_type, _) = split(other);
+          let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          offset += skip(wire_type, &buf[offset..])?;
+        }
+      }
     }
+
+    Ok((
+      offset,
+      Self {
+        ltime: ltime.ok_or_else(|| DecodeError::missing_field("PushPullMessage", "ltime"))?,
+        status_ltimes: if let Some((start, end)) = events_offsets {
+          RepeatedDecoder::new(STATUS_LTIMES_TAG, WireType::LengthDelimited, buf)
+            .with_nums(num_status_ltimes)
+            .with_offsets(start, end)
+        } else {
+          RepeatedDecoder::new(STATUS_LTIMES_TAG, WireType::LengthDelimited, buf)
+        },
+        left_members: if let Some((start, end)) = events_offsets {
+          RepeatedDecoder::new(LEFT_MEMBERS_TAG, WireType::LengthDelimited, buf)
+            .with_nums(num_left_members)
+            .with_offsets(start, end)
+        } else {
+          RepeatedDecoder::new(LEFT_MEMBERS_TAG, WireType::LengthDelimited, buf)
+        },
+        event_ltime: event_ltime
+          .ok_or_else(|| DecodeError::missing_field("PushPullMessage", "event_ltime"))?,
+        events: if let Some((start, end)) = events_offsets {
+          RepeatedDecoder::new(EVENTS_TAG, WireType::LengthDelimited, buf)
+            .with_nums(num_events)
+            .with_offsets(start, end)
+        } else {
+          RepeatedDecoder::new(EVENTS_TAG, WireType::LengthDelimited, buf)
+        },
+        query_ltime: query_ltime
+          .ok_or_else(|| DecodeError::missing_field("PushPullMessage", "query_ltime"))?,
+        _m: core::marker::PhantomData,
+      },
+    ))
   }
 }
 
-impl<'a, I> From<&'a mut PushPullMessage<I>> for PushPullMessageRef<'a, I> {
-  #[inline]
-  fn from(msg: &'a mut PushPullMessage<I>) -> Self {
-    Self {
-      ltime: msg.ltime,
-      status_ltimes: &msg.status_ltimes,
-      left_members: &msg.left_members,
-      event_ltime: msg.event_ltime,
-      events: &msg.events,
-      query_ltime: msg.query_ltime,
+impl<I> Data for PushPullMessage<I>
+where
+  I: Data + Eq + core::hash::Hash,
+{
+  type Ref<'a> = PushPullMessageRef<'a, I::Ref<'a>>;
+
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
+  where
+    Self: Sized,
+  {
+    let left_members = val
+      .left_members
+      .iter::<I>()
+      .map(|res| res.and_then(Data::from_ref))
+      .collect::<Result<IndexSet<I>, DecodeError>>()?;
+
+    Ok(Self {
+      ltime: val.ltime,
+      status_ltimes: val
+        .status_ltimes
+        .iter::<(I, LamportTime)>()
+        .map(|res| res.and_then(Data::from_ref))
+        .collect::<Result<IndexMap<I, LamportTime>, DecodeError>>()?,
+      left_members,
+      event_ltime: val.event_ltime,
+      events: val
+        .events
+        .iter::<UserEvents>()
+        .map(|res| res.and_then(Data::from_ref))
+        .collect::<Result<TinyVec<_>, DecodeError>>()?,
+      query_ltime: val.query_ltime,
+    })
+  }
+
+  fn encoded_len(&self) -> usize {
+    let mut len = 0usize;
+
+    len += 1 + self.ltime.encoded_len();
+
+    len += self
+      .status_ltimes
+      .iter()
+      .map(|(k, v)| 1 + TupleEncoder::new(k, v).encoded_len_with_length_delimited())
+      .sum::<usize>();
+
+    len += self
+      .left_members
+      .iter()
+      .map(|id| 1 + id.encoded_len_with_length_delimited())
+      .sum::<usize>();
+    len += 1 + self.event_ltime.encoded_len();
+    len += 1
+      + self
+        .events
+        .iter()
+        .map(|e| 1 + e.encoded_len_with_length_delimited())
+        .sum::<usize>();
+    len += 1 + self.query_ltime.encoded_len();
+
+    len
+  }
+
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    macro_rules! bail {
+      ($this:ident($offset:expr, $len:ident)) => {
+        if $offset >= $len {
+          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
+        }
+      };
     }
+
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    bail!(self(offset, buf_len));
+    buf[offset] = LTIME_BYTE;
+    offset += 1;
+    offset += self.ltime.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = STATUS_LTIMES_BYTE;
+    offset += 1;
+
+    self
+      .status_ltimes
+      .iter()
+      .try_fold(&mut offset, |off, (k, v)| {
+        bail!(self(*off, buf_len));
+        buf[*off] = LEFT_MEMBERS_BYTE;
+        *off += 1;
+        *off += TupleEncoder::new(k, v).encode_with_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len(), buf_len))?;
+
+    self
+      .left_members
+      .iter()
+      .try_fold(&mut offset, |off, id| {
+        bail!(self(*off, buf_len));
+        buf[*off] = LEFT_MEMBERS_BYTE;
+        *off += 1;
+        *off += id.encode_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len(), buf_len))?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = EVENT_LTIME_BYTE;
+    offset += 1;
+    offset += self.event_ltime.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = EVENTS_BYTE;
+    offset += 1;
+
+    self
+      .events
+      .iter()
+      .try_fold(&mut offset, |off, e| {
+        bail!(self(*off, buf_len));
+        buf[*off] = EVENTS_BYTE;
+        *off += 1;
+        *off += e.encode_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len(), buf_len))?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = QUERY_LTIME_BYTE;
+    offset += 1;
+    offset += self.query_ltime.encode(&mut buf[offset..])?;
+
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, self.encoded_len());
+
+    Ok(offset)
   }
 }

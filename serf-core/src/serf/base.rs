@@ -1524,6 +1524,17 @@ where
 
         true
       }
+      status => {
+        tracing::warn!(status=%status, "serf: received leave intent for unknown member status");
+        member.member.status = MemberStatus::Leaving;
+
+        if msg.prune {
+          let owned = member.clone();
+          drop(members_mut);
+          self.handle_prune(&owned, *members.borrow_mut()).await;
+        }
+        true
+      }
     }
   }
 
