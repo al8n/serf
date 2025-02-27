@@ -1,9 +1,6 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use memberlist_core::{
-  transport::{AddressResolver, MaybeResolvedAddress, Node, Transport},
-  proto::{SmallVec, TinyVec},
-};
+use memberlist_core::{proto::TinyVec, transport::Transport};
 
 use crate::{
   delegate::Delegate,
@@ -14,10 +11,10 @@ use crate::{
 pub use crate::snapshot::SnapshotError;
 
 /// Error type for the serf crate.
-#[derive(thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Returned when the underlyhing memberlist error
@@ -29,25 +26,14 @@ where
   /// Returned when the relay error
   #[error(transparent)]
   Relay(#[from] RelayError<T, D>),
-}
-
-impl<T, D> core::fmt::Debug for Error<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::Memberlist(e) => write!(f, "{e:?}"),
-      Self::Serf(e) => write!(f, "{e:?}"),
-      Self::Relay(e) => write!(f, "{e:?}"),
-    }
-  }
+  /// Multiple errors
+  #[error("errors:\n{}", format_multiple_errors(.0))]
+  Multiple(Arc<[Self]>),
 }
 
 impl<T, D> From<SnapshotError> for Error<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn from(value: SnapshotError) -> Self {
@@ -55,9 +41,19 @@ where
   }
 }
 
+impl<T, D> From<memberlist_core::proto::EncodeError> for Error<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  fn from(e: memberlist_core::proto::EncodeError) -> Self {
+    Self::Memberlist(e.into())
+  }
+}
+
 impl<T, D> Error<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Create a query response too large error
@@ -234,28 +230,28 @@ pub enum SerfError {
 pub struct RelayError<T, D>(
   #[allow(clippy::type_complexity)]
   TinyVec<(
-    Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    Member<T::Id, T::ResolvedAddress>,
     memberlist_core::error::Error<T, SerfDelegate<T, D>>,
   )>,
 )
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport;
 
 impl<T, D>
   From<
     TinyVec<(
-      Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+      Member<T::Id, T::ResolvedAddress>,
       memberlist_core::error::Error<T, SerfDelegate<T, D>>,
     )>,
   > for RelayError<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn from(
     value: TinyVec<(
-      Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+      Member<T::Id, T::ResolvedAddress>,
       memberlist_core::error::Error<T, SerfDelegate<T, D>>,
     )>,
   ) -> Self {
@@ -265,7 +261,7 @@ where
 
 impl<T, D> core::fmt::Display for RelayError<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -285,7 +281,7 @@ where
 
 impl<T, D> core::fmt::Debug for RelayError<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -295,91 +291,20 @@ where
 
 impl<T, D> std::error::Error for RelayError<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
 }
 
-/// `JoinError` is returned when join is partially/totally failed.
-pub struct JoinError<T, D>
+fn format_multiple_errors<T, D>(errors: &[Error<T, D>]) -> String
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  pub(crate) joined: SmallVec<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-  pub(crate) errors: HashMap<Node<T::Id, MaybeResolvedAddress<T>>, Error<T, D>>,
-  pub(crate) broadcast_error: Option<Error<T, D>>,
-}
-
-impl<T, D> JoinError<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  /// Returns the broadcast error that occurred during the join.
-  #[inline]
-  pub const fn broadcast_error(&self) -> Option<&Error<T, D>> {
-    self.broadcast_error.as_ref()
-  }
-
-  /// Returns the errors that occurred during the join.
-  #[inline]
-  pub const fn errors(&self) -> &HashMap<Node<T::Id, MaybeResolvedAddress<T>>, Error<T, D>> {
-    &self.errors
-  }
-
-  /// Returns the nodes have successfully joined.
-  #[inline]
-  pub const fn joined(
-    &self,
-  ) -> &SmallVec<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>> {
-    &self.joined
-  }
-
-  /// Returns how many nodes have successfully joined.
-  #[inline]
-  pub fn num_joined(&self) -> usize {
-    self.joined.len()
-  }
-}
-
-impl<T, D> core::fmt::Debug for JoinError<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(f, "{}", self)
-  }
-}
-
-impl<T, D> core::fmt::Display for JoinError<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    if !self.joined.is_empty() {
-      writeln!(f, "Successes: {:?}", self.joined)?;
-    }
-
-    if !self.errors.is_empty() {
-      writeln!(f, "Failures:")?;
-      for (address, err) in self.errors.iter() {
-        writeln!(f, "\t{}: {}", address, err)?;
-      }
-    }
-
-    if let Some(err) = &self.broadcast_error {
-      writeln!(f, "Broadcast Error: {err}")?;
-    }
-    Ok(())
-  }
-}
-
-impl<T, D> std::error::Error for JoinError<T, D>
-where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
-  T: Transport,
-{
+  errors
+    .iter()
+    .enumerate()
+    .map(|(i, err)| format!("  {}. {}", i + 1, err))
+    .collect::<Vec<_>>()
+    .join("\n")
 }

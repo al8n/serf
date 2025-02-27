@@ -1,13 +1,13 @@
 use crate::{
   Serf,
   broadcast::SerfBroadcast,
-  delegate::{Delegate, },
-  error::{SerfDelegateError, SerfError},
+  delegate::Delegate,
+  error::SerfError,
   event::QueryMessageExt,
   types::{
     DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus,
     MemberlistDelegateVersion, MemberlistProtocolVersion, MessageType, ProtocolVersion,
-    PushPullMessageRef, SerfMessage, UserEventMessage,
+    PushPullMessageBorrow, SerfMessage, UserEventMessage,
   },
 };
 
@@ -22,9 +22,9 @@ use memberlist_core::{
     AliveDelegate, ConflictDelegate, Delegate as MemberlistDelegate, EventDelegate,
     MergeDelegate as MemberlistMergeDelegate, NodeDelegate, PingDelegate,
   },
+  proto::{Meta, NodeState, SmallVec, State, TinyVec},
   tracing,
   transport::{AddressResolver, Transport},
-  types::{Meta, NodeState, SmallVec, State, TinyVec},
 };
 use serf_proto::Tags;
 
@@ -117,7 +117,7 @@ where
     let tags = self.tags.load();
     match tags.is_empty() {
       false => {
-        let encoded_len = <D as >::tags_encoded_len(&tags);
+        let encoded_len = tags_encoded_len(&tags);
         let limit = limit.min(Meta::MAX_SIZE);
         if encoded_len > limit {
           panic!(
@@ -127,7 +127,7 @@ where
         }
 
         let mut role_bytes = vec![0; encoded_len];
-        match <D as >::encode_tags(&tags, &mut role_bytes) {
+        match encode_tags(&tags, &mut role_bytes) {
           Ok(len) => {
             debug_assert_eq!(
               len, encoded_len,
@@ -190,7 +190,7 @@ where
         }
 
         match ty {
-          MessageType::Leave => match <D as >::decode_message(ty, &msg[1..]) {
+          MessageType::Leave => match decode_message(ty, &msg[1..]) {
             Ok((_, l)) => {
               if let SerfMessage::Leave(l) = &l {
                 tracing::debug!("serf: leave message: {}", l.id());
@@ -203,7 +203,7 @@ where
               tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
-          MessageType::Join => match <D as >::decode_message(ty, &msg[1..]) {
+          MessageType::Join => match decode_message(ty, &msg[1..]) {
             Ok((_, j)) => {
               if let SerfMessage::Join(j) = &j {
                 tracing::debug!("serf: join message: {}", j.id());
@@ -216,7 +216,7 @@ where
               tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
-          MessageType::UserEvent => match <D as >::decode_message(ty, &msg[1..]) {
+          MessageType::UserEvent => match decode_message(ty, &msg[1..]) {
             Ok((_, ue)) => {
               if let SerfMessage::UserEvent(ue) = ue {
                 tracing::debug!("serf: user event message: {}", ue.name);
@@ -230,7 +230,7 @@ where
               tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
-          MessageType::Query => match <D as >::decode_message(ty, &msg[1..]) {
+          MessageType::Query => match decode_message(ty, &msg[1..]) {
             Ok((_, q)) => {
               if let SerfMessage::Query(q) = q {
                 tracing::debug!("serf: query message: {}", q.name);
@@ -255,22 +255,20 @@ where
               tracing::warn!(err=%e, "serf: failed to decode message");
             }
           },
-          MessageType::QueryResponse => {
-            match <D as >::decode_message(ty, &msg[1..]) {
-              Ok((_, qr)) => {
-                if let SerfMessage::QueryResponse(qr) = qr {
-                  tracing::debug!("serf: query response message: {}", qr.from);
-                  this.handle_query_response(qr).await;
-                } else {
-                  tracing::warn!("serf: receive unexpected message: {}", qr.ty().as_str());
-                }
-              }
-              Err(e) => {
-                tracing::warn!(err=%e, "serf: failed to decode message");
+          MessageType::QueryResponse => match decode_message(ty, &msg[1..]) {
+            Ok((_, qr)) => {
+              if let SerfMessage::QueryResponse(qr) = qr {
+                tracing::debug!("serf: query response message: {}", qr.from);
+                this.handle_query_response(qr).await;
+              } else {
+                tracing::warn!("serf: receive unexpected message: {}", qr.ty().as_str());
               }
             }
-          }
-          MessageType::Relay => match <D as >::decode_node(&msg[1..]) {
+            Err(e) => {
+              tracing::warn!(err=%e, "serf: failed to decode message");
+            }
+          },
+          MessageType::Relay => match decode_node(&msg[1..]) {
             Ok((consumed, n)) => {
               tracing::debug!("serf: relay message",);
               tracing::debug!("serf: relaying response to node: {}", n);
@@ -389,7 +387,7 @@ where
       .iter()
       .map(|v| v.member.node().id().cheap_clone())
       .collect::<IndexSet<T::Id>>();
-    let pp = PushPullMessageRef {
+    let pp = PushPullMessageBorrow {
       ltime: this.inner.clock.time(),
       status_ltimes: &status_ltimes,
       left_members: &left_members,
@@ -399,19 +397,8 @@ where
     };
     drop(members);
 
-    let expected_encoded_len = <D as >::message_encoded_len(pp);
-    let mut buf = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type byte
-    buf.put_u8(MessageType::PushPull as u8);
-    buf.resize(expected_encoded_len + 1, 0);
-    match <D as >::encode_message(pp, &mut buf[1..]) {
-      Ok(encoded_len) => {
-        debug_assert_eq!(
-          expected_encoded_len, encoded_len,
-          "expected encoded len {} mismatch the actual encoded len {}",
-          expected_encoded_len, encoded_len
-        );
-        buf.freeze()
-      }
+    match serf_proto::Encodable::encode_to_bytes(&pp) {
+      Ok(buf) => buf,
       Err(e) => {
         tracing::error!(err=%e, "serf: failed to encode local state");
         Bytes::new()
@@ -449,7 +436,7 @@ where
 
     match ty {
       MessageType::PushPull => {
-        match <D as >::decode_message(ty, &buf[1..]) {
+        match decode_message(ty, &buf[1..]) {
           Err(e) => {
             tracing::error!(err=%e, "serf: failed to decode remote state");
           }
@@ -677,9 +664,9 @@ where
       coord.portion.resize(len * 2, 0.0);
 
       // The rest of the message is the serialized coordinate.
-      let len = <D as >::coordinate_encoded_len(&coord);
+      let len = coordinate_encoded_len(&coord);
       buf.resize(len + 1, 0);
-      if let Err(e) = <D as >::encode_coordinate(&coord, &mut buf[1..]) {
+      if let Err(e) = encode_coordinate(&coord, &mut buf[1..]) {
         panic!("failed to encode coordinate: {}", e);
       }
       return buf.freeze();
@@ -687,12 +674,12 @@ where
 
     if let Some(c) = self.this().inner.coord_core.as_ref() {
       let coord = c.client.get_coordinate();
-      let encoded_len = <D as >::coordinate_encoded_len(&coord) + 1;
+      let encoded_len = coordinate_encoded_len(&coord) + 1;
       let mut buf = BytesMut::with_capacity(encoded_len);
       buf.put_u8(PING_VERSION);
       buf.resize(encoded_len, 0);
 
-      if let Err(e) = <D as >::encode_coordinate(&coord, &mut buf[1..]) {
+      if let Err(e) = encode_coordinate(&coord, &mut buf[1..]) {
         tracing::error!(err=%e, "serf: failed to encode coordinate");
       }
       buf.into()
@@ -721,7 +708,7 @@ where
       }
 
       // Process the remainder of the message as a coordinate.
-      let coord = match <D as >::decode_coordinate(&payload[1..]) {
+      let coord = match decode_coordinate(&payload[1..]) {
         Ok((readed, c)) => {
           tracing::trace!(read=%readed, coordinate=?c, "serf: decode coordinate successfully");
           c
@@ -815,7 +802,7 @@ where
   Ok(Member {
     node: node.node(),
     tags: if !node.meta().is_empty() {
-      <D as >::decode_tags(node.meta())
+      decode_tags(node.meta())
         .map(|(read, tags)| {
           tracing::trace!(read=%read, tags=?tags, "serf: decode tags successfully");
           Arc::new(tags)

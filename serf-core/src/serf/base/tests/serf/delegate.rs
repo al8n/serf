@@ -14,7 +14,7 @@ where
   .unwrap();
   let meta = s.inner.memberlist.delegate().unwrap().node_meta(32).await;
 
-  let (_, tags) = <DefaultDelegate<T> as >::decode_tags(&meta).unwrap();
+  let (_, tags) = decode_tags(&meta).unwrap();
   assert_eq!(tags.get("role"), Some(&SmolStr::new("test")));
 
   s.shutdown().await.unwrap();
@@ -82,7 +82,7 @@ where
 
   // Attempt a decode
   let (_, pp) =
-    <DefaultDelegate<T> as >::decode_message(MessageType::PushPull, &buf[1..])
+    decode_message(MessageType::PushPull, &buf[1..])
       .unwrap();
 
   let SerfMessage::PushPull(pp) = pp else {
@@ -137,22 +137,20 @@ where
     .collect(),
     left_members: ["foo".into()].into_iter().collect(),
     event_ltime: 50.into(),
-    events: TinyVec::from(Some(UserEvents {
+    events: TinyVec::from(UserEvents {
       ltime: 45.into(),
       events: OneOrMore::from(UserEvent {
         name: "test".into(),
         payload: Bytes::new(),
       }),
-    })),
+    }),
     query_ltime: 100.into(),
   };
-
-  let mut buf = vec![0; <DefaultDelegate<T> as >::message_encoded_len(&pp) + 1];
-  buf[0] = MessageType::PushPull as u8;
-  <DefaultDelegate<T> as >::encode_message(&pp, &mut buf[1..]).unwrap();
+  
+  let buf = serf_proto::Encodable::encode_to_bytes(&pp).unwrap();
 
   // Merge in fake state
-  d.merge_remote_state(buf.into(), false).await;
+  d.merge_remote_state(buf, false).await;
 
   // Verify lamport
   assert_eq!(s.inner.clock.time(), 42.into(), "bad lamport clock");

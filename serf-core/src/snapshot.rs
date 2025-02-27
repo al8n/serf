@@ -18,9 +18,9 @@ use memberlist_core::{
   CheapClone,
   agnostic_lite::{AsyncSpawner, RuntimeLite},
   bytes::{BufMut, BytesMut},
+  proto::{Data, TinyVec},
   tracing,
   transport::{AddressResolver, Id, MaybeResolvedAddress, Node, Transport},
-  proto::TinyVec,
 };
 use rand::seq::SliceRandom;
 use serf_proto::UserEventMessage;
@@ -160,19 +160,19 @@ const MAX_INLINED_BYTES: usize = 64;
 macro_rules! encode {
   ($w:ident.$node: ident::$status: ident) => {{
     let node = $node.as_ref();
-    let encoded_node_len = T::node_encoded_len(node);
+    let encoded_node_len = node.encoded_len();
     let encoded_len = 4 + 1 + encoded_node_len;
     if encoded_len <= MAX_INLINED_BYTES {
       let mut buf = [0u8; MAX_INLINED_BYTES];
       buf[0] = Self::$status;
       buf[1..5].copy_from_slice(&(encoded_node_len as u32).to_le_bytes());
-      T::encode_node(node, &mut buf[5..]).map_err(invalid_data_io_error)?;
+      node.encode(&mut buf[5..]).map_err(invalid_data_io_error)?;
       $w.write_all(&buf[..encoded_len]).map(|_| encoded_len)
     } else {
       let mut buf = BytesMut::with_capacity(encoded_len);
       buf.put_u8(Self::$status);
       buf.put_u32_le(encoded_node_len as u32);
-      T::encode_node(node, &mut buf).map_err(invalid_data_io_error)?;
+      node.encode(&mut buf).map_err(invalid_data_io_error)?;
       $w.write_all(&buf).map(|_| encoded_len)
     }
   }};
@@ -188,8 +188,8 @@ macro_rules! encode {
 
 impl<I, A> SnapshotRecord<'_, I, A>
 where
-  I: Id,
-  A: CheapClone + Send + Sync + 'static,
+  I: Id + Data,
+  A: CheapClone + Data + Send + Sync + 'static,
 {
   const ALIVE: u8 = 0;
   const NOT_ALIVE: u8 = 1;
@@ -200,10 +200,7 @@ where
   const LEAVE: u8 = 6;
   const COMMENT: u8 = 7;
 
-  fn encode<W: Write>(
-    &self,
-    w: &mut W,
-  ) -> std::io::Result<usize> {
+  fn encode<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
     match self {
       Self::Alive(id) => encode!(w.id::ALIVE),
       Self::NotAlive(id) => encode!(w.id::NOT_ALIVE),
@@ -229,8 +226,8 @@ pub(crate) struct ReplayResult<I, A> {
 }
 
 pub(crate) fn open_and_replay_snapshot<
-  I: Id,
-  A: CheapClone + core::hash::Hash + Eq + Send + Sync + 'static,
+  I: Id + Data,
+  A: CheapClone + Data + core::hash::Hash + Eq + Send + Sync + 'static,
   P: AsRef<std::path::Path>,
 >(
   p: &P,
@@ -284,8 +281,8 @@ pub(crate) fn open_and_replay_snapshot<
         buf.resize(len, 0);
         reader.read_exact(&mut buf).map_err(SnapshotError::Replay)?;
 
-        let (_, node) =
-          T::decode_node(&buf).map_err(|e| SnapshotError::Replay(invalid_data_io_error(e)))?;
+        let (_, node) = <Node<I, A> as Data>::decode(&buf)
+          .map_err(|e| SnapshotError::Replay(invalid_data_io_error(e)))?;
         alive_nodes.insert(node);
       }
       SnapshotRecordType::NotAlive => {
@@ -295,8 +292,8 @@ pub(crate) fn open_and_replay_snapshot<
         buf.resize(len, 0);
         reader.read_exact(&mut buf).map_err(SnapshotError::Replay)?;
 
-        let (_, node) =
-          T::decode_node(&buf).map_err(|e| SnapshotError::Replay(invalid_data_io_error(e)))?;
+        let (_, node) = <Node<I, A> as Data>::decode(&buf)
+          .map_err(|e| SnapshotError::Replay(invalid_data_io_error(e)))?;
         alive_nodes.remove(&node);
       }
       SnapshotRecordType::Clock => {
@@ -750,7 +747,7 @@ where
     );
 
     let f = self.fh.as_mut().unwrap();
-    let n = l.encode::<D, _>(f).map_err(SnapshotError::Write)?;
+    let n = l.encode(f).map_err(SnapshotError::Write)?;
 
     // check if we should flush
     if self.last_flush.elapsed() > FLUSH_INTERVAL {
@@ -818,21 +815,21 @@ where
     let mut offset = 0u64;
     for node in self.alive_nodes.iter() {
       offset += SnapshotRecord::Alive(Cow::Borrowed(node))
-        .encode::<D, _>(&mut buf)
+        .encode(&mut buf)
         .map_err(SnapshotError::WriteNew)? as u64;
     }
 
     // Write out the clocks
-    offset += SnapshotRecord::Clock(self.last_clock)
-      .encode::<D, _>(&mut buf)
+    offset += SnapshotRecord::<T::Id, T::ResolvedAddress>::Clock(self.last_clock)
+      .encode(&mut buf)
       .map_err(SnapshotError::WriteNew)? as u64;
 
-    offset += SnapshotRecord::EventClock(self.last_event_clock)
-      .encode::<D, _>(&mut buf)
+    offset += SnapshotRecord::<T::Id, T::ResolvedAddress>::EventClock(self.last_event_clock)
+      .encode(&mut buf)
       .map_err(SnapshotError::WriteNew)? as u64;
 
-    offset += SnapshotRecord::QueryClock(self.last_query_clock)
-      .encode::<D, _>(&mut buf)
+    offset += SnapshotRecord::<T::Id, T::ResolvedAddress>::QueryClock(self.last_query_clock)
+      .encode(&mut buf)
       .map_err(SnapshotError::WriteNew)? as u64;
 
     // Flush the new snapshot

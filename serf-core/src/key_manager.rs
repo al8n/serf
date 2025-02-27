@@ -6,9 +6,9 @@ use futures::StreamExt;
 use memberlist_core::{
   CheapClone,
   bytes::{BufMut, BytesMut},
+  proto::SecretKey,
   tracing,
   transport::{AddressResolver, Transport},
-  types::SecretKey,
 };
 use smol_str::SmolStr;
 
@@ -19,10 +19,10 @@ use crate::event::{
 
 use super::{
   Serf,
-  delegate::{Delegate, },
+  delegate::Delegate,
   error::Error,
   serf::{NodeResponse, QueryResponse},
-  types::{KeyRequestMessage, MessageType, SerfMessage},
+  types::{KeyRequestMessage, MessageType},
 };
 
 /// KeyResponse is used to relay a query for a list of all keys in use.
@@ -186,19 +186,7 @@ where
     event: InternalQueryEvent<T::Id>,
   ) -> Result<KeyResponse<T::Id>, Error<T, D>> {
     let kr = KeyRequestMessage { key };
-    let expected_encoded_len = <D as >::message_encoded_len(&kr);
-    let mut buf = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
-    buf.put_u8(MessageType::KeyRequest as u8);
-    buf.resize(expected_encoded_len + 1, 0);
-    // Encode the query request
-    let len = <D as >::encode_message(&kr, &mut buf[1..])
-      .map_err(Error::transform_delegate)?;
-
-    debug_assert_eq!(
-      len, expected_encoded_len,
-      "expected encoded len {} mismatch the actual encoded len {}",
-      expected_encoded_len, len
-    );
+    let buf = serf_proto::Encodable::encode_to_bytes(&kr)?;
 
     let serf = self.serf.get().unwrap();
     let mut q_param = serf.default_query_param().await;
@@ -206,7 +194,7 @@ where
       q_param.relay_factor = opts.relay_factor;
     }
     let qresp: QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> = serf
-      .internal_query(SmolStr::new(ty), buf.freeze(), Some(q_param), event)
+      .internal_query(SmolStr::new(ty), buf, Some(q_param), event)
       .await?;
 
     // Handle the response stream and populate the KeyResponse
@@ -249,7 +237,7 @@ where
       resp.num_resp += 1;
 
       // Decode the response
-      if r.payload.is_empty() || r.payload[0] != MessageType::KeyResponse as u8 {
+      if r.payload.is_empty() || r.payload[0] != u8::from(MessageType::KeyResponse) {
         resp.messages.insert(
           r.from.id().cheap_clone(),
           SmolStr::new(format!(
@@ -265,30 +253,16 @@ where
         continue;
       }
 
-      let node_response =
-        match <D as >::decode_message(MessageType::KeyResponse, &r.payload[1..]) {
-          Ok((_, nr)) => match nr {
-            SerfMessage::KeyResponse(kr) => kr,
-            msg => {
-              resp.messages.insert(
-                r.from.id().cheap_clone(),
-                SmolStr::new(format!(
-                  "Invalid key query response type: {:?}",
-                  msg.ty().as_str()
-                )),
-              );
-              resp.num_err += 1;
-
-              if resp.num_resp == resp.num_nodes {
-                return resp;
-              }
-              continue;
-            }
-          },
-          Err(e) => {
+      let node_response = match decode_message(MessageType::KeyResponse, &r.payload[1..]) {
+        Ok((_, nr)) => match nr {
+          SerfMessage::KeyResponse(kr) => kr,
+          msg => {
             resp.messages.insert(
               r.from.id().cheap_clone(),
-              SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
+              SmolStr::new(format!(
+                "Invalid key query response type: {:?}",
+                msg.ty().as_str()
+              )),
             );
             resp.num_err += 1;
 
@@ -297,7 +271,20 @@ where
             }
             continue;
           }
-        };
+        },
+        Err(e) => {
+          resp.messages.insert(
+            r.from.id().cheap_clone(),
+            SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
+          );
+          resp.num_err += 1;
+
+          if resp.num_resp == resp.num_nodes {
+            return resp;
+          }
+          continue;
+        }
+      };
 
       if !node_response.result {
         resp

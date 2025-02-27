@@ -382,7 +382,7 @@ where
     macro_rules! bail {
       ($this:ident($offset:expr, $len:ident)) => {
         if $offset >= $len {
-          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
+          return Err(EncodeError::insufficient_buffer($this.encoded_len(), $len));
         }
       };
     }
@@ -451,6 +451,151 @@ where
 
     #[cfg(debug_assertions)]
     super::debug_assert_write_eq(offset, self.encoded_len());
+
+    Ok(offset)
+  }
+}
+
+/// Used when doing a state exchange. This
+/// is a relatively large message, but is sent infrequently
+#[viewit::viewit(getters(skip), setters(skip))]
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct PushPullMessageBorrow<'a, I> {
+  /// Current node lamport time
+  ltime: LamportTime,
+  /// Maps the node to its status time
+  status_ltimes: &'a IndexMap<I, LamportTime>,
+  /// List of left nodes
+  left_members: &'a IndexSet<I>,
+  /// Lamport time for event clock
+  event_ltime: LamportTime,
+  /// Recent events
+  events: &'a [Option<UserEvents>],
+  /// Lamport time for query clock
+  query_ltime: LamportTime,
+}
+
+impl<I> Clone for PushPullMessageBorrow<'_, I> {
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+impl<I> Copy for PushPullMessageBorrow<'_, I> {}
+
+impl<I> PushPullMessageBorrow<'_, I>
+where
+  I: Data,
+{
+  pub(super) fn encoded_len_in(&self) -> usize {
+    let mut len = 0usize;
+
+    len += 1 + self.ltime.encoded_len();
+
+    len += self
+      .status_ltimes
+      .iter()
+      .map(|(k, v)| 1 + TupleEncoder::new(k, v).encoded_len_with_length_delimited())
+      .sum::<usize>();
+
+    len += self
+      .left_members
+      .iter()
+      .map(|id| 1 + id.encoded_len_with_length_delimited())
+      .sum::<usize>();
+    len += 1 + self.event_ltime.encoded_len();
+    len += 1
+      + self
+        .events
+        .iter()
+        .filter_map(|e| {
+          e.as_ref()
+            .map(|e| 1 + e.encoded_len_with_length_delimited())
+        })
+        .sum::<usize>();
+    len += 1 + self.query_ltime.encoded_len();
+
+    len
+  }
+
+  pub(super) fn encode_in(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    macro_rules! bail {
+      ($this:ident($offset:expr, $len:ident)) => {
+        if $offset >= $len {
+          return Err(EncodeError::insufficient_buffer(
+            $this.encoded_len_in(),
+            $len,
+          ));
+        }
+      };
+    }
+
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    bail!(self(offset, buf_len));
+    buf[offset] = LTIME_BYTE;
+    offset += 1;
+    offset += self.ltime.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = STATUS_LTIMES_BYTE;
+    offset += 1;
+
+    self
+      .status_ltimes
+      .iter()
+      .try_fold(&mut offset, |off, (k, v)| {
+        bail!(self(*off, buf_len));
+        buf[*off] = LEFT_MEMBERS_BYTE;
+        *off += 1;
+        *off += TupleEncoder::new(k, v).encode_with_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len_in(), buf_len))?;
+
+    self
+      .left_members
+      .iter()
+      .try_fold(&mut offset, |off, id| {
+        bail!(self(*off, buf_len));
+        buf[*off] = LEFT_MEMBERS_BYTE;
+        *off += 1;
+        *off += id.encode_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len_in(), buf_len))?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = EVENT_LTIME_BYTE;
+    offset += 1;
+    offset += self.event_ltime.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = EVENTS_BYTE;
+    offset += 1;
+
+    self
+      .events
+      .iter()
+      .filter_map(|e| e.as_ref())
+      .try_fold(&mut offset, |off, e| {
+        bail!(self(*off, buf_len));
+        buf[*off] = EVENTS_BYTE;
+        *off += 1;
+        *off += e.encode_length_delimited(&mut buf[*off..])?;
+        Ok(off)
+      })
+      .map_err(|e: EncodeError| e.update(self.encoded_len_in(), buf_len))?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = QUERY_LTIME_BYTE;
+    offset += 1;
+    offset += self.query_ltime.encode(&mut buf[offset..])?;
+
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, self.encoded_len_in());
 
     Ok(offset)
   }

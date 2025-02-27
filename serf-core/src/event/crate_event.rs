@@ -1,21 +1,23 @@
+use memberlist_core::proto::{Data, DecodeError};
 use serf_proto::QueryMessage;
 
 use super::*;
 
-pub(crate) trait QueryMessageExt {
-  fn decode_internal_query<T: >(
-    &self,
-  ) -> Option<Result<InternalQueryEvent<T::Id>, T::Error>>;
+pub(crate) trait QueryMessageExt<I> {
+  fn decode_internal_query(&self) -> Option<Result<InternalQueryEvent<I>, DecodeError>>;
 }
 
-impl<I, A> QueryMessageExt for QueryMessage<I, A> {
-  fn decode_internal_query<T: >(
-    &self,
-  ) -> Option<Result<InternalQueryEvent<T::Id>, T::Error>> {
+impl<I, A> QueryMessageExt<I> for QueryMessage<I, A>
+where
+  I: Data,
+{
+  fn decode_internal_query(&self) -> Option<Result<InternalQueryEvent<I>, DecodeError>> {
     Some(Ok(match self.name().as_str() {
       INTERNAL_PING => InternalQueryEvent::Ping,
       INTERNAL_CONFLICT => {
-        return Some(T::decode_id(&self.payload).map(|(_, id)| InternalQueryEvent::Conflict(id)));
+        return Some(
+          <I as Data>::decode(&self.payload).map(|(_, id)| InternalQueryEvent::Conflict(id)),
+        );
       }
       #[cfg(feature = "encryption")]
       INTERNAL_INSTALL_KEY => InternalQueryEvent::InstallKey,

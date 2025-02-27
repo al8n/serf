@@ -1,370 +1,309 @@
-// use std::sync::Arc;
+use memberlist_proto::{Data, EncodeError, WireType, bytes::Bytes, utils::merge};
 
-// use super::{
-//   JoinMessage, LeaveMessage, Member, PushPullMessage, PushPullMessageRef, QueryMessage,
-//   QueryResponseMessage, UserEventMessage,
-// };
+use super::{
+  ConflictResponseMessage, ConflictResponseMessageBorrow, JoinMessage, LeaveMessage,
+  PushPullMessageBorrow, QueryMessage, QueryResponseMessage, UserEventMessage,
+};
 
-// #[cfg(feature = "encryption")]
-// use super::{KeyRequestMessage, KeyResponseMessage};
+#[cfg(feature = "encryption")]
+use super::{KeyRequestMessage, KeyResponseMessage};
 
-// const LEAVE_MESSAGE_TAG: u8 = 0;
-// const JOIN_MESSAGE_TAG: u8 = 1;
-// const PUSH_PULL_MESSAGE_TAG: u8 = 2;
-// const USER_EVENT_MESSAGE_TAG: u8 = 3;
-// const QUERY_MESSAGE_TAG: u8 = 4;
-// const QUERY_RESPONSE_MESSAGE_TAG: u8 = 5;
-// const CONFLICT_RESPONSE_MESSAGE_TAG: u8 = 6;
-// const RELAY_MESSAGE_TAG: u8 = 7;
-// #[cfg(feature = "encryption")]
-// const KEY_REQUEST_MESSAGE_TAG: u8 = 253;
-// #[cfg(feature = "encryption")]
-// const KEY_RESPONSE_MESSAGE_TAG: u8 = 254;
+const LEAVE_MESSAGE_TAG: u8 = 1;
+const JOIN_MESSAGE_TAG: u8 = 2;
+const PUSH_PULL_MESSAGE_TAG: u8 = 3;
+const USER_EVENT_MESSAGE_TAG: u8 = 4;
+const QUERY_MESSAGE_TAG: u8 = 5;
+const QUERY_RESPONSE_MESSAGE_TAG: u8 = 6;
+const CONFLICT_RESPONSE_MESSAGE_TAG: u8 = 7;
+const RELAY_MESSAGE_TAG: u8 = 8;
+#[cfg(feature = "encryption")]
+const KEY_REQUEST_MESSAGE_TAG: u8 = 9;
+#[cfg(feature = "encryption")]
+const KEY_RESPONSE_MESSAGE_TAG: u8 = 10;
 
-// /// Unknown message type error
-// #[derive(Debug, thiserror::Error)]
-// #[error("unknown message type byte: {0}")]
-// pub struct UnknownMessageType(u8);
+const LEAVE_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, LEAVE_MESSAGE_TAG);
+const JOIN_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, JOIN_MESSAGE_TAG);
+const PUSH_PULL_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, PUSH_PULL_MESSAGE_TAG);
+const USER_EVENT_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, USER_EVENT_MESSAGE_TAG);
+const QUERY_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, QUERY_MESSAGE_TAG);
+const QUERY_RESPONSE_MESSAGE_BYTE: u8 =
+  merge(WireType::LengthDelimited, QUERY_RESPONSE_MESSAGE_TAG);
+const CONFLICT_RESPONSE_MESSAGE_BYTE: u8 =
+  merge(WireType::LengthDelimited, CONFLICT_RESPONSE_MESSAGE_TAG);
+const RELAY_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, RELAY_MESSAGE_TAG);
+#[cfg(feature = "encryption")]
+const KEY_REQUEST_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, KEY_REQUEST_MESSAGE_TAG);
+#[cfg(feature = "encryption")]
+const KEY_RESPONSE_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, KEY_RESPONSE_MESSAGE_TAG);
 
-// impl TryFrom<u8> for MessageType {
-//   type Error = UnknownMessageType;
+/// The types of gossip messages Serf will send along
+/// memberlist.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum MessageType {
+  /// Leave message
+  Leave,
+  /// Join message
+  Join,
+  /// PushPull message
+  PushPull,
+  /// UserEvent message
+  UserEvent,
+  /// Query message
+  Query,
+  /// QueryResponse message
+  QueryResponse,
+  /// ConflictResponse message
+  ConflictResponse,
+  /// Relay message
+  Relay,
+  /// KeyRequest message
+  #[cfg(feature = "encryption")]
+  KeyRequest,
+  /// KeyResponse message
+  #[cfg(feature = "encryption")]
+  KeyResponse,
+  /// Unknown message type, used for forwards and backwards compatibility
+  Unknown(u8),
+}
 
-//   fn try_from(value: u8) -> Result<Self, Self::Error> {
-//     Ok(match value {
-//       LEAVE_MESSAGE_TAG => Self::Leave,
-//       JOIN_MESSAGE_TAG => Self::Join,
-//       PUSH_PULL_MESSAGE_TAG => Self::PushPull,
-//       USER_EVENT_MESSAGE_TAG => Self::UserEvent,
-//       QUERY_MESSAGE_TAG => Self::Query,
-//       QUERY_RESPONSE_MESSAGE_TAG => Self::QueryResponse,
-//       CONFLICT_RESPONSE_MESSAGE_TAG => Self::ConflictResponse,
-//       RELAY_MESSAGE_TAG => Self::Relay,
-//       #[cfg(feature = "encryption")]
-//       KEY_REQUEST_MESSAGE_TAG => Self::KeyRequest,
-//       #[cfg(feature = "encryption")]
-//       KEY_RESPONSE_MESSAGE_TAG => Self::KeyResponse,
-//       _ => return Err(UnknownMessageType(value)),
-//     })
-//   }
-// }
+impl MessageType {
+  /// Get the string representation of the message type
+  #[inline]
+  pub fn as_str(&self) -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Borrowed(match self {
+      Self::Leave => "leave",
+      Self::Join => "join",
+      Self::PushPull => "push_pull",
+      Self::UserEvent => "user_event",
+      Self::Query => "query",
+      Self::QueryResponse => "query_response",
+      Self::ConflictResponse => "conflict_response",
+      Self::Relay => "relay",
+      #[cfg(feature = "encryption")]
+      Self::KeyRequest => "key_request",
+      #[cfg(feature = "encryption")]
+      Self::KeyResponse => "key_response",
+      Self::Unknown(val) => return std::borrow::Cow::Owned(format!("unknown({val})")),
+    })
+  }
+}
 
-// impl From<MessageType> for u8 {
-//   fn from(value: MessageType) -> Self {
-//     value as u8
-//   }
-// }
+impl From<u8> for MessageType {
+  fn from(value: u8) -> Self {
+    match value {
+      LEAVE_MESSAGE_TAG => Self::Leave,
+      JOIN_MESSAGE_TAG => Self::Join,
+      PUSH_PULL_MESSAGE_TAG => Self::PushPull,
+      USER_EVENT_MESSAGE_TAG => Self::UserEvent,
+      QUERY_MESSAGE_TAG => Self::Query,
+      QUERY_RESPONSE_MESSAGE_TAG => Self::QueryResponse,
+      CONFLICT_RESPONSE_MESSAGE_TAG => Self::ConflictResponse,
+      RELAY_MESSAGE_TAG => Self::Relay,
+      #[cfg(feature = "encryption")]
+      KEY_REQUEST_MESSAGE_TAG => Self::KeyRequest,
+      #[cfg(feature = "encryption")]
+      KEY_RESPONSE_MESSAGE_TAG => Self::KeyResponse,
+      val => Self::Unknown(val),
+    }
+  }
+}
 
-// /// The types of gossip messages Serf will send along
-// /// memberlist.
-// #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-// #[repr(u8)]
-// #[non_exhaustive]
-// pub enum MessageType {
-//   /// Leave message
-//   Leave = LEAVE_MESSAGE_TAG,
-//   /// Join message
-//   Join = JOIN_MESSAGE_TAG,
-//   /// PushPull message
-//   PushPull = PUSH_PULL_MESSAGE_TAG,
-//   /// UserEvent message
-//   UserEvent = USER_EVENT_MESSAGE_TAG,
-//   /// Query message
-//   Query = QUERY_MESSAGE_TAG,
-//   /// QueryResponse message
-//   QueryResponse = QUERY_RESPONSE_MESSAGE_TAG,
-//   /// ConflictResponse message
-//   ConflictResponse = CONFLICT_RESPONSE_MESSAGE_TAG,
-//   /// Relay message
-//   Relay = RELAY_MESSAGE_TAG,
-//   /// KeyRequest message
-//   #[cfg(feature = "encryption")]
-//   KeyRequest = KEY_REQUEST_MESSAGE_TAG,
-//   /// KeyResponse message
-//   #[cfg(feature = "encryption")]
-//   KeyResponse = KEY_RESPONSE_MESSAGE_TAG,
-// }
+impl From<MessageType> for u8 {
+  fn from(val: MessageType) -> Self {
+    match val {
+      MessageType::Leave => LEAVE_MESSAGE_TAG,
+      MessageType::Join => JOIN_MESSAGE_TAG,
+      MessageType::PushPull => PUSH_PULL_MESSAGE_TAG,
+      MessageType::UserEvent => USER_EVENT_MESSAGE_TAG,
+      MessageType::Query => QUERY_MESSAGE_TAG,
+      MessageType::QueryResponse => QUERY_RESPONSE_MESSAGE_TAG,
+      MessageType::ConflictResponse => CONFLICT_RESPONSE_MESSAGE_TAG,
+      MessageType::Relay => RELAY_MESSAGE_TAG,
+      #[cfg(feature = "encryption")]
+      MessageType::KeyRequest => KEY_REQUEST_MESSAGE_TAG,
+      #[cfg(feature = "encryption")]
+      MessageType::KeyResponse => KEY_RESPONSE_MESSAGE_TAG,
+      MessageType::Unknown(val) => val,
+    }
+  }
+}
 
-// impl MessageType {
-//   /// Get the string representation of the message type
-//   #[inline]
-//   pub const fn as_str(&self) -> &'static str {
-//     match self {
-//       Self::Leave => "leave",
-//       Self::Join => "join",
-//       Self::PushPull => "push pull",
-//       Self::UserEvent => "user event",
-//       Self::Query => "query",
-//       Self::QueryResponse => "query response",
-//       Self::ConflictResponse => "conflict response",
-//       Self::Relay => "relay",
-//       #[cfg(feature = "encryption")]
-//       Self::KeyRequest => "key request",
-//       #[cfg(feature = "encryption")]
-//       Self::KeyResponse => "key response",
-//     }
-//   }
-// }
+macro_rules! bail {
+  ($this:ident($offset:expr, $len:ident)) => {
+    if $offset >= $len {
+      return Err(EncodeError::insufficient_buffer(
+        Encodable::encoded_len($this),
+        $len,
+      ));
+    }
+  };
+}
 
-// /// Used to do a cheap reference to message reference conversion.
-// pub trait AsMessageRef<I, A> {
-//   /// Converts this type into a shared reference of the (usually inferred) input type.
-//   fn as_message_ref(&self) -> SerfMessageRef<'_, I, A>;
-// }
+/// A trait for encoding messages.
+pub trait Encodable {
+  /// Encodes the message into a buffer.
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError>;
 
-// /// The reference type of [`SerfMessage`].
-// #[derive(Debug)]
-// pub enum SerfMessageRef<'a, I, A> {
-//   /// Leave message reference
-//   Leave(&'a LeaveMessage<I>),
-//   /// Join message reference
-//   Join(&'a JoinMessage<I>),
-//   /// PushPull message reference
-//   PushPull(PushPullMessageRef<'a, I>),
-//   /// UserEvent message reference
-//   UserEvent(&'a UserEventMessage),
-//   /// Query message reference
-//   Query(&'a QueryMessage<I, A>),
-//   /// QueryResponse message reference
-//   QueryResponse(&'a QueryResponseMessage<I, A>),
-//   /// ConflictResponse message reference
-//   ConflictResponse(&'a Member<I, A>),
-//   /// KeyRequest message reference
-//   #[cfg(feature = "encryption")]
-//   KeyRequest(&'a KeyRequestMessage),
-//   /// KeyResponse message reference
-//   #[cfg(feature = "encryption")]
-//   KeyResponse(&'a KeyResponseMessage),
-// }
+  /// Encodes a relay message into a buffer.
+  fn encode_relay(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut offset = 0;
+    let buf_len = buf.len();
 
-// impl<I, A> Clone for SerfMessageRef<'_, I, A> {
-//   fn clone(&self) -> Self {
-//     *self
-//   }
-// }
+    if offset >= buf_len {
+      return Err(EncodeError::insufficient_buffer(
+        self.encoded_len_with_relay(),
+        buf_len,
+      ));
+    }
 
-// impl<I, A> Copy for SerfMessageRef<'_, I, A> {}
+    buf[offset] = RELAY_MESSAGE_BYTE;
+    offset += 1;
 
-// impl<I, A> AsMessageRef<I, A> for SerfMessageRef<'_, I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     *self
-//   }
-// }
+    offset += self
+      .encode(&mut buf[offset..])
+      .map_err(|e| e.update(self.encoded_len_with_relay(), buf_len))?;
 
-// /// The types of gossip messages Serf will send along
-// /// memberlist.
-// #[derive(Debug, Clone)]
-// pub enum SerfMessage<I, A> {
-//   /// Leave message
-//   Leave(LeaveMessage<I>),
-//   /// Join message
-//   Join(JoinMessage<I>),
-//   /// PushPull message
-//   PushPull(PushPullMessage<I>),
-//   /// UserEvent message
-//   UserEvent(UserEventMessage),
-//   /// Query message
-//   Query(QueryMessage<I, A>),
-//   /// QueryResponse message
-//   QueryResponse(QueryResponseMessage<I, A>),
-//   /// ConflictResponse message
-//   ConflictResponse(Member<I, A>),
-//   /// Relay message
-//   #[cfg(feature = "encryption")]
-//   KeyRequest(KeyRequestMessage),
-//   /// KeyResponse message
-//   #[cfg(feature = "encryption")]
-//   KeyResponse(KeyResponseMessage),
-// }
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, self.encoded_len_with_relay());
 
-// impl<'a, I, A> From<&'a SerfMessage<I, A>> for MessageType {
-//   fn from(msg: &'a SerfMessage<I, A>) -> Self {
-//     match msg {
-//       SerfMessage::Leave(_) => MessageType::Leave,
-//       SerfMessage::Join(_) => MessageType::Join,
-//       SerfMessage::PushPull(_) => MessageType::PushPull,
-//       SerfMessage::UserEvent(_) => MessageType::UserEvent,
-//       SerfMessage::Query(_) => MessageType::Query,
-//       SerfMessage::QueryResponse(_) => MessageType::QueryResponse,
-//       SerfMessage::ConflictResponse(_) => MessageType::ConflictResponse,
-//       #[cfg(feature = "encryption")]
-//       SerfMessage::KeyRequest(_) => MessageType::KeyRequest,
-//       #[cfg(feature = "encryption")]
-//       SerfMessage::KeyResponse(_) => MessageType::KeyResponse,
-//     }
-//   }
-// }
+    Ok(offset)
+  }
 
-// impl<I, A> AsMessageRef<I, A> for QueryMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::Query(self)
-//   }
-// }
+  /// Encodes the message into a [`Bytes`].
+  fn encode_to_bytes(&self) -> Result<Bytes, EncodeError> {
+    let len = self.encoded_len();
+    let mut buf = vec![0; len];
+    self.encode(&mut buf).map(|_| Bytes::from(buf))
+  }
 
-// impl<I, A> AsMessageRef<I, A> for QueryResponseMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::QueryResponse(self)
-//   }
-// }
+  /// Encodes a relay message into a [`Bytes`].
+  fn encode_relay_to_bytes(&self) -> Result<Bytes, EncodeError> {
+    let len = self.encoded_len_with_relay();
+    let mut buf = vec![0; len];
+    self.encode_relay(&mut buf).map(|_| Bytes::from(buf))
+  }
 
-// impl<I, A> AsMessageRef<I, A> for JoinMessage<I> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::Join(self)
-//   }
-// }
+  /// Returns the encoded length of the message.
+  fn encoded_len(&self) -> usize;
 
-// impl<I, A> AsMessageRef<I, A> for UserEventMessage {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::UserEvent(self)
-//   }
-// }
+  /// Returns the encoded length of the message with a relay tag.
+  fn encoded_len_with_relay(&self) -> usize {
+    1 + self.encoded_len()
+  }
+}
 
-// impl<I, A> AsMessageRef<I, A> for &QueryMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::Query(self)
-//   }
-// }
+impl<T: Encodable> Encodable for &T {
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    (*self).encode(buf)
+  }
 
-// impl<I, A> AsMessageRef<I, A> for &QueryResponseMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::QueryResponse(self)
-//   }
-// }
+  fn encoded_len(&self) -> usize {
+    (*self).encoded_len()
+  }
+}
 
-// impl<I, A> AsMessageRef<I, A> for &JoinMessage<I> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::Join(self)
-//   }
-// }
+macro_rules! impl_encodable {
+  (
+    $(
+      $(#[$attr:meta])*
+      $type:ident $(<$($generic:ident), +$(,)?>)? = $id:expr,
+    )*
+  ) => {
+    $(
+      $(#[$attr])*
+      impl $(<$($generic), +>)? Encodable for $type $(<$($generic), +>)?
+      $(
+        where
+          $($generic: Data,)+
+      )?
+      {
+        fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+          let mut offset = 0;
+          let buf_len = buf.len();
+          bail!(self(offset, buf_len));
 
-// impl<I, A> AsMessageRef<I, A> for PushPullMessageRef<'_, I> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::PushPull(*self)
-//   }
-// }
+          buf[offset] = $id;
+          offset += 1;
 
-// impl<I, A> AsMessageRef<I, A> for &PushPullMessage<I> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::PushPull(PushPullMessageRef {
-//       ltime: self.ltime,
-//       status_ltimes: &self.status_ltimes,
-//       left_members: &self.left_members,
-//       event_ltime: self.event_ltime,
-//       events: &self.events,
-//       query_ltime: self.query_ltime,
-//     })
-//   }
-// }
+          offset += self.encode_length_delimited(&mut buf[offset..])?;
 
-// impl<I, A> AsMessageRef<I, A> for &UserEventMessage {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::UserEvent(self)
-//   }
-// }
+          #[cfg(debug_assertions)]
+          super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
 
-// impl<I, A> AsMessageRef<I, A> for &LeaveMessage<I> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::Leave(self)
-//   }
-// }
+          Ok(offset)
+        }
 
-// impl<I, A> AsMessageRef<I, A> for &Member<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::ConflictResponse(self)
-//   }
-// }
+        fn encoded_len(&self) -> usize {
+          1 + self.encoded_len_with_length_delimited()
+        }
+      }
+    )*
+  };
+}
 
-// impl<I, A> AsMessageRef<I, A> for &Arc<Member<I, A>> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::ConflictResponse(self)
-//   }
-// }
+impl_encodable!(
+  LeaveMessage<I> = LEAVE_MESSAGE_BYTE,
+  JoinMessage<I> = JOIN_MESSAGE_BYTE,
+  // PushPullMessage<I> = PUSH_PULL_MESSAGE_BYTE,
+  UserEventMessage = USER_EVENT_MESSAGE_BYTE,
+  QueryMessage<I, A> = QUERY_MESSAGE_BYTE,
+  QueryResponseMessage<I, A> = QUERY_RESPONSE_MESSAGE_BYTE,
+  ConflictResponseMessage<I, A> = CONFLICT_RESPONSE_MESSAGE_BYTE,
+  #[cfg(feature = "encryption")]
+  KeyRequestMessage = KEY_REQUEST_MESSAGE_BYTE,
+  #[cfg(feature = "encryption")]
+  KeyResponseMessage = KEY_RESPONSE_MESSAGE_BYTE,
+);
 
-// #[cfg(feature = "encryption")]
-// impl<I, A> AsMessageRef<I, A> for &KeyRequestMessage {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::KeyRequest(self)
-//   }
-// }
+impl<I, A> super::Encodable for ConflictResponseMessageBorrow<'_, I, A>
+where
+  I: Data,
+  A: Data,
+{
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut offset = 0;
+    let buf_len = buf.len();
+    bail!(self(offset, buf_len));
 
-// #[cfg(feature = "encryption")]
-// impl<I, A> AsMessageRef<I, A> for &KeyResponseMessage {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     SerfMessageRef::KeyResponse(self)
-//   }
-// }
+    buf[offset] = CONFLICT_RESPONSE_MESSAGE_BYTE;
+    offset += 1;
 
-// impl<I, A> AsMessageRef<I, A> for SerfMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     match self {
-//       Self::Leave(l) => SerfMessageRef::Leave(l),
-//       Self::Join(j) => SerfMessageRef::Join(j),
-//       Self::PushPull(pp) => SerfMessageRef::PushPull(PushPullMessageRef {
-//         ltime: pp.ltime,
-//         status_ltimes: &pp.status_ltimes,
-//         left_members: &pp.left_members,
-//         event_ltime: pp.event_ltime,
-//         events: &pp.events,
-//         query_ltime: pp.query_ltime,
-//       }),
-//       Self::UserEvent(u) => SerfMessageRef::UserEvent(u),
-//       Self::Query(q) => SerfMessageRef::Query(q),
-//       Self::QueryResponse(q) => SerfMessageRef::QueryResponse(q),
-//       Self::ConflictResponse(m) => SerfMessageRef::ConflictResponse(m),
-//       #[cfg(feature = "encryption")]
-//       Self::KeyRequest(kr) => SerfMessageRef::KeyRequest(kr),
-//       #[cfg(feature = "encryption")]
-//       Self::KeyResponse(kr) => SerfMessageRef::KeyResponse(kr),
-//     }
-//   }
-// }
+    offset += self.encode_in(&mut buf[offset..])?;
 
-// impl<I, A> AsMessageRef<I, A> for &SerfMessage<I, A> {
-//   fn as_message_ref(&self) -> SerfMessageRef<I, A> {
-//     match self {
-//       SerfMessage::Leave(l) => SerfMessageRef::Leave(l),
-//       SerfMessage::Join(j) => SerfMessageRef::Join(j),
-//       SerfMessage::PushPull(pp) => SerfMessageRef::PushPull(PushPullMessageRef {
-//         ltime: pp.ltime,
-//         status_ltimes: &pp.status_ltimes,
-//         left_members: &pp.left_members,
-//         event_ltime: pp.event_ltime,
-//         events: &pp.events,
-//         query_ltime: pp.query_ltime,
-//       }),
-//       SerfMessage::UserEvent(u) => SerfMessageRef::UserEvent(u),
-//       SerfMessage::Query(q) => SerfMessageRef::Query(q),
-//       SerfMessage::QueryResponse(q) => SerfMessageRef::QueryResponse(q),
-//       SerfMessage::ConflictResponse(m) => SerfMessageRef::ConflictResponse(m),
-//       #[cfg(feature = "encryption")]
-//       SerfMessage::KeyRequest(kr) => SerfMessageRef::KeyRequest(kr),
-//       #[cfg(feature = "encryption")]
-//       SerfMessage::KeyResponse(kr) => SerfMessageRef::KeyResponse(kr),
-//     }
-//   }
-// }
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
 
-// impl<I, A> core::fmt::Display for SerfMessage<I, A> {
-//   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-//     write!(f, "{}", self.ty().as_str())
-//   }
-// }
+    Ok(offset)
+  }
 
-// impl<I, A> SerfMessage<I, A> {
-//   /// Returns the message type of this message
-//   #[inline]
-//   pub const fn ty(&self) -> MessageType {
-//     match self {
-//       Self::Leave(_) => MessageType::Leave,
-//       Self::Join(_) => MessageType::Join,
-//       Self::PushPull(_) => MessageType::PushPull,
-//       Self::UserEvent(_) => MessageType::UserEvent,
-//       Self::Query(_) => MessageType::Query,
-//       Self::QueryResponse(_) => MessageType::QueryResponse,
-//       Self::ConflictResponse(_) => MessageType::ConflictResponse,
-//       #[cfg(feature = "encryption")]
-//       Self::KeyRequest(_) => MessageType::KeyRequest,
-//       #[cfg(feature = "encryption")]
-//       Self::KeyResponse(_) => MessageType::KeyResponse,
-//     }
-//   }
-// }
+  fn encoded_len(&self) -> usize {
+    1 + self.encoded_len_in()
+  }
+}
+
+impl<I> super::Encodable for PushPullMessageBorrow<'_, I>
+where
+  I: Data,
+{
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut offset = 0;
+    let buf_len = buf.len();
+    bail!(self(offset, buf_len));
+
+    buf[offset] = PUSH_PULL_MESSAGE_BYTE;
+    offset += 1;
+
+    offset += self.encode_in(&mut buf[offset..])?;
+
+    #[cfg(debug_assertions)]
+    super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
+
+    Ok(offset)
+  }
+
+  fn encoded_len(&self) -> usize {
+    1 + self.encoded_len_in()
+  }
+}

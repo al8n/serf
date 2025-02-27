@@ -17,6 +17,9 @@ mod arbitrary_impl;
 mod clock;
 pub use clock::*;
 
+mod conflict;
+pub use conflict::*;
+
 mod filter;
 pub use filter::*;
 
@@ -26,8 +29,8 @@ pub use leave::*;
 mod member;
 pub use member::*;
 
-// mod message;
-// pub use message::*;
+mod message;
+pub use message::*;
 
 mod join;
 pub use join::*;

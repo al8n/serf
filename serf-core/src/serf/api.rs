@@ -2,15 +2,18 @@ use std::sync::atomic::Ordering;
 
 use futures::{FutureExt, StreamExt};
 use memberlist_core::{
-  bytes::{BufMut, Bytes, BytesMut}, proto::Data, tracing, transport::{MaybeResolvedAddress, Node}, types::{Meta, OneOrMore, SmallVec}, CheapClone
+  CheapClone,
+  bytes::Bytes,
+  proto::{Data, Meta, OneOrMore, SmallVec},
+  tracing,
+  transport::{MaybeResolvedAddress, Node},
 };
 use smol_str::SmolStr;
 
 use crate::{
-  delegate::,
-  error::{Error, JoinError},
+  error::Error,
   event::EventProducer,
-  types::{LeaveMessage, Member, MessageType, SerfMessage, Tags, UserEventMessage},
+  types::{LeaveMessage, Member, Tags, UserEventMessage},
 };
 
 use super::*;
@@ -270,7 +273,7 @@ where
     };
 
     // Start broadcasting the event
-    let len = <D as >::message_encoded_len(&msg);
+    let len = serf_proto::Encodable::encoded_len(&msg);
 
     // Check the size after encoding to be sure again that
     // we're not attempting to send over the specified size limit.
@@ -282,17 +285,7 @@ where
       return Err(Error::raw_user_event_too_large(len));
     }
 
-    let mut raw = BytesMut::with_capacity(len + 1); // + 1 for message type byte
-    raw.put_u8(MessageType::UserEvent as u8);
-    raw.resize(len + 1, 0);
-
-    let actual_encoded_len = <D as >::encode_message(&msg, &mut raw[1..])
-      .map_err(Error::transform_delegate)?;
-    debug_assert_eq!(
-      actual_encoded_len, len,
-      "expected encoded len {} mismatch the actual encoded len {}",
-      len, actual_encoded_len
-    );
+    let raw = serf_proto::Encodable::encode_to_bytes(&msg)?;
 
     self.inner.event_clock.increment();
 
@@ -303,7 +296,7 @@ where
       .inner
       .event_broadcasts
       .queue_broadcast(SerfBroadcast {
-        msg: raw.freeze(),
+        msg: raw,
         notify_tx: None,
       })
       .await;
@@ -382,20 +375,13 @@ where
     existing: impl Iterator<Item = Node<T::Id, MaybeResolvedAddress<T>>>,
     ignore_old: bool,
   ) -> Result<
-    SmallVec<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-    JoinError<T, D>,
+    SmallVec<Node<T::Id, T::ResolvedAddress>>,
+    (SmallVec<Node<T::Id, T::ResolvedAddress>>, Error<T, D>),
   > {
     // Do a quick state check
     let current_state = self.state();
     if current_state != SerfState::Alive {
-      return Err(JoinError {
-        joined: SmallVec::new(),
-        errors: existing
-          .into_iter()
-          .map(|node| (node, Error::bad_join_status(current_state)))
-          .collect(),
-        broadcast_error: None,
-      });
+      return Err((SmallVec::new(), Error::bad_join_status(current_state)));
     }
 
     // Hold the joinLock, this is to make eventJoinIgnore safe
@@ -413,51 +399,28 @@ where
         // Start broadcasting the update
         if let Err(e) = self.broadcast_join(self.inner.clock.time()).await {
           self.inner.event_join_ignore.store(false, Ordering::SeqCst);
-          return Err(JoinError {
-            joined,
-            errors: Default::default(),
-            broadcast_error: Some(e),
-          });
+          return Err((joined, e));
         }
         self.inner.event_join_ignore.store(false, Ordering::SeqCst);
         Ok(joined)
       }
-      Err(e) => {
-        let (joined, errors) = e.into();
+      Err((joined, err)) => {
         // If we joined any nodes, broadcast the join message
         if !joined.is_empty() {
           // Start broadcasting the update
           if let Err(e) = self.broadcast_join(self.inner.clock.time()).await {
             self.inner.event_join_ignore.store(false, Ordering::SeqCst);
-            return Err(JoinError {
+            return Err((
               joined,
-              errors: errors
-                .into_iter()
-                .map(|(addr, err)| (addr, err.into()))
-                .collect(),
-              broadcast_error: Some(e),
-            });
+              Error::Multiple(std::sync::Arc::from_iter([err.into(), e])),
+            ));
           }
 
           self.inner.event_join_ignore.store(false, Ordering::SeqCst);
-          Err(JoinError {
-            joined,
-            errors: errors
-              .into_iter()
-              .map(|(addr, err)| (addr, err.into()))
-              .collect(),
-            broadcast_error: None,
-          })
+          Err((joined, Error::from(err)))
         } else {
           self.inner.event_join_ignore.store(false, Ordering::SeqCst);
-          Err(JoinError {
-            joined,
-            errors: errors
-              .into_iter()
-              .map(|(addr, err)| (addr, err.into()))
-              .collect(),
-            broadcast_error: None,
-          })
+          Err((joined, Error::from(err)))
         }
       }
     }
@@ -498,12 +461,11 @@ where
     // Process the leave locally
     self.handle_node_leave_intent(&msg).await;
 
-    let msg = SerfMessage::Leave(msg);
-
     // Only broadcast the leave message if there is at least one
     // other node alive.
     if self.has_alive_members().await {
       let (notify_tx, notify_rx) = async_channel::bounded(1);
+      let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
       self.broadcast(msg, Some(notify_tx)).await?;
 
       futures::select! {
@@ -632,7 +594,6 @@ where
 }
 
 #[viewit::viewit(vis_all = "", getters(vis_all = "pub", prefix = "get"), setters(skip))]
-#[cfg_attr(feature = "async-graphql", derive(async_graphql::SimpleObject))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Stats {
   members: usize,

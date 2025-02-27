@@ -40,7 +40,7 @@ impl<I, A> Copy for NoopReconnectDelegate<I, A> {}
 
 impl<I, A> ReconnectDelegate for NoopReconnectDelegate<I, A>
 where
-  I: Id,
+  I: Id + Send + Sync + 'static,
   A: CheapClone + Send + Sync + 'static,
 {
   type Id = I;

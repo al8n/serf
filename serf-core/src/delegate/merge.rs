@@ -1,4 +1,4 @@
-use memberlist_core::{CheapClone, transport::Id, proto::TinyVec};
+use memberlist_core::{CheapClone, proto::TinyVec, transport::Id};
 use std::future::Future;
 
 use crate::types::Member;
@@ -39,7 +39,7 @@ impl<I, A> Default for DefaultMergeDelegate<I, A> {
 
 impl<I, A> MergeDelegate for DefaultMergeDelegate<I, A>
 where
-  I: Id,
+  I: Id + Send + Sync + 'static,
   A: CheapClone + Send + Sync + 'static,
 {
   type Error = std::convert::Infallible;

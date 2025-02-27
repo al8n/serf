@@ -1,5 +1,5 @@
 use memberlist_core::proto::OneOrMore;
-use serf_proto::Member;
+use serf_proto::{Member, MessageType};
 
 use std::collections::HashMap;
 

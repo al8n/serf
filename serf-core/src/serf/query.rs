@@ -10,13 +10,13 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use memberlist_core::{
   CheapClone,
   bytes::{BufMut, Bytes, BytesMut},
+  proto::{OneOrMore, SmallVec, TinyVec},
   tracing,
   transport::{AddressResolver, Id, Node, Transport},
-  types::{OneOrMore, SmallVec, TinyVec},
 };
 
 use crate::{
-  delegate::{Delegate, },
+  delegate::Delegate,
   error::Error,
   types::{
     Filter, LamportTime, Member, MemberStatus, MessageType, QueryMessage, QueryResponseMessage,
@@ -396,7 +396,7 @@ fn random_members<I, A>(k: usize, mut members: SmallVec<Member<I, A>>) -> SmallV
   let mut i = 0;
 
   while i < rounds && i < n {
-    let j = rand::random::<usize>() % (n - i) + i;
+    let j = (rand::random::<u32>() as usize) % (n - i) + i;
     members.swap(i, j);
     i += 1;
     if i >= k && i >= rounds {
@@ -444,7 +444,7 @@ where
       }
 
       // Decode the filter
-      let filter = match <D as >::decode_filter(filter) {
+      let filter = match decode_filter(filter) {
         Ok((read, filter)) => {
           tracing::trace!(read=%read, filter=?filter, "serf: decoded filter successully");
           filter
@@ -461,12 +461,14 @@ where
       match filter {
         Filter::Id(nodes) => {
           // Check if we are being targeted
-          let found = nodes.iter().any(|n| n.eq(self.inner.memberlist.local_id()));
+          let found = nodes
+            .iter()
+            .any(|n: &T::Id| n.eq(self.inner.memberlist.local_id()));
           if !found {
             return false;
           }
         }
-        Filter::Tag { tag, expr: fexpr } => {
+        Filter::Tag(tag) => {
           // Check if we match this regex
           let tags = self.inner.opts.tags.load();
           if !tags.is_empty() {
@@ -530,35 +532,15 @@ where
     }
 
     // Prep the relay message, which is a wrapped version of the original.
-    // let relay_msg = SerfRelayMessage::new(node, SerfMessage::QueryResponse(resp));
-    let expected_encoded_len = 1
-      + <D as >::node_encoded_len(&node)
-      + 1
-      + <D as >::message_encoded_len(&resp); // +1 for relay message type byte, +1 for the message type
-    if expected_encoded_len > self.inner.opts.query_response_size_limit {
+    let encoded_len = serf_proto::Encodable::encoded_len_with_relay(&resp);
+    if encoded_len > self.inner.opts.query_response_size_limit {
       return Err(Error::relayed_response_too_large(
         self.inner.opts.query_response_size_limit,
       ));
     }
 
-    let mut raw = BytesMut::with_capacity(expected_encoded_len + 1 + 1); // +1 for relay message type byte, +1 for the message type byte
-    raw.put_u8(MessageType::Relay as u8);
-    raw.resize(expected_encoded_len + 1 + 1, 0);
-    let mut encoded = 1;
-    encoded += <D as >::encode_node(&node, &mut raw[encoded..])
-      .map_err(Error::transform_delegate)?;
-    raw[encoded] = MessageType::QueryResponse as u8;
-    encoded += 1;
-    encoded += <D as >::encode_message(&resp, &mut raw[encoded..])
-      .map_err(Error::transform_delegate)?;
+    let raw = serf_proto::Encodable::encode_relay_to_bytes(&resp)?;
 
-    debug_assert_eq!(
-      encoded, expected_encoded_len,
-      "expected encoded len {} mismatch the actual encoded len {}",
-      expected_encoded_len, encoded
-    );
-
-    let raw = raw.freeze();
     // Relay to a random set of peers.
     let relay_members = random_members(relay_factor as usize, members);
 

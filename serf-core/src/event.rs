@@ -14,18 +14,16 @@ pub(crate) use crate_event::*;
 use futures::Stream;
 use memberlist_core::{
   CheapClone,
-  bytes::{BufMut, Bytes, BytesMut},
-  transport::{AddressResolver, Transport},
+  bytes::Bytes,
   proto::TinyVec,
+  transport::{AddressResolver, Transport},
 };
-use serf_proto::{
-  LamportTime, Member, MessageType, Node, QueryFlag, QueryResponseMessage, UserEventMessage,
-};
+use serf_proto::{LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage};
 use smol_str::SmolStr;
 
 pub(crate) struct QueryContext<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) query_timeout: Duration,
@@ -35,15 +33,14 @@ where
 
 impl<T, D> QueryContext<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  fn check_response_size(&self, resp: &[u8]) -> Result<(), Error<T, D>> {
-    let resp_len = resp.len();
-    if resp_len > self.this.inner.opts.query_response_size_limit {
+  fn check_response_size(&self, size: usize) -> Result<(), Error<T, D>> {
+    if size > self.this.inner.opts.query_response_size_limit {
       Err(Error::query_response_too_large(
         self.this.inner.opts.query_response_size_limit,
-        resp_len,
+        size,
       ))
     } else {
       Ok(())
@@ -52,12 +49,12 @@ where
 
   async fn respond_with_message_and_response(
     &self,
-    respond_to: &<T::Resolver as AddressResolver>::ResolvedAddress,
+    respond_to: &T::ResolvedAddress,
     relay_factor: u8,
     raw: Bytes,
-    resp: QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    resp: QueryResponseMessage<T::Id, T::ResolvedAddress>,
   ) -> Result<(), Error<T, D>> {
-    self.check_response_size(raw.as_ref())?;
+    self.check_response_size(raw.len())?;
 
     let mut mu = self.span.lock().await;
 
@@ -86,7 +83,7 @@ where
 
   async fn respond(
     &self,
-    respond_to: &<T::Resolver as AddressResolver>::ResolvedAddress,
+    respond_to: &T::ResolvedAddress,
     id: u32,
     ltime: LamportTime,
     relay_factor: u8,
@@ -99,18 +96,9 @@ where
       flags: QueryFlag::empty(),
       payload: msg,
     };
-    let expected_encoded_len = <D as >::message_encoded_len(&resp);
-    let mut buf = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type byte
-    buf.put_u8(MessageType::QueryResponse as u8);
-    buf.resize(expected_encoded_len + 1, 0);
-    let len = <D as >::encode_message(&resp, &mut buf[1..])
-      .map_err(Error::transform_delegate)?;
-    debug_assert_eq!(
-      len, expected_encoded_len,
-      "expected encoded len {expected_encoded_len} is not match the actual encoded len {len}"
-    );
+    let buf = serf_proto::Encodable::encode_to_bytes(&resp)?;
     self
-      .respond_with_message_and_response(respond_to, relay_factor, buf.freeze(), resp)
+      .respond_with_message_and_response(respond_to, relay_factor, buf, resp)
       .await
   }
 }
@@ -118,7 +106,7 @@ where
 /// Query event
 pub struct QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) ltime: LamportTime,
@@ -128,14 +116,14 @@ where
   pub(crate) ctx: Arc<QueryContext<T, D>>,
   pub(crate) id: u32,
   /// source node
-  pub(crate) from: Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+  pub(crate) from: Node<T::Id, T::ResolvedAddress>,
   /// Number of duplicate responses to relay back to sender
   pub(crate) relay_factor: u8,
 }
 
 impl<D, T> QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Returns the lamport time of the query
@@ -164,14 +152,14 @@ where
 
   /// Returns the source node of the query
   #[inline]
-  pub const fn from(&self) -> &Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> {
+  pub const fn from(&self) -> &Node<T::Id, T::ResolvedAddress> {
     &self.from
   }
 }
 
 impl<D, T> PartialEq for QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn eq(&self, other: &Self) -> bool {
@@ -186,7 +174,7 @@ where
 
 impl<D, T> AsRef<QueryEvent<T, D>> for QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn as_ref(&self) -> &QueryEvent<T, D> {
@@ -196,7 +184,7 @@ where
 
 impl<D, T> Clone for QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn clone(&self) -> Self {
@@ -214,7 +202,7 @@ where
 
 impl<D, T> core::fmt::Display for QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -224,14 +212,14 @@ where
 
 impl<D, T> QueryEvent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   #[cfg(feature = "encryption")]
   pub(crate) fn create_response(
     &self,
     buf: Bytes,
-  ) -> QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> {
+  ) -> QueryResponseMessage<T::Id, T::ResolvedAddress> {
     QueryResponseMessage {
       ltime: self.ltime,
       id: self.id,
@@ -242,15 +230,15 @@ where
   }
 
   #[cfg(feature = "encryption")]
-  pub(crate) fn check_response_size(&self, resp: &[u8]) -> Result<(), Error<T, D>> {
-    self.ctx.check_response_size(resp)
+  pub(crate) fn check_response_size(&self, size: usize) -> Result<(), Error<T, D>> {
+    self.ctx.check_response_size(size)
   }
 
   #[cfg(feature = "encryption")]
   pub(crate) async fn respond_with_message_and_response(
     &self,
     raw: Bytes,
-    resp: QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    resp: QueryResponseMessage<T::Id, T::ResolvedAddress>,
   ) -> Result<(), Error<T, D>> {
     self
       .ctx
@@ -383,11 +371,11 @@ impl<I, A> From<MemberEvent<I, A>> for (MemberEventType, Arc<TinyVec<Member<I, A
 #[derive(derive_more::From)]
 pub enum Event<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Member related events
-  Member(MemberEvent<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>),
+  Member(MemberEvent<T::Id, T::ResolvedAddress>),
   /// User events
   User(UserEventMessage),
   /// Query events
@@ -396,7 +384,7 @@ where
 
 impl<D, T> Clone for Event<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn clone(&self) -> Self {
@@ -412,7 +400,7 @@ where
 #[derive(Debug)]
 pub struct EventProducer<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) tx: Sender<CrateEvent<T, D>>,
@@ -420,7 +408,7 @@ where
 
 impl<T, D> EventProducer<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Creates a bounded producer and subscriber.
@@ -446,7 +434,7 @@ where
 #[derive(Debug)]
 pub struct EventSubscriber<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   #[pin]
@@ -455,7 +443,7 @@ where
 
 impl<T, D> EventSubscriber<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Receives a event from the subscriber.
@@ -509,7 +497,7 @@ where
 
 impl<T, D> Stream for EventSubscriber<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Item = Event<T, D>;

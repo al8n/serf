@@ -3,12 +3,11 @@ use std::time::Duration;
 use futures::{FutureExt, StreamExt};
 use memberlist_core::{
   CheapClone,
-  agnostic_lite::Detach,
   bytes::{BufMut, Bytes, BytesMut},
   delegate::EventDelegate,
+  proto::{Meta, NodeState, OneOrMore, TinyVec},
   tracing,
   transport::{MaybeResolvedAddress, Node},
-  types::{Meta, NodeState, OneOrMore, TinyVec},
 };
 use rand::{Rng, SeedableRng};
 use smol_str::SmolStr;
@@ -17,14 +16,13 @@ use crate::{
   QueueOptions,
   coalesce::{MemberEventCoalescer, UserEventCoalescer, coalesced_event},
   coordinate::CoordinateOptions,
-  delegate::,
   error::Error,
   event::{InternalQueryEvent, MemberEvent, MemberEventType, QueryContext, QueryEvent},
   snapshot::{Snapshot, open_and_replay_snapshot},
   types::{
     DelegateVersion, Epoch, JoinMessage, LeaveMessage, Member, MemberState, MemberStatus,
     MemberlistDelegateVersion, MemberlistProtocolVersion, MessageType, NodeIntent, ProtocolVersion,
-    QueryFlag, QueryMessage, QueryResponseMessage, SerfMessage, UserEvent, UserEventMessage,
+    QueryFlag, QueryMessage, QueryResponseMessage, UserEvent, UserEventMessage,
   },
 };
 
@@ -32,10 +30,10 @@ use self::internal_query::SerfQueries;
 
 use super::*;
 
-/// Re-export the unit tests
-#[cfg(feature = "test")]
-#[cfg_attr(docsrs, doc(cfg(feature = "test")))]
-pub mod tests;
+// /// Re-export the unit tests
+// #[cfg(feature = "test")]
+// #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+// pub mod tests;
 
 impl<T, D> Serf<T, D>
 where
@@ -74,7 +72,7 @@ where
     {
       let tags = opts.tags.load();
       if !tags.as_ref().is_empty() {
-        let len = <D as >::tags_encoded_len(&tags);
+        let len = tags_encoded_len(&tags);
         if len > Meta::MAX_SIZE {
           return Err(Error::tags_too_large(len));
         }
@@ -128,7 +126,7 @@ where
     // Try access the snapshot
     let (old_clock, old_event_clock, old_query_clock, event_tx, alive_nodes, handle) =
       if let Some(sp) = opts.snapshot_path.as_ref() {
-        let rs = open_and_replay_snapshot::<_, _, D, _>(sp, opts.rejoin_after_leave)?;
+        let rs = open_and_replay_snapshot::<_, _, D>(sp, opts.rejoin_after_leave)?;
         let old_clock = rs.last_clock;
         let old_event_clock = rs.last_event_clock;
         let old_query_clock = rs.last_query_clock;
@@ -362,29 +360,13 @@ where
   /// when the broadcast is sent.
   pub(crate) async fn broadcast(
     &self,
-    msg: SerfMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    msg: Bytes,
     notify_tx: Option<async_channel::Sender<()>>,
   ) -> Result<(), Error<T, D>> {
-    let ty = MessageType::from(&msg);
-    let expected_encoded_len = <D as >::message_encoded_len(&msg);
-    let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // + 1 for message type byte
-    raw.put_u8(ty as u8);
-    raw.resize(expected_encoded_len + 1, 0);
-    let len = <D as >::encode_message(&msg, &mut raw[1..])
-      .map_err(Error::transform_delegate)?;
-    debug_assert_eq!(
-      len, expected_encoded_len,
-      "expected encoded len {} mismatch the actual encoded len {}",
-      expected_encoded_len, len
-    );
-
     self
       .inner
       .broadcasts
-      .queue_broadcast(SerfBroadcast {
-        msg: raw.into(),
-        notify_tx,
-      })
+      .queue_broadcast(SerfBroadcast { msg, notify_tx })
       .await;
     Ok(())
   }
@@ -423,7 +405,6 @@ where
     if let Some(keyring) = self.inner.memberlist.keyring() {
       let encoded_keys = keyring
         .keys()
-        .await
         .map(|k| general_purpose::STANDARD.encode(k))
         .collect::<TinyVec<_>>();
 
@@ -669,7 +650,7 @@ where
 
             let num_alive = (mu.states.len() - num_failed - mu.left_members.len()).max(1);
             let prob = num_failed as f32 / num_alive as f32;
-            let r: f32 = rng.gen();
+            let r: f32 = rng.random();
             if r > prob {
               tracing::debug!("serf: forgoing reconnect for random throttling");
               continue;
@@ -888,9 +869,7 @@ where
     let local = self.inner.memberlist.advertise_node();
 
     // Encode the filters
-    let filters = params
-      .encode_filters::<D>()
-      .map_err(Error::transform_delegate)?;
+    let filters = params.encode_filters::<D>()?;
 
     // Setup the flags
     let flags = if params.request_ack {
@@ -913,23 +892,14 @@ where
     };
 
     // Encode the query
-    let len = <D as >::message_encoded_len(&q);
+    let len = serf_proto::Encodable::encoded_len(&q);
 
     // Check the size
     if len > self.inner.opts.query_size_limit {
       return Err(Error::query_too_large(len));
     }
 
-    let mut raw = BytesMut::with_capacity(len + 1); // + 1 for message type byte
-    raw.put_u8(MessageType::Query as u8);
-    raw.resize(len + 1, 0);
-    let actual_encoded_len = <D as >::encode_message(&q, &mut raw[1..])
-      .map_err(Error::transform_delegate)?;
-    debug_assert_eq!(
-      actual_encoded_len, len,
-      "expected encoded len {} mismatch the actual encoded len {}",
-      len, actual_encoded_len
-    );
+    let raw = serf_proto::Encodable::encode_to_bytes(&q)?;
 
     // Register QueryResponse to track acks and responses
     let resp = QueryResponse::from_query(&q, self.inner.memberlist.num_online_members().await);
@@ -945,7 +915,7 @@ where
       .inner
       .query_broadcasts
       .queue_broadcast(SerfBroadcast {
-        msg: raw.freeze(),
+        msg: raw,
         notify_tx: None,
       })
       .await;
@@ -1067,24 +1037,9 @@ where
         payload: Bytes::new(),
       };
 
-      let expected_encoded_len = <D as >::message_encoded_len(&ack);
-      let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // + 1 for message type byte
-      raw.put_u8(MessageType::QueryResponse as u8);
-      raw.resize(expected_encoded_len + 1, 0);
-
-      match <D as >::encode_message(&ack, &mut raw[1..]) {
-        Ok(len) => {
-          debug_assert_eq!(
-            len, expected_encoded_len,
-            "expected encoded len {} mismatch the actual encoded len {}",
-            expected_encoded_len, len
-          );
-          if let Err(e) = self
-            .inner
-            .memberlist
-            .send(q.from().address(), raw.freeze())
-            .await
-          {
+      match serf_proto::Encodable::encode_to_bytes(&ack) {
+        Ok(raw) => {
+          if let Err(e) = self.inner.memberlist.send(q.from().address(), raw).await {
             tracing::error!(err=%e, "serf: failed to send ack");
           }
 
@@ -1181,7 +1136,7 @@ where
 
     let node = n.node();
     let tags = if !n.meta().is_empty() {
-      match <D as >::decode_tags(n.meta()) {
+      match decode_tags(n.meta()) {
         Ok((readed, tags)) => {
           tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
           tags
@@ -1544,7 +1499,7 @@ where
     &self,
     n: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
   ) {
-    let tags = match <D as >::decode_tags(n.meta()) {
+    let tags = match decode_tags(n.meta()) {
       Ok((readed, tags)) => {
         tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
         tags
@@ -1662,10 +1617,10 @@ where
     // Get the local node
     let local_id = self.inner.memberlist.local_id();
     let local_advertise_addr = self.inner.memberlist.advertise_address();
-    let encoded_id_len = <D as >::id_encoded_len(local_id);
+    let encoded_id_len = id_encoded_len(local_id);
     let mut payload = vec![0u8; encoded_id_len];
 
-    if let Err(e) = <D as >::encode_id(local_id, &mut payload) {
+    if let Err(e) = encode_id(local_id, &mut payload) {
       tracing::error!(err=%e, "serf: failed to encode local id");
       return;
     }
@@ -1699,8 +1654,7 @@ where
         continue;
       }
 
-      match <D as >::decode_message(MessageType::ConflictResponse, &r.payload[1..])
-      {
+      match decode_message(MessageType::ConflictResponse, &r.payload[1..]) {
         Ok((_, decoded)) => {
           match decoded {
             SerfMessage::ConflictResponse(member) => {

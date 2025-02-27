@@ -9,9 +9,9 @@ use futures::stream::FuturesUnordered;
 use memberlist_core::{
   Memberlist,
   agnostic_lite::{AsyncSpawner, RuntimeLite},
+  proto::MediumVec,
   queue::TransmitLimitedQueue,
   transport::{AddressResolver, Transport},
-  proto::MediumVec,
 };
 
 use super::{

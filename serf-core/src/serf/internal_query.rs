@@ -8,16 +8,13 @@ use memberlist_core::{
 };
 
 use crate::{
-  delegate::{Delegate, },
+  delegate::Delegate,
   event::{CrateEvent, InternalQueryEvent, QueryEvent},
   types::MessageType,
 };
 
 #[cfg(feature = "encryption")]
-use crate::{
-  error::Error,
-  types::{KeyResponseMessage, SerfMessage},
-};
+use crate::{error::Error, types::KeyResponseMessage};
 
 #[cfg(feature = "encryption")]
 use smol_str::SmolStr;
@@ -151,20 +148,10 @@ where
     // Encode the response
     match out {
       Some(state) => {
-        let member = state.member();
-        let expected_encoded_len = <D as >::message_encoded_len(member);
-        let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
-        raw.put_u8(MessageType::ConflictResponse as u8);
-        raw.resize(expected_encoded_len + 1, 0);
-        match <D as >::encode_message(member, &mut raw[1..]) {
-          Ok(len) => {
-            debug_assert_eq!(
-              len, expected_encoded_len,
-              "expected encoded len {} mismatch the actual encoded len {}",
-              expected_encoded_len, len
-            );
-
-            if let Err(e) = ev.respond(raw.freeze()).await {
+        let resp = serf_proto::ConflictResponseMessageBorrow::from(state.member());
+        match serf_proto::Encodable::encode_to_bytes(&resp) {
+          Ok(raw) => {
+            if let Err(e) = ev.respond(raw).await {
               tracing::error!(target="serf", err=%e, "failed to respond to conflict query");
             }
           }
@@ -192,26 +179,25 @@ where
   async fn handle_install_key(ev: impl AsRef<QueryEvent<T, D>> + Send) {
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
-    let req =
-      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-        Ok((_, msg)) => match msg {
-          SerfMessage::KeyRequest(req) => req,
-          msg => {
-            tracing::error!(
-              err = "unexpected message type",
-              "serf: {}",
-              msg.ty().as_str()
-            );
-            Self::send_key_response(q, &mut response).await;
-            return;
-          }
-        },
-        Err(e) => {
-          tracing::error!(err=%e, "serf: failed to decode key request");
+    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      Ok((_, msg)) => match msg {
+        SerfMessage::KeyRequest(req) => req,
+        msg => {
+          tracing::error!(
+            err = "unexpected message type",
+            "serf: {}",
+            msg.ty().as_str()
+          );
           Self::send_key_response(q, &mut response).await;
           return;
         }
-      };
+      },
+      Err(e) => {
+        tracing::error!(err=%e, "serf: failed to decode key request");
+        Self::send_key_response(q, &mut response).await;
+        return;
+      }
+    };
 
     if !q.ctx.this.encryption_enabled() {
       tracing::error!(
@@ -227,7 +213,7 @@ where
     let kr = q.ctx.this.inner.memberlist.keyring();
     match kr {
       Some(kr) => {
-        kr.insert(req.key.unwrap()).await;
+        kr.insert(req.key.unwrap());
         if q.ctx.this.inner.opts.keyring_file.is_some() {
           if let Err(e) = q.ctx.this.write_keyring_file().await {
             tracing::error!(err=%e, "serf: failed to write keyring file");
@@ -256,26 +242,25 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req =
-      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-        Ok((_, msg)) => match msg {
-          SerfMessage::KeyRequest(req) => req,
-          msg => {
-            tracing::error!(
-              err = "unexpected message type",
-              "serf: {}",
-              msg.ty().as_str()
-            );
-            Self::send_key_response(q, &mut response).await;
-            return;
-          }
-        },
-        Err(e) => {
-          tracing::error!(err=%e, "serf: failed to decode key request");
+    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      Ok((_, msg)) => match msg {
+        SerfMessage::KeyRequest(req) => req,
+        msg => {
+          tracing::error!(
+            err = "unexpected message type",
+            "serf: {}",
+            msg.ty().as_str()
+          );
           Self::send_key_response(q, &mut response).await;
           return;
         }
-      };
+      },
+      Err(e) => {
+        tracing::error!(err=%e, "serf: failed to decode key request");
+        Self::send_key_response(q, &mut response).await;
+        return;
+      }
+    };
 
     if !q.ctx.this.encryption_enabled() {
       tracing::error!(
@@ -291,7 +276,7 @@ where
     let kr = q.ctx.this.inner.memberlist.keyring();
     match kr {
       Some(kr) => {
-        if let Err(e) = kr.use_key(&req.key.unwrap()).await {
+        if let Err(e) = kr.use_key(&req.key.unwrap()) {
           tracing::error!(err=%e, "serf: failed to change primary key");
           response.message = SmolStr::new(e.to_string());
           Self::send_key_response(q, &mut response).await;
@@ -326,26 +311,25 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req =
-      match <D as >::decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-        Ok((_, msg)) => match msg {
-          SerfMessage::KeyRequest(req) => req,
-          msg => {
-            tracing::error!(
-              err = "unexpected message type",
-              "serf: {}",
-              msg.ty().as_str()
-            );
-            Self::send_key_response(q, &mut response).await;
-            return;
-          }
-        },
-        Err(e) => {
-          tracing::error!(target="serf", err=%e, "failed to decode key request");
+    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
+      Ok((_, msg)) => match msg {
+        SerfMessage::KeyRequest(req) => req,
+        msg => {
+          tracing::error!(
+            err = "unexpected message type",
+            "serf: {}",
+            msg.ty().as_str()
+          );
           Self::send_key_response(q, &mut response).await;
           return;
         }
-      };
+      },
+      Err(e) => {
+        tracing::error!(target="serf", err=%e, "failed to decode key request");
+        Self::send_key_response(q, &mut response).await;
+        return;
+      }
+    };
 
     if !q.ctx.this.encryption_enabled() {
       tracing::error!(
@@ -361,7 +345,7 @@ where
     let kr = q.ctx.this.inner.memberlist.keyring();
     match kr {
       Some(kr) => {
-        if let Err(e) = kr.remove(&req.key.unwrap()).await {
+        if let Err(e) = kr.remove(&req.key.unwrap()) {
           tracing::error!(err=%e, "serf: failed to remove key");
           response.message = SmolStr::new(e.to_string());
           Self::send_key_response(q, &mut response).await;
@@ -411,11 +395,11 @@ where
     let kr = q.ctx.this.inner.memberlist.keyring();
     match kr {
       Some(kr) => {
-        for k in kr.keys().await {
+        for k in kr.keys() {
           response.keys.push(k);
         }
 
-        let primary_key = kr.primary_key().await;
+        let primary_key = kr.primary_key();
         response.primary_key = Some(primary_key);
         response.result = true;
         Self::send_key_response(q, &mut response).await;
@@ -450,43 +434,14 @@ where
       (q.ctx.this.inner.opts.query_response_size_limit / MIN_ENCODED_KEY_LENGTH).min(actual);
 
     for i in (0..=max_list_keys).rev() {
-      let expected_k_encoded_len = <D as >::message_encoded_len(&*resp);
-      let mut raw = BytesMut::with_capacity(expected_k_encoded_len + 1); // +1 for the message type
-      raw.put_u8(MessageType::KeyResponse as u8);
-      raw.resize(expected_k_encoded_len + 1, 0);
-
-      let len = <D as >::encode_message(&*resp, &mut raw[1..])
-        .map_err(Error::transform_delegate)?;
-
-      debug_assert_eq!(
-        len, expected_k_encoded_len,
-        "expected encoded len {} mismatch the actual encoded len {}",
-        expected_k_encoded_len, len
-      );
-      let kraw = raw.freeze();
+      let kraw = serf_proto::Encodable::encode_to_bytes(&*resp)?;
 
       // create response
       let qresp = q.create_response(kraw.clone());
 
-      // encode response
-      let expected_encoded_len = <D as >::message_encoded_len(&qresp);
-      let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
-      raw.put_u8(MessageType::QueryResponse as u8);
-      raw.resize(expected_encoded_len + 1, 0);
-
-      let len = <D as >::encode_message(&qresp, &mut raw[1..])
-        .map_err(Error::transform_delegate)?;
-
-      debug_assert_eq!(
-        len, expected_encoded_len,
-        "expected encoded len {} mismatch the actual encoded len {}",
-        expected_encoded_len, len
-      );
-
-      let qraw = raw.freeze();
-
+      let encoded_len = serf_proto::Encodable::encoded_len(&qresp);
       // Check the size limit
-      if q.check_response_size(&qraw).is_err() {
+      if q.check_response_size(encoded_len).is_err() {
         resp.keys.drain(i..);
         resp.message = SmolStr::new(format!(
           "truncated key list response, showing first {} of {} keys",
@@ -494,6 +449,9 @@ where
         ));
         continue;
       }
+
+      // encode response
+      let qraw = serf_proto::Encodable::encode_to_bytes(&qresp)?;
 
       if actual > i {
         tracing::warn!("serf: {}", resp.message);
@@ -506,7 +464,7 @@ where
   #[cfg(feature = "encryption")]
   async fn send_key_response(q: &QueryEvent<T, D>, resp: &mut KeyResponseMessage) {
     match q.name.as_str() {
-      "serf-list-keys" => {
+      "_serf_list_keys" => {
         let (raw, qresp) = match Self::key_list_response_with_correct_size(q, resp) {
           Ok((raw, qresp)) => (raw, qresp),
           Err(e) => {
@@ -519,28 +477,16 @@ where
           tracing::error!(target="serf", err=%e, "failed to respond to key query");
         }
       }
-      _ => {
-        let expected_encoded_len = <D as >::message_encoded_len(&*resp);
-        let mut raw = BytesMut::with_capacity(expected_encoded_len + 1); // +1 for the message type
-        raw.put_u8(MessageType::KeyResponse as u8);
-        raw.resize(expected_encoded_len + 1, 0);
-        match <D as >::encode_message(&*resp, &mut raw[1..]) {
-          Ok(len) => {
-            debug_assert_eq!(
-              len, expected_encoded_len,
-              "expected encoded len {} mismatch the actual encoded len {}",
-              expected_encoded_len, len
-            );
-
-            if let Err(e) = q.respond(raw.freeze()).await {
-              tracing::error!(target="serf", err=%e, "failed to respond to key query");
-            }
-          }
-          Err(e) => {
-            tracing::error!(target="serf", err=%e, "failed to encode key response");
+      _ => match serf_proto::Encodable::encode_to_bytes(&*resp) {
+        Ok(raw) => {
+          if let Err(e) = q.respond(raw).await {
+            tracing::error!(target="serf", err=%e, "failed to respond to key query");
           }
         }
-      }
+        Err(e) => {
+          tracing::error!(target="serf", err=%e, "failed to encode key response");
+        }
+      },
     }
   }
 }

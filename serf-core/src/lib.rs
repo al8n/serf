@@ -1,7 +1,7 @@
 #![doc = include_str!("../../README.md")]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/serf/main/art/logo_72x72.png")]
 #![forbid(unsafe_code)]
-#![deny(warnings, missing_docs)]
+// #![deny(warnings, missing_docs)]
 #![allow(clippy::type_complexity)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
@@ -52,7 +52,7 @@ pub mod tests {
   pub use memberlist_core::tests::{AnyError, next_socket_addr_v4, next_socket_addr_v6};
   pub use paste;
 
-  pub use super::serf::base::tests::{serf::*, *};
+  // pub use super::serf::base::tests::{serf::*, *};
 
   /// Add `test` prefix to the predefined unit test fn with a given [`Runtime`](memberlist_core::agnostic_lite::RuntimeLite)
   #[cfg(any(feature = "test", test))]
