@@ -1,17 +1,66 @@
 use std::sync::Arc;
 
-use memberlist_core::{proto::TinyVec, transport::Transport};
+use memberlist_core::{
+  delegate::DelegateError as MemberlistDelegateError, proto::TinyVec, transport::Transport,
+};
 
 use crate::{
-  delegate::Delegate,
+  delegate::{Delegate, MergeDelegate},
   serf::{SerfDelegate, SerfState},
   types::Member,
 };
 
 pub use crate::snapshot::SnapshotError;
 
+/// Error trait for [`Delegate`]
+#[derive(thiserror::Error)]
+pub enum SerfDelegateError<D: Delegate> {
+  /// Serf error
+  #[error(transparent)]
+  Serf(#[from] SerfError),
+  /// [`MergeDelegate`] error
+  #[error(transparent)]
+  Merge(<D as MergeDelegate>::Error),
+}
+
+impl<D: Delegate> core::fmt::Debug for SerfDelegateError<D> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Merge(err) => write!(f, "{err:?}"),
+      Self::Serf(err) => write!(f, "{err:?}"),
+    }
+  }
+}
+
+impl<D: Delegate> SerfDelegateError<D> {
+  /// Create a delegate error from a merge delegate error.
+  #[inline]
+  pub const fn merge(err: <D as MergeDelegate>::Error) -> Self {
+    Self::Merge(err)
+  }
+
+  /// Create a delegate error from a serf error.
+  #[inline]
+  pub const fn serf(err: crate::error::SerfError) -> Self {
+    Self::Serf(err)
+  }
+}
+
+impl<T, D> From<MemberlistDelegateError<SerfDelegate<T, D>>> for SerfDelegateError<D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  fn from(value: MemberlistDelegateError<SerfDelegate<T, D>>) -> Self {
+    match value {
+      MemberlistDelegateError::AliveDelegate(e) => e,
+      MemberlistDelegateError::MergeDelegate(e) => e,
+    }
+  }
+}
+
 /// Error type for the serf crate.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum Error<T, D>
 where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
@@ -31,6 +80,21 @@ where
   Multiple(Arc<[Self]>),
 }
 
+impl<T, D> core::fmt::Debug for Error<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Memberlist(e) => write!(f, "{e:?}"),
+      Self::Serf(e) => write!(f, "{e:?}"),
+      Self::Relay(e) => write!(f, "{e:?}"),
+      Self::Multiple(e) => write!(f, "{e:?}"),
+    }
+  }
+}
+
 impl<T, D> From<SnapshotError> for Error<T, D>
 where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
@@ -47,7 +111,17 @@ where
   T: Transport,
 {
   fn from(e: memberlist_core::proto::EncodeError) -> Self {
-    Self::Memberlist(e.into())
+    Self::Serf(e.into())
+  }
+}
+
+impl<T, D> From<memberlist_core::proto::DecodeError> for Error<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  fn from(e: memberlist_core::proto::DecodeError) -> Self {
+    Self::Serf(e.into())
   }
 }
 
@@ -169,28 +243,28 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum SerfError {
   /// Returned when the user event exceeds the configured limit.
-  #[error("serf: user event exceeds configured limit of {0} bytes before encoding")]
+  #[error("user event exceeds configured limit of {0} bytes before encoding")]
   UserEventLimitTooLarge(usize),
   /// Returned when the user event exceeds the sane limit.
-  #[error("serf: user event exceeds sane limit of {0} bytes before encoding")]
+  #[error("user event exceeds sane limit of {0} bytes before encoding")]
   UserEventTooLarge(usize),
   /// Returned when the join status is bad.
-  #[error("serf: join called on {0} statues")]
+  #[error("join called on {0} statues")]
   BadJoinStatus(SerfState),
   /// Returned when the leave status is bad.
-  #[error("serf: leave called on {0} statues")]
+  #[error("leave called on {0} statues")]
   BadLeaveStatus(SerfState),
   /// Returned when the encoded user event exceeds the sane limit after encoding.
-  #[error("serf: user event exceeds sane limit of {0} bytes after encoding")]
+  #[error("user event exceeds sane limit of {0} bytes after encoding")]
   RawUserEventTooLarge(usize),
   /// Returned when the query size exceeds the configured limit.
-  #[error("serf: query exceeds limit of {0} bytes")]
+  #[error("query exceeds limit of {0} bytes")]
   QueryTooLarge(usize),
   /// Returned when the query is timeout.
-  #[error("serf: query response is past the deadline")]
+  #[error("query response is past the deadline")]
   QueryTimeout,
   /// Returned when the query response is too large.
-  #[error("serf: query response ({got} bytes) exceeds limit of {limit} bytes")]
+  #[error("query response ({got} bytes) exceeds limit of {limit} bytes")]
   QueryResponseTooLarge {
     /// The query response size limit.
     limit: usize,
@@ -198,31 +272,37 @@ pub enum SerfError {
     got: usize,
   },
   /// Returned when the query has already been responded.
-  #[error("serf: query response already sent")]
+  #[error("query response already sent")]
   QueryAlreadyResponsed,
   /// Returned when failed to truncate response so that it fits into message.
-  #[error("serf: failed to truncate response so that it fits into message")]
+  #[error("failed to truncate response so that it fits into message")]
   FailTruncateResponse,
   /// Returned when the tags too large.
-  #[error("serf: encoded length of tags exceeds limit of {0} bytes")]
+  #[error("encoded length of tags exceeds limit of {0} bytes")]
   TagsTooLarge(usize),
   /// Returned when the relayed response is too large.
-  #[error("serf: relayed response exceeds limit of {0} bytes")]
+  #[error("relayed response exceeds limit of {0} bytes")]
   RelayedResponseTooLarge(usize),
   /// Returned when failed to deliver query response, dropping.
-  #[error("serf: failed to deliver query response, dropping")]
+  #[error("failed to deliver query response, dropping")]
   QueryResponseDeliveryFailed,
   /// Returned when the coordinates are disabled.
-  #[error("serf: coordinates are disabled")]
+  #[error("coordinates are disabled")]
   CoordinatesDisabled,
   /// Returned when snapshot error.
-  #[error("serf: {0}")]
+  #[error(transparent)]
   Snapshot(#[from] SnapshotError),
+  /// Returned when trying to decode a serf data
+  #[error(transparent)]
+  Decode(#[from] memberlist_core::proto::DecodeError),
+  /// Returned when trying to encode a serf data
+  #[error(transparent)]
+  Encode(#[from] memberlist_core::proto::EncodeError),
   /// Returned when timed out broadcasting node removal.
-  #[error("serf: timed out broadcasting node removal")]
+  #[error("timed out broadcasting node removal")]
   RemovalBroadcastTimeout,
   /// Returned when the timed out broadcasting channel closed.
-  #[error("serf: timed out broadcasting channel closed")]
+  #[error("timed out broadcasting channel closed")]
   BroadcastChannelClosed,
 }
 

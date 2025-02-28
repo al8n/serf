@@ -54,7 +54,7 @@ fn test_member_status<I: Id, A>(
 /// Unit tests for the get queue max
 pub async fn serf_get_queue_max<T>(
   transport_opts: T::Options,
-  mut get_addr: impl FnMut(usize) -> <T::Resolver as AddressResolver>::ResolvedAddress,
+  mut get_addr: impl FnMut(usize) -> T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
   T::Options: Clone,
@@ -161,7 +161,7 @@ pub async fn serf_get_queue_max<T>(
 pub async fn serf_update<T, F>(
   transport_opts1: T::Options,
   transport_opts2: T::Options,
-  get_transport: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport,
   T::Options: Clone,

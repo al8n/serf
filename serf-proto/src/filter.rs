@@ -1,12 +1,9 @@
 use memberlist_proto::{
-  Data, DataRef, DecodeError, EncodeError, TinyVec, WireType,
-  utils::{merge, split},
+  Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TinyVec, WireType,
+  utils::{merge, skip, split},
 };
 
-pub use id_filter::*;
 pub use tag_filter::*;
-
-mod id_filter;
 mod tag_filter;
 
 /// The type of filter
@@ -85,31 +82,15 @@ const FILTER_ID_TAG: u8 = 1;
 const FILTER_TAG_TAG: u8 = 2;
 
 /// The reference type to [`Filter`]
-pub enum FilterRef<'a, I> {
+#[derive(Clone, Copy, Debug)]
+pub enum FilterRef<'a> {
   /// Filter by node ids
-  Id(IdDecoder<'a, I>),
+  Id(RepeatedDecoder<'a>),
   /// Filter by tag
   Tag(TagFilterRef<'a>),
 }
 
-impl<I> Clone for FilterRef<'_, I> {
-  fn clone(&self) -> Self {
-    *self
-  }
-}
-
-impl<I> Copy for FilterRef<'_, I> {}
-
-impl<I> core::fmt::Debug for FilterRef<'_, I> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::Id(id) => f.debug_tuple("FilterRef::Id").field(id).finish(),
-      Self::Tag(t) => f.debug_tuple("FilterRef::Tag").field(t).finish(),
-    }
-  }
-}
-
-impl<'a, I> DataRef<'a, Filter<I>> for FilterRef<'a, I>
+impl<'a, I> DataRef<'a, Filter<I>> for FilterRef<'a>
 where
   I: Data,
 {
@@ -123,26 +104,70 @@ where
     }
 
     let mut offset = 0;
+    let mut ids_offsets = None;
+    let mut num_ids = 0;
+    let mut f = None;
 
-    match buf[0] {
-      val if val == Filter::<I>::id_byte() => {
-        offset += 1;
-        Ok((offset, Self::Id(IdDecoder::new(&buf[offset..]))))
-      }
-      val if val == Filter::<I>::tag_byte() => {
-        offset += 1;
-        let (read, tag) =
-          <TagFilterRef as DataRef<'_, TagFilter>>::decode_length_delimited(&buf[offset..])?;
-        offset += read;
-        Ok((offset, Self::Tag(tag)))
-      }
-      b => {
-        let (wire_type, tag) = split(b);
-        WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+    while offset < buf_len {
+      match buf[offset] {
+        val if val == Filter::<I>::id_byte() => {
+          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = ids_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
 
-        Err(DecodeError::unknown_tag("Filter", tag))
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            ids_offsets = Some((offset - 1, offset + readed));
+          }
+          num_ids += 1;
+          offset += readed;
+        }
+        val if val == Filter::<I>::tag_byte() => {
+          if let Some(Self::Tag(_)) = f {
+            return Err(DecodeError::duplicate_field(
+              "Filter",
+              "tag",
+              FILTER_TAG_TAG,
+            ));
+          }
+
+          if ids_offsets.is_some() {
+            return Err(DecodeError::duplicate_field("Filter", "id", FILTER_ID_TAG));
+          }
+
+          offset += 1;
+          let (read, tag) =
+            <TagFilterRef as DataRef<'_, TagFilter>>::decode_length_delimited(&buf[offset..])?;
+          offset += read;
+          f = Some(FilterRef::Tag(tag));
+        }
+        b => {
+          let (wire_type, _) = split(b);
+          let wt = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          offset += 1;
+          offset += skip(wt, &buf[offset..])?;
+        }
       }
     }
+
+    Ok((
+      offset,
+      if let Some(tag) = f {
+        tag
+      } else if let Some((start, end)) = ids_offsets {
+        Self::Id(
+          RepeatedDecoder::new(FILTER_ID_TAG, WireType::LengthDelimited, buf)
+            .with_nums(num_ids)
+            .with_offsets(start, end),
+        )
+      } else {
+        return Err(DecodeError::missing_field("Filter", "value"));
+      },
+    ))
   }
 }
 
@@ -163,7 +188,7 @@ impl<I> Data for Filter<I>
 where
   I: Data,
 {
-  type Ref<'a> = FilterRef<'a, I>;
+  type Ref<'a> = FilterRef<'a>;
 
   fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
   where
@@ -171,6 +196,7 @@ where
   {
     match val {
       FilterRef::Id(decoder) => decoder
+        .iter::<I>()
         .map(|res| res.and_then(I::from_ref))
         .collect::<Result<_, DecodeError>>()
         .map(Self::Id),
@@ -183,7 +209,7 @@ where
       + match self {
         Filter::Id(ids) => ids
           .iter()
-          .map(|id| id.encoded_len_with_length_delimited())
+          .map(|id| 1 + id.encoded_len_with_length_delimited())
           .sum::<usize>(),
         Filter::Tag(tag) => 1 + tag.encoded_len_with_length_delimited(),
       }
@@ -202,12 +228,19 @@ where
 
     match self {
       Filter::Id(ids) => {
-        buf[offset] = Self::id_byte();
-        offset += 1;
-
         ids
           .iter()
           .try_fold(&mut offset, |offset, id| {
+            if *offset >= buf_len {
+              return Err(EncodeError::insufficient_buffer(
+                self.encoded_len(),
+                buf_len,
+              ));
+            }
+
+            buf[*offset] = Self::id_byte();
+            *offset += 1;
+
             *offset += id.encode_length_delimited(&mut buf[*offset..])?;
 
             Ok(offset)

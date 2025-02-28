@@ -1,15 +1,12 @@
-use memberlist_core::{
-  CheapClone,
-  proto::TinyVec,
-  transport::{Id, Node},
-};
-use serf_proto::MessageType;
+use memberlist_core::{CheapClone, transport::Id};
 
-use crate::{coordinate::Coordinate, types::Member};
+use crate::types::Member;
 
 use super::{
   DefaultMergeDelegate, Delegate, MergeDelegate, NoopReconnectDelegate, ReconnectDelegate,
 };
+
+use std::sync::Arc;
 
 /// `CompositeDelegate` is a helpful struct to split the [`Delegate`] into multiple small delegates,
 /// so that users do not need to implement full [`Delegate`] when they only want to custom some methods
@@ -78,7 +75,7 @@ where
 
   async fn notify_merge(
     &self,
-    members: TinyVec<Member<Self::Id, Self::Address>>,
+    members: Arc<[Member<Self::Id, Self::Address>]>,
   ) -> Result<(), Self::Error> {
     self.merge.notify_merge(members).await
   }

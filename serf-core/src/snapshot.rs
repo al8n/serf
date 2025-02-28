@@ -20,7 +20,7 @@ use memberlist_core::{
   bytes::{BufMut, BytesMut},
   proto::{Data, TinyVec},
   tracing,
-  transport::{AddressResolver, Id, MaybeResolvedAddress, Node, Transport},
+  transport::{Id, MaybeResolvedAddress, Node, Transport},
 };
 use rand::seq::SliceRandom;
 use serf_proto::UserEventMessage;
@@ -372,10 +372,10 @@ impl SnapshotHandle {
 /// them to disk, and providing a recovery mechanism at start time.
 pub(crate) struct Snapshot<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  alive_nodes: HashSet<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
+  alive_nodes: HashSet<Node<T::Id, T::ResolvedAddress>>,
   clock: LamportClock,
   fh: Option<BufWriter<File>>,
   last_flush: Epoch,
@@ -431,12 +431,12 @@ macro_rules! tee_stream_flush_event {
 
 impl<D, T> Snapshot<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   #[allow(clippy::type_complexity)]
   pub(crate) fn from_replay_result(
-    replay_result: ReplayResult<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    replay_result: ReplayResult<T::Id, T::ResolvedAddress>,
     min_compact_size: u64,
     rejoin_after_leave: bool,
     clock: LamportClock,
@@ -677,10 +677,7 @@ where
   }
 
   /// Used to handle a single member event
-  fn process_member_event(
-    &mut self,
-    e: &MemberEvent<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-  ) {
+  fn process_member_event(&mut self, e: &MemberEvent<T::Id, T::ResolvedAddress>) {
     match e.ty {
       MemberEventType::Join => {
         for m in e.members() {
@@ -713,10 +710,7 @@ where
     }
   }
 
-  fn try_append(
-    &mut self,
-    l: SnapshotRecord<'_, T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-  ) {
+  fn try_append(&mut self, l: SnapshotRecord<'_, T::Id, T::ResolvedAddress>) {
     if let Err(e) = self.append_line(l) {
       tracing::error!(err = %e, "serf: failed to update snapshot");
       if self.last_attempted_compaction.elapsed() > SNAPSHOT_ERROR_RECOVERY_INTERVAL {
@@ -733,7 +727,7 @@ where
 
   fn append_line(
     &mut self,
-    l: SnapshotRecord<'_, T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    l: SnapshotRecord<'_, T::Id, T::ResolvedAddress>,
   ) -> Result<(), SnapshotError> {
     #[cfg(feature = "metrics")]
     let start = crate::types::Epoch::now();

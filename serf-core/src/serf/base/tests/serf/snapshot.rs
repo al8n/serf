@@ -5,7 +5,7 @@ use super::*;
 /// Unit test for the snapshoter.
 pub async fn snapshoter<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -214,7 +214,7 @@ pub async fn snapshoter<T>(
 /// Unit test for the snapshoter force compact.
 pub async fn snapshoter_force_compact<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -283,7 +283,7 @@ pub async fn snapshoter_force_compact<T>(
 /// Unit test for the snapshoter leave
 pub async fn snapshoter_leave<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -394,7 +394,7 @@ pub async fn snapshoter_leave<T>(
 /// Unit test for the snapshoter leave rejoin
 pub async fn snapshoter_leave_rejoin<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -502,7 +502,7 @@ pub async fn snapshoter_leave_rejoin<T>(
 pub async fn serf_snapshot_recovery<T, F>(
   transport_opts1: T::Options,
   transport_opts2: T::Options,
-  get_transport: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport,
   T::Options: Clone,

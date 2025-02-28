@@ -4,7 +4,7 @@ use async_channel::Sender;
 use memberlist_core::{
   CheapClone,
   proto::TinyVec,
-  transport::{AddressResolver, Node, Transport},
+  transport::{Node, Transport},
 };
 
 use crate::{
@@ -22,12 +22,8 @@ pub(crate) struct CoalesceEvent<I, A> {
 
 #[derive(Default)]
 pub(crate) struct MemberEventCoalescer<T: Transport, D> {
-  last_events:
-    HashMap<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, MemberEventType>,
-  latest_events: HashMap<
-    Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    CoalesceEvent<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-  >,
+  last_events: HashMap<Node<T::Id, T::ResolvedAddress>, MemberEventType>,
+  latest_events: HashMap<Node<T::Id, T::ResolvedAddress>, CoalesceEvent<T::Id, T::ResolvedAddress>>,
   _m: PhantomData<D>,
 }
 
@@ -43,7 +39,7 @@ impl<T: Transport, D> MemberEventCoalescer<T, D> {
 
 impl<T, D> Coalescer for MemberEventCoalescer<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Delegate = D;
@@ -78,10 +74,8 @@ where
     &mut self,
     out_tx: &Sender<CrateEvent<Self::Transport, Self::Delegate>>,
   ) -> Result<(), super::ClosedOutChannel> {
-    let mut events: HashMap<
-      MemberEventType,
-      MemberEventMut<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    > = HashMap::with_capacity(self.latest_events.len());
+    let mut events: HashMap<MemberEventType, MemberEventMut<T::Id, T::ResolvedAddress>> =
+      HashMap::with_capacity(self.latest_events.len());
     // Coalesce the various events we got into a single set of events.
     for (id, cev) in self.latest_events.drain() {
       match self.last_events.get(&id) {

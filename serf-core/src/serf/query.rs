@@ -6,21 +6,21 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use async_lock::RwLock;
+use either::Either;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use memberlist_core::{
   CheapClone,
-  bytes::{BufMut, Bytes, BytesMut},
-  proto::{OneOrMore, SmallVec, TinyVec},
+  bytes::Bytes,
+  proto::{Data, RepeatedDecoder, SmallVec, TinyVec},
   tracing,
-  transport::{AddressResolver, Id, Node, Transport},
+  transport::{Node, Transport},
 };
+use serf_proto::FilterRef;
 
 use crate::{
   delegate::Delegate,
   error::Error,
-  types::{
-    Filter, LamportTime, Member, MemberStatus, MessageType, QueryMessage, QueryResponseMessage,
-  },
+  types::{Filter, LamportTime, Member, MemberStatus, QueryMessage, QueryResponseMessage},
 };
 
 use super::Serf;
@@ -40,7 +40,7 @@ pub struct QueryParam<I> {
     getter(const, attrs(doc = "Returns the filters of the query")),
     setter(attrs(doc = "Sets the filters of the query"))
   )]
-  filters: OneOrMore<Filter<I>>,
+  filters: TinyVec<Filter<I>>,
 
   /// If true, we are requesting an delivery acknowledgement from
   /// every node that meets the filter requirement. This means nodes
@@ -245,7 +245,7 @@ impl<I, A> QueryResponse<I, A> {
   ) where
     I: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
     A: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     // Check if the query is closed
@@ -308,7 +308,7 @@ impl<I, A> QueryResponse<I, A> {
   where
     I: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
     A: Eq + std::hash::Hash + CheapClone + core::fmt::Debug,
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     let mut c = self.inner.core.write().await;
@@ -342,7 +342,7 @@ impl<I, A> QueryResponse<I, A> {
   where
     I: Eq + std::hash::Hash + CheapClone,
     A: Eq + std::hash::Hash + CheapClone,
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     let mut c = self.inner.core.write().await;
@@ -410,7 +410,7 @@ fn random_members<I, A>(k: usize, mut members: SmallVec<Member<I, A>>) -> SmallV
 
 impl<T, D> Serf<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Returns the default timeout value for a query
@@ -429,78 +429,103 @@ where
   /// Used to return the default query parameters
   pub async fn default_query_param(&self) -> QueryParam<T::Id> {
     QueryParam {
-      filters: OneOrMore::new(),
+      filters: TinyVec::new(),
       request_ack: false,
       relay_factor: 0,
       timeout: self.default_query_timeout().await,
     }
   }
 
-  pub(crate) fn should_process_query(&self, filters: &[Bytes]) -> bool {
-    for filter in filters.iter() {
-      if filter.is_empty() {
-        tracing::warn!("serf: empty filter");
-        return false;
-      }
-
-      // Decode the filter
-      let filter = match decode_filter(filter) {
-        Ok((read, filter)) => {
-          tracing::trace!(read=%read, filter=?filter, "serf: decoded filter successully");
-          filter
-        }
-        Err(err) => {
-          tracing::warn!(
-            err = %err,
-            "serf: failed to decode filter"
-          );
-          return false;
-        }
-      };
-
-      match filter {
-        Filter::Id(nodes) => {
-          // Check if we are being targeted
-          let found = nodes
-            .iter()
-            .any(|n: &T::Id| n.eq(self.inner.memberlist.local_id()));
-          if !found {
-            return false;
-          }
-        }
-        Filter::Tag(tag) => {
-          // Check if we match this regex
-          let tags = self.inner.opts.tags.load();
-          if !tags.is_empty() {
-            if let Some(expr) = tags.get(&tag) {
-              match regex::Regex::new(&fexpr) {
-                Ok(re) => {
-                  if !re.is_match(expr) {
-                    return false;
-                  }
-                }
-                Err(err) => {
-                  tracing::warn!(err=%err, "serf: failed to compile filter regex ({})", fexpr);
-                  return false;
+  pub(crate) fn should_process_query(
+    &self,
+    filters: Either<RepeatedDecoder<'_>, &[Filter<T::Id>]>,
+  ) -> Result<bool, memberlist_core::proto::DecodeError> {
+    match filters {
+      Either::Left(filters) => {
+        for filter in filters.iter::<Filter<T::Id>>() {
+          let filter = filter?;
+          match filter {
+            FilterRef::Id(ids) => {
+              // Check if we are being targeted
+              let mut found = false;
+              for id in ids.iter::<T::Id>() {
+                let id = id?;
+                if <T::Id as Data>::from_ref(id)?.eq(self.inner.memberlist.local_id()) {
+                  found = true;
+                  break;
                 }
               }
-            } else {
-              return false;
+              if !found {
+                return Ok(false);
+              }
             }
-          } else {
-            return false;
+            FilterRef::Tag(tag) => {
+              // Check if we match this regex
+              let tags = self.inner.opts.tags.load();
+              if !tags.is_empty() {
+                if let Some(expr) = tags.get(tag.tag()) {
+                  if let Some(re) = tag.expr() {
+                    if !regex::Regex::new(re)
+                      .map_err(|_| memberlist_core::proto::DecodeError::custom("invalid regex"))?
+                      .is_match(expr)
+                    {
+                      return Ok(false);
+                    }
+                  }
+                } else {
+                  return Ok(false);
+                }
+              } else {
+                return Ok(false);
+              }
+            }
           }
         }
+
+        Ok(true)
+      }
+      Either::Right(filters) => {
+        for filter in filters.iter() {
+          match &filter {
+            Filter::Id(nodes) => {
+              // Check if we are being targeted
+              let found = nodes
+                .iter()
+                .any(|n: &T::Id| n.eq(self.inner.memberlist.local_id()));
+              if !found {
+                return Ok(false);
+              }
+            }
+            Filter::Tag(tag) => {
+              // Check if we match this regex
+              let tags = self.inner.opts.tags.load();
+              if !tags.is_empty() {
+                if let Some(expr) = tags.get(tag.tag()) {
+                  if let Some(re) = tag.expr() {
+                    if !re.is_match(expr) {
+                      return Ok(false);
+                    }
+                  }
+                } else {
+                  return Ok(false);
+                }
+              } else {
+                return Ok(false);
+              }
+            }
+            _ => {}
+          }
+        }
+        Ok(true)
       }
     }
-    true
   }
 
   pub(crate) async fn relay_response(
     &self,
     relay_factor: u8,
-    node: Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    resp: QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    node: Node<T::Id, T::ResolvedAddress>,
+    resp: QueryResponseMessage<T::Id, T::ResolvedAddress>,
   ) -> Result<(), Error<T, D>> {
     if relay_factor == 0 {
       return Ok(());
@@ -532,14 +557,14 @@ where
     }
 
     // Prep the relay message, which is a wrapped version of the original.
-    let encoded_len = serf_proto::Encodable::encoded_len_with_relay(&resp);
+    let encoded_len = serf_proto::Encodable::encoded_len_with_relay(&resp, &node);
     if encoded_len > self.inner.opts.query_response_size_limit {
       return Err(Error::relayed_response_too_large(
         self.inner.opts.query_response_size_limit,
       ));
     }
 
-    let raw = serf_proto::Encodable::encode_relay_to_bytes(&resp)?;
+    let raw = serf_proto::Encodable::encode_relay_to_bytes(&resp, &node)?;
 
     // Relay to a random set of peers.
     let relay_members = random_members(relay_factor as usize, members);

@@ -1,15 +1,18 @@
 use std::time::Duration;
 
+use either::Either;
 use futures::{FutureExt, StreamExt};
 use memberlist_core::{
   CheapClone,
-  bytes::{BufMut, Bytes, BytesMut},
+  agnostic_lite::AfterHandle,
+  bytes::Bytes,
   delegate::EventDelegate,
-  proto::{Meta, NodeState, OneOrMore, TinyVec},
+  proto::{Data, Meta, NodeState, OneOrMore, TinyVec},
   tracing,
   transport::{MaybeResolvedAddress, Node},
 };
 use rand::{Rng, SeedableRng};
+use serf_proto::{MessageRef, QueryMessageRef, QueryResponseMessageRef, Tags, UserEventMessageRef};
 use smol_str::SmolStr;
 
 use crate::{
@@ -37,7 +40,7 @@ use super::*;
 
 impl<T, D> Serf<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   #[cfg(feature = "test")]
@@ -72,8 +75,9 @@ where
     {
       let tags = opts.tags.load();
       if !tags.as_ref().is_empty() {
-        let len = tags_encoded_len(&tags);
-        if len > Meta::MAX_SIZE {
+        let len = tags.encoded_len_with_length_delimited();
+        let meta_encoded_len = 1 + (len as u32).encoded_len() + len;
+        if meta_encoded_len > Meta::MAX_SIZE {
           return Err(Error::tags_too_large(len));
         }
       }
@@ -126,7 +130,7 @@ where
     // Try access the snapshot
     let (old_clock, old_event_clock, old_query_clock, event_tx, alive_nodes, handle) =
       if let Some(sp) = opts.snapshot_path.as_ref() {
-        let rs = open_and_replay_snapshot::<_, _, D>(sp, opts.rejoin_after_leave)?;
+        let rs = open_and_replay_snapshot(sp, opts.rejoin_after_leave)?;
         let old_clock = rs.last_clock;
         let old_event_clock = rs.last_event_clock;
         let old_query_clock = rs.last_query_clock;
@@ -383,7 +387,7 @@ where
     // Process update locally
     self.handle_node_join_intent(&msg).await;
 
-    let msg = SerfMessage::Join(msg);
+    let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
     // Start broadcasting the update
     if let Err(e) = self.broadcast(msg, None).await {
       tracing::warn!(err=%e, "serf: failed to broadcast join intent");
@@ -468,7 +472,7 @@ where
       return Ok(());
     }
 
-    let msg = SerfMessage::Leave(msg);
+    let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
     // Broadcast the remove
     let (ntx, nrx) = async_channel::bounded(1);
     self.broadcast(msg, Some(ntx)).await?;
@@ -483,12 +487,12 @@ where
 
 struct Reaper<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   coord_core: Option<Arc<CoordCore<T::Id>>>,
   memberlist: Memberlist<T, SerfDelegate<T, D>>,
-  members: Arc<RwLock<Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>>,
+  members: Arc<RwLock<Members<T::Id, T::ResolvedAddress>>>,
   event_tx: async_channel::Sender<CrateEvent<T, D>>,
   shutdown_rx: async_channel::Receiver<()>,
   reap_interval: Duration,
@@ -555,7 +559,7 @@ macro_rules! reap {
 
 impl<T, D> Reaper<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   async fn run(self) {
@@ -589,7 +593,7 @@ where
 
   async fn reap_failed(
     local_id: &T::Id,
-    old: &mut Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    old: &mut Members<T::Id, T::ResolvedAddress>,
     event_tx: &async_channel::Sender<CrateEvent<T, D>>,
     reconnector: Option<&D>,
     coord: Option<&CoordCore<T::Id>>,
@@ -600,7 +604,7 @@ where
 
   async fn reap_left(
     local_id: &T::Id,
-    old: &mut Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    old: &mut Members<T::Id, T::ResolvedAddress>,
     event_tx: &async_channel::Sender<CrateEvent<T, D>>,
     reconnector: Option<&D>,
     coord: Option<&CoordCore<T::Id>>,
@@ -613,9 +617,9 @@ where
 struct Reconnector<T, D>
 where
   T: Transport,
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
 {
-  members: Arc<RwLock<Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>>,
+  members: Arc<RwLock<Members<T::Id, T::ResolvedAddress>>>,
   memberlist: Memberlist<T, SerfDelegate<T, D>>,
   shutdown_rx: async_channel::Receiver<()>,
   reconnect_interval: Duration,
@@ -623,11 +627,11 @@ where
 
 impl<T, D> Reconnector<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn spawn(self) -> <<T::Runtime as RuntimeLite>::Spawner as AsyncSpawner>::JoinHandle<()> {
-    let mut rng = rand::rngs::StdRng::from_rng(rand::thread_rng()).unwrap();
+    let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
 
     <T::Runtime as RuntimeLite>::spawn(async move {
       let tick = <T::Runtime as RuntimeLite>::interval(self.reconnect_interval);
@@ -657,7 +661,7 @@ where
             }
 
             // Select a random member to try and join
-            let idx: usize = rng.gen_range(0..num_failed);
+            let idx: usize = rng.random_range(0..num_failed);
             let member = &mu.failed_members[idx];
 
             let (id, address) = member.member.node().cheap_clone().into_components();
@@ -743,38 +747,58 @@ where
 // ---------------------------------Hanlders Methods-------------------------------
 impl<T, D> Serf<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Called when a user event broadcast is
   /// received. Returns if the message should be rebroadcast.
-  pub(crate) async fn handle_user_event(&self, msg: UserEventMessage) -> bool {
+  pub(crate) async fn handle_user_event(
+    &self,
+    msg: Either<UserEventMessageRef<'_>, UserEventMessage>,
+  ) -> bool {
+    let (ltime, name) = match &msg {
+      Either::Left(msg) => (msg.ltime(), msg.name()),
+      Either::Right(msg) => (msg.ltime, msg.name.as_str()),
+    };
+
     // Witness a potentially newer time
-    self.inner.event_clock.witness(msg.ltime);
+    self.inner.event_clock.witness(ltime);
 
     let mut el = self.inner.event_core.write().await;
 
     // Ignore if it is before our minimum event time
-    if msg.ltime < el.min_time {
+    if ltime < el.min_time {
       return false;
     }
 
     // Check if this message is too old
     let bltime = LamportTime::new(el.buffer.len() as u64);
     let cur_time = self.inner.event_clock.time();
-    if cur_time > bltime && msg.ltime < cur_time - bltime {
+    if cur_time > bltime && ltime < cur_time - bltime {
       tracing::warn!(
         "serf: received old event {} from time {} (current: {})",
-        msg.name,
-        msg.ltime,
+        name,
+        ltime,
         cur_time
       );
       return false;
     }
 
     // Check if we've already seen this
-    let idx = u64::from(msg.ltime % bltime) as usize;
+    let idx = u64::from(ltime % bltime) as usize;
     let seen: Option<&mut UserEvents> = el.buffer[idx].as_mut();
+
+    let msg = match msg {
+      Either::Left(msg) => match UserEventMessage::from_ref(msg) {
+        Ok(msg) => msg,
+        Err(e) => {
+          tracing::warn!("serf: failed to decode user event message: {}", e);
+          return false;
+        }
+      },
+      Either::Right(msg) => msg,
+    };
+
     let user_event = UserEvent {
       name: msg.name.clone(),
       payload: msg.payload.clone(),
@@ -788,7 +812,7 @@ where
       seen.events.push(user_event);
     } else {
       el.buffer[idx] = Some(UserEvents {
-        ltime: msg.ltime,
+        ltime,
         events: OneOrMore::from(user_event),
       });
     }
@@ -819,20 +843,26 @@ where
 
   pub(crate) fn query_event(
     &self,
-    q: QueryMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    ltime: LamportTime,
+    name: SmolStr,
+    payload: Bytes,
+    timeout: Duration,
+    id: u32,
+    from: Node<T::Id, T::ResolvedAddress>,
+    relay_factor: u8,
   ) -> QueryEvent<T, D> {
     QueryEvent {
-      ltime: q.ltime,
-      name: q.name,
-      payload: q.payload,
+      ltime,
+      name,
+      payload,
       ctx: Arc::new(QueryContext {
-        query_timeout: q.timeout,
+        query_timeout: timeout,
         span: Mutex::new(Some(Epoch::now())),
         this: self.clone(),
       }),
-      id: q.id,
-      from: q.from,
-      relay_factor: q.relay_factor,
+      id,
+      from,
+      relay_factor,
     }
   }
 
@@ -842,8 +872,7 @@ where
     payload: Bytes,
     params: Option<QueryParam<T::Id>>,
     ty: InternalQueryEvent<T::Id>,
-  ) -> Result<QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, Error<T, D>>
-  {
+  ) -> Result<QueryResponse<T::Id, T::ResolvedAddress>, Error<T, D>> {
     self.query_in(name, payload, params, Some(ty)).await
   }
 
@@ -853,8 +882,7 @@ where
     payload: Bytes,
     params: Option<QueryParam<T::Id>>,
     ty: Option<InternalQueryEvent<T::Id>>,
-  ) -> Result<QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, Error<T, D>>
-  {
+  ) -> Result<QueryResponse<T::Id, T::ResolvedAddress>, Error<T, D>> {
     // Provide default parameters if none given.
     let params = match params {
       Some(params) if params.timeout != Duration::ZERO => params,
@@ -868,9 +896,6 @@ where
     // Get the local node
     let local = self.inner.memberlist.advertise_node();
 
-    // Encode the filters
-    let filters = params.encode_filters::<D>()?;
-
     // Setup the flags
     let flags = if params.request_ack {
       QueryFlag::ACK
@@ -883,7 +908,7 @@ where
       ltime: self.inner.query_clock.time(),
       id: rand::random(),
       from: local.cheap_clone(),
-      filters,
+      filters: params.filters,
       flags,
       relay_factor: params.relay_factor,
       timeout: params.timeout,
@@ -908,7 +933,7 @@ where
       .await;
 
     // Process query locally
-    self.handle_query(q, ty).await;
+    self.handle_query(Either::Right(q), ty).await;
 
     // Start broadcasting the event
     self
@@ -927,7 +952,7 @@ where
   pub(crate) async fn register_query_response(
     &self,
     timeout: Duration,
-    resp: QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    resp: QueryResponse<T::Id, T::ResolvedAddress>,
   ) {
     let tresps = self.inner.query_core.clone();
     let mut resps = self.inner.query_core.write().await;
@@ -950,17 +975,41 @@ where
   /// received. Returns if the message should be rebroadcast.
   pub(crate) async fn handle_query(
     &self,
-    q: QueryMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    q: Either<
+      <QueryMessage<T::Id, T::ResolvedAddress> as Data>::Ref<'_>,
+      QueryMessage<T::Id, T::ResolvedAddress>,
+    >,
     ty: Option<InternalQueryEvent<T::Id>>,
-  ) -> bool {
+  ) -> Result<bool, memberlist_core::proto::DecodeError> {
+    let (qm_ltime, qm_id, qm_timeout, no_broadcast, ack, name, filters) = match q.as_ref() {
+      Either::Left(q) => (
+        q.ltime(),
+        q.id(),
+        q.timeout(),
+        q.no_broadcast(),
+        q.ack(),
+        q.name(),
+        Either::Left(*q.filters()),
+      ),
+      Either::Right(q) => (
+        q.ltime,
+        q.id(),
+        q.timeout(),
+        q.no_broadcast(),
+        q.ack(),
+        q.name.as_str(),
+        Either::Right(q.filters.as_slice()),
+      ),
+    };
+
     // Witness a potentially newer time
-    self.inner.query_clock.witness(q.ltime);
+    self.inner.query_clock.witness(qm_ltime);
 
     let mut query = self.inner.query_core.write().await;
 
     // Ignore if it is before our minimum query time
-    if q.ltime < query.min_time {
-      return false;
+    if qm_ltime < query.min_time {
+      return Ok(false);
     }
 
     // Check if this message is too old
@@ -969,30 +1018,30 @@ where
     if cur_time > q_time && q_time < cur_time - q_time {
       tracing::warn!(
         "serf: received old query {} from time {} (current: {})",
-        q.name,
-        q.ltime,
+        name,
+        qm_ltime,
         cur_time
       );
-      return false;
+      return Ok(false);
     }
 
     // Check if we've already seen this
-    let idx = u64::from(q.ltime % q_time) as usize;
+    let idx = u64::from(qm_ltime % q_time) as usize;
     let seen = query.buffer[idx].as_mut();
     if let Some(seen) = seen {
-      if seen.ltime == q.ltime {
+      if seen.ltime == qm_ltime {
         for &prev in seen.query_ids.iter() {
-          if q.id == prev {
+          if qm_id == prev {
             // Seen this ID already
-            return false;
+            return Ok(false);
           }
         }
       }
-      seen.query_ids.push(q.id);
+      seen.query_ids.push(qm_id);
     } else {
       query.buffer[idx] = Some(Queries {
-        ltime: q.ltime,
-        query_ids: MediumVec::from(q.id),
+        ltime: qm_ltime,
+        query_ids: MediumVec::from(qm_id),
       });
     }
 
@@ -1006,7 +1055,7 @@ where
       .increment(1);
 
       // TODO: how to avoid allocating here?
-      let named = format!("serf.queries.{}", q.name);
+      let named = format!("serf.queries.{}", name);
       metrics::counter!(
         named,
         self.inner.opts.memberlist_options.metric_labels().iter()
@@ -1016,22 +1065,22 @@ where
 
     // Check if we should rebroadcast, this may be disabled by a flag
     let mut rebroadcast = true;
-    if q.no_broadcast() {
+    if no_broadcast {
       rebroadcast = false;
     }
 
     // Filter the query
-    if !self.should_process_query(&q.filters) {
+    if !self.should_process_query(filters)? {
       // Even if we don't process it further, we should rebroadcast,
       // since it is the first time we've seen this.
-      return rebroadcast;
+      return Ok(rebroadcast);
     }
 
     // Send ack if requested, without waiting for client to respond()
-    if q.ack() {
+    let (name, payload, from, relay_factor) = if ack {
       let ack = QueryResponseMessage {
-        ltime: q.ltime,
-        id: q.id,
+        ltime: qm_ltime,
+        id: qm_id,
         from: self.inner.memberlist.advertise_node(),
         flags: QueryFlag::ACK,
         payload: Bytes::new(),
@@ -1039,24 +1088,59 @@ where
 
       match serf_proto::Encodable::encode_to_bytes(&ack) {
         Ok(raw) => {
-          if let Err(e) = self.inner.memberlist.send(q.from().address(), raw).await {
+          let (name, payload, from, relay_factor) = match q {
+            Either::Left(q) => (
+              SmolStr::new(q.name()),
+              Bytes::copy_from_slice(q.payload()),
+              Node::from_ref(*q.from())?,
+              q.relay_factor(),
+            ),
+            Either::Right(q) => (q.name, q.payload, q.from, q.relay_factor),
+          };
+
+          if let Err(e) = self.inner.memberlist.send(from.address(), raw).await {
             tracing::error!(err=%e, "serf: failed to send ack");
           }
 
-          if let Err(e) = self
-            .relay_response(q.relay_factor, q.from.clone(), ack)
-            .await
-          {
+          if let Err(e) = self.relay_response(relay_factor, from.clone(), ack).await {
             tracing::error!(err=%e, "serf: failed to relay ack");
           }
+          (name, payload, from, relay_factor)
         }
         Err(e) => {
           tracing::error!(err=%e, "serf: failed to format ack");
+          match q {
+            Either::Left(q) => (
+              SmolStr::new(q.name()),
+              Bytes::copy_from_slice(q.payload()),
+              Node::from_ref(*q.from())?,
+              q.relay_factor(),
+            ),
+            Either::Right(q) => (q.name, q.payload, q.from, q.relay_factor),
+          }
         }
       }
-    }
+    } else {
+      match q {
+        Either::Left(q) => (
+          SmolStr::new(q.name()),
+          Bytes::copy_from_slice(q.payload()),
+          Node::from_ref(*q.from())?,
+          q.relay_factor(),
+        ),
+        Either::Right(q) => (q.name, q.payload, q.from, q.relay_factor),
+      }
+    };
 
-    let ev = self.query_event(q);
+    let ev = self.query_event(
+      qm_ltime,
+      name,
+      payload,
+      qm_timeout,
+      qm_id,
+      from,
+      relay_factor,
+    );
 
     if let Err(e) = self
       .inner
@@ -1070,15 +1154,15 @@ where
       tracing::error!(err=%e, "serf: failed to send query");
     }
 
-    rebroadcast
+    Ok(rebroadcast)
   }
 
   /// Called when a query response is
   /// received.
   pub(crate) async fn handle_query_response(
     &self,
-    resp: QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-  ) {
+    resp: <QueryResponseMessage<T::Id, T::ResolvedAddress> as Data>::Ref<'_>,
+  ) -> Result<(), memberlist_core::proto::DecodeError> {
     // Look for a corresponding QueryResponse
     let qc = self
       .inner
@@ -1086,18 +1170,20 @@ where
       .read()
       .await
       .responses
-      .get(&resp.ltime)
+      .get(&resp.ltime())
       .cloned();
     if let Some(query) = qc {
       // Verify the ID matches
-      if query.id != resp.id {
+      if query.id != resp.id() {
         tracing::warn!(
           "serf: query reply ID mismatch (local: {}, response: {})",
           query.id,
-          resp.id
+          resp.id()
         );
-        return;
+        return Ok(());
       }
+
+      let resp = QueryResponseMessage::<T::Id, T::ResolvedAddress>::from_ref(resp)?;
 
       query
         .handle_query_response::<T, D>(
@@ -1109,20 +1195,19 @@ where
         .await;
     } else {
       tracing::warn!(
-        "serf: reply for non-running query (LTime: {}, ID: {}) From: {}",
-        resp.ltime,
-        resp.id,
-        resp.from
+        "serf: reply for non-running query (LTime: {}, ID: {}) From: {:?}",
+        resp.ltime(),
+        resp.id(),
+        resp.from()
       );
     }
+
+    Ok(())
   }
 
   /// Called when a node join event is received
   /// from memberlist.
-  pub(crate) async fn handle_node_join(
-    &self,
-    n: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-  ) {
+  pub(crate) async fn handle_node_join(&self, n: Arc<NodeState<T::Id, T::ResolvedAddress>>) {
     let mut members = self.inner.members.write().await;
 
     #[cfg(any(test, feature = "test"))]
@@ -1136,7 +1221,7 @@ where
 
     let node = n.node();
     let tags = if !n.meta().is_empty() {
-      match decode_tags(n.meta()) {
+      match <Tags as Data>::decode(n.meta()) {
         Ok((readed, tags)) => {
           tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
           tags
@@ -1291,10 +1376,7 @@ where
     }
   }
 
-  pub(crate) async fn handle_node_leave(
-    &self,
-    n: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-  ) {
+  pub(crate) async fn handle_node_leave(&self, n: Arc<NodeState<T::Id, T::ResolvedAddress>>) {
     let mut members = self.inner.members.write().await;
 
     let Some(member_state) = members.states.get_mut(n.id()) else {
@@ -1495,11 +1577,8 @@ where
 
   /// Called when a node meta data update
   /// has taken place
-  pub(crate) async fn handle_node_update(
-    &self,
-    n: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-  ) {
-    let tags = match decode_tags(n.meta()) {
+  pub(crate) async fn handle_node_update(&self, n: Arc<NodeState<T::Id, T::ResolvedAddress>>) {
+    let tags = match <Tags as Data>::decode(n.meta()) {
       Ok((readed, tags)) => {
         tracing::trace!(read = %readed, tags=?tags, "serf: decode tags successfully");
         tags
@@ -1552,8 +1631,8 @@ where
   /// erases a member from the list of members
   pub(crate) async fn handle_prune(
     &self,
-    member: &MemberState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    members: &mut Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+    member: &MemberState<T::Id, T::ResolvedAddress>,
+    members: &mut Members<T::Id, T::ResolvedAddress>,
   ) {
     let ms = member.member.status;
     if ms == MemberStatus::Leaving {
@@ -1582,8 +1661,8 @@ where
   /// will reject the "new" node mapping, but we can still be notified.
   pub(crate) async fn handle_node_conflict(
     &self,
-    existing: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-    other: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
+    existing: Arc<NodeState<T::Id, T::ResolvedAddress>>,
+    other: Arc<NodeState<T::Id, T::ResolvedAddress>>,
   ) {
     // Log a basic warning if the node is not us...
     if existing.id() != self.inner.memberlist.local_id() {
@@ -1617,13 +1696,14 @@ where
     // Get the local node
     let local_id = self.inner.memberlist.local_id();
     let local_advertise_addr = self.inner.memberlist.advertise_address();
-    let encoded_id_len = id_encoded_len(local_id);
-    let mut payload = vec![0u8; encoded_id_len];
 
-    if let Err(e) = encode_id(local_id, &mut payload) {
-      tracing::error!(err=%e, "serf: failed to encode local id");
-      return;
-    }
+    let payload = match local_id.encode_to_bytes() {
+      Ok(id) => id,
+      Err(e) => {
+        tracing::error!(err=%e, "serf: failed to encode local id");
+        return;
+      }
+    };
 
     // Start an id resolution query
     let ty = InternalQueryEvent::Conflict(local_id.clone());
@@ -1645,29 +1725,29 @@ where
     // Gather responses
     let resp_rx = resp.response_rx();
     while let Ok(r) = resp_rx.recv().await {
-      // Decode the response
-      if r.payload.is_empty() || r.payload[0] != MessageType::ConflictResponse as u8 {
-        tracing::warn!(
-          "serf: invalid conflict query response type: {:?}",
-          r.payload.as_ref()
-        );
-        continue;
-      }
-
-      match decode_message(MessageType::ConflictResponse, &r.payload[1..]) {
-        Ok((_, decoded)) => {
-          match decoded {
-            SerfMessage::ConflictResponse(member) => {
+      let res = serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&r.payload);
+      match res {
+        Ok(msg) => {
+          match msg {
+            MessageRef::ConflictResponse(resp) => {
               // Update the counters
               responses += 1;
-              if member.node.address().eq(local_advertise_addr) {
-                matching += 1;
+              match <T::ResolvedAddress as Data>::from_ref(*resp.member().node().address()) {
+                Ok(addr) => {
+                  if addr.eq(local_advertise_addr) {
+                    matching += 1;
+                  }
+                }
+                Err(e) => {
+                  tracing::error!(err=%e, "serf: failed to decode conflict query response");
+                  continue;
+                }
               }
             }
             msg => {
               tracing::warn!(
-                "serf: invalid conflict query response type: {}",
-                msg.ty().as_str()
+                type = %msg.ty(),
+                "serf: invalid conflict query response type",
               );
               continue;
             }

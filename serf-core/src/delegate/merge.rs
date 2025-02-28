@@ -1,5 +1,5 @@
-use memberlist_core::{CheapClone, proto::TinyVec, transport::Id};
-use std::future::Future;
+use memberlist_core::{CheapClone, transport::Id};
+use std::{future::Future, sync::Arc};
 
 use crate::types::Member;
 
@@ -23,7 +23,7 @@ pub trait MergeDelegate: Send + Sync + 'static {
   /// the return value is `Err`, the merge is canceled.
   fn notify_merge(
     &self,
-    members: TinyVec<Member<Self::Id, Self::Address>>,
+    members: Arc<[Member<Self::Id, Self::Address>]>,
   ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -48,7 +48,7 @@ where
 
   async fn notify_merge(
     &self,
-    _members: TinyVec<Member<Self::Id, Self::Address>>,
+    _members: Arc<[Member<Self::Id, Self::Address>]>,
   ) -> Result<(), Self::Error> {
     Ok(())
   }

@@ -2,15 +2,15 @@ use async_channel::{Receiver, Sender, bounded};
 use futures::FutureExt;
 use memberlist_core::{
   agnostic_lite::{AsyncSpawner, RuntimeLite},
-  bytes::{BufMut, Bytes, BytesMut},
+  bytes::Bytes,
   tracing,
-  transport::{AddressResolver, Transport},
+  transport::Transport,
 };
 
 use crate::{
   delegate::Delegate,
   event::{CrateEvent, InternalQueryEvent, QueryEvent},
-  types::MessageType,
+  types::MessageRef,
 };
 
 #[cfg(feature = "encryption")]
@@ -29,7 +29,7 @@ const MIN_ENCODED_KEY_LENGTH: usize = 25;
 
 pub(crate) struct SerfQueries<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   in_rx: Receiver<CrateEvent<T, D>>,
@@ -39,7 +39,7 @@ where
 
 impl<D, T> SerfQueries<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   #[allow(clippy::new_ret_no_self)]
@@ -179,9 +179,9 @@ where
   async fn handle_install_key(ev: impl AsRef<QueryEvent<T, D>> + Send) {
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
-    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-      Ok((_, msg)) => match msg {
-        SerfMessage::KeyRequest(req) => req,
+    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+      Ok(msg) => match msg {
+        MessageRef::KeyRequest(req) => req,
         msg => {
           tracing::error!(
             err = "unexpected message type",
@@ -242,15 +242,11 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-      Ok((_, msg)) => match msg {
-        SerfMessage::KeyRequest(req) => req,
+    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+      Ok(msg) => match msg {
+        MessageRef::KeyRequest(req) => req,
         msg => {
-          tracing::error!(
-            err = "unexpected message type",
-            "serf: {}",
-            msg.ty().as_str()
-          );
+          tracing::error!(err = "unexpected message type", "serf: {}", msg.ty());
           Self::send_key_response(q, &mut response).await;
           return;
         }
@@ -311,15 +307,11 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req = match decode_message(MessageType::KeyRequest, &q.payload[1..]) {
-      Ok((_, msg)) => match msg {
-        SerfMessage::KeyRequest(req) => req,
+    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+      Ok(msg) => match msg {
+        MessageRef::KeyRequest(req) => req,
         msg => {
-          tracing::error!(
-            err = "unexpected message type",
-            "serf: {}",
-            msg.ty().as_str()
-          );
+          tracing::error!(err = "unexpected message type", "serf: {}", msg.ty());
           Self::send_key_response(q, &mut response).await;
           return;
         }
@@ -422,7 +414,7 @@ where
   ) -> Result<
     (
       Bytes,
-      serf_proto::QueryResponseMessage<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+      serf_proto::QueryResponseMessage<T::Id, T::ResolvedAddress>,
     ),
     Error<T, D>,
   > {

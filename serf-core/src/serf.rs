@@ -130,40 +130,24 @@ where
 
 pub(crate) struct SerfCore<T, D = DefaultDelegate<T>>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) clock: LamportClock,
   pub(crate) event_clock: LamportClock,
   pub(crate) query_clock: LamportClock,
 
-  broadcasts: Arc<
-    TransmitLimitedQueue<
-      SerfBroadcast,
-      NumMembers<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    >,
-  >,
-  event_broadcasts: Arc<
-    TransmitLimitedQueue<
-      SerfBroadcast,
-      NumMembers<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    >,
-  >,
-  query_broadcasts: Arc<
-    TransmitLimitedQueue<
-      SerfBroadcast,
-      NumMembers<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
-    >,
-  >,
+  broadcasts: Arc<TransmitLimitedQueue<SerfBroadcast, NumMembers<T::Id, T::ResolvedAddress>>>,
+  event_broadcasts: Arc<TransmitLimitedQueue<SerfBroadcast, NumMembers<T::Id, T::ResolvedAddress>>>,
+  query_broadcasts: Arc<TransmitLimitedQueue<SerfBroadcast, NumMembers<T::Id, T::ResolvedAddress>>>,
 
   pub(crate) memberlist: Memberlist<T, SerfDelegate<T, D>>,
-  pub(crate) members:
-    Arc<RwLock<Members<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>>,
+  pub(crate) members: Arc<RwLock<Members<T::Id, T::ResolvedAddress>>>,
   event_tx: async_channel::Sender<CrateEvent<T, D>>,
   pub(crate) event_join_ignore: AtomicBool,
 
   pub(crate) event_core: RwLock<EventCore>,
-  query_core: Arc<RwLock<QueryCore<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>>,
+  query_core: Arc<RwLock<QueryCore<T::Id, T::ResolvedAddress>>>,
   handles: AtomicRefCell<
     FuturesUnordered<<<T::Runtime as RuntimeLite>::Spawner as AsyncSpawner>::JoinHandle<()>>,
   >,
@@ -190,7 +174,7 @@ where
 #[repr(transparent)]
 pub struct Serf<T: Transport, D = DefaultDelegate<T>>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) inner: Arc<SerfCore<T, D>>,
@@ -198,7 +182,7 @@ where
 
 impl<T: Transport, D: Delegate> Clone for Serf<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   fn clone(&self) -> Self {

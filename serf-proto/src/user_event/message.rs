@@ -80,16 +80,24 @@ const PAYLOAD_BYTE: u8 = merge(WireType::LengthDelimited, PAYLOAD_TAG);
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct UserEventMessageRef<'a> {
   /// The lamport time
-  #[viewit(getter(const, attrs(doc = "Returns the lamport time for this message")))]
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns the lamport time for this message")
+  ))]
   ltime: LamportTime,
   /// The name of the event
-  #[viewit(getter(const, attrs(doc = "Returns the name of the event")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the name of the event")))]
   name: &'a str,
   /// The payload of the event
-  #[viewit(getter(const, attrs(doc = "Returns the payload of the event")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the payload of the event")))]
   payload: &'a [u8],
   /// "Can Coalesce".
-  #[viewit(getter(const, attrs(doc = "Returns if this message can be coalesced")))]
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns if this message can be coalesced")
+  ))]
   cc: bool,
 }
 

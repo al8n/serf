@@ -3,14 +3,9 @@ use std::{collections::HashMap, sync::OnceLock};
 use async_channel::Receiver;
 use async_lock::RwLock;
 use futures::StreamExt;
-use memberlist_core::{
-  CheapClone,
-  bytes::{BufMut, BytesMut},
-  proto::SecretKey,
-  tracing,
-  transport::{AddressResolver, Transport},
-};
-use smol_str::SmolStr;
+use memberlist_core::{CheapClone, proto::SecretKey, tracing, transport::Transport};
+use serf_proto::MessageRef;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::event::{
   INTERNAL_INSTALL_KEY, INTERNAL_LIST_KEYS, INTERNAL_REMOVE_KEY, INTERNAL_USE_KEY,
@@ -84,7 +79,7 @@ pub struct KeyRequestOptions {
 /// encryption keyring changes across a cluster.
 pub struct KeyManager<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   serf: OnceLock<Serf<T, D>>,
@@ -94,7 +89,7 @@ where
 
 impl<T, D> KeyManager<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) fn new() -> Self {
@@ -193,7 +188,7 @@ where
     if let Some(opts) = opts {
       q_param.relay_factor = opts.relay_factor;
     }
-    let qresp: QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> = serf
+    let qresp: QueryResponse<T::Id, T::ResolvedAddress> = serf
       .internal_query(SmolStr::new(ty), buf, Some(q_param), event)
       .await?;
 
@@ -222,7 +217,7 @@ where
 
   async fn stream_key_response(
     &self,
-    ch: Receiver<NodeResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
+    ch: Receiver<NodeResponse<T::Id, T::ResolvedAddress>>,
   ) -> KeyResponse<T::Id> {
     let mut resp = KeyResponse {
       num_nodes: self.serf.get().unwrap().num_members().await,
@@ -253,16 +248,14 @@ where
         continue;
       }
 
-      let node_response = match decode_message(MessageType::KeyResponse, &r.payload[1..]) {
-        Ok((_, nr)) => match nr {
-          SerfMessage::KeyResponse(kr) => kr,
+      let node_response = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&r.payload)
+      {
+        Ok(msg) => match msg {
+          MessageRef::KeyResponse(kr) => kr,
           msg => {
             resp.messages.insert(
               r.from.id().cheap_clone(),
-              SmolStr::new(format!(
-                "Invalid key query response type: {:?}",
-                msg.ty().as_str()
-              )),
+              format_smolstr!("Invalid key query response type: {}", msg.ty()),
             );
             resp.num_err += 1;
 
@@ -286,27 +279,47 @@ where
         }
       };
 
-      if !node_response.result {
-        resp
-          .messages
-          .insert(r.from.id().cheap_clone(), node_response.message);
+      if !node_response.result() {
+        resp.messages.insert(
+          r.from.id().cheap_clone(),
+          SmolStr::new(node_response.message()),
+        );
         resp.num_err += 1;
-      } else if node_response.result && node_response.message.is_empty() {
-        tracing::warn!("serf: {}", node_response.message);
-        resp
-          .messages
-          .insert(r.from.id().cheap_clone(), node_response.message);
+      } else if node_response.result() && node_response.message().is_empty() {
+        tracing::warn!("serf: {}", node_response.message());
+        resp.messages.insert(
+          r.from.id().cheap_clone(),
+          SmolStr::new(node_response.message()),
+        );
       }
 
       // Currently only used for key list queries, this adds keys to a counter
       // and increments them for each node response which contains them.
-      for k in node_response.keys {
-        let count = resp.keys.entry(k).or_insert(0);
-        *count += 1;
+      let res = node_response
+        .keys()
+        .iter::<SecretKey>()
+        .try_for_each(|res| {
+          res.map(|k| {
+            let count = resp.keys.entry(k).or_insert(0);
+            *count += 1;
+          })
+        });
+
+      if let Err(e) = res {
+        resp.messages.insert(
+          r.from.id().cheap_clone(),
+          SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
+        );
+        resp.num_err += 1;
+
+        if resp.num_resp == resp.num_nodes {
+          return resp;
+        }
+        continue;
       }
 
-      if let Some(pk) = node_response.primary_key {
-        let ctr = resp.primary_keys.entry(pk).or_insert(0);
+      if let Some(pk) = node_response.primary_key() {
+        let ctr = resp.primary_keys.entry(*pk).or_insert(0);
         *ctr += 1;
       }
 

@@ -81,19 +81,23 @@ impl<I, A> QueryResponseMessage<I, A> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct QueryResponseMessageRef<'a, I, A> {
   /// Event lamport time
-  #[viewit(getter(const, attrs(doc = "Returns the lamport time for this message")))]
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns the lamport time for this message")
+  ))]
   ltime: LamportTime,
   /// query id
-  #[viewit(getter(const, attrs(doc = "Returns the query id")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the query id")))]
   id: u32,
   /// node
   #[viewit(getter(const, attrs(doc = "Returns the from node")))]
   from: Node<I, A>,
   /// Used to provide various flags
-  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the flags")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the flags")))]
   flags: QueryFlag,
   /// Optional response payload
-  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the payload")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the payload")))]
   payload: &'a [u8],
 }
 

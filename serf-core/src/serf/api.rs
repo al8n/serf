@@ -58,7 +58,7 @@ where
 
 impl<T, D> Serf<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   /// Creates a new Serf instance with the given transport and options.
@@ -104,7 +104,7 @@ where
 
   /// Returns the local node's ID and the advertised address
   #[inline]
-  pub fn advertise_node(&self) -> Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> {
+  pub fn advertise_node(&self) -> Node<T::Id, T::ResolvedAddress> {
     self.inner.memberlist.advertise_node()
   }
 
@@ -134,9 +134,7 @@ where
 
   /// Returns a point-in-time snapshot of the members of this cluster.
   #[inline]
-  pub async fn members(
-    &self,
-  ) -> OneOrMore<Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>> {
+  pub async fn members(&self) -> OneOrMore<Member<T::Id, T::ResolvedAddress>> {
     self
       .inner
       .members
@@ -202,9 +200,7 @@ where
 
   /// Returns the Member information for the local node
   #[inline]
-  pub async fn local_member(
-    &self,
-  ) -> Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress> {
+  pub async fn local_member(&self) -> Member<T::Id, T::ResolvedAddress> {
     self
       .inner
       .members
@@ -290,7 +286,7 @@ where
     self.inner.event_clock.increment();
 
     // Process update locally
-    self.handle_user_event(msg).await;
+    self.handle_user_event(either::Either::Right(msg)).await;
 
     self
       .inner
@@ -312,8 +308,7 @@ where
     name: impl Into<SmolStr>,
     payload: impl Into<Bytes>,
     params: Option<QueryParam<T::Id>>,
-  ) -> Result<QueryResponse<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, Error<T, D>>
-  {
+  ) -> Result<QueryResponse<T::Id, T::ResolvedAddress>, Error<T, D>> {
     self
       .query_in(name.into(), payload.into(), params, None)
       .await
@@ -326,7 +321,7 @@ where
     &self,
     node: Node<T::Id, MaybeResolvedAddress<T>>,
     ignore_old: bool,
-  ) -> Result<Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, Error<T, D>> {
+  ) -> Result<Node<T::Id, T::ResolvedAddress>, Error<T, D>> {
     // Do a quick state check
     let current_state = self.state();
     if current_state != SerfState::Alive {

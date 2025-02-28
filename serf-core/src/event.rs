@@ -12,12 +12,7 @@ pub use async_channel::{RecvError, TryRecvError};
 use async_lock::Mutex;
 pub(crate) use crate_event::*;
 use futures::Stream;
-use memberlist_core::{
-  CheapClone,
-  bytes::Bytes,
-  proto::TinyVec,
-  transport::{AddressResolver, Transport},
-};
+use memberlist_core::{CheapClone, bytes::Bytes, proto::TinyVec, transport::Transport};
 use serf_proto::{LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage};
 use smol_str::SmolStr;
 

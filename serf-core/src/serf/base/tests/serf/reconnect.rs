@@ -10,7 +10,7 @@ use super::*;
 pub async fn serf_reconnect<T, F>(
   transport_opts1: T::Options,
   transport_opts2: T::Options,
-  get_transport: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport,
   F: core::future::Future<Output = T::Options>,
@@ -74,7 +74,7 @@ pub async fn serf_reconnect<T, F>(
 pub async fn serf_reconnect_same_ip<T, R, F>(
   transport_opts1: T::Options,
   transport2_id: T::Id,
-  get_transport: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport<Id = SmolStr, Resolver = SocketAddrResolver<R>>,
   T::Options: Clone,

@@ -1,4 +1,13 @@
-use memberlist_proto::{Data, EncodeError, WireType, bytes::Bytes, utils::merge};
+use memberlist_proto::{
+  Data, DataRef, DecodeError, EncodeError, Node, WireType,
+  bytes::Bytes,
+  utils::{merge, skip, split},
+};
+
+use crate::{
+  ConflictResponseMessageRef, PushPullMessage, PushPullMessageRef, QueryMessageRef,
+  QueryResponseMessageRef, UserEventMessageRef,
+};
 
 use super::{
   ConflictResponseMessage, ConflictResponseMessageBorrow, JoinMessage, LeaveMessage,
@@ -6,7 +15,7 @@ use super::{
 };
 
 #[cfg(feature = "encryption")]
-use super::{KeyRequestMessage, KeyResponseMessage};
+use super::{KeyRequestMessage, KeyResponseMessage, KeyResponseMessageRef};
 
 const LEAVE_MESSAGE_TAG: u8 = 1;
 const JOIN_MESSAGE_TAG: u8 = 2;
@@ -38,33 +47,44 @@ const KEY_RESPONSE_MESSAGE_BYTE: u8 = merge(WireType::LengthDelimited, KEY_RESPO
 
 /// The types of gossip messages Serf will send along
 /// memberlist.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, derive_more::Display, derive_more::IsVariant)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum MessageType {
   /// Leave message
+  #[display("leave")]
   Leave,
   /// Join message
+  #[display("join")]
   Join,
   /// PushPull message
+  #[display("push_pull")]
   PushPull,
   /// UserEvent message
+  #[display("user_event")]
   UserEvent,
   /// Query message
+  #[display("query")]
   Query,
   /// QueryResponse message
+  #[display("query_response")]
   QueryResponse,
   /// ConflictResponse message
+  #[display("conflict_response")]
   ConflictResponse,
   /// Relay message
+  #[display("relay")]
   Relay,
   /// KeyRequest message
   #[cfg(feature = "encryption")]
+  #[display("key_request")]
   KeyRequest,
   /// KeyResponse message
   #[cfg(feature = "encryption")]
+  #[display("key_response")]
   KeyResponse,
   /// Unknown message type, used for forwards and backwards compatibility
+  #[display("unknown({_0})")]
   Unknown(u8),
 }
 
@@ -141,19 +161,29 @@ macro_rules! bail {
   };
 }
 
+const RELAY_NODE_TAG: u8 = 1;
+const RELAY_MSG_TAG: u8 = 2;
+
+const RELAY_NODE_BYTE: u8 = merge(WireType::LengthDelimited, RELAY_NODE_TAG);
+const RELAY_MSG_BYTE: u8 = merge(WireType::LengthDelimited, RELAY_MSG_TAG);
+
 /// A trait for encoding messages.
 pub trait Encodable {
   /// Encodes the message into a buffer.
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError>;
 
   /// Encodes a relay message into a buffer.
-  fn encode_relay(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+  fn encode_relay<I, A>(&self, node: &Node<I, A>, buf: &mut [u8]) -> Result<usize, EncodeError>
+  where
+    I: Data,
+    A: Data,
+  {
     let mut offset = 0;
     let buf_len = buf.len();
 
     if offset >= buf_len {
       return Err(EncodeError::insufficient_buffer(
-        self.encoded_len_with_relay(),
+        self.encoded_len_with_relay(node),
         buf_len,
       ));
     }
@@ -161,12 +191,36 @@ pub trait Encodable {
     buf[offset] = RELAY_MESSAGE_BYTE;
     offset += 1;
 
+    if offset >= buf_len {
+      return Err(EncodeError::insufficient_buffer(
+        self.encoded_len_with_relay(node),
+        buf_len,
+      ));
+    }
+
+    buf[offset] = RELAY_NODE_BYTE;
+    offset += 1;
+
+    offset += node
+      .encode_length_delimited(&mut buf[offset..])
+      .map_err(|e| e.update(self.encoded_len_with_relay(node), buf_len))?;
+
+    if offset >= buf_len {
+      return Err(EncodeError::insufficient_buffer(
+        self.encoded_len_with_relay(node),
+        buf_len,
+      ));
+    }
+
+    buf[offset] = RELAY_MSG_BYTE;
+    offset += 1;
+
     offset += self
       .encode(&mut buf[offset..])
-      .map_err(|e| e.update(self.encoded_len_with_relay(), buf_len))?;
+      .map_err(|e| e.update(self.encoded_len_with_relay(node), buf_len))?;
 
     #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, self.encoded_len_with_relay());
+    super::debug_assert_write_eq(offset, self.encoded_len_with_relay(node));
 
     Ok(offset)
   }
@@ -179,18 +233,26 @@ pub trait Encodable {
   }
 
   /// Encodes a relay message into a [`Bytes`].
-  fn encode_relay_to_bytes(&self) -> Result<Bytes, EncodeError> {
-    let len = self.encoded_len_with_relay();
+  fn encode_relay_to_bytes<I, A>(&self, node: &Node<I, A>) -> Result<Bytes, EncodeError>
+  where
+    I: Data,
+    A: Data,
+  {
+    let len = self.encoded_len_with_relay(node);
     let mut buf = vec![0; len];
-    self.encode_relay(&mut buf).map(|_| Bytes::from(buf))
+    self.encode_relay(node, &mut buf).map(|_| Bytes::from(buf))
   }
 
   /// Returns the encoded length of the message.
   fn encoded_len(&self) -> usize;
 
   /// Returns the encoded length of the message with a relay tag.
-  fn encoded_len_with_relay(&self) -> usize {
-    1 + self.encoded_len()
+  fn encoded_len_with_relay<I, A>(&self, node: &Node<I, A>) -> usize
+  where
+    I: Data,
+    A: Data,
+  {
+    1 + node.encoded_len_with_length_delimited() + 1 + self.encoded_len()
   }
 }
 
@@ -306,4 +368,320 @@ where
   fn encoded_len(&self) -> usize {
     1 + self.encoded_len_in()
   }
+}
+
+/// A reference to a message.
+pub enum MessageRef<'a, I, A> {
+  /// Leave message
+  Leave(LeaveMessage<I>),
+  /// Join message
+  Join(JoinMessage<I>),
+  /// PushPull message
+  PushPull(PushPullMessageRef<'a, I>),
+  /// UserEvent message
+  UserEvent(UserEventMessageRef<'a>),
+  /// Query message
+  Query(QueryMessageRef<'a, I, A>),
+  /// QueryResponse message
+  QueryResponse(QueryResponseMessageRef<'a, I, A>),
+  /// ConflictResponse message
+  ConflictResponse(ConflictResponseMessageRef<'a, I, A>),
+  /// Relay message
+  Relay {
+    /// The node
+    node: Node<I, A>,
+    /// The offset of the payload to the original buffer
+    payload_offset: usize,
+    /// The relay message payload
+    payload: &'a [u8],
+  },
+  #[cfg(feature = "encryption")]
+  /// KeyRequest message
+  KeyRequest(KeyRequestMessage),
+  #[cfg(feature = "encryption")]
+  /// KeyResponse message
+  KeyResponse(KeyResponseMessageRef<'a>),
+}
+
+impl<I, A> MessageRef<'_, I, A> {
+  /// Returns the message type.
+  #[inline]
+  pub fn ty(&self) -> MessageType {
+    match self {
+      Self::Leave(_) => MessageType::Leave,
+      Self::Join(_) => MessageType::Join,
+      Self::PushPull(_) => MessageType::PushPull,
+      Self::UserEvent(_) => MessageType::UserEvent,
+      Self::Query(_) => MessageType::Query,
+      Self::QueryResponse(_) => MessageType::QueryResponse,
+      Self::ConflictResponse(_) => MessageType::ConflictResponse,
+      Self::Relay { .. } => MessageType::Relay,
+      #[cfg(feature = "encryption")]
+      Self::KeyRequest(_) => MessageType::KeyRequest,
+      #[cfg(feature = "encryption")]
+      Self::KeyResponse(_) => MessageType::KeyResponse,
+    }
+  }
+}
+
+/// Decode a message from a buffer.
+pub fn decode_message<I, A>(
+  buf: &[u8],
+) -> Result<MessageRef<'_, I::Ref<'_>, A::Ref<'_>>, DecodeError>
+where
+  I: Data + Eq + core::hash::Hash,
+  A: Data,
+{
+  let mut offset = 0;
+  let buf_len = buf.len();
+  let mut msg = None;
+
+  while offset < buf_len {
+    match buf[offset] {
+      LEAVE_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            LEAVE_MESSAGE_TAG,
+          ));
+        }
+        offset += 1;
+
+        let (len, val) =
+          <LeaveMessage<I::Ref<'_>> as DataRef<'_, LeaveMessage<I>>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        msg = Some(MessageRef::Leave(val));
+      }
+      JOIN_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            JOIN_MESSAGE_TAG,
+          ));
+        }
+
+        offset += 1;
+        let (len, val) =
+          <JoinMessage<I::Ref<'_>> as DataRef<'_, JoinMessage<I>>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        msg = Some(MessageRef::Join(val));
+      }
+      PUSH_PULL_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            PUSH_PULL_MESSAGE_TAG,
+          ));
+        }
+
+        offset += 1;
+        let (len, val) = <PushPullMessageRef<'_, I::Ref<'_>> as DataRef<'_, PushPullMessage<I>>>::decode_length_delimited(&buf[offset..])?;
+        offset += len;
+        msg = Some(MessageRef::PushPull(val));
+      }
+      USER_EVENT_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            USER_EVENT_MESSAGE_TAG,
+          ));
+        }
+
+        offset += 1;
+        let (len, val) =
+          <UserEventMessageRef<'_> as DataRef<'_, UserEventMessage>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        msg = Some(MessageRef::UserEvent(val));
+      }
+      QUERY_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            QUERY_MESSAGE_TAG,
+          ));
+        }
+        offset += 1;
+        let (len, val) = <QueryMessageRef<'_, I::Ref<'_>, A::Ref<'_>> as DataRef<
+          '_,
+          QueryMessage<I, A>,
+        >>::decode_length_delimited(&buf[offset..])?;
+        offset += len;
+        msg = Some(MessageRef::Query(val));
+      }
+      QUERY_RESPONSE_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            QUERY_RESPONSE_MESSAGE_TAG,
+          ));
+        }
+        offset += 1;
+        let (len, val) = <QueryResponseMessageRef<'_, I::Ref<'_>, A::Ref<'_>> as DataRef<
+          '_,
+          QueryResponseMessage<I, A>,
+        >>::decode_length_delimited(&buf[offset..])?;
+        offset += len;
+        msg = Some(MessageRef::QueryResponse(val));
+      }
+      CONFLICT_RESPONSE_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            CONFLICT_RESPONSE_MESSAGE_TAG,
+          ));
+        }
+        offset += 1;
+        let (len, val) = <ConflictResponseMessageRef<'_, I::Ref<'_>, A::Ref<'_>> as DataRef<
+          '_,
+          ConflictResponseMessage<I, A>,
+        >>::decode_length_delimited(&buf[offset..])?;
+        offset += len;
+        msg = Some(MessageRef::ConflictResponse(val));
+      }
+      RELAY_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            RELAY_MESSAGE_TAG,
+          ));
+        }
+        offset += 1;
+        let (readed, (node, payload)) = decode_relay::<I, A>(&buf[offset..])?;
+        offset += readed;
+        msg = Some(MessageRef::Relay {
+          node,
+          payload,
+          payload_offset: offset - payload.len(),
+        });
+      }
+      #[cfg(feature = "encryption")]
+      KEY_REQUEST_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            KEY_REQUEST_MESSAGE_TAG,
+          ));
+        }
+
+        offset += 1;
+        let (len, val) =
+          <KeyRequestMessage as DataRef<'_, KeyRequestMessage>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        msg = Some(MessageRef::KeyRequest(val));
+      }
+      #[cfg(feature = "encryption")]
+      KEY_RESPONSE_MESSAGE_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "Message",
+            "value",
+            KEY_RESPONSE_MESSAGE_TAG,
+          ));
+        }
+
+        offset += 1;
+        let (len, val) =
+          <KeyResponseMessageRef<'_> as DataRef<'_, KeyResponseMessage>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        msg = Some(MessageRef::KeyResponse(val));
+      }
+      other => {
+        offset += 1;
+
+        let (wire_type, _) = split(other);
+        let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+        offset += skip(wire_type, &buf[offset..])?;
+      }
+    }
+  }
+
+  let msg = msg.ok_or(DecodeError::missing_field("Message", "value"))?;
+  Ok(msg)
+}
+
+fn decode_relay<I, A>(
+  buf: &[u8],
+) -> Result<(usize, (Node<I::Ref<'_>, A::Ref<'_>>, &[u8])), DecodeError>
+where
+  I: Data,
+  A: Data,
+{
+  let mut offset = 0;
+  let buf_len = buf.len();
+
+  let mut node = None;
+  let mut msg = None;
+
+  while offset < buf_len {
+    match buf[offset] {
+      RELAY_NODE_BYTE => {
+        if node.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "RelayMessage",
+            "node",
+            RELAY_NODE_TAG,
+          ));
+        }
+        offset += 1;
+
+        let (len, val) =
+          <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(
+            &buf[offset..],
+          )?;
+        offset += len;
+        node = Some(val);
+      }
+      RELAY_MSG_BYTE => {
+        if msg.is_some() {
+          return Err(DecodeError::duplicate_field(
+            "RelayMessage",
+            "msg",
+            RELAY_MSG_TAG,
+          ));
+        }
+        offset += 1;
+
+        // Skip length-delimited field by reading the length and skipping the payload
+        if buf[offset..].is_empty() {
+          return Err(DecodeError::buffer_underflow());
+        }
+
+        let (read, length) = <u32 as Data>::decode(&buf[offset..])?;
+        offset += read;
+
+        msg = Some(&buf[offset..offset + length as usize]);
+        offset += length as usize;
+      }
+      other => {
+        offset += 1;
+
+        let (wire_type, _) = split(other);
+        let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+        offset += skip(wire_type, &buf[offset..])?;
+      }
+    }
+  }
+
+  let node = node.ok_or(DecodeError::missing_field("RelayMessage", "node"))?;
+
+  Ok((offset, (node, msg.unwrap_or_default())))
 }

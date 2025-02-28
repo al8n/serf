@@ -32,7 +32,7 @@ impl<T, D> UserEventCoalescer<T, D> {
 
 impl<T, D> Coalescer for UserEventCoalescer<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Delegate = D;

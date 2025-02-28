@@ -40,7 +40,7 @@ where
 /// Unit test for reap handler
 pub async fn serf_reap_handler<T>(
   opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -131,7 +131,7 @@ pub async fn serf_reap_handler<T>(
 }
 
 /// Unit test for reap
-pub async fn serf_reap<T>(opts: T::Options, addr: <T::Resolver as AddressResolver>::ResolvedAddress)
+pub async fn serf_reap<T>(opts: T::Options, addr: T::ResolvedAddress)
 where
   T: Transport<Id = SmolStr>,
 {

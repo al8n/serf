@@ -168,11 +168,25 @@ pub struct QueryMessageRef<'a, I, A> {
   ))]
   timeout: Duration,
   /// Query nqme
-  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the name of the query")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the name of the query")))]
   name: &'a str,
   /// Query payload
-  #[viewit(getter(const, style = "ref", attrs(doc = "Returns the payload")))]
+  #[viewit(getter(const, style = "move", attrs(doc = "Returns the payload")))]
   payload: &'a [u8],
+}
+
+impl<I, A> QueryMessageRef<'_, I, A> {
+  /// Checks if the ack flag is set
+  #[inline]
+  pub fn ack(&self) -> bool {
+    self.flags.contains(QueryFlag::ACK)
+  }
+
+  /// Checks if the no broadcast flag is set
+  #[inline]
+  pub fn no_broadcast(&self) -> bool {
+    self.flags.contains(QueryFlag::NO_BROADCAST)
+  }
 }
 
 impl<'a, I, A> DataRef<'a, QueryMessage<I, A>> for QueryMessageRef<'a, I::Ref<'a>, A::Ref<'a>>

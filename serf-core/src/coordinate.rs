@@ -4,7 +4,10 @@ use std::{
   time::Duration,
 };
 
-use memberlist_core::CheapClone;
+use memberlist_core::{
+  CheapClone,
+  proto::{Data, DataRef, DecodeError, EncodeError, RepeatedDecoder},
+};
 use parking_lot::RwLock;
 use rand::Rng;
 use smallvec::SmallVec;
@@ -720,6 +723,44 @@ fn rand_f64() -> f64 {
       continue;
     }
     return f;
+  }
+}
+
+/// The reference type to [`Coordinate`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CoordinateRef<'a> {
+  portion: RepeatedDecoder<'a>,
+  error: f64,
+  adjustment: f64,
+  height: f64,
+}
+
+impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
+  fn decode(buf: &'a [u8]) -> Result<(usize, Self), DecodeError>
+  where
+    Self: Sized,
+  {
+    todo!()
+  }
+}
+
+impl Data for Coordinate {
+  type Ref<'a> = CoordinateRef<'a>;
+
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
+  where
+    Self: Sized,
+  {
+    // Ok(val)
+    todo!()
+  }
+
+  fn encoded_len(&self) -> usize {
+    todo!()
+  }
+
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    todo!()
   }
 }
 

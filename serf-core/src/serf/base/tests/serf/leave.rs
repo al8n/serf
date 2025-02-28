@@ -34,7 +34,7 @@ where
 /// Unit tests for the leave intent old message
 pub async fn leave_intent_old_message<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -86,7 +86,7 @@ pub async fn leave_intent_old_message<T>(
 /// Unit tests for the leave intent newer
 pub async fn leave_intent_newer<T>(
   transport_opts: T::Options,
-  addr: <T::Resolver as AddressResolver>::ResolvedAddress,
+  addr: T::ResolvedAddress,
 ) where
   T: Transport<Id = SmolStr>,
 {
@@ -417,7 +417,7 @@ pub async fn serf_leave_rejoin_different_role<T>(
 pub async fn serf_leave_snapshot_recovery<T, F>(
   transport_opts1: T::Options,
   transport_opts2: T::Options,
-  get_transport: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport,
   F: core::future::Future<Output = T::Options>,

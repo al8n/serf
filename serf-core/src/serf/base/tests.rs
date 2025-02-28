@@ -42,7 +42,7 @@ fn test_config() -> Options {
 
 async fn wait_until_num_nodes<T, D>(desired_nodes: usize, serfs: &[Serf<T, D>])
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let start = Epoch::now();
@@ -68,7 +68,7 @@ where
 
 async fn wait_until_intent_queue_len<T, D>(desired_len: usize, serfs: &[Serf<T, D>])
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let start = Epoch::now();
@@ -104,7 +104,7 @@ async fn test_events<T, D>(
   node: T::Id,
   expected: Vec<CrateEventType>,
 ) where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let mut actual = Vec::with_capacity(expected.len());
@@ -147,7 +147,7 @@ async fn test_user_events<T, D>(
   expected_name: Vec<SmolStr>,
   expected_payload: Vec<Bytes>,
 ) where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let mut actual_name = Vec::with_capacity(expected_name.len());
@@ -182,7 +182,7 @@ async fn test_query_events<T, D>(
   expected_name: Vec<SmolStr>,
   expected_payload: Vec<Bytes>,
 ) where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let mut actual_name = Vec::with_capacity(expected_name.len());

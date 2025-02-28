@@ -2,18 +2,22 @@ use crate::{
   Serf,
   broadcast::SerfBroadcast,
   delegate::Delegate,
-  error::SerfError,
+  error::{Error, SerfDelegateError, SerfError},
   event::QueryMessageExt,
   types::{
     DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus,
-    MemberlistDelegateVersion, MemberlistProtocolVersion, MessageType, ProtocolVersion,
-    PushPullMessageBorrow, SerfMessage, UserEventMessage,
+    MemberlistDelegateVersion, MemberlistProtocolVersion, MessageRef, MessageType, ProtocolVersion,
+    PushPullMessageBorrow, UserEventMessage,
   },
 };
 
-use std::sync::{Arc, OnceLock, atomic::Ordering};
+use std::{
+  borrow::Cow,
+  sync::{Arc, OnceLock, atomic::Ordering},
+};
 
 use arc_swap::ArcSwap;
+use either::Either;
 use indexmap::IndexSet;
 use memberlist_core::{
   CheapClone, META_MAX_SIZE,
@@ -22,11 +26,11 @@ use memberlist_core::{
     AliveDelegate, ConflictDelegate, Delegate as MemberlistDelegate, EventDelegate,
     MergeDelegate as MemberlistMergeDelegate, NodeDelegate, PingDelegate,
   },
-  proto::{Meta, NodeState, SmallVec, State, TinyVec},
+  proto::{Data, Meta, NodeState, SmallVec, State, TinyVec},
   tracing,
   transport::{AddressResolver, Transport},
 };
-use serf_proto::Tags;
+use serf_proto::{PushPullMessage, Tags};
 
 // PingVersion is an internal version for the ping message, above the normal
 // versioning we get from the protocol version. This enables small updates
@@ -41,7 +45,7 @@ pub(crate) trait MessageDropper: Send + Sync + 'static {
 /// The memberlist delegate for Serf.
 pub struct SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   serf: OnceLock<Serf<T, D>>,
@@ -58,7 +62,7 @@ where
 
 impl<D, T> SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   pub(crate) fn new(d: Option<D>, tags: Arc<ArcSwap<Tags>>) -> Self {
@@ -110,14 +114,14 @@ where
 
 impl<D, T> NodeDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   async fn node_meta(&self, limit: usize) -> Meta {
     let tags = self.tags.load();
     match tags.is_empty() {
       false => {
-        let encoded_len = tags_encoded_len(&tags);
+        let encoded_len = tags.encoded_len();
         let limit = limit.min(Meta::MAX_SIZE);
         if encoded_len > limit {
           panic!(
@@ -127,14 +131,8 @@ where
         }
 
         let mut role_bytes = vec![0; encoded_len];
-        match encode_tags(&tags, &mut role_bytes) {
+        match tags.encode(&mut role_bytes) {
           Ok(len) => {
-            debug_assert_eq!(
-              len, encoded_len,
-              "expected encoded len {} mismatch the actual encoded len {}",
-              encoded_len, len
-            );
-
             if len > limit {
               panic!(
                 "node tags {:?} exceeds length limit of {} bytes",
@@ -154,9 +152,16 @@ where
     }
   }
 
-  async fn notify_message(&self, mut msg: Bytes) {
+  async fn notify_message(&self, buf: Cow<'_, [u8]>) {
+    fn to_owned(buf: Cow<'_, [u8]>) -> Bytes {
+      match buf {
+        Cow::Borrowed(buf) => Bytes::copy_from_slice(buf),
+        Cow::Owned(buf) => Bytes::from(buf),
+      }
+    }
+
     // If we didn't actually receive any data, then ignore it.
-    if msg.is_empty() {
+    if buf.is_empty() {
       return;
     }
 
@@ -172,14 +177,15 @@ where
           .metric_labels
           .iter()
       )
-      .record(msg.len() as f64);
+      .record(buf.len() as f64);
     }
 
     let this = self.this();
-    let mut rebroadcast = None;
+    let mut rebroadcast = false;
     let mut rebroadcast_queue = &this.inner.broadcasts;
-    match MessageType::try_from(msg[0]) {
-      Ok(ty) => {
+    let mut relay = None;
+    match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(buf.as_ref()) {
+      Ok(msg) => {
         #[cfg(any(test, feature = "test"))]
         {
           if let Some(ref dropper) = this.inner.memberlist.delegate().unwrap().message_dropper {
@@ -189,130 +195,132 @@ where
           }
         }
 
-        match ty {
-          MessageType::Leave => match decode_message(ty, &msg[1..]) {
-            Ok((_, l)) => {
-              if let SerfMessage::Leave(l) = &l {
-                tracing::debug!("serf: leave message: {}", l.id());
-                rebroadcast = this.handle_node_leave_intent(l).await.then(|| msg.clone());
-              } else {
-                tracing::warn!("serf: receive unexpected message: {}", l.ty().as_str());
+        match msg {
+          MessageRef::Leave(l) => {
+            tracing::debug!("serf: leave message: {:?}", l.id());
+            // TODO(al8n): do not read to owned here
+            match <LeaveMessage<T::Id> as Data>::from_ref(l) {
+              Err(e) => {
+                tracing::error!(err=%e, "serf: failed to decode leave message");
               }
-            }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode message");
-            }
-          },
-          MessageType::Join => match decode_message(ty, &msg[1..]) {
-            Ok((_, j)) => {
-              if let SerfMessage::Join(j) = &j {
-                tracing::debug!("serf: join message: {}", j.id());
-                rebroadcast = this.handle_node_join_intent(j).await.then(|| msg.clone());
-              } else {
-                tracing::warn!("serf: receive unexpected message: {}", j.ty().as_str());
+              Ok(l) => {
+                rebroadcast = this.handle_node_leave_intent(&l).await;
               }
-            }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode message");
-            }
-          },
-          MessageType::UserEvent => match decode_message(ty, &msg[1..]) {
-            Ok((_, ue)) => {
-              if let SerfMessage::UserEvent(ue) = ue {
-                tracing::debug!("serf: user event message: {}", ue.name);
-                rebroadcast = this.handle_user_event(ue).await.then(|| msg.clone());
-                rebroadcast_queue = &this.inner.event_broadcasts;
-              } else {
-                tracing::warn!("serf: receive unexpected message: {}", ue.ty().as_str());
+            };
+          }
+          MessageRef::Join(j) => {
+            tracing::debug!("serf: join message: {:?}", j.id());
+            // TODO(al8n): do not read to owned here
+
+            match <JoinMessage<T::Id> as Data>::from_ref(j) {
+              Err(e) => {
+                tracing::error!(err=%e, "serf: failed to decode join message");
               }
-            }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode message");
-            }
-          },
-          MessageType::Query => match decode_message(ty, &msg[1..]) {
-            Ok((_, q)) => {
-              if let SerfMessage::Query(q) = q {
-                tracing::debug!("serf: query message: {}", q.name);
-                match q.decode_internal_query::<D>() {
-                  Some(Err(e)) => {
-                    tracing::warn!(err=%e, "serf: failed to decode message");
-                  }
-                  Some(Ok(res)) => {
-                    rebroadcast = this.handle_query(q, Some(res)).await.then(|| msg.clone());
-                    rebroadcast_queue = &this.inner.query_broadcasts;
-                  }
-                  None => {
-                    rebroadcast = this.handle_query(q, None).await.then(|| msg.clone());
-                    rebroadcast_queue = &this.inner.query_broadcasts;
-                  }
-                };
-              } else {
-                tracing::warn!("serf: receive unexpected message: {}", q.ty().as_str());
+              Ok(j) => {
+                rebroadcast = this.handle_node_join_intent(&j).await;
               }
-            }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode message");
-            }
-          },
-          MessageType::QueryResponse => match decode_message(ty, &msg[1..]) {
-            Ok((_, qr)) => {
-              if let SerfMessage::QueryResponse(qr) = qr {
-                tracing::debug!("serf: query response message: {}", qr.from);
-                this.handle_query_response(qr).await;
-              } else {
-                tracing::warn!("serf: receive unexpected message: {}", qr.ty().as_str());
+            };
+          }
+          MessageRef::UserEvent(ue) => {
+            tracing::debug!("serf: user event message: {}", ue.name());
+            rebroadcast = this.handle_user_event(either::Either::Left(ue)).await;
+            rebroadcast_queue = &this.inner.event_broadcasts;
+          }
+          MessageRef::Query(q) => {
+            tracing::debug!("serf: query message: {}", q.name());
+            match q.decode_internal_query() {
+              Some(Err(e)) => {
+                tracing::warn!(err=%e, "serf: failed to decode message");
               }
+              Some(Ok(res)) => match this.handle_query(either::Either::Left(q), Some(res)).await {
+                Ok(val) => {
+                  rebroadcast = val;
+                  rebroadcast_queue = &this.inner.query_broadcasts;
+                }
+                Err(e) => {
+                  tracing::warn!(err=%e, "serf: failed to decode query message");
+                }
+              },
+              None => match this.handle_query(either::Either::Left(q), None).await {
+                Ok(val) => {
+                  rebroadcast = val;
+                  rebroadcast_queue = &this.inner.query_broadcasts;
+                }
+                Err(e) => {
+                  tracing::warn!(err=%e, "serf: failed to decode query message");
+                }
+              },
             }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode message");
+          }
+          MessageRef::QueryResponse(qr) => {
+            tracing::debug!("serf: query response message: {:?}", qr.from());
+            if let Err(e) = this.handle_query_response(qr).await {
+              tracing::warn!(err=%e, "serf: failed to decode query response message");
             }
-          },
-          MessageType::Relay => match decode_node(&msg[1..]) {
-            Ok((consumed, n)) => {
-              tracing::debug!("serf: relay message",);
-              tracing::debug!("serf: relaying response to node: {}", n);
-              // + 1 for the message type byte
-              msg.advance(consumed + 1);
-              if let Err(e) = this.inner.memberlist.send(n.address(), msg.clone()).await {
-                tracing::error!(err=%e, "serf: failed to forwarding message to {}", n);
+          }
+          MessageRef::Relay {
+            node,
+            payload,
+            payload_offset,
+          } => {
+            tracing::debug!("serf: relaying response to node: {:?}", node);
+            match Data::from_ref(*node.address()) {
+              Err(e) => {
+                tracing::error!(err=%e, "serf: failed to encode address");
               }
+              Ok(addr) => match buf {
+                Cow::Borrowed(_) => {
+                  relay = Some((addr, Either::Left(Bytes::copy_from_slice(payload))));
+                }
+                Cow::Owned(_) => {
+                  relay = Some((addr, Either::Right((payload_offset, payload.len()))));
+                }
+              },
             }
-            Err(e) => {
-              tracing::warn!(err=%e, "serf: failed to decode relay destination");
-            }
-          },
-          ty => {
-            tracing::warn!("serf: receive unexpected message: {}", ty.as_str());
+          }
+          msg => {
+            tracing::warn!("serf: receive unexpected message type: {}", msg.ty());
           }
         }
       }
       Err(e) => {
-        tracing::warn!(err=%e, "serf: receive unknown message type");
+        tracing::warn!(err=%e, "serf: failed to decode message");
       }
     }
 
-    if let Some(msg) = rebroadcast {
+    if rebroadcast {
       rebroadcast_queue
         .queue_broadcast(SerfBroadcast {
-          msg,
+          msg: to_owned(buf),
           notify_tx: None,
         })
         .await;
+    } else if let Some((addr, payload)) = relay {
+      let msg = match payload {
+        Either::Left(p) => p,
+        Either::Right((offset, len)) => {
+          let mut buf = to_owned(buf);
+          buf.advance(offset);
+          buf.split_to(len)
+        }
+      };
+
+      if let Err(e) = this.inner.memberlist.send(&addr, msg).await {
+        tracing::error!(err=%e, "serf: failed to forwarding message to {}", addr);
+      }
     }
   }
 
   async fn broadcast_messages<F>(
     &self,
-    overhead: usize,
     limit: usize,
     encoded_len: F,
-  ) -> TinyVec<Bytes>
+  ) -> impl Iterator<Item = Bytes> + Send
   where
-    F: Fn(Bytes) -> (usize, Bytes) + Send,
+    F: Fn(Bytes) -> (usize, Bytes) + Send + Sync + 'static,
   {
     let this = self.this();
-    let mut msgs = this.inner.broadcasts.get_broadcasts(overhead, limit).await;
+    let mut msgs = this.inner.broadcasts.get_broadcasts(limit).await;
 
     // Determine the bytes used already
     let mut bytes_used = 0;
@@ -333,7 +341,7 @@ where
     let query_msgs = this
       .inner
       .query_broadcasts
-      .get_broadcasts(overhead, limit - bytes_used)
+      .get_broadcasts(limit - bytes_used)
       .await;
     for msg in query_msgs.iter() {
       let (encoded_len, _) = encoded_len(msg.clone());
@@ -352,7 +360,7 @@ where
     let event_msgs = this
       .inner
       .event_broadcasts
-      .get_broadcasts(overhead, limit - bytes_used)
+      .get_broadcasts(limit - bytes_used)
       .await;
     for msg in event_msgs.iter() {
       let (encoded_len, _) = encoded_len(msg.clone());
@@ -368,7 +376,7 @@ where
     }
     msgs.extend(query_msgs);
     msgs.extend(event_msgs);
-    msgs
+    msgs.into_iter()
   }
 
   async fn local_state(&self, _join: bool) -> Bytes {
@@ -406,16 +414,19 @@ where
     }
   }
 
-  async fn merge_remote_state(&self, buf: Bytes, is_join: bool) {
+  async fn merge_remote_state(&self, buf: &[u8], is_join: bool) {
     if buf.is_empty() {
       tracing::error!("serf: remote state is zero bytes");
       return;
     }
 
     // Check the message type
-    let Ok(ty) = MessageType::try_from(buf[0]) else {
-      tracing::error!("serf: remote state has bad type prefix {}", buf[0]);
-      return;
+    let msg = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(buf) {
+      Ok(msg) => msg,
+      Err(e) => {
+        tracing::error!(err=%e, "serf: fail to decode remote state");
+        return;
+      }
     };
 
     #[cfg(any(test, feature = "test"))]
@@ -434,108 +445,100 @@ where
       }
     }
 
-    match ty {
-      MessageType::PushPull => {
-        match decode_message(ty, &buf[1..]) {
+    match msg {
+      MessageRef::PushPull(pp) => {
+        let ltime = pp.ltime();
+        let event_ltime = pp.event_ltime();
+        let query_ltime = pp.query_ltime();
+        let this = self.this();
+        // Witness the Lamport clocks first.
+        // We subtract 1 since no message with that clock has been sent yet
+        if ltime > LamportTime::ZERO {
+          this.inner.clock.witness(ltime - LamportTime::new(1));
+        }
+        if event_ltime > LamportTime::ZERO {
+          this
+            .inner
+            .event_clock
+            .witness(event_ltime - LamportTime::new(1));
+        }
+        if query_ltime > LamportTime::ZERO {
+          this
+            .inner
+            .query_clock
+            .witness(query_ltime - LamportTime::new(1));
+        }
+
+        let pp = match <PushPullMessage<T::Id> as Data>::from_ref(pp) {
+          Ok(pp) => pp,
           Err(e) => {
-            tracing::error!(err=%e, "serf: failed to decode remote state");
+            tracing::error!(err=%e, "serf: failed to decode push pull message");
+            return;
           }
-          Ok((_, msg)) => {
-            match msg {
-              SerfMessage::PushPull(pp) => {
-                let this = self.this();
-                // Witness the Lamport clocks first.
-                // We subtract 1 since no message with that clock has been sent yet
-                if pp.ltime > LamportTime::ZERO {
-                  this.inner.clock.witness(pp.ltime - LamportTime::new(1));
-                }
-                if pp.event_ltime > LamportTime::ZERO {
-                  this
-                    .inner
-                    .event_clock
-                    .witness(pp.event_ltime - LamportTime::new(1));
-                }
-                if pp.query_ltime > LamportTime::ZERO {
-                  this
-                    .inner
-                    .query_clock
-                    .witness(pp.query_ltime - LamportTime::new(1));
-                }
+        };
 
-                // Process the left nodes first to avoid the LTimes from incrementing
-                // in the wrong order. Note that we don't have the actual Lamport time
-                // for the leave message, so we go one past the join time, since the
-                // leave must have been accepted after that to get onto the left members
-                // list. If we didn't do this then the message would not get processed.
-                for node in &pp.left_members {
-                  if let Some(&ltime) = pp.status_ltimes.get(node) {
-                    this
-                      .handle_node_leave_intent(&LeaveMessage {
-                        ltime: ltime + LamportTime::new(1),
-                        id: node.cheap_clone(),
-                        prune: false,
-                      })
-                      .await;
-                  } else {
-                    tracing::error!(
-                      "serf: {} is in left members, but cannot find the lamport time for it in status",
-                      node
-                    );
-                  }
-                }
+        // Process the left nodes first to avoid the LTimes from incrementing
+        // in the wrong order. Note that we don't have the actual Lamport time
+        // for the leave message, so we go one past the join time, since the
+        // leave must have been accepted after that to get onto the left members
+        // list. If we didn't do this then the message would not get processed.
+        for node in &pp.left_members {
+          if let Some(&ltime) = pp.status_ltimes.get(node) {
+            this
+              .handle_node_leave_intent(&LeaveMessage {
+                ltime: ltime + LamportTime::new(1),
+                id: node.cheap_clone(),
+                prune: false,
+              })
+              .await;
+          } else {
+            tracing::error!(
+              "serf: {} is in left members, but cannot find the lamport time for it in status",
+              node
+            );
+          }
+        }
 
-                // Update any other LTimes
-                for (node, ltime) in pp.status_ltimes {
-                  // Skip the left nodes
-                  if pp.left_members.contains(&node) {
-                    continue;
-                  }
+        // Update any other LTimes
+        for (node, ltime) in pp.status_ltimes {
+          // Skip the left nodes
+          if pp.left_members.contains(&node) {
+            continue;
+          }
 
-                  // Create an artificial join message
-                  this
-                    .handle_node_join_intent(&JoinMessage { ltime, id: node })
-                    .await;
-                }
+          // Create an artificial join message
+          this
+            .handle_node_join_intent(&JoinMessage { ltime, id: node })
+            .await;
+        }
 
-                // If we are doing a join, and eventJoinIgnore is set
-                // then we set the eventMinTime to the EventLTime. This
-                // prevents any of the incoming events from being processed
-                let event_join_ignore = this.inner.event_join_ignore.load(Ordering::Acquire);
-                if is_join && event_join_ignore {
-                  let mut ec = this.inner.event_core.write().await;
-                  if pp.event_ltime > ec.min_time {
-                    ec.min_time = pp.event_ltime;
-                  }
-                }
+        // If we are doing a join, and eventJoinIgnore is set
+        // then we set the eventMinTime to the EventLTime. This
+        // prevents any of the incoming events from being processed
+        let event_join_ignore = this.inner.event_join_ignore.load(Ordering::Acquire);
+        if is_join && event_join_ignore {
+          let mut ec = this.inner.event_core.write().await;
+          if event_ltime > ec.min_time {
+            ec.min_time = event_ltime;
+          }
+        }
 
-                // Process all the events
-                for events in pp.events {
-                  match events {
-                    Some(events) => {
-                      for e in events.events {
-                        this
-                          .handle_user_event(UserEventMessage {
-                            ltime: events.ltime,
-                            name: e.name,
-                            payload: e.payload,
-                            cc: false,
-                          })
-                          .await;
-                      }
-                    }
-                    None => continue,
-                  }
-                }
-              }
-              msg => {
-                tracing::error!("serf: remote state has bad type {}", msg.ty().as_str());
-              }
-            }
+        // Process all the events
+        for events in pp.events {
+          for e in events.events {
+            this
+              .handle_user_event(either::Either::Right(UserEventMessage {
+                ltime: events.ltime,
+                name: e.name,
+                payload: e.payload,
+                cc: false,
+              }))
+              .await;
           }
         }
       }
-      ty => {
-        tracing::error!("serf: remote state has bad type {}", ty.as_str());
+      msg => {
+        tracing::error!("serf: remote state has bad message type {}", msg.ty());
       }
     }
   }
@@ -543,11 +546,11 @@ where
 
 impl<D, T> EventDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
 
   async fn notify_join(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
     if let Some(serf) = self.serf.get() {
@@ -566,11 +569,11 @@ where
 
 impl<D, T> AliveDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
   type Error = SerfDelegateError<D>;
 
   async fn notify_alive(
@@ -578,11 +581,11 @@ where
     node: Arc<NodeState<Self::Id, Self::Address>>,
   ) -> Result<(), Self::Error> {
     if let Some(ref d) = self.delegate {
-      let member = node_to_member::<T, D>(node)?;
+      let member = node_to_member::<T, D>(&node)?;
       return d
-        .notify_merge(TinyVec::from(member))
+        .notify_merge(Arc::from_iter([member]))
         .await
-        .map_err(SerfDelegateError::merge);
+        .map_err(SerfDelegateError::Merge);
     }
 
     Ok(())
@@ -591,26 +594,26 @@ where
 
 impl<D, T> MemberlistMergeDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
   type Error = SerfDelegateError<D>;
 
   async fn notify_merge(
     &self,
-    peers: SmallVec<Arc<NodeState<Self::Id, Self::Address>>>,
+    peers: Arc<[NodeState<Self::Id, Self::Address>]>,
   ) -> Result<(), Self::Error> {
     if let Some(ref d) = self.delegate {
       let peers = peers
-        .into_iter()
+        .iter()
         .map(node_to_member::<T, D>)
-        .collect::<Result<TinyVec<_>, _>>()?;
+        .collect::<Result<Arc<_>, _>>()?;
       return d
         .notify_merge(peers)
         .await
-        .map_err(SerfDelegateError::merge);
+        .map_err(SerfDelegateError::Merge);
     }
     Ok(())
   }
@@ -618,12 +621,12 @@ where
 
 impl<D, T> ConflictDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
 
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
 
   async fn notify_conflict(
     &self,
@@ -636,12 +639,12 @@ where
 
 impl<D, T> PingDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
 
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
 
   async fn ack_payload(&self) -> Bytes {
     #[cfg(any(feature = "test", test))]
@@ -664,9 +667,9 @@ where
       coord.portion.resize(len * 2, 0.0);
 
       // The rest of the message is the serialized coordinate.
-      let len = coordinate_encoded_len(&coord);
+      let len = coord.encoded_len();
       buf.resize(len + 1, 0);
-      if let Err(e) = encode_coordinate(&coord, &mut buf[1..]) {
+      if let Err(e) = coord.encode(&mut buf[1..]) {
         panic!("failed to encode coordinate: {}", e);
       }
       return buf.freeze();
@@ -674,12 +677,12 @@ where
 
     if let Some(c) = self.this().inner.coord_core.as_ref() {
       let coord = c.client.get_coordinate();
-      let encoded_len = coordinate_encoded_len(&coord) + 1;
+      let encoded_len = coord.encoded_len() + 1;
       let mut buf = BytesMut::with_capacity(encoded_len);
       buf.put_u8(PING_VERSION);
       buf.resize(encoded_len, 0);
 
-      if let Err(e) = encode_coordinate(&coord, &mut buf[1..]) {
+      if let Err(e) = coord.encode(&mut buf[1..]) {
         tracing::error!(err=%e, "serf: failed to encode coordinate");
       }
       buf.into()
@@ -708,7 +711,7 @@ where
       }
 
       // Process the remainder of the message as a coordinate.
-      let coord = match decode_coordinate(&payload[1..]) {
+      let coord = match <super::Coordinate as Data>::decode(&payload[1..]) {
         Ok((readed, c)) => {
           tracing::trace!(read=%readed, coordinate=?c, "serf: decode coordinate successfully");
           c
@@ -764,28 +767,23 @@ where
       }
     }
   }
-
-  #[inline]
-  fn disable_promised_pings(&self, _id: &Self::Id) -> bool {
-    false
-  }
 }
 
 impl<D, T> MemberlistDelegate for SerfDelegate<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   type Id = T::Id;
 
-  type Address = <T::Resolver as AddressResolver>::ResolvedAddress;
+  type Address = T::ResolvedAddress;
 }
 
 fn node_to_member<T, D>(
-  node: Arc<NodeState<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>>,
-) -> Result<Member<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>, SerfDelegateError<D>>
+  node: &NodeState<T::Id, T::ResolvedAddress>,
+) -> Result<Member<T::Id, T::ResolvedAddress>, SerfDelegateError<D>>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let status = if node.state() == State::Left {
@@ -796,25 +794,25 @@ where
 
   let meta = node.meta();
   if meta.len() > META_MAX_SIZE {
-    return Err(SerfDelegateError::serf(SerfError::TagsTooLarge(meta.len())));
+    return Err(SerfDelegateError::Serf(SerfError::TagsTooLarge(meta.len())));
   }
 
   Ok(Member {
     node: node.node(),
     tags: if !node.meta().is_empty() {
-      decode_tags(node.meta())
+      <Tags as Data>::decode(node.meta())
         .map(|(read, tags)| {
           tracing::trace!(read=%read, tags=?tags, "serf: decode tags successfully");
           Arc::new(tags)
         })
-        .map_err(SerfDelegateError::transform)?
+        .map_err(|e| SerfDelegateError::Serf(SerfError::from(e)))?
     } else {
       Default::default()
     },
     status,
     protocol_version: ProtocolVersion::V1,
     delegate_version: DelegateVersion::V1,
-    memberlist_delegate_version: MemberlistDelegateVersion::V1,
-    memberlist_protocol_version: MemberlistProtocolVersion::V1,
+    memberlist_delegate_version: node.delegate_version(),
+    memberlist_protocol_version: node.protocol_version(),
   })
 }

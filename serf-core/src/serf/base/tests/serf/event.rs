@@ -248,7 +248,7 @@ pub async fn serf_events_leave_avoid_infinite_rebroadcast<T, F>(
   transport_opts2: T::Options,
   transport_opts3: T::Options,
   transport_opts4: T::Options,
-  get_transport_opts: impl FnOnce(T::Id, <T::Resolver as AddressResolver>::ResolvedAddress) -> F + Copy,
+  get_transport_opts: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
   T: Transport,
   F: core::future::Future<Output = T::Options>,
@@ -652,7 +652,7 @@ where
 /// Unit tests for the query old message
 pub async fn query_old_message<T>(
   transport_opts: T::Options,
-  from: Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+  from: Node<T::Id, T::ResolvedAddress>,
 ) where
   T: Transport,
 {
@@ -689,7 +689,7 @@ pub async fn query_old_message<T>(
 /// Unit tests for the query same clock
 pub async fn query_same_clock<T>(
   transport_opts: T::Options,
-  from: Node<T::Id, <T::Resolver as AddressResolver>::ResolvedAddress>,
+  from: Node<T::Id, T::ResolvedAddress>,
 ) where
   T: Transport,
 {

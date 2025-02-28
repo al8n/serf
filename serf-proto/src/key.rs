@@ -161,13 +161,25 @@ const KEY_RESPONSE_PRIMARY_KEY_BYTE: u8 =
 #[viewit::viewit(getters(style = "ref", vis_all = "pub"), setters(skip), vis_all = "")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct KeyResponseMessageRef<'a> {
-  #[viewit(getter(const, attrs(doc = "Returns true/false if there were errors or not")))]
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns true/false if there were errors or not")
+  ))]
   result: bool,
-  #[viewit(getter(const, attrs(doc = "Returns the error messages or other information")))]
+  #[viewit(getter(
+    const,
+    style = "move",
+    attrs(doc = "Returns the error messages or other information")
+  ))]
   message: &'a str,
   #[viewit(getter(const, attrs(doc = "Returns a list of installed keys")))]
   keys: RepeatedDecoder<'a>,
-  #[viewit(getter(const, attrs(doc = "Returns the primary key")))]
+  #[viewit(getter(
+    const,
+    attrs(doc = "Returns the primary key"),
+    result(converter(fn = "Option::as_ref"), type = "Option<&SecretKey>"),
+  ))]
   primary_key: Option<SecretKey>,
 }
 
