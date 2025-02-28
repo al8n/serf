@@ -148,8 +148,8 @@ where
     // Encode the response
     match out {
       Some(state) => {
-        let resp = serf_proto::ConflictResponseMessageBorrow::from(state.member());
-        match serf_proto::Encodable::encode_to_bytes(&resp) {
+        let resp = crate::types::ConflictResponseMessageBorrow::from(state.member());
+        match crate::types::Encodable::encode_to_bytes(&resp) {
           Ok(raw) => {
             if let Err(e) = ev.respond(raw).await {
               tracing::error!(target="serf", err=%e, "failed to respond to conflict query");
@@ -179,7 +179,7 @@ where
   async fn handle_install_key(ev: impl AsRef<QueryEvent<T, D>> + Send) {
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
-    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+    let req = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
       Ok(msg) => match msg {
         MessageRef::KeyRequest(req) => req,
         msg => {
@@ -242,7 +242,7 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+    let req = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
       Ok(msg) => match msg {
         MessageRef::KeyRequest(req) => req,
         msg => {
@@ -307,7 +307,7 @@ where
     let q = ev.as_ref();
     let mut response = KeyResponseMessage::default();
 
-    let req = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
+    let req = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(&q.payload) {
       Ok(msg) => match msg {
         MessageRef::KeyRequest(req) => req,
         msg => {
@@ -414,7 +414,7 @@ where
   ) -> Result<
     (
       Bytes,
-      serf_proto::QueryResponseMessage<T::Id, T::ResolvedAddress>,
+      crate::types::QueryResponseMessage<T::Id, T::ResolvedAddress>,
     ),
     Error<T, D>,
   > {
@@ -426,12 +426,12 @@ where
       (q.ctx.this.inner.opts.query_response_size_limit / MIN_ENCODED_KEY_LENGTH).min(actual);
 
     for i in (0..=max_list_keys).rev() {
-      let kraw = serf_proto::Encodable::encode_to_bytes(&*resp)?;
+      let kraw = crate::types::Encodable::encode_to_bytes(&*resp)?;
 
       // create response
       let qresp = q.create_response(kraw.clone());
 
-      let encoded_len = serf_proto::Encodable::encoded_len(&qresp);
+      let encoded_len = crate::types::Encodable::encoded_len(&qresp);
       // Check the size limit
       if q.check_response_size(encoded_len).is_err() {
         resp.keys.drain(i..);
@@ -443,7 +443,7 @@ where
       }
 
       // encode response
-      let qraw = serf_proto::Encodable::encode_to_bytes(&qresp)?;
+      let qraw = crate::types::Encodable::encode_to_bytes(&qresp)?;
 
       if actual > i {
         tracing::warn!("serf: {}", resp.message);
@@ -469,7 +469,7 @@ where
           tracing::error!(target="serf", err=%e, "failed to respond to key query");
         }
       }
-      _ => match serf_proto::Encodable::encode_to_bytes(&*resp) {
+      _ => match crate::types::Encodable::encode_to_bytes(&*resp) {
         Ok(raw) => {
           if let Err(e) = q.respond(raw).await {
             tracing::error!(target="serf", err=%e, "failed to respond to key query");

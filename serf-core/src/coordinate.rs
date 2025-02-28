@@ -6,7 +6,10 @@ use std::{
 
 use memberlist_core::{
   CheapClone,
-  proto::{Data, DataRef, DecodeError, EncodeError, RepeatedDecoder},
+  proto::{
+    Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, WireType,
+    utils::{merge, skip, split},
+  },
 };
 use parking_lot::RwLock;
 use rand::Rng;
@@ -726,6 +729,15 @@ fn rand_f64() -> f64 {
   }
 }
 
+const PORTION_TAG: u8 = 1;
+const ERROR_TAG: u8 = 2;
+const ADJUSTMENT_TAG: u8 = 3;
+const HEIGHT_TAG: u8 = 4;
+const PORTION_BYTE: u8 = merge(WireType::LengthDelimited, PORTION_TAG);
+const ERROR_BYTE: u8 = merge(WireType::Fixed64, ERROR_TAG);
+const ADJUSTMENT_BYTE: u8 = merge(WireType::Fixed64, ADJUSTMENT_TAG);
+const HEIGHT_BYTE: u8 = merge(WireType::Fixed64, HEIGHT_TAG);
+
 /// The reference type to [`Coordinate`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct CoordinateRef<'a> {
@@ -740,7 +752,98 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
   where
     Self: Sized,
   {
-    todo!()
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    let mut portion_offsets = None;
+    let mut num_portions = 0;
+    let mut error = None;
+    let mut adjustment = None;
+    let mut height = None;
+
+    while offset < buf_len {
+      match buf[offset] {
+        PORTION_TAG => {
+          let readed = skip(WireType::Fixed64, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = portion_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
+
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            portion_offsets = Some((offset - 1, offset + readed));
+          }
+          num_portions += 1;
+          offset += readed;
+        }
+        ERROR_TAG => {
+          if error.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "error",
+              ERROR_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          error = Some(val);
+        }
+        ADJUSTMENT_TAG => {
+          if adjustment.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "adjustment",
+              ADJUSTMENT_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          adjustment = Some(val);
+        }
+        HEIGHT_TAG => {
+          if height.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "height",
+              HEIGHT_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          height = Some(val);
+        }
+        other => {
+          offset += 1;
+
+          let (wire_type, _) = split(other);
+          let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          offset += skip(wire_type, &buf[offset..])?;
+        }
+      }
+    }
+
+    Ok((
+      offset,
+      Self {
+        portion: if let Some((start, end)) = portion_offsets {
+          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
+            .with_nums(num_portions)
+            .with_offsets(start, end)
+        } else {
+          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
+        },
+        error: error.ok_or_else(|| DecodeError::missing_field("Coordinate", "error"))?,
+        adjustment: adjustment
+          .ok_or_else(|| DecodeError::missing_field("Coordinate", "adjustment"))?,
+        height: height.ok_or_else(|| DecodeError::missing_field("Coordinate", "height"))?,
+      },
+    ))
   }
 }
 
@@ -751,16 +854,67 @@ impl Data for Coordinate {
   where
     Self: Sized,
   {
-    // Ok(val)
-    todo!()
+    val
+      .portion
+      .iter::<f64>()
+      .collect::<Result<SmallVec<[f64; DEFAULT_DIMENSIONALITY]>, _>>()
+      .map(|portion| Self {
+        portion,
+        error: val.error,
+        adjustment: val.adjustment,
+        height: val.height,
+      })
   }
 
   fn encoded_len(&self) -> usize {
-    todo!()
+    self
+      .portion
+      .iter()
+      .fold(0, |acc, x| acc + 1 + x.encoded_len_with_length_delimited())
+      + 1
+      + self.error.encoded_len()
+      + 1
+      + self.adjustment.encoded_len()
+      + 1
+      + self.height.encoded_len()
   }
 
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
-    todo!()
+    macro_rules! bail {
+      ($this:ident($offset:expr, $len:ident)) => {
+        if $offset >= $len {
+          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
+        }
+      };
+    }
+
+    let mut offset = 0;
+    let buf_len = buf.len();
+    for x in self.portion.iter() {
+      bail!(self(offset, buf_len));
+      buf[offset] = PORTION_BYTE;
+      offset += 1;
+      offset += x
+        .encode(&mut buf[offset..])
+        .map_err(|e| e.update(self.encoded_len(), buf_len))?;
+    }
+
+    bail!(self(offset, buf_len));
+    buf[offset] = ERROR_BYTE;
+    offset += 1;
+    offset += self.error.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = ADJUSTMENT_BYTE;
+    offset += 1;
+    offset += self.adjustment.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = HEIGHT_BYTE;
+    offset += 1;
+    offset += self.height.encode(&mut buf[offset..])?;
+
+    Ok(offset)
   }
 }
 

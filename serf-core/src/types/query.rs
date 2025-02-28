@@ -2,7 +2,7 @@ use smol_str::SmolStr;
 
 use std::time::Duration;
 
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, RepeatedDecoder, TinyVec, WireType,
   bytes::Bytes,
   utils::{merge, skip, split},
@@ -77,7 +77,7 @@ pub struct QueryMessage<I, A> {
     getter(const, attrs(doc = "Returns the potential query filters")),
     setter(attrs(doc = "Sets the potential query filters (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<Filter<I>>, TinyVec<Filter<I>>>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<Filter<I>>, TinyVec<Filter<I>>>))]
   filters: TinyVec<Filter<I>>,
   /// Used to provide various flags
   #[viewit(
@@ -116,7 +116,7 @@ pub struct QueryMessage<I, A> {
     getter(const, style = "ref", attrs(doc = "Returns the payload")),
     setter(attrs(doc = "Sets the payload (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<u8>, Bytes>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<u8>, Bytes>))]
   payload: Bytes,
 }
 

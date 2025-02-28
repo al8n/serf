@@ -5,9 +5,8 @@ use crate::{
   error::{SerfDelegateError, SerfError},
   event::QueryMessageExt,
   types::{
-    DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus,
-    MessageRef, MessageType, ProtocolVersion,
-    PushPullMessageBorrow, UserEventMessage,
+    DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus, MessageRef,
+    MessageType, ProtocolVersion, PushPullMessageBorrow, UserEventMessage,
   },
 };
 
@@ -16,6 +15,7 @@ use std::{
   sync::{Arc, OnceLock, atomic::Ordering},
 };
 
+use crate::types::{PushPullMessage, Tags};
 use arc_swap::ArcSwap;
 use either::Either;
 use indexmap::IndexSet;
@@ -30,7 +30,6 @@ use memberlist_core::{
   tracing,
   transport::Transport,
 };
-use serf_proto::{PushPullMessage, Tags};
 
 // PingVersion is an internal version for the ping message, above the normal
 // versioning we get from the protocol version. This enables small updates
@@ -184,7 +183,7 @@ where
     let mut rebroadcast = false;
     let mut rebroadcast_queue = &this.inner.broadcasts;
     let mut relay = None;
-    match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(buf.as_ref()) {
+    match crate::types::decode_message::<T::Id, T::ResolvedAddress>(buf.as_ref()) {
       Ok(msg) => {
         #[cfg(any(test, feature = "test"))]
         {
@@ -405,7 +404,7 @@ where
     };
     drop(members);
 
-    match serf_proto::Encodable::encode_to_bytes(&pp) {
+    match crate::types::Encodable::encode_to_bytes(&pp) {
       Ok(buf) => buf,
       Err(e) => {
         tracing::error!(err=%e, "serf: failed to encode local state");
@@ -421,7 +420,7 @@ where
     }
 
     // Check the message type
-    let msg = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(buf) {
+    let msg = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(buf) {
       Ok(msg) => msg,
       Err(e) => {
         tracing::error!(err=%e, "serf: fail to decode remote state");

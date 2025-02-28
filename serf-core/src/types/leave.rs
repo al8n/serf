@@ -1,4 +1,4 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
   utils::{merge, skip, split},
 };

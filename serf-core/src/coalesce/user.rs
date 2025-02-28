@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
+use crate::types::UserEventMessage;
 use indexmap::IndexMap;
 use memberlist_core::proto::TinyVec;
-use serf_proto::UserEventMessage;
 use smol_str::SmolStr;
 
 use crate::types::LamportTime;

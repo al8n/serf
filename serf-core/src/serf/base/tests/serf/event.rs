@@ -1,4 +1,4 @@
-use serf_proto::{Filter, FilterType};
+use crate::types::{Filter, FilterType};
 
 use super::*;
 

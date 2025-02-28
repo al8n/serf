@@ -1,4 +1,4 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
   utils::{merge, skip, split},
 };
@@ -126,7 +126,7 @@ where
 {
   type Ref<'a> = JoinMessage<I::Ref<'a>>;
 
-  fn from_ref(val: Self::Ref<'_>) -> Result<Self, memberlist_proto::DecodeError>
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
   where
     Self: Sized,
   {

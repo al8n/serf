@@ -4,9 +4,8 @@ use futures::{FutureExt, StreamExt};
 use memberlist_core::{
   CheapClone,
   bytes::Bytes,
-  proto::{Data, Meta, OneOrMore, SmallVec},
+  proto::{Data, MaybeResolvedAddress, Meta, Node, OneOrMore, SmallVec},
   tracing,
-  transport::{MaybeResolvedAddress, Node},
 };
 use smol_str::SmolStr;
 
@@ -269,7 +268,7 @@ where
     };
 
     // Start broadcasting the event
-    let len = serf_proto::Encodable::encoded_len(&msg);
+    let len = crate::types::Encodable::encoded_len(&msg);
 
     // Check the size after encoding to be sure again that
     // we're not attempting to send over the specified size limit.
@@ -281,7 +280,7 @@ where
       return Err(Error::raw_user_event_too_large(len));
     }
 
-    let raw = serf_proto::Encodable::encode_to_bytes(&msg)?;
+    let raw = crate::types::Encodable::encode_to_bytes(&msg)?;
 
     self.inner.event_clock.increment();
 
@@ -319,7 +318,7 @@ where
   /// user messages sent prior to the join will be ignored.
   pub async fn join(
     &self,
-    node: Node<T::Id, MaybeResolvedAddress<T>>,
+    node: Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>,
     ignore_old: bool,
   ) -> Result<Node<T::Id, T::ResolvedAddress>, Error<T, D>> {
     // Do a quick state check
@@ -367,7 +366,7 @@ where
   /// user messages sent prior to the join will be ignored.
   pub async fn join_many(
     &self,
-    existing: impl Iterator<Item = Node<T::Id, MaybeResolvedAddress<T>>>,
+    existing: impl Iterator<Item = Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>>,
     ignore_old: bool,
   ) -> Result<
     SmallVec<Node<T::Id, T::ResolvedAddress>>,
@@ -460,7 +459,7 @@ where
     // other node alive.
     if self.has_alive_members().await {
       let (notify_tx, notify_rx) = async_channel::bounded(1);
-      let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
+      let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
       self.broadcast(msg, Some(notify_tx)).await?;
 
       futures::select! {

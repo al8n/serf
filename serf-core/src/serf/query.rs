@@ -4,6 +4,7 @@ use std::{
   time::{Duration, Instant},
 };
 
+use crate::types::FilterRef;
 use async_channel::{Receiver, Sender};
 use async_lock::RwLock;
 use either::Either;
@@ -15,7 +16,6 @@ use memberlist_core::{
   tracing,
   transport::{Node, Transport},
 };
-use serf_proto::FilterRef;
 
 use crate::{
   delegate::Delegate,
@@ -557,14 +557,14 @@ where
     }
 
     // Prep the relay message, which is a wrapped version of the original.
-    let encoded_len = serf_proto::Encodable::encoded_len_with_relay(&resp, &node);
+    let encoded_len = crate::types::Encodable::encoded_len_with_relay(&resp, &node);
     if encoded_len > self.inner.opts.query_response_size_limit {
       return Err(Error::relayed_response_too_large(
         self.inner.opts.query_response_size_limit,
       ));
     }
 
-    let raw = serf_proto::Encodable::encode_relay_to_bytes(&resp, &node)?;
+    let raw = crate::types::Encodable::encode_relay_to_bytes(&resp, &node)?;
 
     // Relay to a random set of peers.
     let relay_members = random_members(relay_factor as usize, members);

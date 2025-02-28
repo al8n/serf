@@ -1,11 +1,9 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, OneOrMore, RepeatedDecoder, WireType,
   utils::{merge, skip, split},
 };
 
-use crate::LamportTime;
-
-use super::UserEvent;
+use super::{super::LamportTime, UserEvent};
 
 const LTIME_TAG: u8 = 1;
 const EVENTS_TAG: u8 = 2;
@@ -34,7 +32,7 @@ pub struct UserEvents {
     getter(const, style = "ref", attrs(doc = "Returns the user events")),
     setter(attrs(doc = "Sets the user events (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<UserEvent>, OneOrMore<UserEvent>>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<UserEvent>, OneOrMore<UserEvent>>))]
   events: OneOrMore<UserEvent>,
 }
 

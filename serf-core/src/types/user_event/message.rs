@@ -1,11 +1,11 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   CheapClone, Data, DataRef, DecodeError, EncodeError, WireType,
   bytes::Bytes,
   utils::{merge, skip, split},
 };
 use smol_str::SmolStr;
 
-use crate::LamportTime;
+use super::super::LamportTime;
 
 /// Used for user-generated events
 #[viewit::viewit(setters(prefix = "with"))]
@@ -37,7 +37,7 @@ pub struct UserEventMessage {
     getter(const, attrs(doc = "Returns the payload of the event")),
     setter(attrs(doc = "Sets the payload of the event (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<u8>, Bytes>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<u8>, Bytes>))]
   payload: Bytes,
   /// "Can Coalesce".
   #[viewit(

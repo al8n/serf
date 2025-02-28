@@ -1,17 +1,14 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, WireType,
   bytes::Bytes,
   utils::{merge, skip, split},
 };
 
-use crate::{
-  ConflictResponseMessageRef, PushPullMessage, PushPullMessageRef, QueryMessageRef,
-  QueryResponseMessageRef, UserEventMessageRef,
-};
-
 use super::{
-  ConflictResponseMessage, ConflictResponseMessageBorrow, JoinMessage, LeaveMessage,
-  PushPullMessageBorrow, QueryMessage, QueryResponseMessage, UserEventMessage,
+  ConflictResponseMessage, ConflictResponseMessageBorrow, ConflictResponseMessageRef, JoinMessage,
+  LeaveMessage, PushPullMessage, PushPullMessageBorrow, PushPullMessageRef, QueryMessage,
+  QueryMessageRef, QueryResponseMessage, QueryResponseMessageRef, UserEventMessage,
+  UserEventMessageRef,
 };
 
 #[cfg(feature = "encryption")]

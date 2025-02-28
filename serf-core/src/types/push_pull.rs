@@ -1,5 +1,5 @@
 use indexmap::{IndexMap, IndexSet};
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TinyVec, TupleEncoder, WireType,
   utils::{merge, skip, split},
 };
@@ -39,14 +39,14 @@ pub struct PushPullMessage<I> {
     ),
     setter(attrs(doc = "Sets the maps the node to its status time (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::arbitrary_indexmap))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::arbitrary_indexmap))]
   status_ltimes: IndexMap<I, LamportTime>,
   /// List of left nodes
   #[viewit(
     getter(const, style = "ref", attrs(doc = "Returns the list of left nodes")),
     setter(attrs(doc = "Sets the list of left nodes (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::arbitrary_indexset))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::arbitrary_indexset))]
   left_members: IndexSet<I>,
   /// Lamport time for event clock
   #[viewit(
@@ -66,7 +66,7 @@ pub struct PushPullMessage<I> {
     getter(const, style = "ref", attrs(doc = "Returns the recent events")),
     setter(attrs(doc = "Sets the recent events (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<UserEvents>, TinyVec<UserEvents>>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<UserEvents>, TinyVec<UserEvents>>))]
   events: TinyVec<UserEvents>,
   /// Lamport time for query clock
   #[viewit(

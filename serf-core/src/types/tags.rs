@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TupleEncoder, WireType,
   utils::{merge, skip, split},
 };
@@ -23,8 +23,8 @@ const TAGS_BYTE: u8 = merge(WireType::LengthDelimited, TAGS_TAG);
 #[cfg_attr(feature = "serde", serde(transparent))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Tags(
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::arbitrary_indexmap))]
-  IndexMap<SmolStr, SmolStr>,
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::arbitrary_indexmap))]
+   IndexMap<SmolStr, SmolStr>,
 );
 
 impl IntoIterator for Tags {
@@ -73,7 +73,7 @@ pub struct TagsRef<'a> {
 }
 
 impl<'a> DataRef<'a, Tags> for TagsRef<'a> {
-  fn decode(src: &'a [u8]) -> Result<(usize, Self), memberlist_proto::DecodeError>
+  fn decode(src: &'a [u8]) -> Result<(usize, Self), DecodeError>
   where
     Self: Sized,
   {

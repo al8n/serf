@@ -1,4 +1,4 @@
-use memberlist_proto::{Data, DataRef, DecodeError, EncodeError, WireType};
+use memberlist_core::proto::{Data, DataRef, DecodeError, EncodeError, WireType};
 
 /// Delegate version
 #[derive(

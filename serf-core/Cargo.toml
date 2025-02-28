@@ -13,14 +13,14 @@ categories.workspace = true
 
 [features]
 default = ["metrics"]
-metrics = ["memberlist-core/metrics", "dep:metrics", "serf-proto/metrics"]
-encryption = ["memberlist-core/encryption", "serf-proto/encryption", "base64", "serde"]
+metrics = ["memberlist-core/metrics", "dep:metrics"]
+encryption = ["memberlist-core/encryption", "base64", "serde"]
 
 serde = [
   "dep:serde",
   "dep:humantime-serde",
+  "bitflags/serde",
   "memberlist-core/serde",
-  "serf-proto/serde",
   "smol_str/serde",
   "smallvec/serde",
   "indexmap/serde",
@@ -28,12 +28,17 @@ serde = [
 
 test = ["memberlist-core/test", "paste", "tracing-subscriber", "tempfile"]
 
+arbitrary = ["dep:arbitrary", "memberlist-core/arbitrary", "smol_str/arbitrary"]
+quickcheck = ["dep:quickcheck", "memberlist-core/quickcheck"]
+
+
 [dependencies]
 auto_impl = "1"
 atomic_refcell = "0.1"
 arc-swap = "1"
 async-lock = "3"
 async-channel = "2"
+bitflags = "2"
 byteorder.workspace = true
 crossbeam-queue = "0.3"
 derive_more.workspace = true
@@ -51,7 +56,6 @@ smallvec.workspace = true
 thiserror.workspace = true
 viewit.workspace = true
 memberlist-core.workspace = true
-serf-proto.workspace = true
 
 metrics = { version = "0.24", optional = true }
 
@@ -60,6 +64,9 @@ humantime-serde = { workspace = true, optional = true }
 serde_json = "1"
 
 base64 = { version = "0.22", optional = true }
+
+arbitrary = { version = "1", optional = true, default-features = false, features = ["derive"] }
+quickcheck = { version = "1", optional = true, default-features = false }
 
 # test features
 paste = { version = "1", optional = true }

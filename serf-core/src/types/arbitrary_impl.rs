@@ -3,12 +3,10 @@ use std::{
   hash::Hash,
 };
 
-use crate::TagFilter;
-
-use super::Filter;
+use super::{Filter, TagFilter};
 use arbitrary::{Arbitrary, Unstructured};
 use indexmap::{IndexMap, IndexSet};
-use memberlist_proto::TinyVec;
+use memberlist_core::proto::TinyVec;
 
 pub(super) fn into<'a, F, T>(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<T>
 where

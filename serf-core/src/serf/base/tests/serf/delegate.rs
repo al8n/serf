@@ -82,7 +82,7 @@ where
 
   // Attempt a decode
   let pp =
-    serf_proto::decode_message(&buf)
+    crate::types::decode_message(&buf)
       .unwrap();
 
   let MessageRef::PushPull(pp) = pp else {
@@ -148,7 +148,7 @@ where
     query_ltime: 100.into(),
   };
   
-  let buf = serf_proto::Encodable::encode_to_bytes(&pp).unwrap();
+  let buf = crate::types::Encodable::encode_to_bytes(&pp).unwrap();
 
   // Merge in fake state
   d.merge_remote_state(&buf, false).await;

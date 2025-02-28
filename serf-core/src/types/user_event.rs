@@ -1,4 +1,4 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
   bytes::Bytes,
   utils::{merge, skip, split},
@@ -34,7 +34,7 @@ pub struct UserEvent {
     getter(const, attrs(doc = "Returns the payload of the event")),
     setter(attrs(doc = "Sets the payload of the event (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<u8>, Bytes>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<u8>, Bytes>))]
   payload: Bytes,
 }
 

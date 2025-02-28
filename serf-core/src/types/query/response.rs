@@ -1,12 +1,10 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, WireType,
   bytes::Bytes,
   utils::{merge, skip, split},
 };
 
-use crate::LamportTime;
-
-use super::QueryFlag;
+use super::{LamportTime, QueryFlag};
 
 const LTIME_TAG: u8 = 1;
 const ID_TAG: u8 = 2;
@@ -58,7 +56,7 @@ pub struct QueryResponseMessage<I, A> {
     getter(const, style = "ref", attrs(doc = "Returns the payload")),
     setter(attrs(doc = "Sets the payload (Builder pattern)"))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::arbitrary_impl::into::<Vec<u8>, Bytes>))]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<u8>, Bytes>))]
   payload: Bytes,
 }
 

@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::OnceLock};
 
+use crate::types::MessageRef;
 use async_channel::Receiver;
 use async_lock::RwLock;
 use futures::StreamExt;
 use memberlist_core::{CheapClone, proto::SecretKey, tracing, transport::Transport};
-use serf_proto::MessageRef;
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::event::{
@@ -181,7 +181,7 @@ where
     event: InternalQueryEvent<T::Id>,
   ) -> Result<KeyResponse<T::Id>, Error<T, D>> {
     let kr = KeyRequestMessage { key };
-    let buf = serf_proto::Encodable::encode_to_bytes(&kr)?;
+    let buf = crate::types::Encodable::encode_to_bytes(&kr)?;
 
     let serf = self.serf.get().unwrap();
     let mut q_param = serf.default_query_param().await;
@@ -248,14 +248,27 @@ where
         continue;
       }
 
-      let node_response = match serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&r.payload)
-      {
-        Ok(msg) => match msg {
-          MessageRef::KeyResponse(kr) => kr,
-          msg => {
+      let node_response =
+        match crate::types::decode_message::<T::Id, T::ResolvedAddress>(&r.payload) {
+          Ok(msg) => match msg {
+            MessageRef::KeyResponse(kr) => kr,
+            msg => {
+              resp.messages.insert(
+                r.from.id().cheap_clone(),
+                format_smolstr!("Invalid key query response type: {}", msg.ty()),
+              );
+              resp.num_err += 1;
+
+              if resp.num_resp == resp.num_nodes {
+                return resp;
+              }
+              continue;
+            }
+          },
+          Err(e) => {
             resp.messages.insert(
               r.from.id().cheap_clone(),
-              format_smolstr!("Invalid key query response type: {}", msg.ty()),
+              SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
             );
             resp.num_err += 1;
 
@@ -264,20 +277,7 @@ where
             }
             continue;
           }
-        },
-        Err(e) => {
-          resp.messages.insert(
-            r.from.id().cheap_clone(),
-            SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
-          );
-          resp.num_err += 1;
-
-          if resp.num_resp == resp.num_nodes {
-            return resp;
-          }
-          continue;
-        }
-      };
+        };
 
       if !node_response.result() {
         resp.messages.insert(

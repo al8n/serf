@@ -1,16 +1,15 @@
 use std::time::Duration;
 
+use crate::types::{
+  MessageRef, MessageType, Node, PushPullMessage, QueryFlag, QueryMessage, UserEvent,
+  UserEventMessage,
+};
 use async_channel::Receiver;
 use memberlist_core::{
   agnostic_lite::RuntimeLite,
   bytes::Bytes,
   delegate::NodeDelegate,
-  transport::MaybeResolvedAddress,
-  proto::{OneOrMore, TinyVec},
-};
-use serf_proto::{
-  MessageType, Node, PushPullMessage, QueryFlag, QueryMessage, UserEvent,
-  UserEventMessage, MessageRef,
+  proto::{MaybeResolvedAddress, OneOrMore, TinyVec},
 };
 use smol_str::SmolStr;
 
@@ -332,8 +331,8 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
 ) where
   T: Transport,
 {
+  use crate::types::KeyResponseMessage;
   use memberlist_core::proto::SecretKey;
-  use serf_proto::KeyResponseMessage;
 
   let size_limit = opts.query_response_size_limit() * 10;
   let opts = opts.with_query_response_size_limit(size_limit);
@@ -355,10 +354,10 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
 
   let mut found = 0;
   for i in (0..=resp.keys.len()).rev() {
-    let dst = serf_proto::Encodable::encode_to_bytes(&resp).unwrap();
+    let dst = crate::types::Encodable::encode_to_bytes(&resp).unwrap();
 
     let qresp = query.create_response(dst);
-    let dst = serf_proto::Encodable::encode_to_bytes(&qresp).unwrap();
+    let dst = crate::types::Encodable::encode_to_bytes(&qresp).unwrap();
     if query.check_response_size(dst.len()).is_err() {
       resp.keys.truncate(i);
       continue;
@@ -385,8 +384,8 @@ pub async fn key_list_key_response_with_correct_size<T>(transport_opts: T::Optio
 where
   T: Transport,
 {
+  use crate::types::KeyResponseMessage;
   use memberlist_core::proto::SecretKey;
-  use serf_proto::KeyResponseMessage;
 
   let opts = opts.with_query_response_size_limit(1024);
   let s = Serf::<T>::new(transport_opts, opts).await.unwrap();

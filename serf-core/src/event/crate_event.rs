@@ -1,5 +1,5 @@
+use crate::types::{QueryMessage, QueryMessageRef};
 use memberlist_core::proto::{Data, DecodeError};
-use serf_proto::{QueryMessage, QueryMessageRef};
 
 use super::*;
 

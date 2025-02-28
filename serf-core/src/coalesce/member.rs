@@ -122,7 +122,7 @@ where
 //     agnostic_lite::{RuntimeLite, tokio::TokioRuntime},
 //     transport::resolver::socket_addr::SocketAddrResolver,
 //   };
-//   use serf_proto::{MemberStatus, UserEventMessage};
+//   use crate::types::{MemberStatus, UserEventMessage};
 //   use smol_str::SmolStr;
 
 //   use crate::{

@@ -3,7 +3,7 @@ use std::sync::{
   atomic::{AtomicU64, Ordering},
 };
 
-use memberlist_proto::{Data, DataRef};
+use memberlist_core::proto::{Data, DataRef, DecodeError, EncodeError};
 
 /// A lamport time is a simple u64 that represents a point in time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -96,7 +96,7 @@ impl core::ops::Rem<Self> for LamportTime {
 impl Data for LamportTime {
   type Ref<'a> = Self;
 
-  fn from_ref(val: Self::Ref<'_>) -> Result<Self, memberlist_proto::DecodeError>
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
   where
     Self: Sized,
   {
@@ -107,13 +107,13 @@ impl Data for LamportTime {
     <u64 as Data>::encoded_len(&self.0)
   }
 
-  fn encode(&self, buf: &mut [u8]) -> Result<usize, memberlist_proto::EncodeError> {
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
     <u64 as Data>::encode(&self.0, buf)
   }
 }
 
 impl<'a> DataRef<'a, LamportTime> for LamportTime {
-  fn decode(src: &'a [u8]) -> Result<(usize, LamportTime), memberlist_proto::DecodeError> {
+  fn decode(src: &'a [u8]) -> Result<(usize, LamportTime), DecodeError> {
     <u64 as DataRef<'a, u64>>::decode(src).map(|(n, v)| (n, v.into()))
   }
 }

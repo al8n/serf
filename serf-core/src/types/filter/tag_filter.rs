@@ -1,4 +1,4 @@
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
   utils::{merge, skip, split},
 };
@@ -21,7 +21,7 @@ pub struct TagFilterRef<'a> {
 }
 
 impl<'a> DataRef<'a, TagFilter> for TagFilterRef<'a> {
-  fn decode(src: &'a [u8]) -> Result<(usize, Self), memberlist_proto::DecodeError>
+  fn decode(src: &'a [u8]) -> Result<(usize, Self), DecodeError>
   where
     Self: Sized,
   {

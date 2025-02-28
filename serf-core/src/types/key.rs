@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use memberlist_proto::{
+use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, SecretKey, SecretKeys, WireType,
   utils::{merge, skip, split},
 };

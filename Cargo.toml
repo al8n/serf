@@ -2,7 +2,6 @@
 members = [
   "serf",
   "serf-core",
-  "serf-proto"
 ]
 resolver = "3"
 
@@ -40,4 +39,3 @@ memberlist-core = { version = "0.6", path = "../memberlist/memberlist-core", def
 memberlist = { version = "0.6", path = "../memberlist/memberlist", default-features = false }
 
 serf-core = { path = "serf-core", version = "0.3.0", default-features = false }
-serf-proto = { path = "serf-proto", version = "0.1.0", default-features = false }

@@ -11,6 +11,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::prelude::OpenOptionsExt;
 
+use crate::types::UserEventMessage;
 use async_channel::{Receiver, Sender};
 use byteorder::{LittleEndian, ReadBytesExt};
 use futures::FutureExt;
@@ -18,12 +19,11 @@ use memberlist_core::{
   CheapClone,
   agnostic_lite::{AsyncSpawner, RuntimeLite},
   bytes::{BufMut, BytesMut},
-  proto::{Data, TinyVec},
+  proto::{Data, MaybeResolvedAddress, TinyVec},
   tracing,
-  transport::{Id, MaybeResolvedAddress, Node, Transport},
+  transport::{Id, Node, Transport},
 };
 use rand::seq::SliceRandom;
-use serf_proto::UserEventMessage;
 
 use crate::{
   delegate::Delegate,
@@ -446,7 +446,7 @@ where
   ) -> Result<
     (
       Sender<CrateEvent<T, D>>,
-      TinyVec<Node<T::Id, MaybeResolvedAddress<T>>>,
+      TinyVec<Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>>,
       SnapshotHandle,
     ),
     SnapshotError,

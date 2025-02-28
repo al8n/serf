@@ -1,9 +1,63 @@
-pub use serf_proto::*;
+use std::time::Duration;
+
+pub use memberlist_core::proto::{
+  DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr, Node, NodeId, ParseDomainError,
+  ParseHostAddrError, ParseNodeIdError, ProtocolVersion as MemberlistProtocolVersion,
+};
+
+#[cfg(feature = "arbitrary")]
+mod arbitrary_impl;
+
+mod clock;
+pub use clock::*;
+
+mod conflict;
+pub(crate) use conflict::*;
+
+mod filter;
+pub(crate) use filter::*;
+
+mod leave;
+pub(crate) use leave::*;
 
 mod member;
-pub(crate) use member::*;
+pub use member::*;
 
-use std::time::Duration;
+mod message;
+pub(crate) use message::*;
+
+mod join;
+pub(crate) use join::*;
+
+mod tags;
+pub use tags::*;
+
+mod push_pull;
+pub(crate) use push_pull::*;
+
+mod user_event;
+pub(crate) use user_event::*;
+
+mod query;
+pub(crate) use query::*;
+
+mod version;
+pub use version::*;
+
+#[cfg(feature = "encryption")]
+mod key;
+#[cfg(feature = "encryption")]
+#[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]
+pub use key::*;
+
+#[cfg(debug_assertions)]
+#[inline]
+fn debug_assert_write_eq(actual: usize, expected: usize) {
+  debug_assert_eq!(
+    actual, expected,
+    "expect writting {expected} bytes, but actual write {actual} bytes"
+  );
+}
 
 #[cfg(windows)]
 pub(crate) type Epoch = system_epoch::SystemTimeEpoch;

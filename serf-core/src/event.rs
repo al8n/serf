@@ -9,11 +9,11 @@ mod crate_event;
 use async_channel::Sender;
 pub use async_channel::{RecvError, TryRecvError};
 
+use crate::types::{LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage};
 use async_lock::Mutex;
 pub(crate) use crate_event::*;
 use futures::Stream;
 use memberlist_core::{CheapClone, bytes::Bytes, proto::TinyVec, transport::Transport};
-use serf_proto::{LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage};
 use smol_str::SmolStr;
 
 pub(crate) struct QueryContext<T, D>
@@ -91,7 +91,7 @@ where
       flags: QueryFlag::empty(),
       payload: msg,
     };
-    let buf = serf_proto::Encodable::encode_to_bytes(&resp)?;
+    let buf = crate::types::Encodable::encode_to_bytes(&resp)?;
     self
       .respond_with_message_and_response(respond_to, relay_factor, buf, resp)
       .await

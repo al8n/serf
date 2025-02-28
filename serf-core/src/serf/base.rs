@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::types::{MessageRef, Tags, UserEventMessageRef};
 use either::Either;
 use futures::{FutureExt, StreamExt};
 use memberlist_core::{
@@ -7,12 +8,10 @@ use memberlist_core::{
   agnostic_lite::AfterHandle,
   bytes::Bytes,
   delegate::EventDelegate,
-  proto::{Data, Meta, NodeState, OneOrMore, TinyVec},
+  proto::{Data, MaybeResolvedAddress, Meta, Node, NodeState, OneOrMore, TinyVec},
   tracing,
-  transport::{MaybeResolvedAddress, Node},
 };
 use rand::{Rng, SeedableRng};
-use serf_proto::{MessageRef, Tags, UserEventMessageRef};
 use smol_str::SmolStr;
 
 use crate::{
@@ -387,7 +386,7 @@ where
     // Process update locally
     self.handle_node_join_intent(&msg).await;
 
-    let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
+    let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
     // Start broadcasting the update
     if let Err(e) = self.broadcast(msg, None).await {
       tracing::warn!(err=%e, "serf: failed to broadcast join intent");
@@ -472,7 +471,7 @@ where
       return Ok(());
     }
 
-    let msg = serf_proto::Encodable::encode_to_bytes(&msg)?;
+    let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
     // Broadcast the remove
     let (ntx, nrx) = async_channel::bounded(1);
     self.broadcast(msg, Some(ntx)).await?;
@@ -918,14 +917,14 @@ where
     };
 
     // Encode the query
-    let len = serf_proto::Encodable::encoded_len(&q);
+    let len = crate::types::Encodable::encoded_len(&q);
 
     // Check the size
     if len > self.inner.opts.query_size_limit {
       return Err(Error::query_too_large(len));
     }
 
-    let raw = serf_proto::Encodable::encode_to_bytes(&q)?;
+    let raw = crate::types::Encodable::encode_to_bytes(&q)?;
 
     // Register QueryResponse to track acks and responses
     let resp = QueryResponse::from_query(&q, self.inner.memberlist.num_online_members().await);
@@ -1087,7 +1086,7 @@ where
         payload: Bytes::new(),
       };
 
-      match serf_proto::Encodable::encode_to_bytes(&ack) {
+      match crate::types::Encodable::encode_to_bytes(&ack) {
         Ok(raw) => {
           let (name, payload, from, relay_factor) = match q {
             Either::Left(q) => (
@@ -1726,7 +1725,7 @@ where
     // Gather responses
     let resp_rx = resp.response_rx();
     while let Ok(r) = resp_rx.recv().await {
-      let res = serf_proto::decode_message::<T::Id, T::ResolvedAddress>(&r.payload);
+      let res = crate::types::decode_message::<T::Id, T::ResolvedAddress>(&r.payload);
       match res {
         Ok(msg) => {
           match msg {
@@ -1786,7 +1785,7 @@ where
 
   pub(crate) fn handle_rejoin(
     memberlist: Memberlist<T, SerfDelegate<T, D>>,
-    alive_nodes: TinyVec<Node<T::Id, MaybeResolvedAddress<T>>>,
+    alive_nodes: TinyVec<Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>>,
   ) {
     <T::Runtime as RuntimeLite>::spawn_detach(async move {
       for prev in alive_nodes {
