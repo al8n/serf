@@ -39,20 +39,6 @@ impl<I> JoinMessage<I> {
     Self { ltime, id }
   }
 
-  /// Set the lamport time
-  #[inline]
-  pub fn set_ltime(&mut self, ltime: LamportTime) -> &mut Self {
-    self.ltime = ltime;
-    self
-  }
-
-  /// Set the id of the node
-  #[inline]
-  pub fn set_id(&mut self, id: I) -> &mut Self {
-    self.id = id;
-    self
-  }
-
   const fn id_byte() -> u8
   where
     I: Data,

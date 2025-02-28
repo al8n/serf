@@ -19,13 +19,6 @@ pub struct ConflictResponseMessage<I, A> {
   member: Member<I, A>,
 }
 
-impl<I, A> ConflictResponseMessage<I, A> {
-  /// Create a new conflict response message
-  pub fn new(member: Member<I, A>) -> Self {
-    Self { member }
-  }
-}
-
 /// The borrow type of conflict message
 #[viewit::viewit(setters(prefix = "with"))]
 #[derive(Debug, PartialEq)]

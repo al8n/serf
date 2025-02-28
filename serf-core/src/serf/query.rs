@@ -513,7 +513,6 @@ where
                 return Ok(false);
               }
             }
-            _ => {}
           }
         }
         Ok(true)
