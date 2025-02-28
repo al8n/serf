@@ -615,7 +615,7 @@ pub async fn serf_snapshot_recovery<T, F>(
 async fn test_snapshoter_slow_disk_not_blocking_event_tx() {
   use memberlist_core::{
     agnostic_lite::tokio::TokioRuntime,
-    transport::{Lpe, resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport},
+    transport::{resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport},
   };
   use std::net::SocketAddr;
 

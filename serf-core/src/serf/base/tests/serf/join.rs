@@ -562,7 +562,7 @@ impl<A: CheapClone + Send + Sync + 'static> MergeDelegate for CancelMergeDelegat
 
   async fn notify_merge(
     &self,
-    _members: TinyVec<Member<Self::Id, Self::Address>>,
+    _members: Arc<[Member<Self::Id, Self::Address>]>,
   ) -> Result<(), Self::Error> {
     self.invoked.store(true, Ordering::SeqCst);
     Err(CancelMergeError)

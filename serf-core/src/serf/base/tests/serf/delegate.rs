@@ -14,7 +14,7 @@ where
   .unwrap();
   let meta = s.inner.memberlist.delegate().unwrap().node_meta(32).await;
 
-  let (_, tags) = decode_tags(&meta).unwrap();
+  let (_, tags) = Tags::decode(&meta).unwrap();
   assert_eq!(tags.get("role"), Some(&SmolStr::new("test")));
 
   s.shutdown().await.unwrap();
@@ -78,16 +78,17 @@ where
     .await;
 
   // Verify
-  assert_eq!(buf[0], MessageType::PushPull as u8, "bad message type");
+  assert_eq!(buf[0], MessageType::PushPull.into(), "bad message type");
 
   // Attempt a decode
-  let (_, pp) =
-    decode_message(MessageType::PushPull, &buf[1..])
+  let pp =
+    serf_proto::decode_message(&buf)
       .unwrap();
 
-  let SerfMessage::PushPull(pp) = pp else {
+  let MessageRef::PushPull(pp) = pp else {
     panic!("bad message")
   };
+  let pp = PushPullMessage::from_ref(pp).unwrap();
 
   // Verify lamport clock
   assert_eq!(pp.ltime(), serfs[0].inner.clock.time(), "bad lamport clock");
@@ -150,7 +151,7 @@ where
   let buf = serf_proto::Encodable::encode_to_bytes(&pp).unwrap();
 
   // Merge in fake state
-  d.merge_remote_state(buf, false).await;
+  d.merge_remote_state(&buf, false).await;
 
   // Verify lamport
   assert_eq!(s.inner.clock.time(), 42.into(), "bad lamport clock");

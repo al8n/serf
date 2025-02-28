@@ -18,9 +18,10 @@ where
   assert!(
     !s1
       .handle_user_event(
-        UserEventMessage::default()
+        Either::Right(UserEventMessage::default()
           .with_ltime(1.into())
           .with_name("old".into())
+        )
       )
       .await,
     "should not rebroadcast"
@@ -43,19 +44,19 @@ where
     .with_ltime(1.into())
     .with_name("first".into())
     .with_payload(Bytes::from_static(b"test"));
-  assert!(s1.handle_user_event(msg).await, "should rebroadcast");
+  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
 
   let msg = UserEventMessage::default()
     .with_ltime(1.into())
     .with_name("first".into())
     .with_payload(Bytes::from_static(b"newpayload"));
-  assert!(s1.handle_user_event(msg).await, "should rebroadcast");
+  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
 
   let msg = UserEventMessage::default()
     .with_ltime(1.into())
     .with_name("second".into())
     .with_payload(Bytes::from_static(b"other"));
-  assert!(s1.handle_user_event(msg).await, "should rebroadcast");
+  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
 
   test_user_events(
     event_rx.rx,
@@ -679,7 +680,7 @@ pub async fn query_old_message<T>(
         },
         None
       )
-      .await,
+      .await.unwrap(),
     "should not rebroadcast"
   );
 
@@ -712,11 +713,11 @@ pub async fn query_same_clock<T>(
   };
 
   assert!(
-    s1.handle_query(msg.clone(), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None).await,
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(msg.clone(), None).await,
+    !s1.handle_query(Either::Right(msg.clone()), None).await,
     "should not rebroadcast"
   );
 
@@ -733,11 +734,11 @@ pub async fn query_same_clock<T>(
   };
 
   assert!(
-    s1.handle_query(msg.clone(), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None).await,
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(msg.clone(), None).await,
+    !s1.handle_query(Either::Right(msg.clone()), None).await,
     "should not rebroadcast"
   );
 
@@ -753,11 +754,11 @@ pub async fn query_same_clock<T>(
     payload: Bytes::from_static(b"other"),
   };
   assert!(
-    s1.handle_query(msg.clone(), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None).await,
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(msg.clone(), None).await,
+    !s1.handle_query(Either::Right(msg.clone()), None).await,
     "should not rebroadcast"
   );
 

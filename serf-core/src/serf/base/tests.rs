@@ -6,23 +6,22 @@ use memberlist_core::{
   bytes::Bytes,
   delegate::NodeDelegate,
   transport::MaybeResolvedAddress,
-  types::{OneOrMore, TinyVec},
+  proto::{OneOrMore, TinyVec},
 };
 use serf_proto::{
-  MessageType, Node, PushPullMessage, QueryFlag, QueryMessage, SerfMessage, UserEvent,
-  UserEventMessage,
+  MessageType, Node, PushPullMessage, QueryFlag, QueryMessage, UserEvent,
+  UserEventMessage, MessageRef,
 };
 use smol_str::SmolStr;
 
 use crate::{
-  delegate::,
   event::{CrateEvent, CrateEventType, MemberEvent, MemberEventType},
   types::Epoch,
 };
 
 use super::*;
 
-pub(crate) mod serf;
+// pub(crate) mod serf;
 
 fn test_config() -> Options {
   let mut opts = Options::new();
@@ -232,17 +231,15 @@ where
   event_tx.send(event.clone()).await.unwrap();
 
   // Push a query
-  let query = s.query_event(QueryMessage {
-    ltime: 42.into(),
-    id: 1,
-    from: s.memberlist().advertise_node(),
-    filters: TinyVec::new(),
-    flags: QueryFlag::empty(),
-    relay_factor: 0,
-    timeout: Default::default(),
-    name: "foo".into(),
-    payload: Bytes::new(),
-  });
+  let query = s.query_event(
+    42.into(),
+    "foo".into(),
+    Bytes::new(),
+    Default::default(),
+    1,
+    s.memberlist().advertise_node(),
+    0,
+  );
   event_tx.send(CrateEvent::from(query)).await.unwrap();
 
   // Push a member event
@@ -272,17 +269,15 @@ where
   let (event_tx, _handle) = SerfQueries::<T, DefaultDelegate<T>>::new(Some(tx), shutdown_rx);
 
   // Push a query
-  let query = s.query_event(QueryMessage {
-    ltime: 42.into(),
-    id: 1,
-    from: s.memberlist().advertise_node(),
-    filters: TinyVec::new(),
-    flags: QueryFlag::empty(),
-    relay_factor: 0,
-    timeout: Default::default(),
-    name: "ping".into(),
-    payload: Bytes::new(),
-  });
+  let query = s.query_event(
+    42.into(),
+    "ping".into(),
+    Bytes::new(),
+    Default::default(),
+    1,
+    s.memberlist().advertise_node(),
+    0,
+  );
   event_tx
     .send(CrateEvent::from((InternalQueryEvent::Ping, query)))
     .await
@@ -305,17 +300,15 @@ where
   let (event_tx, _handle) = SerfQueries::<T, DefaultDelegate<T>>::new(Some(tx), shutdown_rx);
 
   // Push a query
-  let query = s.query_event(QueryMessage {
-    ltime: 42.into(),
-    id: 1,
-    from: s.memberlist().advertise_node(),
-    filters: TinyVec::new(),
-    flags: QueryFlag::empty(),
-    relay_factor: 0,
-    timeout: Default::default(),
-    name: "conflict".into(),
-    payload: Bytes::new(),
-  });
+  let query = s.query_event(
+    42.into(),
+    "conflict".into(),
+    Bytes::new(),
+    Default::default(),
+    1,
+    s.memberlist().advertise_node(),
+    0,
+  );
   let id = s.memberlist().local_id().clone();
   event_tx
     .send(CrateEvent::from((InternalQueryEvent::Conflict(id), query)))
@@ -345,17 +338,15 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
   let size_limit = opts.query_response_size_limit() * 10;
   let opts = opts.with_query_response_size_limit(size_limit);
   let s = Serf::<T>::new(transport_opts, opts).await.unwrap();
-  let query = s.query_event(QueryMessage {
-    ltime: 0.into(),
-    id: 0,
-    from: s.memberlist().advertise_node(),
-    filters: TinyVec::new(),
-    flags: QueryFlag::empty(),
-    relay_factor: 0,
-    timeout: Default::default(),
-    name: Default::default(),
-    payload: Default::default(),
-  });
+  let query = s.query_event(
+    0.into(),
+    Default::default(),
+    Default::default(),
+    Default::default(),
+    0,
+    s.memberlist().advertise_node(),
+    0,
+  );
 
   let mut resp = KeyResponseMessage::default();
   for _ in 0..=(size_limit / 25) {
@@ -395,21 +386,19 @@ where
   T: Transport,
 {
   use memberlist_core::proto::SecretKey;
-  use serf_proto::{Encodable, KeyResponseMessage};
+  use serf_proto::KeyResponseMessage;
 
   let opts = opts.with_query_response_size_limit(1024);
   let s = Serf::<T>::new(transport_opts, opts).await.unwrap();
-  let query = s.query_event(QueryMessage {
-    ltime: 0.into(),
-    id: 0,
-    from: s.memberlist().advertise_node(),
-    filters: TinyVec::new(),
-    flags: QueryFlag::empty(),
-    relay_factor: 0,
-    timeout: Default::default(),
-    name: Default::default(),
-    payload: Default::default(),
-  });
+  let query = s.query_event(
+    0.into(),
+    Default::default(),
+    Default::default(),
+    Default::default(),
+    0,
+    s.memberlist().advertise_node(),
+    0,
+  );
 
   let k = [0; 16];
   let encoded_len = SecretKey::from(k).encoded_len();

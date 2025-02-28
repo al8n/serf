@@ -2,11 +2,11 @@ use crate::{
   Serf,
   broadcast::SerfBroadcast,
   delegate::Delegate,
-  error::{Error, SerfDelegateError, SerfError},
+  error::{SerfDelegateError, SerfError},
   event::QueryMessageExt,
   types::{
     DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus,
-    MemberlistDelegateVersion, MemberlistProtocolVersion, MessageRef, MessageType, ProtocolVersion,
+    MessageRef, MessageType, ProtocolVersion,
     PushPullMessageBorrow, UserEventMessage,
   },
 };
@@ -26,9 +26,9 @@ use memberlist_core::{
     AliveDelegate, ConflictDelegate, Delegate as MemberlistDelegate, EventDelegate,
     MergeDelegate as MemberlistMergeDelegate, NodeDelegate, PingDelegate,
   },
-  proto::{Data, Meta, NodeState, SmallVec, State, TinyVec},
+  proto::{Data, Meta, NodeState, State},
   tracing,
-  transport::{AddressResolver, Transport},
+  transport::Transport,
 };
 use serf_proto::{PushPullMessage, Tags};
 

@@ -649,7 +649,9 @@ where
     }
 
     self.wait_tx.close();
-    tee_handle.await;
+    if let Err(e) = tee_handle.await {
+      tracing::error!(target="serf", err=%e, "failed to wait for tee stream to exit");
+    }
     tracing::debug!("serf: snapshotter stream exits");
   }
 

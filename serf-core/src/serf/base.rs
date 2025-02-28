@@ -12,7 +12,7 @@ use memberlist_core::{
   transport::{MaybeResolvedAddress, Node},
 };
 use rand::{Rng, SeedableRng};
-use serf_proto::{MessageRef, QueryMessageRef, QueryResponseMessageRef, Tags, UserEventMessageRef};
+use serf_proto::{MessageRef, Tags, UserEventMessageRef};
 use smol_str::SmolStr;
 
 use crate::{
@@ -33,17 +33,17 @@ use self::internal_query::SerfQueries;
 
 use super::*;
 
-// /// Re-export the unit tests
-// #[cfg(feature = "test")]
-// #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
-// pub mod tests;
+/// Re-export the unit tests
+#[cfg(feature = "test")]
+#[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+pub mod tests;
 
 impl<T, D> Serf<T, D>
 where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  #[cfg(feature = "test")]
+  #[cfg(any(feature = "test", test))]
   pub(crate) async fn with_message_dropper(
     transport: T::Options,
     opts: Options,
@@ -54,7 +54,7 @@ where
       None,
       transport,
       opts,
-      #[cfg(feature = "test")]
+      #[cfg(any(feature = "test", test))]
       Some(message_dropper),
     )
     .await
@@ -841,6 +841,7 @@ where
     true
   }
 
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn query_event(
     &self,
     ltime: LamportTime,
@@ -933,7 +934,7 @@ where
       .await;
 
     // Process query locally
-    self.handle_query(Either::Right(q), ty).await;
+    self.handle_query(Either::Right(q), ty).await?;
 
     // Start broadcasting the event
     self
@@ -1708,7 +1709,7 @@ where
     // Start an id resolution query
     let ty = InternalQueryEvent::Conflict(local_id.clone());
     let resp = match self
-      .internal_query(SmolStr::new(ty.as_str()), payload.into(), None, ty)
+      .internal_query(SmolStr::new(ty.as_str()), payload, None, ty)
       .await
     {
       Ok(resp) => resp,
