@@ -17,7 +17,6 @@ use smol_str::SmolStr;
 use crate::{
   QueueOptions,
   coalesce::{MemberEventCoalescer, UserEventCoalescer, coalesced_event},
-  coordinate::CoordinateOptions,
   error::Error,
   event::{InternalQueryEvent, MemberEvent, MemberEventType, QueryContext, QueryEvent},
   snapshot::{Snapshot, open_and_replay_snapshot},
@@ -25,6 +24,7 @@ use crate::{
     DelegateVersion, Epoch, JoinMessage, LeaveMessage, Member, MemberState, MemberStatus,
     MemberlistDelegateVersion, MemberlistProtocolVersion, MessageType, NodeIntent, ProtocolVersion,
     QueryFlag, QueryMessage, QueryResponseMessage, UserEvent, UserEventMessage,
+    coordinate::CoordinateOptions,
   },
 };
 

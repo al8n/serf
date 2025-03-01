@@ -65,8 +65,8 @@ serde_json = "1"
 
 base64 = { version = "0.22", optional = true }
 
-arbitrary = { version = "1", optional = true, default-features = false, features = ["derive"] }
-quickcheck = { version = "1", optional = true, default-features = false }
+arbitrary = { workspace = true, optional = true, default-features = false, features = ["derive"] }
+quickcheck = { workspace = true, optional = true, default-features = false }
 
 # test features
 paste = { version = "1", optional = true }
@@ -81,6 +81,9 @@ agnostic-lite = { version = "0.5", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 futures = { workspace = true, features = ["executor"] }
 tempfile = "3"
+memberlist-core = { workspace = true, features = ["quickcheck", "arbitrary"] }
+quickcheck_macros = "1"
+quickcheck.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

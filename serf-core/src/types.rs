@@ -8,8 +8,18 @@ pub use memberlist_core::proto::{
 #[cfg(feature = "arbitrary")]
 mod arbitrary_impl;
 
+#[cfg(feature = "quickcheck")]
+mod quickcheck_impl;
+
+#[cfg(test)]
+mod tests;
+
+
 mod clock;
 pub use clock::*;
+
+/// Vivialdi coordinate implementation
+pub mod coordinate;
 
 mod conflict;
 pub(crate) use conflict::*;

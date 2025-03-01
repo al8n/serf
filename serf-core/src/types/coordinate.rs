@@ -1,19 +1,19 @@
+use core::time::Duration;
+
+use memberlist_core::proto::{
+  Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, WireType,
+  utils::{merge, skip, split},
+};
+use rand::Rng;
+use smallvec::SmallVec;
+
 use std::{
   collections::HashMap,
   sync::atomic::{AtomicUsize, Ordering},
-  time::Duration,
 };
 
-use memberlist_core::{
-  CheapClone,
-  proto::{
-    Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, WireType,
-    utils::{merge, skip, split},
-  },
-};
+use memberlist_core::CheapClone;
 use parking_lot::RwLock;
-use rand::Rng;
-use smallvec::SmallVec;
 
 /// Used to convert float seconds to nanoseconds.
 const SECONDS_TO_NANOSECONDS: f64 = 1.0e9;
@@ -28,20 +28,6 @@ const DEFAULT_DIMENSIONALITY: usize = 8;
 const DEFAULT_ADJUSTMENT_WINDOW_SIZE: usize = 20;
 
 const DEFAULT_LATENCY_FILTER_SAMPLES_SIZE: usize = 8;
-
-/// Error type for the [`Coordinate`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum CoordinateError {
-  /// Returned when the dimensions of the coordinates are not compatible.
-  #[error("dimensions aren't compatible")]
-  DimensionalityMismatch,
-  /// Returned when the coordinate is invalid.
-  #[error("invalid coordinate")]
-  InvalidCoordinate,
-  /// Returned when the round trip time is not in a valid range.
-  #[error("round trip time not in valid range, duration {0:?} is not a value less than 10s")]
-  InvalidRTT(Duration),
-}
 
 /// CoordinateOptions is used to set the parameters of the Vivaldi-based coordinate mapping
 /// algorithm.
@@ -215,6 +201,437 @@ impl CoordinateOptions {
       metric_labels: std::sync::Arc::new(memberlist_core::proto::MetricLabels::default()),
     }
   }
+}
+
+/// A specialized structure for holding network coordinates for the
+/// Vivaldi-based coordinate mapping algorithm. All of the fields should be public
+/// to enable this to be serialized. All values in here are in units of seconds.
+#[viewit::viewit(getters(style = "move"), setters(prefix = "with"))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Coordinate {
+  /// The Euclidean portion of the coordinate. This is used along
+  /// with the other fields to provide an overall distance estimate. The
+  /// units here are seconds.
+  #[viewit(
+    getter(
+      const,
+      style = "ref",
+      attrs(doc = "Returns the Euclidean portion of the coordinate.")
+    ),
+    setter(attrs(doc = "Sets the Euclidean portion of the coordinate."))
+  )]
+  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<f64>, SmallVec<[f64; DEFAULT_DIMENSIONALITY]>>))]
+  portion: SmallVec<[f64; DEFAULT_DIMENSIONALITY]>,
+  /// Reflects the confidence in the given coordinate and is updated
+  /// dynamically by the Vivaldi Client. This is dimensionless.
+  #[viewit(
+    getter(const, attrs(doc = "Returns the confidence in the given coordinate.")),
+    setter(attrs(doc = "Sets the confidence in the given coordinate."))
+  )]
+  error: f64,
+  /// A distance offset computed based on a calculation over
+  /// observations from all other nodes over a fixed window and is updated
+  /// dynamically by the Vivaldi Client. The units here are seconds.
+  #[viewit(
+    getter(const, attrs(doc = "Returns the distance offset.")),
+    setter(attrs(doc = "Sets the distance offset."))
+  )]
+  adjustment: f64,
+  /// A distance offset that accounts for non-Euclidean effects
+  /// which model the access links from nodes to the core Internet. The access
+  /// links are usually set by bandwidth and congestion, and the core links
+  /// usually follow distance based on geography.
+  #[viewit(
+    getter(
+      const,
+      attrs(doc = "Returns the distance offset that accounts for non-Euclidean effects.")
+    ),
+    setter(attrs(doc = "Sets the distance offset that accounts for non-Euclidean effects."))
+  )]
+  height: f64,
+}
+
+impl Default for Coordinate {
+  #[inline]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Coordinate {
+  /// Creates a new coordinate at the origin, using the default options
+  /// to supply key initial values.
+  #[inline]
+  pub fn new() -> Self {
+    Self::with_options(CoordinateOptions::new())
+  }
+
+  /// Creates a new coordinate at the origin, using the given options
+  /// to supply key initial values.
+  #[inline]
+  pub fn with_options(opts: CoordinateOptions) -> Self {
+    let mut vec = SmallVec::with_capacity(opts.dimensionality);
+    vec.resize(opts.dimensionality, 0.0);
+    Self {
+      portion: vec,
+      error: opts.vivaldi_error_max,
+      adjustment: 0.0,
+      height: opts.height_min,
+    }
+  }
+
+  /// Returns true if the coordinate is valid.
+  #[inline]
+  pub fn is_valid(&self) -> bool {
+    self.portion.iter().all(|&f| f.is_finite())
+      && self.error.is_finite()
+      && self.adjustment.is_finite()
+      && self.height.is_finite()
+  }
+
+  /// Returns true if the dimensions of the coordinates are compatible.
+  #[inline]
+  pub fn is_compatible_with(&self, other: &Self) -> bool {
+    self.portion.len() == other.portion.len()
+  }
+
+  /// Returns the result of applying the force from the direction of the
+  /// other coordinate.
+  pub fn apply_force(&self, height_min: f64, force: f64, other: &Self) -> Self {
+    assert!(
+      self.is_compatible_with(other),
+      "coordinate dimensionality does not match"
+    );
+
+    let mut ret = self.clone();
+    let (mut unit, mag) = unit_vector_at(&self.portion, &other.portion);
+    add_in_place(&mut ret.portion, mul_in_place(&mut unit, force));
+    if mag > ZERO_THRESHOLD {
+      ret.height = (ret.height + other.height) * force / mag + ret.height;
+      ret.height = ret.height.max(height_min);
+    }
+    ret
+  }
+
+  /// Apply the result of applying the force from the direction of the
+  /// other coordinate to self.
+  pub fn apply_force_in_place(&mut self, height_min: f64, force: f64, other: &Self) {
+    assert!(
+      self.is_compatible_with(other),
+      "coordinate dimensionality does not match"
+    );
+    let (mut unit, mag) = unit_vector_at(&self.portion, &other.portion);
+    add_in_place(&mut self.portion, mul_in_place(&mut unit, force));
+
+    if mag > ZERO_THRESHOLD {
+      self.height = (self.height + other.height) * force / mag + self.height;
+      self.height = self.height.max(height_min);
+    }
+  }
+
+  /// Returns the distance between this coordinate and the other
+  /// coordinate, including adjustments.
+  pub fn distance_to(&self, other: &Self) -> Duration {
+    assert!(
+      self.is_compatible_with(other),
+      "coordinate dimensionality does not match"
+    );
+
+    let dist = self.raw_distance_to(other);
+    let adjusted_dist = dist + self.adjustment + other.adjustment;
+    let dist = if adjusted_dist > 0.0 {
+      adjusted_dist
+    } else {
+      dist
+    };
+    Duration::from_nanos((dist * SECONDS_TO_NANOSECONDS) as u64)
+  }
+
+  #[inline]
+  pub(crate) fn raw_distance_to(&self, other: &Self) -> f64 {
+    magnitude_in_place(diff_in_place(&self.portion, &other.portion)) + self.height + other.height
+  }
+}
+
+#[inline]
+fn add_in_place(vec1: &mut [f64], vec2: &[f64]) {
+  for (x, y) in vec1.iter_mut().zip(vec2.iter()) {
+    *x += y;
+  }
+}
+
+/// Returns difference between the vec1 and vec2. This assumes the
+/// dimensions have already been checked to be compatible.
+#[inline]
+fn diff(vec1: &[f64], vec2: &[f64]) -> SmallVec<[f64; DEFAULT_DIMENSIONALITY]> {
+  vec1.iter().zip(vec2).map(|(x, y)| x - y).collect()
+}
+
+/// computes difference between the vec1 and vec2 in place. This assumes the
+/// dimensions have already been checked to be compatible.
+#[inline]
+fn diff_in_place<'a>(vec1: &'a [f64], vec2: &'a [f64]) -> impl Iterator<Item = f64> + 'a {
+  vec1.iter().zip(vec2).map(|(x, y)| x - y)
+}
+
+/// multiplied by a scalar factor in place.
+#[inline]
+fn mul_in_place(vec: &mut [f64], factor: f64) -> &mut [f64] {
+  for x in vec.iter_mut() {
+    *x *= factor;
+  }
+  vec
+}
+
+/// Computes the magnitude of the vec.
+#[inline]
+fn magnitude_in_place(vec: impl Iterator<Item = f64>) -> f64 {
+  vec.fold(0.0, |acc, x| acc + x * x).sqrt()
+}
+
+/// Returns a unit vector pointing at vec1 from vec2. If the two
+/// positions are the same then a random unit vector is returned. We also return
+/// the distance between the points for use in the later height calculation.
+fn unit_vector_at(vec1: &[f64], vec2: &[f64]) -> (SmallVec<[f64; DEFAULT_DIMENSIONALITY]>, f64) {
+  let mut ret = diff(vec1, vec2);
+
+  let mag = magnitude_in_place(ret.iter().copied());
+  if mag > ZERO_THRESHOLD {
+    mul_in_place(&mut ret, mag.recip());
+    return (ret, mag);
+  }
+
+  for x in ret.iter_mut() {
+    *x = rand_f64() - 0.5;
+  }
+
+  let mag = magnitude_in_place(ret.iter().copied());
+  if mag > ZERO_THRESHOLD {
+    mul_in_place(&mut ret, mag.recip());
+    return (ret, 0.0);
+  }
+
+  // And finally just give up and make a unit vector along the first
+  // dimension. This should be exceedingly rare.
+  ret.fill(0.0);
+  ret[0] = 1.0;
+  (ret, 0.0)
+}
+
+fn rand_f64() -> f64 {
+  let mut rng = rand::rng();
+  loop {
+    let f = (rng.random_range::<u64, _>(0..(1u64 << 63u64)) as f64) / ((1u64 << 63u64) as f64);
+    if f == 1.0 {
+      continue;
+    }
+    return f;
+  }
+}
+
+const PORTION_TAG: u8 = 1;
+const ERROR_TAG: u8 = 2;
+const ADJUSTMENT_TAG: u8 = 3;
+const HEIGHT_TAG: u8 = 4;
+const PORTION_BYTE: u8 = merge(WireType::LengthDelimited, PORTION_TAG);
+const ERROR_BYTE: u8 = merge(WireType::Fixed64, ERROR_TAG);
+const ADJUSTMENT_BYTE: u8 = merge(WireType::Fixed64, ADJUSTMENT_TAG);
+const HEIGHT_BYTE: u8 = merge(WireType::Fixed64, HEIGHT_TAG);
+
+/// The reference type to [`Coordinate`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CoordinateRef<'a> {
+  portion: RepeatedDecoder<'a>,
+  error: f64,
+  adjustment: f64,
+  height: f64,
+}
+
+impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
+  fn decode(buf: &'a [u8]) -> Result<(usize, Self), DecodeError>
+  where
+    Self: Sized,
+  {
+    let mut offset = 0;
+    let buf_len = buf.len();
+
+    let mut portion_offsets = None;
+    let mut num_portions = 0;
+    let mut error = None;
+    let mut adjustment = None;
+    let mut height = None;
+
+    while offset < buf_len {
+      match buf[offset] {
+        PORTION_TAG => {
+          let readed = skip(WireType::Fixed64, &buf[offset..])?;
+          if let Some((ref mut fnso, ref mut lnso)) = portion_offsets {
+            if *fnso > offset {
+              *fnso = offset - 1;
+            }
+
+            if *lnso < offset + readed {
+              *lnso = offset + readed;
+            }
+          } else {
+            portion_offsets = Some((offset - 1, offset + readed));
+          }
+          num_portions += 1;
+          offset += readed;
+        }
+        ERROR_TAG => {
+          if error.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "error",
+              ERROR_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          error = Some(val);
+        }
+        ADJUSTMENT_TAG => {
+          if adjustment.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "adjustment",
+              ADJUSTMENT_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          adjustment = Some(val);
+        }
+        HEIGHT_TAG => {
+          if height.is_some() {
+            return Err(DecodeError::duplicate_field(
+              "Coordinate",
+              "height",
+              HEIGHT_TAG,
+            ));
+          }
+
+          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
+          offset += len;
+          height = Some(val);
+        }
+        other => {
+          offset += 1;
+
+          let (wire_type, _) = split(other);
+          let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          offset += skip(wire_type, &buf[offset..])?;
+        }
+      }
+    }
+
+    Ok((
+      offset,
+      Self {
+        portion: if let Some((start, end)) = portion_offsets {
+          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
+            .with_nums(num_portions)
+            .with_offsets(start, end)
+        } else {
+          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
+        },
+        error: error.ok_or_else(|| DecodeError::missing_field("Coordinate", "error"))?,
+        adjustment: adjustment
+          .ok_or_else(|| DecodeError::missing_field("Coordinate", "adjustment"))?,
+        height: height.ok_or_else(|| DecodeError::missing_field("Coordinate", "height"))?,
+      },
+    ))
+  }
+}
+
+impl Data for Coordinate {
+  type Ref<'a> = CoordinateRef<'a>;
+
+  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
+  where
+    Self: Sized,
+  {
+    val
+      .portion
+      .iter::<f64>()
+      .collect::<Result<SmallVec<[f64; DEFAULT_DIMENSIONALITY]>, _>>()
+      .map(|portion| Self {
+        portion,
+        error: val.error,
+        adjustment: val.adjustment,
+        height: val.height,
+      })
+  }
+
+  fn encoded_len(&self) -> usize {
+    self
+      .portion
+      .iter()
+      .fold(0, |acc, x| acc + 1 + x.encoded_len_with_length_delimited())
+      + 1
+      + self.error.encoded_len()
+      + 1
+      + self.adjustment.encoded_len()
+      + 1
+      + self.height.encoded_len()
+  }
+
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    macro_rules! bail {
+      ($this:ident($offset:expr, $len:ident)) => {
+        if $offset >= $len {
+          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
+        }
+      };
+    }
+
+    let mut offset = 0;
+    let buf_len = buf.len();
+    for x in self.portion.iter() {
+      bail!(self(offset, buf_len));
+      buf[offset] = PORTION_BYTE;
+      offset += 1;
+      offset += x
+        .encode(&mut buf[offset..])
+        .map_err(|e| e.update(self.encoded_len(), buf_len))?;
+    }
+
+    bail!(self(offset, buf_len));
+    buf[offset] = ERROR_BYTE;
+    offset += 1;
+    offset += self.error.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = ADJUSTMENT_BYTE;
+    offset += 1;
+    offset += self.adjustment.encode(&mut buf[offset..])?;
+
+    bail!(self(offset, buf_len));
+    buf[offset] = HEIGHT_BYTE;
+    offset += 1;
+    offset += self.height.encode(&mut buf[offset..])?;
+
+    Ok(offset)
+  }
+}
+
+/// Error type for the [`Coordinate`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CoordinateError {
+  /// Returned when the dimensions of the coordinates are not compatible.
+  #[error("dimensions aren't compatible")]
+  DimensionalityMismatch,
+  /// Returned when the coordinate is invalid.
+  #[error("invalid coordinate")]
+  InvalidCoordinate,
+  /// Returned when the round trip time is not in a valid range.
+  #[error("round trip time not in valid range, duration {0:?} is not a value less than 10s")]
+  InvalidRTT(Duration),
 }
 
 /// Used to record events that occur when updating coordinates.
@@ -500,421 +917,6 @@ where
     }
 
     Ok(l.coord.clone())
-  }
-}
-
-/// A specialized structure for holding network coordinates for the
-/// Vivaldi-based coordinate mapping algorithm. All of the fields should be public
-/// to enable this to be serialized. All values in here are in units of seconds.
-#[viewit::viewit(getters(style = "move"), setters(prefix = "with"))]
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Coordinate {
-  /// The Euclidean portion of the coordinate. This is used along
-  /// with the other fields to provide an overall distance estimate. The
-  /// units here are seconds.
-  #[viewit(
-    getter(
-      const,
-      style = "ref",
-      attrs(doc = "Returns the Euclidean portion of the coordinate.")
-    ),
-    setter(attrs(doc = "Sets the Euclidean portion of the coordinate."))
-  )]
-  portion: SmallVec<[f64; DEFAULT_DIMENSIONALITY]>,
-  /// Reflects the confidence in the given coordinate and is updated
-  /// dynamically by the Vivaldi Client. This is dimensionless.
-  #[viewit(
-    getter(const, attrs(doc = "Returns the confidence in the given coordinate.")),
-    setter(attrs(doc = "Sets the confidence in the given coordinate."))
-  )]
-  error: f64,
-  /// A distance offset computed based on a calculation over
-  /// observations from all other nodes over a fixed window and is updated
-  /// dynamically by the Vivaldi Client. The units here are seconds.
-  #[viewit(
-    getter(const, attrs(doc = "Returns the distance offset.")),
-    setter(attrs(doc = "Sets the distance offset."))
-  )]
-  adjustment: f64,
-  /// A distance offset that accounts for non-Euclidean effects
-  /// which model the access links from nodes to the core Internet. The access
-  /// links are usually set by bandwidth and congestion, and the core links
-  /// usually follow distance based on geography.
-  #[viewit(
-    getter(
-      const,
-      attrs(doc = "Returns the distance offset that accounts for non-Euclidean effects.")
-    ),
-    setter(attrs(doc = "Sets the distance offset that accounts for non-Euclidean effects."))
-  )]
-  height: f64,
-}
-
-impl Default for Coordinate {
-  #[inline]
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl Coordinate {
-  /// Creates a new coordinate at the origin, using the default options
-  /// to supply key initial values.
-  #[inline]
-  pub fn new() -> Self {
-    Self::with_options(CoordinateOptions::new())
-  }
-
-  /// Creates a new coordinate at the origin, using the given options
-  /// to supply key initial values.
-  #[inline]
-  pub fn with_options(opts: CoordinateOptions) -> Self {
-    let mut vec = SmallVec::with_capacity(opts.dimensionality);
-    vec.resize(opts.dimensionality, 0.0);
-    Self {
-      portion: vec,
-      error: opts.vivaldi_error_max,
-      adjustment: 0.0,
-      height: opts.height_min,
-    }
-  }
-
-  /// Returns true if the coordinate is valid.
-  #[inline]
-  pub fn is_valid(&self) -> bool {
-    self.portion.iter().all(|&f| f.is_finite())
-      && self.error.is_finite()
-      && self.adjustment.is_finite()
-      && self.height.is_finite()
-  }
-
-  /// Returns true if the dimensions of the coordinates are compatible.
-  #[inline]
-  pub fn is_compatible_with(&self, other: &Self) -> bool {
-    self.portion.len() == other.portion.len()
-  }
-
-  /// Returns the result of applying the force from the direction of the
-  /// other coordinate.
-  pub fn apply_force(&self, height_min: f64, force: f64, other: &Self) -> Self {
-    assert!(
-      self.is_compatible_with(other),
-      "coordinate dimensionality does not match"
-    );
-
-    let mut ret = self.clone();
-    let (mut unit, mag) = unit_vector_at(&self.portion, &other.portion);
-    add_in_place(&mut ret.portion, mul_in_place(&mut unit, force));
-    if mag > ZERO_THRESHOLD {
-      ret.height = (ret.height + other.height) * force / mag + ret.height;
-      ret.height = ret.height.max(height_min);
-    }
-    ret
-  }
-
-  /// Apply the result of applying the force from the direction of the
-  /// other coordinate to self.
-  pub fn apply_force_in_place(&mut self, height_min: f64, force: f64, other: &Self) {
-    assert!(
-      self.is_compatible_with(other),
-      "coordinate dimensionality does not match"
-    );
-    let (mut unit, mag) = unit_vector_at(&self.portion, &other.portion);
-    add_in_place(&mut self.portion, mul_in_place(&mut unit, force));
-
-    if mag > ZERO_THRESHOLD {
-      self.height = (self.height + other.height) * force / mag + self.height;
-      self.height = self.height.max(height_min);
-    }
-  }
-
-  /// Returns the distance between this coordinate and the other
-  /// coordinate, including adjustments.
-  pub fn distance_to(&self, other: &Self) -> Duration {
-    assert!(
-      self.is_compatible_with(other),
-      "coordinate dimensionality does not match"
-    );
-
-    let dist = self.raw_distance_to(other);
-    let adjusted_dist = dist + self.adjustment + other.adjustment;
-    let dist = if adjusted_dist > 0.0 {
-      adjusted_dist
-    } else {
-      dist
-    };
-    Duration::from_nanos((dist * SECONDS_TO_NANOSECONDS) as u64)
-  }
-
-  #[inline]
-  fn raw_distance_to(&self, other: &Self) -> f64 {
-    magnitude_in_place(diff_in_place(&self.portion, &other.portion)) + self.height + other.height
-  }
-}
-
-#[inline]
-fn add_in_place(vec1: &mut [f64], vec2: &[f64]) {
-  for (x, y) in vec1.iter_mut().zip(vec2.iter()) {
-    *x += y;
-  }
-}
-
-/// Returns difference between the vec1 and vec2. This assumes the
-/// dimensions have already been checked to be compatible.
-#[inline]
-fn diff(vec1: &[f64], vec2: &[f64]) -> SmallVec<[f64; DEFAULT_DIMENSIONALITY]> {
-  vec1.iter().zip(vec2).map(|(x, y)| x - y).collect()
-}
-
-/// computes difference between the vec1 and vec2 in place. This assumes the
-/// dimensions have already been checked to be compatible.
-#[inline]
-fn diff_in_place<'a>(vec1: &'a [f64], vec2: &'a [f64]) -> impl Iterator<Item = f64> + 'a {
-  vec1.iter().zip(vec2).map(|(x, y)| x - y)
-}
-
-/// multiplied by a scalar factor in place.
-#[inline]
-fn mul_in_place(vec: &mut [f64], factor: f64) -> &mut [f64] {
-  for x in vec.iter_mut() {
-    *x *= factor;
-  }
-  vec
-}
-
-/// Computes the magnitude of the vec.
-#[inline]
-fn magnitude_in_place(vec: impl Iterator<Item = f64>) -> f64 {
-  vec.fold(0.0, |acc, x| acc + x * x).sqrt()
-}
-
-/// Returns a unit vector pointing at vec1 from vec2. If the two
-/// positions are the same then a random unit vector is returned. We also return
-/// the distance between the points for use in the later height calculation.
-fn unit_vector_at(vec1: &[f64], vec2: &[f64]) -> (SmallVec<[f64; DEFAULT_DIMENSIONALITY]>, f64) {
-  let mut ret = diff(vec1, vec2);
-
-  let mag = magnitude_in_place(ret.iter().copied());
-  if mag > ZERO_THRESHOLD {
-    mul_in_place(&mut ret, mag.recip());
-    return (ret, mag);
-  }
-
-  for x in ret.iter_mut() {
-    *x = rand_f64() - 0.5;
-  }
-
-  let mag = magnitude_in_place(ret.iter().copied());
-  if mag > ZERO_THRESHOLD {
-    mul_in_place(&mut ret, mag.recip());
-    return (ret, 0.0);
-  }
-
-  // And finally just give up and make a unit vector along the first
-  // dimension. This should be exceedingly rare.
-  ret.fill(0.0);
-  ret[0] = 1.0;
-  (ret, 0.0)
-}
-
-fn rand_f64() -> f64 {
-  let mut rng = rand::rng();
-  loop {
-    let f = (rng.random_range::<u64, _>(0..(1u64 << 63u64)) as f64) / ((1u64 << 63u64) as f64);
-    if f == 1.0 {
-      continue;
-    }
-    return f;
-  }
-}
-
-const PORTION_TAG: u8 = 1;
-const ERROR_TAG: u8 = 2;
-const ADJUSTMENT_TAG: u8 = 3;
-const HEIGHT_TAG: u8 = 4;
-const PORTION_BYTE: u8 = merge(WireType::LengthDelimited, PORTION_TAG);
-const ERROR_BYTE: u8 = merge(WireType::Fixed64, ERROR_TAG);
-const ADJUSTMENT_BYTE: u8 = merge(WireType::Fixed64, ADJUSTMENT_TAG);
-const HEIGHT_BYTE: u8 = merge(WireType::Fixed64, HEIGHT_TAG);
-
-/// The reference type to [`Coordinate`].
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct CoordinateRef<'a> {
-  portion: RepeatedDecoder<'a>,
-  error: f64,
-  adjustment: f64,
-  height: f64,
-}
-
-impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
-  fn decode(buf: &'a [u8]) -> Result<(usize, Self), DecodeError>
-  where
-    Self: Sized,
-  {
-    let mut offset = 0;
-    let buf_len = buf.len();
-
-    let mut portion_offsets = None;
-    let mut num_portions = 0;
-    let mut error = None;
-    let mut adjustment = None;
-    let mut height = None;
-
-    while offset < buf_len {
-      match buf[offset] {
-        PORTION_TAG => {
-          let readed = skip(WireType::Fixed64, &buf[offset..])?;
-          if let Some((ref mut fnso, ref mut lnso)) = portion_offsets {
-            if *fnso > offset {
-              *fnso = offset - 1;
-            }
-
-            if *lnso < offset + readed {
-              *lnso = offset + readed;
-            }
-          } else {
-            portion_offsets = Some((offset - 1, offset + readed));
-          }
-          num_portions += 1;
-          offset += readed;
-        }
-        ERROR_TAG => {
-          if error.is_some() {
-            return Err(DecodeError::duplicate_field(
-              "Coordinate",
-              "error",
-              ERROR_TAG,
-            ));
-          }
-
-          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
-          offset += len;
-          error = Some(val);
-        }
-        ADJUSTMENT_TAG => {
-          if adjustment.is_some() {
-            return Err(DecodeError::duplicate_field(
-              "Coordinate",
-              "adjustment",
-              ADJUSTMENT_TAG,
-            ));
-          }
-
-          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
-          offset += len;
-          adjustment = Some(val);
-        }
-        HEIGHT_TAG => {
-          if height.is_some() {
-            return Err(DecodeError::duplicate_field(
-              "Coordinate",
-              "height",
-              HEIGHT_TAG,
-            ));
-          }
-
-          let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
-          offset += len;
-          height = Some(val);
-        }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
-      }
-    }
-
-    Ok((
-      offset,
-      Self {
-        portion: if let Some((start, end)) = portion_offsets {
-          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
-            .with_nums(num_portions)
-            .with_offsets(start, end)
-        } else {
-          RepeatedDecoder::new(PORTION_TAG, WireType::Fixed64, buf)
-        },
-        error: error.ok_or_else(|| DecodeError::missing_field("Coordinate", "error"))?,
-        adjustment: adjustment
-          .ok_or_else(|| DecodeError::missing_field("Coordinate", "adjustment"))?,
-        height: height.ok_or_else(|| DecodeError::missing_field("Coordinate", "height"))?,
-      },
-    ))
-  }
-}
-
-impl Data for Coordinate {
-  type Ref<'a> = CoordinateRef<'a>;
-
-  fn from_ref(val: Self::Ref<'_>) -> Result<Self, DecodeError>
-  where
-    Self: Sized,
-  {
-    val
-      .portion
-      .iter::<f64>()
-      .collect::<Result<SmallVec<[f64; DEFAULT_DIMENSIONALITY]>, _>>()
-      .map(|portion| Self {
-        portion,
-        error: val.error,
-        adjustment: val.adjustment,
-        height: val.height,
-      })
-  }
-
-  fn encoded_len(&self) -> usize {
-    self
-      .portion
-      .iter()
-      .fold(0, |acc, x| acc + 1 + x.encoded_len_with_length_delimited())
-      + 1
-      + self.error.encoded_len()
-      + 1
-      + self.adjustment.encoded_len()
-      + 1
-      + self.height.encoded_len()
-  }
-
-  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
-    macro_rules! bail {
-      ($this:ident($offset:expr, $len:ident)) => {
-        if $offset >= $len {
-          return Err(EncodeError::insufficient_buffer(self.encoded_len(), $len));
-        }
-      };
-    }
-
-    let mut offset = 0;
-    let buf_len = buf.len();
-    for x in self.portion.iter() {
-      bail!(self(offset, buf_len));
-      buf[offset] = PORTION_BYTE;
-      offset += 1;
-      offset += x
-        .encode(&mut buf[offset..])
-        .map_err(|e| e.update(self.encoded_len(), buf_len))?;
-    }
-
-    bail!(self(offset, buf_len));
-    buf[offset] = ERROR_BYTE;
-    offset += 1;
-    offset += self.error.encode(&mut buf[offset..])?;
-
-    bail!(self(offset, buf_len));
-    buf[offset] = ADJUSTMENT_BYTE;
-    offset += 1;
-    offset += self.adjustment.encode(&mut buf[offset..])?;
-
-    bail!(self(offset, buf_len));
-    buf[offset] = HEIGHT_BYTE;
-    offset += 1;
-    offset += self.height.encode(&mut buf[offset..])?;
-
-    Ok(offset)
   }
 }
 

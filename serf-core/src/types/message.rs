@@ -86,6 +86,22 @@ pub enum MessageType {
 }
 
 impl MessageType {
+  /// All message types in order
+  pub const ALL: &[Self] = &[
+    Self::Leave,
+    Self::Join,
+    Self::PushPull,
+    Self::UserEvent,
+    Self::Query,
+    Self::QueryResponse,
+    Self::ConflictResponse,
+    Self::Relay,
+    #[cfg(feature = "encryption")]
+    Self::KeyRequest,
+    #[cfg(feature = "encryption")]
+    Self::KeyResponse,
+  ];
+
   /// Get the string representation of the message type
   #[inline]
   pub fn as_str(&self) -> std::borrow::Cow<'static, str> {

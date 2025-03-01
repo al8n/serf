@@ -3,7 +3,7 @@ use std::{
   hash::Hash,
 };
 
-use super::{Filter, TagFilter};
+use super::{Filter, MessageType, TagFilter};
 use arbitrary::{Arbitrary, Unstructured};
 use indexmap::{IndexMap, IndexSet};
 use memberlist_core::proto::TinyVec;
@@ -156,5 +156,12 @@ where
       keys: arbitrary_indexmap(u)?,
       primary_keys: arbitrary_indexmap(u)?,
     })
+  }
+}
+
+impl<'a> Arbitrary<'a> for MessageType {
+  fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+    u.arbitrary::<u8>()
+      .map(|val| Self::from(val % Self::ALL.len() as u8))
   }
 }

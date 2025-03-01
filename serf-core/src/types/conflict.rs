@@ -7,7 +7,7 @@ use super::*;
 
 /// A conflict message
 #[viewit::viewit(setters(prefix = "with"))]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ConflictResponseMessage<I, A> {

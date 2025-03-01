@@ -18,6 +18,9 @@ const TAGS_BYTE: u8 = merge(WireType::LengthDelimited, TAGS_TAG);
   derive_more::Into,
   derive_more::Deref,
   derive_more::DerefMut,
+  derive_more::AsRef,
+  derive_more::AsMut,
+  derive_more::IntoIterator,
 )]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
@@ -27,27 +30,16 @@ pub struct Tags(
    IndexMap<SmolStr, SmolStr>,
 );
 
-impl IntoIterator for Tags {
-  type Item = (SmolStr, SmolStr);
-  type IntoIter = indexmap::map::IntoIter<SmolStr, SmolStr>;
-
-  fn into_iter(self) -> Self::IntoIter {
-    self.0.into_iter()
-  }
-}
-
-impl FromIterator<(SmolStr, SmolStr)> for Tags {
-  fn from_iter<T: IntoIterator<Item = (SmolStr, SmolStr)>>(iter: T) -> Self {
-    Self(iter.into_iter().collect())
-  }
-}
-
-impl<'a> FromIterator<(&'a str, &'a str)> for Tags {
-  fn from_iter<T: IntoIterator<Item = (&'a str, &'a str)>>(iter: T) -> Self {
+impl<K, V> FromIterator<(K, V)> for Tags
+where
+  K: Into<SmolStr>,
+  V: Into<SmolStr>,
+{
+  fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
     Self(
       iter
         .into_iter()
-        .map(|(k, v)| (SmolStr::new(k), SmolStr::new(v)))
+        .map(|(k, v)| (k.into(), v.into()))
         .collect(),
     )
   }

@@ -10,9 +10,6 @@ pub(crate) mod broadcast;
 
 mod coalesce;
 
-/// Coordinate.
-pub mod coordinate;
-
 /// Events for [`Serf`]
 pub mod event;
 
@@ -27,6 +24,7 @@ pub use options::*;
 
 /// The types used in `serf`.
 pub mod types;
+pub use types::coordinate;
 
 /// Secret key management.
 #[cfg(feature = "encryption")]

@@ -172,17 +172,6 @@ impl LamportClock {
   }
 }
 
-#[cfg(feature = "quickcheck")]
-const _: () = {
-  use quickcheck::{Arbitrary, Gen};
-
-  impl Arbitrary for LamportTime {
-    fn arbitrary(g: &mut Gen) -> Self {
-      Self(u64::arbitrary(g))
-    }
-  }
-};
-
 #[test]
 fn test_lamport_clock() {
   let l = LamportClock::new();

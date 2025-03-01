@@ -34,6 +34,9 @@ smol_str = "0.3"
 smallvec = "1"
 rand = "0.9"
 
+arbitrary = { version = "1", default-features = false, features = ["derive"] }
+quickcheck = { version = "1", default-features = false }
+
 memberlist-proto = { version = "0.1", path = "../memberlist/memberlist-proto", default-features = false }
 memberlist-core = { version = "0.6", path = "../memberlist/memberlist-core", default-features = false }
 memberlist = { version = "0.6", path = "../memberlist/memberlist", default-features = false }

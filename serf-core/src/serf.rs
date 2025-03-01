@@ -17,11 +17,13 @@ use memberlist_core::{
 use super::{
   Options,
   broadcast::SerfBroadcast,
-  coordinate::{Coordinate, CoordinateClient},
   delegate::{CompositeDelegate, Delegate},
   event::CrateEvent,
   snapshot::SnapshotHandle,
-  types::{LamportClock, LamportTime, Members, UserEvents},
+  types::{
+    LamportClock, LamportTime, Members, UserEvents,
+    coordinate::{Coordinate, CoordinateClient},
+  },
 };
 
 mod api;
