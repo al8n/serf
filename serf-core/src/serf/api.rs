@@ -268,7 +268,7 @@ where
     };
 
     // Start broadcasting the event
-    let len = crate::types::Encodable::encoded_len(&msg);
+    let len = crate::types::encoded_message_len(&msg);
 
     // Check the size after encoding to be sure again that
     // we're not attempting to send over the specified size limit.
@@ -280,7 +280,7 @@ where
       return Err(Error::raw_user_event_too_large(len));
     }
 
-    let raw = crate::types::Encodable::encode_to_bytes(&msg)?;
+    let raw = crate::types::encode_message_to_bytes(&msg)?;
 
     self.inner.event_clock.increment();
 
@@ -459,7 +459,7 @@ where
     // other node alive.
     if self.has_alive_members().await {
       let (notify_tx, notify_rx) = async_channel::bounded(1);
-      let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
+      let msg = crate::types::encode_message_to_bytes(&msg)?;
       self.broadcast(msg, Some(notify_tx)).await?;
 
       futures::select! {

@@ -75,7 +75,7 @@ where
           offset += read;
           ltime = Some(value);
         }
-        ID_TAG => {
+        b if b == JoinMessage::<I>::id_byte() => {
           if id.is_some() {
             return Err(DecodeError::duplicate_field("JoinMessage", "id", ID_TAG));
           }
@@ -139,7 +139,7 @@ where
 
     buf[offset] = LTIME_BYTE;
     offset += 1;
-    offset += self.ltime.encode(buf)?;
+    offset += self.ltime.encode(&mut buf[offset..])?;
 
     if buf_len <= offset {
       return Err(EncodeError::insufficient_buffer(
@@ -154,7 +154,7 @@ where
     offset += self.id.encode_length_delimited(&mut buf[offset..])?;
 
     #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, self.encoded_len());
+    super::debug_assert_write_eq::<Self>(offset, self.encoded_len());
 
     Ok(offset)
   }

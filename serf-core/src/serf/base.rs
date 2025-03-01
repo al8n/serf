@@ -386,7 +386,7 @@ where
     // Process update locally
     self.handle_node_join_intent(&msg).await;
 
-    let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
+    let msg = crate::types::encode_message_to_bytes(&msg)?;
     // Start broadcasting the update
     if let Err(e) = self.broadcast(msg, None).await {
       tracing::warn!(err=%e, "serf: failed to broadcast join intent");
@@ -471,7 +471,7 @@ where
       return Ok(());
     }
 
-    let msg = crate::types::Encodable::encode_to_bytes(&msg)?;
+    let msg = crate::types::encode_message_to_bytes(&msg)?;
     // Broadcast the remove
     let (ntx, nrx) = async_channel::bounded(1);
     self.broadcast(msg, Some(ntx)).await?;
@@ -917,14 +917,14 @@ where
     };
 
     // Encode the query
-    let len = crate::types::Encodable::encoded_len(&q);
+    let len = crate::types::encoded_message_len(&q);
 
     // Check the size
     if len > self.inner.opts.query_size_limit {
       return Err(Error::query_too_large(len));
     }
 
-    let raw = crate::types::Encodable::encode_to_bytes(&q)?;
+    let raw = crate::types::encode_message_to_bytes(&q)?;
 
     // Register QueryResponse to track acks and responses
     let resp = QueryResponse::from_query(&q, self.inner.memberlist.num_online_members().await);
@@ -1086,7 +1086,7 @@ where
         payload: Bytes::new(),
       };
 
-      match crate::types::Encodable::encode_to_bytes(&ack) {
+      match crate::types::encode_message_to_bytes(&ack) {
         Ok(raw) => {
           let (name, payload, from, relay_factor) = match q {
             Either::Left(q) => (

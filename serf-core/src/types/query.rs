@@ -451,7 +451,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = LTIME_BYTE;
     offset += 1;
-
     offset += self
       .ltime
       .encode(&mut buf[offset..])
@@ -460,7 +459,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = ID_BYTE;
     offset += 1;
-
     offset += self
       .id
       .encode(&mut buf[offset..])
@@ -469,7 +467,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = FROM_BYTE;
     offset += 1;
-
     offset += self
       .from
       .encode_length_delimited(&mut buf[offset..])
@@ -488,14 +485,12 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = FLAGS_BYTE;
     offset += 1;
-
     offset += <u32 as Data>::encode(&self.flags.bits(), &mut buf[offset..])
       .map_err(|e| e.update(self.encoded_len(), buf_len))?;
 
     bail!(self(offset, buf_len));
     buf[offset] = RELAY_FACTOR_BYTE;
     offset += 1;
-
     bail!(self(offset, buf_len));
     buf[offset] = self.relay_factor;
     offset += 1;
@@ -503,7 +498,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = TIMEOUT_BYTE;
     offset += 1;
-
     offset += self
       .timeout
       .encode(&mut buf[offset..])
@@ -513,7 +507,6 @@ where
       bail!(self(offset, buf_len));
       buf[offset] = NAME_BYTE;
       offset += 1;
-
       offset += self
         .name
         .encode_length_delimited(&mut buf[offset..])
@@ -524,7 +517,6 @@ where
       bail!(self(offset, buf_len));
       buf[offset] = PAYLOAD_BYTE;
       offset += 1;
-
       offset += self
         .payload
         .encode_length_delimited(&mut buf[offset..])
@@ -532,7 +524,7 @@ where
     }
 
     #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, self.encoded_len());
+    super::debug_assert_write_eq::<Self>(offset, self.encoded_len());
 
     Ok(offset)
   }

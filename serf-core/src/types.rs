@@ -14,7 +14,6 @@ mod quickcheck_impl;
 #[cfg(test)]
 mod tests;
 
-
 mod clock;
 pub use clock::*;
 
@@ -62,10 +61,12 @@ pub use key::*;
 
 #[cfg(debug_assertions)]
 #[inline]
-fn debug_assert_write_eq(actual: usize, expected: usize) {
+fn debug_assert_write_eq<T: ?Sized>(actual: usize, expected: usize) {
   debug_assert_eq!(
-    actual, expected,
-    "expect writting {expected} bytes, but actual write {actual} bytes"
+    actual,
+    expected,
+    "{}: expect writting {expected} bytes, but actual write {actual} bytes",
+    core::any::type_name::<T>(),
   );
 }
 

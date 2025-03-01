@@ -159,7 +159,7 @@ where
 
           offset += 1;
           let (o, v) =
-            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode(&buf[offset..])?;
+            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(&buf[offset..])?;
           offset += o;
           from = Some(v);
         }
@@ -187,7 +187,7 @@ where
           }
 
           offset += 1;
-          let (o, v) = <&[u8] as DataRef<'_, Bytes>>::decode(&buf[offset..])?;
+          let (o, v) = <&[u8] as DataRef<'_, Bytes>>::decode_length_delimited(&buf[offset..])?;
           offset += o;
           payload = Some(v);
         }
@@ -262,7 +262,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = LTIME_BYTE;
     offset += 1;
-
     offset += self
       .ltime
       .encode(&mut buf[offset..])
@@ -271,7 +270,6 @@ where
     bail!(self(offset, buf_len));
     buf[offset] = ID_BYTE;
     offset += 1;
-
     offset += self
       .id
       .encode(&mut buf[offset..])
@@ -305,8 +303,7 @@ where
     }
 
     #[cfg(debug_assertions)]
-    super::super::debug_assert_write_eq(offset, self.encoded_len());
-
+    super::super::debug_assert_write_eq::<Self>(offset, self.encoded_len());
     Ok(offset)
   }
 }

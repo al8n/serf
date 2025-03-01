@@ -167,7 +167,15 @@ macro_rules! bail {
   ($this:ident($offset:expr, $len:ident)) => {
     if $offset >= $len {
       return Err(EncodeError::insufficient_buffer(
-        Encodable::encoded_len($this),
+        encoded_message_len($this),
+        $len,
+      ));
+    }
+  };
+  (@relay $this:ident($offset:expr, $len:ident, $node:ident)) => {
+    if $offset >= $len {
+      return Err(EncodeError::insufficient_buffer(
+        encoded_relay_message_len($this, $node),
         $len,
       ));
     }
@@ -182,94 +190,18 @@ const RELAY_MSG_BYTE: u8 = merge(WireType::LengthDelimited, RELAY_MSG_TAG);
 
 /// A trait for encoding messages.
 pub trait Encodable {
+  const ID: u8;
+
   /// Encodes the message into a buffer.
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError>;
 
-  /// Encodes a relay message into a buffer.
-  fn encode_relay<I, A>(&self, node: &Node<I, A>, buf: &mut [u8]) -> Result<usize, EncodeError>
-  where
-    I: Data,
-    A: Data,
-  {
-    let mut offset = 0;
-    let buf_len = buf.len();
-
-    if offset >= buf_len {
-      return Err(EncodeError::insufficient_buffer(
-        self.encoded_len_with_relay(node),
-        buf_len,
-      ));
-    }
-
-    buf[offset] = RELAY_MESSAGE_BYTE;
-    offset += 1;
-
-    if offset >= buf_len {
-      return Err(EncodeError::insufficient_buffer(
-        self.encoded_len_with_relay(node),
-        buf_len,
-      ));
-    }
-
-    buf[offset] = RELAY_NODE_BYTE;
-    offset += 1;
-
-    offset += node
-      .encode_length_delimited(&mut buf[offset..])
-      .map_err(|e| e.update(self.encoded_len_with_relay(node), buf_len))?;
-
-    if offset >= buf_len {
-      return Err(EncodeError::insufficient_buffer(
-        self.encoded_len_with_relay(node),
-        buf_len,
-      ));
-    }
-
-    buf[offset] = RELAY_MSG_BYTE;
-    offset += 1;
-
-    offset += self
-      .encode(&mut buf[offset..])
-      .map_err(|e| e.update(self.encoded_len_with_relay(node), buf_len))?;
-
-    #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, self.encoded_len_with_relay(node));
-
-    Ok(offset)
-  }
-
-  /// Encodes the message into a [`Bytes`].
-  fn encode_to_bytes(&self) -> Result<Bytes, EncodeError> {
-    let len = self.encoded_len();
-    let mut buf = vec![0; len];
-    self.encode(&mut buf).map(|_| Bytes::from(buf))
-  }
-
-  /// Encodes a relay message into a [`Bytes`].
-  fn encode_relay_to_bytes<I, A>(&self, node: &Node<I, A>) -> Result<Bytes, EncodeError>
-  where
-    I: Data,
-    A: Data,
-  {
-    let len = self.encoded_len_with_relay(node);
-    let mut buf = vec![0; len];
-    self.encode_relay(node, &mut buf).map(|_| Bytes::from(buf))
-  }
-
   /// Returns the encoded length of the message.
   fn encoded_len(&self) -> usize;
-
-  /// Returns the encoded length of the message with a relay tag.
-  fn encoded_len_with_relay<I, A>(&self, node: &Node<I, A>) -> usize
-  where
-    I: Data,
-    A: Data,
-  {
-    1 + node.encoded_len_with_length_delimited() + 1 + self.encoded_len()
-  }
 }
 
 impl<T: Encodable> Encodable for &T {
+  const ID: u8 = T::ID;
+
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
     (*self).encode(buf)
   }
@@ -294,24 +226,14 @@ macro_rules! impl_encodable {
           $($generic: Data,)+
       )?
       {
+        const ID: u8 = $id;
+
         fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
-          let mut offset = 0;
-          let buf_len = buf.len();
-          bail!(self(offset, buf_len));
-
-          buf[offset] = $id;
-          offset += 1;
-
-          offset += self.encode_length_delimited(&mut buf[offset..])?;
-
-          #[cfg(debug_assertions)]
-          super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
-
-          Ok(offset)
+          Data::encode(self, buf)
         }
 
         fn encoded_len(&self) -> usize {
-          1 + self.encoded_len_with_length_delimited()
+          Data::encoded_len(self)
         }
       }
     )*
@@ -321,7 +243,6 @@ macro_rules! impl_encodable {
 impl_encodable!(
   LeaveMessage<I> = LEAVE_MESSAGE_BYTE,
   JoinMessage<I> = JOIN_MESSAGE_BYTE,
-  // PushPullMessage<I> = PUSH_PULL_MESSAGE_BYTE,
   UserEventMessage = USER_EVENT_MESSAGE_BYTE,
   QueryMessage<I, A> = QUERY_MESSAGE_BYTE,
   QueryResponseMessage<I, A> = QUERY_RESPONSE_MESSAGE_BYTE,
@@ -337,24 +258,29 @@ where
   I: Data,
   A: Data,
 {
+  const ID: u8 = CONFLICT_RESPONSE_MESSAGE_BYTE;
+
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
-    let mut offset = 0;
-    let buf_len = buf.len();
-    bail!(self(offset, buf_len));
-
-    buf[offset] = CONFLICT_RESPONSE_MESSAGE_BYTE;
-    offset += 1;
-
-    offset += self.encode_in(&mut buf[offset..])?;
-
-    #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
-
-    Ok(offset)
+    self.encode_in(buf)
   }
 
   fn encoded_len(&self) -> usize {
-    1 + self.encoded_len_in()
+    self.encoded_len_in()
+  }
+}
+
+impl<I> super::Encodable for PushPullMessage<I>
+where
+  I: Data + Eq + core::hash::Hash,
+{
+  const ID: u8 = PUSH_PULL_MESSAGE_BYTE;
+
+  fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
+    Data::encode(self, buf)
+  }
+
+  fn encoded_len(&self) -> usize {
+    Data::encoded_len(self)
   }
 }
 
@@ -362,24 +288,14 @@ impl<I> super::Encodable for PushPullMessageBorrow<'_, I>
 where
   I: Data,
 {
+  const ID: u8 = PUSH_PULL_MESSAGE_BYTE;
+
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
-    let mut offset = 0;
-    let buf_len = buf.len();
-    bail!(self(offset, buf_len));
-
-    buf[offset] = PUSH_PULL_MESSAGE_BYTE;
-    offset += 1;
-
-    offset += self.encode_in(&mut buf[offset..])?;
-
-    #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, Encodable::encoded_len(self));
-
-    Ok(offset)
+    self.encode_in(buf)
   }
 
   fn encoded_len(&self) -> usize {
-    1 + self.encoded_len_in()
+    self.encoded_len_in()
   }
 }
 
@@ -434,6 +350,127 @@ impl<I, A> MessageRef<'_, I, A> {
       #[cfg(feature = "encryption")]
       Self::KeyResponse(_) => MessageType::KeyResponse,
     }
+  }
+}
+
+/// Encode a message into a Bytes.
+pub fn encode_message_to_bytes<T>(msg: &T) -> Result<Bytes, EncodeError>
+where
+  T: Encodable,
+{
+  let len = encoded_message_len(msg);
+  let mut buf = vec![0; len];
+  encode_message(msg, &mut buf).map(|_| Bytes::from(buf))
+}
+
+/// Encode a relay message into a Bytes.
+pub fn encode_relay_message_to_bytes<T, I, A>(msg: &T, node: &Node<I, A>) -> Result<Bytes, EncodeError>
+where
+  T: Encodable,
+  I: Data,
+  A: Data,
+{
+  let len = encoded_relay_message_len(msg, node);
+  let mut buf = vec![0; len];
+  encode_relay_message(msg, node, &mut buf).map(|_| Bytes::from(buf))
+}
+
+/// Encode a message into a buffer.
+pub fn encode_message<T>(msg: &T, buf: &mut [u8]) -> Result<usize, EncodeError>
+where
+  T: Encodable,
+{
+  let mut offset = 0;
+  let buf_len = buf.len();
+  bail!(msg(offset, buf_len));
+
+  buf[offset] = T::ID;
+  offset += 1;
+
+  let encoded_len = msg.encoded_len();
+  if encoded_len > u32::MAX as usize {
+    return Err(EncodeError::TooLarge);
+  }
+
+  offset += (encoded_len as u32).encode(&mut buf[offset..]).map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
+
+  offset += msg.encode(&mut buf[offset..]).map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
+
+  #[cfg(debug_assertions)]
+  {
+    struct Message<T>(core::marker::PhantomData<T>);
+    super::debug_assert_write_eq::<Message<T>>(offset, encoded_message_len(msg));
+  }
+
+  Ok(offset)
+}
+
+/// Encode a relay message into a buffer.
+pub fn encode_relay_message<T, I, A>(msg: &T, node: &Node<I, A>, buf: &mut [u8]) -> Result<usize, EncodeError>
+where
+  T: Encodable,
+  I: Data,
+  A: Data,
+{
+  let mut offset = 0;
+  let buf_len = buf.len();
+  bail!(@relay msg(offset, buf_len, node));
+
+  buf[offset] = RELAY_MESSAGE_BYTE;
+  offset += 1;
+
+  bail!(@relay msg(offset, buf_len, node));
+  buf[offset] = RELAY_NODE_BYTE;
+  offset += 1;
+  offset += node
+    .encode_length_delimited(&mut buf[offset..])
+    .map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
+
+  bail!(@relay msg(offset, buf_len, node));
+  buf[offset] = RELAY_MSG_BYTE;
+  offset += 1;
+
+  bail!(@relay msg(offset, buf_len, node));
+  buf[offset] = T::ID;
+  offset += 1;
+
+  let encoded_len = msg.encoded_len();
+  if encoded_len > u32::MAX as usize {
+    return Err(EncodeError::TooLarge);
+  }
+
+  offset += (encoded_len as u32).encode(&mut buf[offset..]).map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
+  offset += msg.encode(&mut buf[offset..]).map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
+
+
+  #[cfg(debug_assertions)]
+  {
+    struct Message<T>(core::marker::PhantomData<T>);
+    super::debug_assert_write_eq::<Message<T>>(offset, encoded_relay_message_len(msg, node));
+  }
+
+  Ok(offset)
+}
+
+/// Returns the encoded length of a message.
+pub fn encoded_message_len<T>(msg: &T) -> usize
+where
+  T: Encodable,
+{
+  let encoded_len = msg.encoded_len();
+  1 + (encoded_len as u32).encoded_len() + encoded_len
+}
+
+/// Returns the encoded length of the relay message.
+pub fn encoded_relay_message_len<T, I, A>(msg: &T, node: &Node<I, A>) -> usize
+where
+  T: Encodable,
+  I: Data,
+  A: Data,
+{
+  1 + 1 + node.encoded_len_with_length_delimited() + 1 + {
+    let encoded_len = msg.encoded_len();
+    1 + (encoded_len as u32).encoded_len() + encoded_len
   }
 }
 
@@ -674,15 +711,18 @@ where
         offset += 1;
 
         // Skip length-delimited field by reading the length and skipping the payload
-        if buf[offset..].is_empty() {
+        if buf[offset..].len() < 2 {
           return Err(DecodeError::buffer_underflow());
         }
 
+        let start_offset = offset;
+        let _ = buf[offset];
+        offset += 1;
+
         let (read, length) = <u32 as Data>::decode(&buf[offset..])?;
         offset += read;
-
-        msg = Some(&buf[offset..offset + length as usize]);
         offset += length as usize;
+        msg = Some(&buf[start_offset..offset]);
       }
       other => {
         offset += 1;

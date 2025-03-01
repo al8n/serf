@@ -77,6 +77,8 @@ impl<'a> DataRef<'a, UserEvents> for UserEventsRef<'a> {
           offset += size;
         }
         EVENTS_BYTE => {
+          offset += 1;
+
           let readed = super::skip(WireType::LengthDelimited, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = events_offsets {
             if *fnso > offset {
@@ -170,8 +172,15 @@ impl Data for UserEvents {
       .events
       .iter()
       .try_fold(&mut offset, |offset, ev| {
+        if *offset >= buf_len {
+          return Err(EncodeError::insufficient_buffer(
+            self.encoded_len(),
+            buf_len,
+          ));
+        }
+        buf[*offset] = EVENTS_BYTE;
+        *offset += 1;
         *offset += ev.encode_length_delimited(&mut buf[*offset..])?;
-
         Ok(offset)
       })
       .map(|offset| *offset)

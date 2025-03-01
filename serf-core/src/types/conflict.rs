@@ -77,7 +77,7 @@ where
       .map_err(|e| e.update(self.encoded_len_in(), buf.len()))?;
 
     #[cfg(debug_assertions)]
-    super::debug_assert_write_eq(offset, self.encoded_len_in());
+    super::debug_assert_write_eq::<Self>(offset, self.encoded_len_in());
 
     Ok(offset)
   }

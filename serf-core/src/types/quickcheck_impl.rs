@@ -6,7 +6,8 @@ use smol_str::SmolStr;
 use super::{
   ConflictResponseMessage, DelegateVersion, Filter, JoinMessage, LamportTime, LeaveMessage, Member,
   MemberStatus, MessageType, ProtocolVersion, PushPullMessage, QueryFlag, QueryMessage,
-  QueryResponseMessage, TagFilter, Tags, UserEvent, UserEventMessage, UserEvents, coordinate::Coordinate,
+  QueryResponseMessage, TagFilter, Tags, UserEvent, UserEventMessage, UserEvents,
+  coordinate::Coordinate,
 };
 
 #[cfg(feature = "encryption")]

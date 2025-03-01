@@ -148,7 +148,7 @@ where
     query_ltime: 100.into(),
   };
   
-  let buf = crate::types::Encodable::encode_to_bytes(&pp).unwrap();
+  let buf = crate::types::encode_message_to_bytes(&pp).unwrap();
 
   // Merge in fake state
   d.merge_remote_state(&buf, false).await;

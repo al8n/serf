@@ -354,10 +354,10 @@ pub async fn estimate_max_keys_in_list_key_response_factor<T>(
 
   let mut found = 0;
   for i in (0..=resp.keys.len()).rev() {
-    let dst = crate::types::Encodable::encode_to_bytes(&resp).unwrap();
+    let dst = crate::types::encode_message_to_bytes(&resp).unwrap();
 
     let qresp = query.create_response(dst);
-    let dst = crate::types::Encodable::encode_to_bytes(&qresp).unwrap();
+    let dst = crate::types::encode_message_to_bytes(&qresp).unwrap();
     if query.check_response_size(dst.len()).is_err() {
       resp.keys.truncate(i);
       continue;

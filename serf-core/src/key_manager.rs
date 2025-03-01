@@ -181,7 +181,7 @@ where
     event: InternalQueryEvent<T::Id>,
   ) -> Result<KeyResponse<T::Id>, Error<T, D>> {
     let kr = KeyRequestMessage { key };
-    let buf = crate::types::Encodable::encode_to_bytes(&kr)?;
+    let buf = crate::types::encode_message_to_bytes(&kr)?;
 
     let serf = self.serf.get().unwrap();
     let mut q_param = serf.default_query_param().await;

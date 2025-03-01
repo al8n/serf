@@ -99,10 +99,6 @@ where
     Self: Sized,
   {
     let buf_len = buf.len();
-    if buf_len < 1 {
-      return Err(DecodeError::buffer_underflow());
-    }
-
     let mut offset = 0;
     let mut ids_offsets = None;
     let mut num_ids = 0;
@@ -111,7 +107,8 @@ where
     while offset < buf_len {
       match buf[offset] {
         val if val == Filter::<I>::id_byte() => {
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          offset += 1;
+          let readed = skip(I::WIRE_TYPE, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = ids_offsets {
             if *fnso > offset {
               *fnso = offset - 1;
@@ -160,12 +157,15 @@ where
         tag
       } else if let Some((start, end)) = ids_offsets {
         Self::Id(
-          RepeatedDecoder::new(FILTER_ID_TAG, WireType::LengthDelimited, buf)
+          RepeatedDecoder::new(FILTER_ID_TAG, I::WIRE_TYPE, buf)
             .with_nums(num_ids)
             .with_offsets(start, end),
         )
       } else {
-        return Err(DecodeError::missing_field("Filter", "value"));
+        Self::Id(
+          RepeatedDecoder::new(FILTER_ID_TAG, I::WIRE_TYPE, buf)
+            .with_nums(0),
+        )
       },
     ))
   }
@@ -205,14 +205,13 @@ where
   }
 
   fn encoded_len(&self) -> usize {
-    1usize
-      + match self {
-        Filter::Id(ids) => ids
-          .iter()
-          .map(|id| 1 + id.encoded_len_with_length_delimited())
-          .sum::<usize>(),
-        Filter::Tag(tag) => 1 + tag.encoded_len_with_length_delimited(),
-      }
+    match self {
+      Filter::Id(ids) => ids
+        .iter()
+        .map(|id| 1 + id.encoded_len_with_length_delimited())
+        .sum::<usize>(),
+      Filter::Tag(tag) => 1 + tag.encoded_len_with_length_delimited(),
+    }
   }
 
   fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {

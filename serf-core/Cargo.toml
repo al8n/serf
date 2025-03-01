@@ -84,6 +84,7 @@ tempfile = "3"
 memberlist-core = { workspace = true, features = ["quickcheck", "arbitrary"] }
 quickcheck_macros = "1"
 quickcheck.workspace = true
+paste = "1"
 
 [package.metadata.docs.rs]
 all-features = true

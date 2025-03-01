@@ -271,7 +271,7 @@ impl Data for UserEventMessage {
     }
 
     #[cfg(debug_assertions)]
-    super::super::debug_assert_write_eq(offset, self.encoded_len());
+    super::super::debug_assert_write_eq::<Self>(offset, self.encoded_len());
 
     Ok(offset)
   }

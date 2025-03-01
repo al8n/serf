@@ -404,7 +404,7 @@ where
     };
     drop(members);
 
-    match crate::types::Encodable::encode_to_bytes(&pp) {
+    match crate::types::encode_message_to_bytes(&pp) {
       Ok(buf) => buf,
       Err(e) => {
         tracing::error!(err=%e, "serf: failed to encode local state");

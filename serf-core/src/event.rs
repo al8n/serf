@@ -91,7 +91,7 @@ where
       flags: QueryFlag::empty(),
       payload: msg,
     };
-    let buf = crate::types::Encodable::encode_to_bytes(&resp)?;
+    let buf = crate::types::encode_message_to_bytes(&resp)?;
     self
       .respond_with_message_and_response(respond_to, relay_factor, buf, resp)
       .await

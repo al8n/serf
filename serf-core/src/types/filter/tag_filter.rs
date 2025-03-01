@@ -38,7 +38,8 @@ impl<'a> DataRef<'a, TagFilter> for TagFilterRef<'a> {
           }
           offset += 1;
 
-          let (read, value) = <&str as DataRef<'_, SmolStr>>::decode(&src[offset..])?;
+          let (read, value) =
+            <&str as DataRef<'_, SmolStr>>::decode_length_delimited(&src[offset..])?;
           offset += read;
           tag = Some(value);
         }
@@ -48,7 +49,8 @@ impl<'a> DataRef<'a, TagFilter> for TagFilterRef<'a> {
           }
           offset += 1;
 
-          let (read, value) = <&str as DataRef<'_, SmolStr>>::decode(&src[offset..])?;
+          let (read, value) =
+            <&str as DataRef<'_, SmolStr>>::decode_length_delimited(&src[offset..])?;
           offset += read;
           expr = Some(value);
         }
@@ -191,7 +193,7 @@ impl Data for TagFilter {
     }
 
     #[cfg(debug_assertions)]
-    super::super::debug_assert_write_eq(offset, self.encoded_len());
+    super::super::debug_assert_write_eq::<Self>(offset, self.encoded_len());
 
     Ok(offset)
   }

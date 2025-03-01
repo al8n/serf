@@ -78,6 +78,8 @@ impl<'a> DataRef<'a, Tags> for TagsRef<'a> {
     while offset < buf_len {
       match src[offset] {
         TAGS_BYTE => {
+          offset += 1;
+
           let readed = skip(WireType::LengthDelimited, &src[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = tags_offsets {
             if *fnso > offset {
