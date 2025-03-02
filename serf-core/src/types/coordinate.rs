@@ -524,7 +524,8 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
           offset += 1;
 
           let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          let wire_type = WireType::try_from(wire_type)
+            .map_err(|v| DecodeError::unknown_wire_type("Coordinate", v))?;
           offset += skip(wire_type, &buf[offset..])?;
         }
       }

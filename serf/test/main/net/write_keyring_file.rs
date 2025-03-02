@@ -47,7 +47,9 @@ macro_rules! test_mod {
 
               [< $rt:camel Runtime >],
             >,
-          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(serf::net::security::EncryptionAlgo::default()))));
+          >(|kr| {
+            (opts, MemberlistOptions::lan().with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(EncryptionAlgorithm::default())))
+          }));
         }
       }
     }

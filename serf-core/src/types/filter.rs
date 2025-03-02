@@ -155,7 +155,8 @@ where
         }
         b => {
           let (wire_type, _) = split(b);
-          let wt = WireType::try_from(wire_type).map_err(DecodeError::unknown_wire_type)?;
+          let wt = WireType::try_from(wire_type)
+            .map_err(|v| DecodeError::unknown_wire_type("Filter", v))?;
           offset += 1;
           offset += skip(wt, &buf[offset..])?;
         }

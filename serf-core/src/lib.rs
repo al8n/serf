@@ -97,8 +97,8 @@ pub mod tests {
     use std::sync::Once;
     static TRACE: Once = Once::new();
     TRACE.call_once(|| {
-      let filter = std::env::var("RUSERF_TESTING_LOG")
-        .unwrap_or_else(|_| "serf_core=info,memberlist_core=debug".to_owned());
+      let filter = std::env::var("SERF_TESTING_LOG")
+        .unwrap_or_else(|_| "serf_core=debug,memberlist_core=debug".to_owned());
       memberlist_core::tracing::subscriber::set_global_default(
         tracing_subscriber::fmt::fmt()
           .without_time()
@@ -119,7 +119,7 @@ pub mod tests {
     B: FnOnce(F) -> F::Output,
     F: std::future::Future<Output = ()>,
   {
-    // initialize_tests_tracing();
+    initialize_tests_tracing();
     block_on(fut);
   }
 }
