@@ -35,10 +35,8 @@ where
 }
 
 /// Unit tests for the join intent old message
-pub async fn join_intent_old_message<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn join_intent_old_message<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();
@@ -87,10 +85,8 @@ pub async fn join_intent_old_message<T>(
 }
 
 /// Unit tests for the join intent newer
-pub async fn join_intent_newer<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn join_intent_newer<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();
@@ -138,10 +134,8 @@ pub async fn join_intent_newer<T>(
 }
 
 /// Unit tests for the join intent reset leaving
-pub async fn join_intent_reset_leaving<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn join_intent_reset_leaving<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();
@@ -270,10 +264,8 @@ where
 }
 
 /// Unit tests for the join pending intent logic
-pub async fn join_pending_intent<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn join_pending_intent<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();
@@ -310,10 +302,8 @@ pub async fn join_pending_intent<T>(
 }
 
 /// Unit tests for the join pending intent logic
-pub async fn join_pending_intents<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn join_pending_intents<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();

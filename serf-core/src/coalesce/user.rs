@@ -114,7 +114,7 @@ where
 //   type Transport = UnimplementedTransport<
 //     SmolStr,
 //     SocketAddrResolver<TokioRuntime>,
-//     Lpe<SmolStr, SocketAddr>,
+//
 //     TokioRuntime,
 //   >;
 

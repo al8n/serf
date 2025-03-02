@@ -20,7 +20,7 @@ use crate::{
 
 use super::*;
 
-// pub(crate) mod serf;
+pub(crate) mod serf;
 
 fn test_config() -> Options {
   let mut opts = Options::new();

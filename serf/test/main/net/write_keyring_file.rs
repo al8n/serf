@@ -2,8 +2,6 @@ macro_rules! test_mod {
   ($rt:ident) => {
     paste::paste! {
       mod [< $rt:snake >] {
-        use std::net::SocketAddr;
-
         use crate::[< $rt:snake _run >];
         use serf::{
           net::{
@@ -11,9 +9,9 @@ macro_rules! test_mod {
             NetTransportOptions,
           },
           [< $rt:snake >]::[< $rt:camel Runtime >],
-          transport::Lpe,
+
         };
-        use serf_core::tests::{serf_write_keyring_file, next_socket_addr_v4, next_socket_addr_v6};
+        use serf_core::{tests::{serf_write_keyring_file, next_socket_addr_v4, next_socket_addr_v6}, MemberlistOptions, types::EncryptionAlgorithm};
         use smol_str::SmolStr;
 
         #[test]
@@ -27,10 +25,12 @@ macro_rules! test_mod {
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
               Tcp<[< $rt:camel Runtime >]>,
-              Lpe<SmolStr, SocketAddr>,
+
               [< $rt:camel Runtime >],
             >,
-          >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(serf::net::security::EncryptionAlgo::default()))));
+          >(|kr| {
+            (opts, MemberlistOptions::lan().with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(EncryptionAlgorithm::default())))
+          }));
         }
 
         #[test]
@@ -44,7 +44,7 @@ macro_rules! test_mod {
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
               Tcp<[< $rt:camel Runtime >]>,
-              Lpe<SmolStr, SocketAddr>,
+
               [< $rt:camel Runtime >],
             >,
           >(|kr| opts.with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(serf::net::security::EncryptionAlgo::default()))));

@@ -14,7 +14,19 @@ categories.workspace = true
 [features]
 default = ["metrics"]
 metrics = ["memberlist-core/metrics", "dep:metrics"]
+
 encryption = ["memberlist-core/encryption", "base64", "serde"]
+
+crc32 = ["memberlist-core/crc32"]
+murmur3 = ["memberlist-core/murmur3"]
+xxhash64 = ["memberlist-core/xxhash64"]
+xxhash32 = ["memberlist-core/xxhash32"]
+xxhash3 = ["memberlist-core/xxhash3"]
+
+snappy = ["memberlist-core/snappy"]
+zstd = ["memberlist-core/zstd"]
+lz4 = ["memberlist-core/lz4"]
+brotli = ["memberlist-core/brotli"]
 
 serde = [
   "dep:serde",

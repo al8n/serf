@@ -6,7 +6,7 @@ use crate::{
   event::QueryMessageExt,
   types::{
     DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus, MessageRef,
-    MessageType, ProtocolVersion, PushPullMessageBorrow, UserEventMessage,
+    ProtocolVersion, PushPullMessageBorrow, UserEventMessage,
   },
 };
 
@@ -30,6 +30,9 @@ use memberlist_core::{
   tracing,
   transport::Transport,
 };
+
+#[cfg(any(test, feature = "test"))]
+use crate::types::MessageType;
 
 // PingVersion is an internal version for the ping message, above the normal
 // versioning we get from the protocol version. This enables small updates

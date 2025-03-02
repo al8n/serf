@@ -38,10 +38,8 @@ where
 }
 
 /// Unit test for reap handler
-pub async fn serf_reap_handler<T>(
-  opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn serf_reap_handler<T>(opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let s = Serf::<T>::new(

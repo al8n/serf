@@ -5,6 +5,46 @@ pub use memberlist_core::proto::{
   ParseHostAddrError, ParseNodeIdError, ProtocolVersion as MemberlistProtocolVersion,
 };
 
+#[cfg(feature = "encryption")]
+#[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]
+pub use memberlist_core::proto::encryption::*;
+
+#[cfg(any(
+  feature = "crc32",
+  feature = "xxhash64",
+  feature = "xxhash32",
+  feature = "xxhash3",
+  feature = "murmur3",
+))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    feature = "crc32",
+    feature = "xxhash64",
+    feature = "xxhash32",
+    feature = "xxhash3",
+    feature = "murmur3"
+  )))
+)]
+pub use memberlist_core::proto::checksum::*;
+
+#[cfg(any(
+  feature = "zstd",
+  feature = "lz4",
+  feature = "snappy",
+  feature = "brotli",
+))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "brotli"
+  )))
+)]
+pub use memberlist_core::proto::compression::*;
+
 #[cfg(feature = "arbitrary")]
 mod arbitrary_impl;
 

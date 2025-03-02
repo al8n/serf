@@ -57,8 +57,19 @@ impl From<FilterType> for u8 {
 
 /// Used with a queryFilter to specify the type of
 /// filter we are sending
-#[derive(Debug, Clone, PartialEq, Eq, derive_more::IsVariant)]
+#[derive(
+  Debug,
+  Clone,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::From,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum Filter<I> {
   /// Filter by node ids

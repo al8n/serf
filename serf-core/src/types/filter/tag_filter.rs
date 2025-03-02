@@ -118,6 +118,13 @@ impl TagFilter {
       expr: None,
     }
   }
+
+  /// Set the expression for the tag filter
+  #[inline]
+  pub fn with_expr(mut self, expr: Regex) -> Self {
+    self.expr = Some(expr);
+    self
+  }
 }
 
 impl PartialEq for TagFilter {

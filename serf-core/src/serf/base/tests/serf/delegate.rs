@@ -78,17 +78,15 @@ where
     .await;
 
   // Verify
-  assert_eq!(buf[0], MessageType::PushPull.into(), "bad message type");
+  assert_eq!(buf[0], u8::from(MessageType::PushPull), "bad message type");
 
   // Attempt a decode
-  let pp =
-    crate::types::decode_message(&buf)
-      .unwrap();
+  let pp = crate::types::decode_message::<T::Id, T::ResolvedAddress>(&buf).unwrap();
 
   let MessageRef::PushPull(pp) = pp else {
     panic!("bad message")
   };
-  let pp = PushPullMessage::from_ref(pp).unwrap();
+  let pp = <PushPullMessage<T::Id> as Data>::from_ref(pp).unwrap();
 
   // Verify lamport clock
   assert_eq!(pp.ltime(), serfs[0].inner.clock.time(), "bad lamport clock");
@@ -147,7 +145,7 @@ where
     }),
     query_ltime: 100.into(),
   };
-  
+
   let buf = crate::types::encode_message_to_bytes(&pp).unwrap();
 
   // Merge in fake state

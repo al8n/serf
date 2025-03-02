@@ -50,7 +50,7 @@ pub mod tests {
   pub use memberlist_core::tests::{AnyError, next_socket_addr_v4, next_socket_addr_v6};
   pub use paste;
 
-  // pub use super::serf::base::tests::{serf::*, *};
+  pub use super::serf::base::tests::{serf::*, *};
 
   /// Add `test` prefix to the predefined unit test fn with a given [`Runtime`](memberlist_core::agnostic_lite::RuntimeLite)
   #[cfg(any(feature = "test", test))]

@@ -32,10 +32,8 @@ where
 }
 
 /// Unit tests for the leave intent old message
-pub async fn leave_intent_old_message<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn leave_intent_old_message<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();
@@ -84,10 +82,8 @@ pub async fn leave_intent_old_message<T>(
 }
 
 /// Unit tests for the leave intent newer
-pub async fn leave_intent_newer<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn leave_intent_newer<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let opts = test_config();

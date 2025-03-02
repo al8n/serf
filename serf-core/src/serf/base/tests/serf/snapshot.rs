@@ -3,10 +3,8 @@ use std::io::Read;
 use super::*;
 
 /// Unit test for the snapshoter.
-pub async fn snapshoter<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn snapshoter<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let dir = tempfile::tempdir().unwrap();
@@ -16,7 +14,7 @@ pub async fn snapshoter<T>(
   let clock = LamportClock::new();
   let (out_tx, out_rx) = async_channel::bounded(64);
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
   let (event_tx, _, handle) = Snapshot::<T, DefaultDelegate<T>>::from_replay_result(
     res,
     SNAPSHOT_SIZE_LIMIT,
@@ -162,7 +160,7 @@ pub async fn snapshoter<T>(
 
   // Open the snapshoter
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
 
   assert_eq!(res.last_clock, 100.into());
   assert_eq!(res.last_event_clock, 42.into());
@@ -184,7 +182,7 @@ pub async fn snapshoter<T>(
   assert_eq!(alive_nodes.len(), 1);
   let n = &alive_nodes[0];
   assert_eq!(n.id(), "foo");
-  assert_eq!(n.address().clone().into_resolved().unwrap(), addr);
+  assert_eq!(n.address().clone().unwrap_resolved(), addr);
 
   // Close the snapshoter
   shutdown_tx.close();
@@ -193,7 +191,7 @@ pub async fn snapshoter<T>(
   // Open the snapshoter, make sure nothing dies reading with coordinates
   // disabled.
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
 
   let (out_tx, _out_rx) = async_channel::bounded(64);
   let (_event_tx, _, handle) = Snapshot::<T, DefaultDelegate<T>>::from_replay_result(
@@ -212,10 +210,8 @@ pub async fn snapshoter<T>(
 }
 
 /// Unit test for the snapshoter force compact.
-pub async fn snapshoter_force_compact<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn snapshoter_force_compact<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let dir = tempfile::tempdir().unwrap();
@@ -226,7 +222,7 @@ pub async fn snapshoter_force_compact<T>(
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
 
   // Create a very low limit
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
   let (out_tx, _out_rx) = async_channel::unbounded();
   let (event_tx, _, handle) = Snapshot::<T, DefaultDelegate<T>>::from_replay_result(
     res,
@@ -274,17 +270,15 @@ pub async fn snapshoter_force_compact<T>(
   handle.wait().await;
 
   // Open the snapshoter
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<T::Id, T::ResolvedAddress, _>(&p, false).unwrap();
 
   assert_eq!(res.last_event_clock, 1023.into());
   assert_eq!(res.last_query_clock, 1023.into());
 }
 
 /// Unit test for the snapshoter leave
-pub async fn snapshoter_leave<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn snapshoter_leave<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let dir = tempfile::tempdir().unwrap();
@@ -293,7 +287,7 @@ pub async fn snapshoter_leave<T>(
 
   let clock = LamportClock::new();
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
   let (out_tx, _out_rx) = async_channel::unbounded();
   let (event_tx, _, handle) = Snapshot::<T, DefaultDelegate<T>>::from_replay_result(
     res,
@@ -359,7 +353,7 @@ pub async fn snapshoter_leave<T>(
 
   // Open the snapshoter
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, false).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, false).unwrap();
   assert!(res.last_clock == 0.into(), "last_clock: {}", res.last_clock);
   assert!(
     res.last_event_clock == 0.into(),
@@ -392,10 +386,8 @@ pub async fn snapshoter_leave<T>(
 }
 
 /// Unit test for the snapshoter leave rejoin
-pub async fn snapshoter_leave_rejoin<T>(
-  transport_opts: T::Options,
-  addr: T::ResolvedAddress,
-) where
+pub async fn snapshoter_leave_rejoin<T>(transport_opts: T::Options, addr: T::ResolvedAddress)
+where
   T: Transport<Id = SmolStr>,
 {
   let dir = tempfile::tempdir().unwrap();
@@ -404,7 +396,7 @@ pub async fn snapshoter_leave_rejoin<T>(
 
   let clock = LamportClock::new();
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, true).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, true).unwrap();
   let (out_tx, _out_rx) = async_channel::unbounded();
   let (event_tx, _, handle) = Snapshot::<T, DefaultDelegate<T>>::from_replay_result(
     res,
@@ -474,7 +466,7 @@ pub async fn snapshoter_leave_rejoin<T>(
 
   // Open the snapshoter
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, DefaultDelegate<T>, _>(&p, true).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, true).unwrap();
   assert!(res.last_clock == 100.into());
   assert!(res.last_event_clock == 42.into());
   assert!(res.last_query_clock == 50.into());
@@ -615,18 +607,12 @@ pub async fn serf_snapshot_recovery<T, F>(
 async fn test_snapshoter_slow_disk_not_blocking_event_tx() {
   use memberlist_core::{
     agnostic_lite::tokio::TokioRuntime,
-    transport::{resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport},
+    transport::{resolver::socket_addr::SocketAddrResolver, unimplemented::UnimplementedTransport},
   };
-  use std::net::SocketAddr;
 
   crate::tests::initialize_tests_tracing();
 
-  type Transport = UnimplementedTransport<
-    SmolStr,
-    SocketAddrResolver<TokioRuntime>,
-    Lpe<SmolStr, SocketAddr>,
-    TokioRuntime,
-  >;
+  type Transport = UnimplementedTransport<SmolStr, SocketAddrResolver<TokioRuntime>, TokioRuntime>;
 
   type Delegate = DefaultDelegate<Transport>;
 
@@ -638,7 +624,7 @@ async fn test_snapshoter_slow_disk_not_blocking_event_tx() {
   let clock = LamportClock::new();
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
   let (out_tx, out_rx) = async_channel::bounded(1024);
-  let res = open_and_replay_snapshot::<_, _, Delegate, _>(&p, true).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, true).unwrap();
   let (event_tx, _, handle) = Snapshot::<Transport, Delegate>::from_replay_result(
     res,
     SNAPSHOT_SIZE_LIMIT,
@@ -703,7 +689,7 @@ async fn test_snapshoter_slow_disk_not_blocking_event_tx() {
   // 115ms on my machine so this should give plenty of headroom for slower CI
   // environments while still being low enough that actual disk IO would
   // reliably blow it.
-  let deadline = TokioRuntime::sleep_until(std::time::Instant::now() + Duration::from_millis(500));
+  let deadline = TokioRuntime::sleep_until(TokioRuntime::now() + Duration::from_millis(500));
   futures::pin_mut!(deadline);
   let mut num_recvd = 0;
   let start = Epoch::now();
@@ -732,16 +718,10 @@ async fn test_snapshoter_slow_disk_not_blocking_event_tx() {
 async fn test_snapshoter_slow_disk_not_blocking_memberlist() {
   use memberlist_core::{
     agnostic_lite::tokio::TokioRuntime,
-    transport::{Lpe, resolver::socket_addr::SocketAddrResolver, tests::UnimplementedTransport},
+    transport::{resolver::socket_addr::SocketAddrResolver, unimplemented::UnimplementedTransport},
   };
-  use std::net::SocketAddr;
 
-  type Transport = UnimplementedTransport<
-    SmolStr,
-    SocketAddrResolver<TokioRuntime>,
-    Lpe<SmolStr, SocketAddr>,
-    TokioRuntime,
-  >;
+  type Transport = UnimplementedTransport<SmolStr, SocketAddrResolver<TokioRuntime>, TokioRuntime>;
 
   type Delegate = DefaultDelegate<Transport>;
 
@@ -753,7 +733,7 @@ async fn test_snapshoter_slow_disk_not_blocking_memberlist() {
   let clock = LamportClock::new();
   let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
   let (out_tx, _out_rx) = async_channel::bounded(1);
-  let res = open_and_replay_snapshot::<_, _, Delegate, _>(&p, true).unwrap();
+  let res = open_and_replay_snapshot::<_, _, _>(&p, true).unwrap();
   let (event_tx, _, handle) = Snapshot::<Transport, Delegate>::from_replay_result(
     res,
     SNAPSHOT_SIZE_LIMIT,

@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use core::{marker::PhantomData, net::SocketAddr};
 
 use memberlist_core::transport::resolver::socket_addr::SocketAddrResolver;
 
@@ -76,7 +76,7 @@ pub async fn serf_reconnect_same_ip<T, R, F>(
   transport2_id: T::Id,
   get_transport: impl FnOnce(T::Id, T::ResolvedAddress) -> F + Copy,
 ) where
-  T: Transport<Id = SmolStr, Resolver = SocketAddrResolver<R>>,
+  T: Transport<Id = SmolStr, ResolvedAddress = SocketAddr, Resolver = SocketAddrResolver<R>>,
   T::Options: Clone,
   R: RuntimeLite,
   F: core::future::Future<Output = T::Options>,

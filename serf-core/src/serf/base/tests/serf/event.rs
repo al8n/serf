@@ -1,4 +1,6 @@
-use crate::types::{Filter, FilterType};
+use memberlist_core::proto::DataRef;
+
+use crate::types::{Filter, QueryResponseMessageRef, TagFilter};
 
 use super::*;
 
@@ -17,12 +19,11 @@ where
     .witness(((event_buffer + 1000) as u64).into());
   assert!(
     !s1
-      .handle_user_event(
-        Either::Right(UserEventMessage::default()
+      .handle_user_event(Either::Right(
+        UserEventMessage::default()
           .with_ltime(1.into())
           .with_name("old".into())
-        )
-      )
+      ))
       .await,
     "should not rebroadcast"
   );
@@ -44,19 +45,28 @@ where
     .with_ltime(1.into())
     .with_name("first".into())
     .with_payload(Bytes::from_static(b"test"));
-  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
+  assert!(
+    s1.handle_user_event(Either::Right(msg)).await,
+    "should rebroadcast"
+  );
 
   let msg = UserEventMessage::default()
     .with_ltime(1.into())
     .with_name("first".into())
     .with_payload(Bytes::from_static(b"newpayload"));
-  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
+  assert!(
+    s1.handle_user_event(Either::Right(msg)).await,
+    "should rebroadcast"
+  );
 
   let msg = UserEventMessage::default()
     .with_ltime(1.into())
     .with_name("second".into())
     .with_payload(Bytes::from_static(b"other"));
-  assert!(s1.handle_user_event(Either::Right(msg)).await, "should rebroadcast");
+  assert!(
+    s1.handle_user_event(Either::Right(msg)).await,
+    "should rebroadcast"
+  );
 
   test_user_events(
     event_rx.rx,
@@ -548,42 +558,6 @@ where
   assert_eq!(params.timeout, timeout);
 }
 
-/// Unit test for query params encode filters
-pub async fn query_params_encode_filters<T>(transport_opts: T::Options)
-where
-  T: Transport<Id = SmolStr>,
-{
-  let opts = test_config();
-  let s = Serf::<T>::new(transport_opts, opts).await.unwrap();
-  let mut params = s.default_query_param().await;
-  params
-    .filters
-    .push(Filter::Id(["foo".into(), "bar".into()].into()));
-  params.filters.push(Filter::Tag {
-    tag: "role".into(),
-    expr: "^web".into(),
-  });
-  params.filters.push(Filter::Tag {
-    tag: "datacenter".into(),
-    expr: "aws$".into(),
-  });
-
-  let filters = params.encode_filters::<DefaultDelegate<T>>().unwrap();
-  assert_eq!(filters.len(), 3);
-
-  let (_, node_filt) =
-    decode_filter(&filters[0]).unwrap();
-  assert_eq!(node_filt.ty(), FilterType::Id);
-
-  let (_, tag_filt) =
-    decode_filter(&filters[1]).unwrap();
-  assert_eq!(tag_filt.ty(), FilterType::Tag);
-
-  let (_, tag_filt) =
-    decode_filter(&filters[2]).unwrap();
-  assert_eq!(tag_filt.ty(), FilterType::Tag);
-}
-
 /// Unit test for should process functionallity
 pub async fn should_process<T>(transport_opts: T::Options)
 where
@@ -606,19 +580,21 @@ where
     .into_iter()
     .collect(),
   ));
-  params.filters.push(Filter::Tag {
-    tag: "role".into(),
-    expr: "^web".into(),
-  });
-  params.filters.push(Filter::Tag {
-    tag: "datacenter".into(),
-    expr: "aws$".into(),
-  });
+  params.filters.push(Filter::Tag(
+    TagFilter::new()
+      .with_tag("role".into())
+      .with_expr("^web".try_into().unwrap()),
+  ));
+  params.filters.push(Filter::Tag(
+    TagFilter::new()
+      .with_tag("datacenter".into())
+      .with_expr("aws$".try_into().unwrap()),
+  ));
 
-  let filters = params.encode_filters::<DefaultDelegate<T>>().unwrap();
-  assert_eq!(filters.len(), 3);
-
-  assert!(s.should_process_query(&filters));
+  assert!(
+    s.should_process_query(Either::Right(&params.filters))
+      .unwrap()
+  );
 
   // Omit node
   let mut params = s.default_query_param().await;
@@ -626,35 +602,41 @@ where
     .filters
     .push(Filter::Id(["foo".into(), "bar".into()].into()));
 
-  let filters = params.encode_filters::<DefaultDelegate<T>>().unwrap();
-  assert!(!s.should_process_query(&filters));
+  assert!(
+    !s.should_process_query(Either::Right(&params.filters))
+      .unwrap()
+  );
 
   // Filter on missing tag
   let mut params = s.default_query_param().await;
-  params.filters.push(Filter::Tag {
-    tag: "other".into(),
-    expr: "cool".into(),
-  });
+  params.filters.push(Filter::Tag(
+    TagFilter::new()
+      .with_tag("other".into())
+      .with_expr("cool".try_into().unwrap()),
+  ));
 
-  let filters = params.encode_filters::<DefaultDelegate<T>>().unwrap();
-  assert!(!s.should_process_query(&filters));
+  assert!(
+    !s.should_process_query(Either::Right(&params.filters))
+      .unwrap()
+  );
 
   // Bad tag
   let mut params = s.default_query_param().await;
-  params.filters.push(Filter::Tag {
-    tag: "role".into(),
-    expr: "db".into(),
-  });
+  params.filters.push(Filter::Tag(
+    TagFilter::new()
+      .with_tag("role".into())
+      .with_expr("db".try_into().unwrap()),
+  ));
 
-  let filters = params.encode_filters::<DefaultDelegate<T>>().unwrap();
-  assert!(!s.should_process_query(&filters));
+  assert!(
+    !s.should_process_query(Either::Right(&params.filters))
+      .unwrap()
+  );
 }
 
 /// Unit tests for the query old message
-pub async fn query_old_message<T>(
-  transport_opts: T::Options,
-  from: Node<T::Id, T::ResolvedAddress>,
-) where
+pub async fn query_old_message<T>(transport_opts: T::Options, from: Node<T::Id, T::ResolvedAddress>)
+where
   T: Transport,
 {
   let opts = test_config();
@@ -667,7 +649,7 @@ pub async fn query_old_message<T>(
   assert!(
     !s1
       .handle_query(
-        QueryMessage {
+        Either::Right(QueryMessage {
           ltime: 1.into(),
           id: 0,
           from,
@@ -677,10 +659,11 @@ pub async fn query_old_message<T>(
           timeout: Default::default(),
           name: "old".into(),
           payload: Bytes::new(),
-        },
+        }),
         None
       )
-      .await.unwrap(),
+      .await
+      .unwrap(),
     "should not rebroadcast"
   );
 
@@ -688,10 +671,8 @@ pub async fn query_old_message<T>(
 }
 
 /// Unit tests for the query same clock
-pub async fn query_same_clock<T>(
-  transport_opts: T::Options,
-  from: Node<T::Id, T::ResolvedAddress>,
-) where
+pub async fn query_same_clock<T>(transport_opts: T::Options, from: Node<T::Id, T::ResolvedAddress>)
+where
   T: Transport,
 {
   let opts = test_config();
@@ -713,11 +694,16 @@ pub async fn query_same_clock<T>(
   };
 
   assert!(
-    s1.handle_query(Either::Right(msg.clone()), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(Either::Right(msg.clone()), None).await,
+    !s1
+      .handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should not rebroadcast"
   );
 
@@ -734,11 +720,16 @@ pub async fn query_same_clock<T>(
   };
 
   assert!(
-    s1.handle_query(Either::Right(msg.clone()), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(Either::Right(msg.clone()), None).await,
+    !s1
+      .handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should not rebroadcast"
   );
 
@@ -754,11 +745,16 @@ pub async fn query_same_clock<T>(
     payload: Bytes::from_static(b"other"),
   };
   assert!(
-    s1.handle_query(Either::Right(msg.clone()), None).await,
+    s1.handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should rebroadcast"
   );
   assert!(
-    !s1.handle_query(Either::Right(msg.clone()), None).await,
+    !s1
+      .handle_query(Either::Right(msg.clone()), None)
+      .await
+      .unwrap(),
     "should not rebroadcast"
   );
 
@@ -1016,7 +1012,7 @@ where
     payload: Default::default(),
   };
   let query = QueryResponse::from_query(&mq, 3);
-  let mut response = QueryResponseMessage {
+  let response = QueryResponseMessage {
     ltime: mq.ltime,
     id: mq.id,
     from: s.advertise_node(),
@@ -1028,12 +1024,21 @@ where
     qc.responses.insert(mq.ltime, query.clone());
   }
 
+  let buf = response.encode_to_bytes().unwrap();
+  let (_, resp_ref) = <QueryResponseMessageRef<'_, _, _> as DataRef<
+    '_,
+    QueryResponseMessage<T::Id, T::ResolvedAddress>,
+  >>::decode(&buf)
+  .unwrap();
+
   // Send a few duplicate responses
-  s.handle_query_response(response.clone()).await;
-  s.handle_query_response(response.clone()).await;
-  response.flags |= QueryFlag::ACK;
-  s.handle_query_response(response.clone()).await;
-  s.handle_query_response(response.clone()).await;
+  s.handle_query_response(resp_ref).await.unwrap();
+  s.handle_query_response(resp_ref).await.unwrap();
+
+  let mut resp_ref2 = resp_ref;
+  resp_ref2.flags |= QueryFlag::ACK;
+  s.handle_query_response(resp_ref2).await.unwrap();
+  s.handle_query_response(resp_ref2).await.unwrap();
 
   // Ensure we only get one NodeResponse off the channel
   let resp_rx = query.response_rx();

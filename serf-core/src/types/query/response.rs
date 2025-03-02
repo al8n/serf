@@ -66,16 +66,14 @@ impl<I, A> QueryResponseMessage<I, A> {
   pub fn ack(&self) -> bool {
     self.flags.contains(QueryFlag::ACK)
   }
-
-  /// Checks if the no broadcast flag is set
-  #[inline]
-  pub fn no_broadcast(&self) -> bool {
-    self.flags.contains(QueryFlag::NO_BROADCAST)
-  }
 }
 
 /// The reference type to a query response message
-#[viewit::viewit(vis_all = "", getters(vis_all = "pub", style = "ref"), setters(skip))]
+#[viewit::viewit(
+  vis_all = "pub(crate)",
+  getters(vis_all = "pub", style = "ref"),
+  setters(skip)
+)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct QueryResponseMessageRef<'a, I, A> {
   /// Event lamport time

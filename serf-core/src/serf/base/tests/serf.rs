@@ -2,9 +2,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memberlist_core::{tests::AnyError, transport::Id};
 
-use crate::types::{Member, MemberStatus, Tags};
-
-use crate::{event::EventProducer, types::MemberState};
+use crate::{
+  event::EventProducer,
+  options::MemberlistOptions,
+  types::{Member, MemberState, MemberStatus, Tags},
+};
 
 use super::*;
 
@@ -782,7 +784,7 @@ where
 /// Unit test for serf write keying file
 #[cfg(feature = "encryption")]
 pub async fn serf_write_keyring_file<T>(
-  get_transport_opts: impl FnOnce(memberlist_core::proto::SecretKey) -> T::Options,
+  get_transport_opts: impl FnOnce(memberlist_core::proto::SecretKey) -> (T::Options, MemberlistOptions),
 ) where
   T: Transport,
 {
@@ -800,9 +802,12 @@ pub async fn serf_write_keyring_file<T>(
   let existing_bytes = general_purpose::STANDARD.decode(EXISTING).unwrap();
   let sk = memberlist_core::proto::SecretKey::try_from(existing_bytes.as_slice()).unwrap();
 
+  let (topts, mopts) = get_transport_opts(sk);
   let serf = Serf::<T>::new(
-    get_transport_opts(sk),
-    test_config().with_keyring_file(Some(p.clone())),
+    topts,
+    test_config()
+      .with_keyring_file(Some(p.clone()))
+      .with_memberlist_options(mopts),
   )
   .await
   .unwrap();
