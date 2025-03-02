@@ -162,10 +162,7 @@ where
             .with_offsets(start, end),
         )
       } else {
-        Self::Id(
-          RepeatedDecoder::new(FILTER_ID_TAG, I::WIRE_TYPE, buf)
-            .with_nums(0),
-        )
+        Self::Id(RepeatedDecoder::new(FILTER_ID_TAG, I::WIRE_TYPE, buf).with_nums(0))
       },
     ))
   }

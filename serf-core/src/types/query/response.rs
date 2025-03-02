@@ -159,7 +159,9 @@ where
 
           offset += 1;
           let (o, v) =
-            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(&buf[offset..])?;
+            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(
+              &buf[offset..],
+            )?;
           offset += o;
           from = Some(v);
         }

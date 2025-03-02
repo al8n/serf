@@ -249,11 +249,14 @@ where
 
           offset += 1;
           let (o, v) =
-            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode(&buf[offset..])?;
+            <Node<I::Ref<'_>, A::Ref<'_>> as DataRef<'_, Node<I, A>>>::decode_length_delimited(
+              &buf[offset..],
+            )?;
           offset += o;
           from = Some(v);
         }
         FILTERS_BYTE => {
+          offset += 1;
           let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = filters_offsets {
             if *fnso > offset {

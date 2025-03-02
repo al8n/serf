@@ -128,8 +128,8 @@ mod tests {
     let _ = DelegateVersion::arbitrary(&mut data).unwrap();
 
     assert_eq!(u8::from(DelegateVersion::V1), 1u8);
-    assert_eq!(DelegateVersion::V1.to_string(), "V1");
-    assert_eq!(DelegateVersion::Unknown(2).to_string(), "Unknown(2)");
+    assert_eq!(DelegateVersion::V1.to_string(), "v1");
+    assert_eq!(DelegateVersion::Unknown(2).to_string(), "unknown(2)");
     assert_eq!(DelegateVersion::from(1), DelegateVersion::V1);
     assert_eq!(DelegateVersion::from(2), DelegateVersion::Unknown(2));
   }
@@ -143,8 +143,8 @@ mod tests {
     let mut data = Unstructured::new(&buf);
     let _ = ProtocolVersion::arbitrary(&mut data).unwrap();
     assert_eq!(u8::from(ProtocolVersion::V1), 1);
-    assert_eq!(ProtocolVersion::V1.to_string(), "V1");
-    assert_eq!(ProtocolVersion::Unknown(2).to_string(), "Unknown(2)");
+    assert_eq!(ProtocolVersion::V1.to_string(), "v1");
+    assert_eq!(ProtocolVersion::Unknown(2).to_string(), "unknown(2)");
     assert_eq!(ProtocolVersion::from(1), ProtocolVersion::V1);
     assert_eq!(ProtocolVersion::from(2), ProtocolVersion::Unknown(2));
   }

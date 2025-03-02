@@ -106,10 +106,14 @@ const QUERY_LTIME_TAG: u8 = 6;
 
 const LTIME_BYTE: u8 = merge(WireType::Varint, LTIME_TAG);
 const STATUS_LTIMES_BYTE: u8 = merge(WireType::LengthDelimited, STATUS_LTIMES_TAG);
-const LEFT_MEMBERS_BYTE: u8 = merge(WireType::LengthDelimited, LEFT_MEMBERS_TAG);
 const EVENT_LTIME_BYTE: u8 = merge(WireType::Varint, EVENT_LTIME_TAG);
 const EVENTS_BYTE: u8 = merge(WireType::LengthDelimited, EVENTS_TAG);
 const QUERY_LTIME_BYTE: u8 = merge(WireType::Varint, QUERY_LTIME_TAG);
+
+#[inline]
+const fn left_members_byte<I: Data>() -> u8 {
+  merge(I::WIRE_TYPE, LEFT_MEMBERS_TAG)
+}
 
 /// Used when doing a state exchange. This
 /// is a relatively large message, but is sent infrequently
@@ -179,6 +183,8 @@ where
     let mut num_events = 0;
     let mut query_ltime = None;
 
+    let left_members_byte = left_members_byte::<I>();
+
     while offset < buf_len {
       match buf[offset] {
         LTIME_BYTE => {
@@ -196,6 +202,7 @@ where
           ltime = Some(v);
         }
         STATUS_LTIMES_BYTE => {
+          offset += 1;
           let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = status_ltimes_offsets {
             if *fnso > offset {
@@ -211,8 +218,9 @@ where
           num_status_ltimes += 1;
           offset += readed;
         }
-        LEFT_MEMBERS_BYTE => {
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+        b if b == left_members_byte => {
+          offset += 1;
+          let readed = skip(I::WIRE_TYPE, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = left_members_offsets {
             if *fnso > offset {
               *fnso = offset - 1;
@@ -242,6 +250,7 @@ where
           event_ltime = Some(v);
         }
         EVENTS_BYTE => {
+          offset += 1;
           let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = events_offsets {
             if *fnso > offset {
@@ -285,19 +294,19 @@ where
       offset,
       Self {
         ltime: ltime.ok_or_else(|| DecodeError::missing_field("PushPullMessage", "ltime"))?,
-        status_ltimes: if let Some((start, end)) = events_offsets {
+        status_ltimes: if let Some((start, end)) = status_ltimes_offsets {
           RepeatedDecoder::new(STATUS_LTIMES_TAG, WireType::LengthDelimited, buf)
             .with_nums(num_status_ltimes)
             .with_offsets(start, end)
         } else {
           RepeatedDecoder::new(STATUS_LTIMES_TAG, WireType::LengthDelimited, buf)
         },
-        left_members: if let Some((start, end)) = events_offsets {
-          RepeatedDecoder::new(LEFT_MEMBERS_TAG, WireType::LengthDelimited, buf)
+        left_members: if let Some((start, end)) = left_members_offsets {
+          RepeatedDecoder::new(LEFT_MEMBERS_TAG, I::WIRE_TYPE, buf)
             .with_nums(num_left_members)
             .with_offsets(start, end)
         } else {
-          RepeatedDecoder::new(LEFT_MEMBERS_TAG, WireType::LengthDelimited, buf)
+          RepeatedDecoder::new(LEFT_MEMBERS_TAG, I::WIRE_TYPE, buf)
         },
         event_ltime: event_ltime
           .ok_or_else(|| DecodeError::missing_field("PushPullMessage", "event_ltime"))?,
@@ -326,12 +335,6 @@ where
   where
     Self: Sized,
   {
-    let left_members = val
-      .left_members
-      .iter::<I>()
-      .map(|res| res.and_then(Data::from_ref))
-      .collect::<Result<IndexSet<I>, DecodeError>>()?;
-
     Ok(Self {
       ltime: val.ltime,
       status_ltimes: val
@@ -339,7 +342,11 @@ where
         .iter::<(I, LamportTime)>()
         .map(|res| res.and_then(Data::from_ref))
         .collect::<Result<IndexMap<I, LamportTime>, DecodeError>>()?,
-      left_members,
+      left_members: val
+        .left_members
+        .iter::<I>()
+        .map(|res| res.and_then(Data::from_ref))
+        .collect::<Result<IndexSet<I>, DecodeError>>()?,
       event_ltime: val.event_ltime,
       events: val
         .events
@@ -366,13 +373,15 @@ where
       .iter()
       .map(|id| 1 + id.encoded_len_with_length_delimited())
       .sum::<usize>();
+
     len += 1 + self.event_ltime.encoded_len();
-    len += 1
-      + self
-        .events
-        .iter()
-        .map(|e| 1 + e.encoded_len_with_length_delimited())
-        .sum::<usize>();
+
+    len += self
+      .events
+      .iter()
+      .map(|e| 1 + e.encoded_len_with_length_delimited())
+      .sum::<usize>();
+
     len += 1 + self.query_ltime.encoded_len();
 
     len
@@ -395,28 +404,25 @@ where
     offset += 1;
     offset += self.ltime.encode(&mut buf[offset..])?;
 
-    bail!(self(offset, buf_len));
-    buf[offset] = STATUS_LTIMES_BYTE;
-    offset += 1;
-
     self
       .status_ltimes
       .iter()
       .try_fold(&mut offset, |off, (k, v)| {
         bail!(self(*off, buf_len));
-        buf[*off] = LEFT_MEMBERS_BYTE;
+        buf[*off] = STATUS_LTIMES_BYTE;
         *off += 1;
         *off += TupleEncoder::new(k, v).encode_with_length_delimited(&mut buf[*off..])?;
         Ok(off)
       })
       .map_err(|e: EncodeError| e.update(self.encoded_len(), buf_len))?;
 
+    let left_members_byte = left_members_byte::<I>();
     self
       .left_members
       .iter()
       .try_fold(&mut offset, |off, id| {
         bail!(self(*off, buf_len));
-        buf[*off] = LEFT_MEMBERS_BYTE;
+        buf[*off] = left_members_byte;
         *off += 1;
         *off += id.encode_length_delimited(&mut buf[*off..])?;
         Ok(off)
@@ -427,10 +433,6 @@ where
     buf[offset] = EVENT_LTIME_BYTE;
     offset += 1;
     offset += self.event_ltime.encode(&mut buf[offset..])?;
-
-    bail!(self(offset, buf_len));
-    buf[offset] = EVENTS_BYTE;
-    offset += 1;
 
     self
       .events
@@ -548,19 +550,20 @@ where
       .iter()
       .try_fold(&mut offset, |off, (k, v)| {
         bail!(self(*off, buf_len));
-        buf[*off] = LEFT_MEMBERS_BYTE;
+        buf[*off] = STATUS_LTIMES_BYTE;
         *off += 1;
         *off += TupleEncoder::new(k, v).encode_with_length_delimited(&mut buf[*off..])?;
         Ok(off)
       })
       .map_err(|e: EncodeError| e.update(self.encoded_len_in(), buf_len))?;
 
+    let left_members_byte = left_members_byte::<I>();
     self
       .left_members
       .iter()
       .try_fold(&mut offset, |off, id| {
         bail!(self(*off, buf_len));
-        buf[*off] = LEFT_MEMBERS_BYTE;
+        buf[*off] = left_members_byte;
         *off += 1;
         *off += id.encode_length_delimited(&mut buf[*off..])?;
         Ok(off)
@@ -571,10 +574,6 @@ where
     buf[offset] = EVENT_LTIME_BYTE;
     offset += 1;
     offset += self.event_ltime.encode(&mut buf[offset..])?;
-
-    bail!(self(offset, buf_len));
-    buf[offset] = EVENTS_BYTE;
-    offset += 1;
 
     self
       .events

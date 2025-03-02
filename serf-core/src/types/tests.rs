@@ -16,6 +16,14 @@ fn data_round_trip<T: Data + PartialEq>(data: &T) {
   let decoded = T::from_ref(decoded).unwrap();
   assert_eq!(len, readed);
   assert_eq!(data, &decoded);
+
+  let mut buf = vec![0; data.encoded_len_with_length_delimited() + 2];
+  let len = data.encode_length_delimited(&mut buf).unwrap();
+  let buf = &buf[..len];
+  let (readed, decoded) = DataRef::decode_length_delimited(&buf[..len]).unwrap();
+  let decoded = T::from_ref(decoded).unwrap();
+  assert_eq!(len, readed);
+  assert_eq!(data, &decoded);
 }
 
 macro_rules! data_round_trip {
@@ -61,20 +69,9 @@ type ConflictResponseMessageStringString = ConflictResponseMessage<String, Strin
 type ConflictResponseMessageU64U64 = ConflictResponseMessage<u64, u64>;
 type ConflictResponseMessageStringU64 = ConflictResponseMessage<String, u64>;
 
-
-// QueryMessageStringString,
-// QueryMessageU64U64,
-// PushPullMessageString,
-// PushPullMessageU64,
-
 type QueryResponseMessageStringString = QueryResponseMessage<String, String>;
 type QueryResponseMessageU64U64 = QueryResponseMessage<u64, u64>;
 type QueryResponseMessageStringU64 = QueryResponseMessage<String, u64>;
-
-data_round_trip!(
-  QueryMessageU64U64,
-);
-
 
 data_round_trip! {
   ConflictResponseMessageStringString,
@@ -95,6 +92,12 @@ data_round_trip! {
   UserEvent,
   UserEvents,
   UserEventMessage,
+  PushPullMessageU64,
+  PushPullMessageString,
+  QueryMessageStringString,
+  QueryMessageU64String,
+  QueryMessageStringU64,
+  QueryMessageU64U64,
   QueryResponseMessageStringString,
   QueryResponseMessageU64U64,
   QueryResponseMessageStringU64,
@@ -269,8 +272,18 @@ macro_rules! encodable_round_trip {
     $(
       paste::paste! {
         #[quickcheck_macros::quickcheck]
-        fn [< message _encodable_round_trip_ $a:snake _ $b:snake >](msg: Message<$a, $b>, node: Option<Node<$a, $b>>) -> bool {
-          encodable_round_trip(msg, node)
+        fn [< message _encodable_round_trip_ $a:snake _ $b:snake >](msg: Message<$a, $b>) -> bool {
+          encodable_round_trip(msg, None)
+        }
+      }
+    )*
+  };
+  (@relay_message $(<$a:ty, $b:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< relay_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: Message<$a, $b>, node: Node<$a, $b>) -> bool {
+          encodable_round_trip(msg, Some(node))
         }
       }
     )*
@@ -295,6 +308,36 @@ macro_rules! encodable_round_trip {
       }
     )*
   };
+  (@join_message $(<$a:ty, $b:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< join_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: JoinMessage<$a>, node: Option<Node<$a, $b>>) -> bool {
+          encodable_round_trip(Message::Join(msg), node)
+        }
+      }
+    )*
+  };
+  (@push_pull_message $(<$a:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< push_pull_message _encodable_round_trip_ $a:snake >](msg: PushPullMessage<$a>, node: Option<Node<$a, $a>>) -> bool {
+          encodable_round_trip(Message::PushPull(msg), node)
+        }
+      }
+    )*
+  };
+  (@leave_message $(<$a:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< leave_message _encodable_round_trip_ $a:snake >](msg: LeaveMessage<$a>, node: Option<Node<$a, $a>>) -> bool {
+          encodable_round_trip(Message::Leave(msg), node)
+        }
+      }
+    )*
+  };
   (@conflict_response_message $(<$a:ty, $b:ty>),+$(,)?) => {
     $(
       paste::paste! {
@@ -305,12 +348,32 @@ macro_rules! encodable_round_trip {
       }
     )*
   };
-  (@join_message $(<$a:ty, $b:ty>),+$(,)?) => {
+  (@user_event_message $(<$a:ty, $b:ty>),+$(,)?) => {
     $(
       paste::paste! {
         #[quickcheck_macros::quickcheck]
-        fn [< join_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: JoinMessage<$a>, node: Option<Node<$a, $b>>) -> bool {
-          encodable_round_trip(Message::Join(msg), node)
+        fn [< user_event_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: UserEventMessage, node: Option<Node<$a, $b>>) -> bool {
+          encodable_round_trip(Message::UserEvent(msg), node)
+        }
+      }
+    )*
+  };
+  (@key_request_message $(<$a:ty, $b:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< key_request_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: KeyRequestMessage, node: Option<Node<$a, $b>>) -> bool {
+          encodable_round_trip(Message::KeyRequest(msg), node)
+        }
+      }
+    )*
+  };
+  (@key_response_message $(<$a:ty, $b:ty>),+$(,)?) => {
+    $(
+      paste::paste! {
+        #[quickcheck_macros::quickcheck]
+        fn [< key_response_message _encodable_round_trip_ $a:snake _ $b:snake >](msg: KeyResponseMessage, node: Option<Node<$a, $b>>) -> bool {
+          encodable_round_trip(Message::KeyResponse(msg), node)
         }
       }
     )*
@@ -326,26 +389,79 @@ encodable_round_trip!(
 );
 
 encodable_round_trip!(
+  @relay_message
+    <u64, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
+);
+
+encodable_round_trip!(
   @query_message
     <u64, u64>,
-    // <String, String>,
-    // <u64, String>,
-    // <String, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
 );
 
 encodable_round_trip!(
   @query_response_message
     <u64, u64>,
-    // <String, String>,
-    // <u64, String>,
-    // <String, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
 );
 
 encodable_round_trip!(
   @conflict_response_message
     <u64, u64>,
-    // <String, String>,
-    // <u64, String>,
-    // <String, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
 );
 
+encodable_round_trip!(
+  @join_message
+    <u64, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
+);
+
+encodable_round_trip!(
+  @push_pull_message
+    <u64>,
+    <String>,
+);
+
+encodable_round_trip!(
+  @leave_message
+    <u64>,
+    <String>,
+);
+
+encodable_round_trip!(
+  @user_event_message
+    <u64, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
+);
+
+#[cfg(feature = "encryption")]
+encodable_round_trip!(
+  @key_request_message
+    <u64, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
+);
+
+#[cfg(feature = "encryption")]
+encodable_round_trip!(
+  @key_response_message
+    <u64, u64>,
+    <String, String>,
+    <u64, String>,
+    <String, u64>,
+);

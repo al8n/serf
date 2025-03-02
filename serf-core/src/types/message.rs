@@ -364,7 +364,10 @@ where
 }
 
 /// Encode a relay message into a Bytes.
-pub fn encode_relay_message_to_bytes<T, I, A>(msg: &T, node: &Node<I, A>) -> Result<Bytes, EncodeError>
+pub fn encode_relay_message_to_bytes<T, I, A>(
+  msg: &T,
+  node: &Node<I, A>,
+) -> Result<Bytes, EncodeError>
 where
   T: Encodable,
   I: Data,
@@ -392,9 +395,13 @@ where
     return Err(EncodeError::TooLarge);
   }
 
-  offset += (encoded_len as u32).encode(&mut buf[offset..]).map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
+  offset += (encoded_len as u32)
+    .encode(&mut buf[offset..])
+    .map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
 
-  offset += msg.encode(&mut buf[offset..]).map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
+  offset += msg
+    .encode(&mut buf[offset..])
+    .map_err(|e| e.update(encoded_message_len(msg), buf_len))?;
 
   #[cfg(debug_assertions)]
   {
@@ -406,7 +413,11 @@ where
 }
 
 /// Encode a relay message into a buffer.
-pub fn encode_relay_message<T, I, A>(msg: &T, node: &Node<I, A>, buf: &mut [u8]) -> Result<usize, EncodeError>
+pub fn encode_relay_message<T, I, A>(
+  msg: &T,
+  node: &Node<I, A>,
+  buf: &mut [u8],
+) -> Result<usize, EncodeError>
 where
   T: Encodable,
   I: Data,
@@ -439,9 +450,12 @@ where
     return Err(EncodeError::TooLarge);
   }
 
-  offset += (encoded_len as u32).encode(&mut buf[offset..]).map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
-  offset += msg.encode(&mut buf[offset..]).map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
-
+  offset += (encoded_len as u32)
+    .encode(&mut buf[offset..])
+    .map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
+  offset += msg
+    .encode(&mut buf[offset..])
+    .map_err(|e| e.update(encoded_relay_message_len(msg, node), buf_len))?;
 
   #[cfg(debug_assertions)]
   {
