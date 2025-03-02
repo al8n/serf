@@ -508,8 +508,7 @@ where
       .map(|id| 1 + id.encoded_len_with_length_delimited())
       .sum::<usize>();
     len += 1 + self.event_ltime.encoded_len();
-    len += 1
-      + self
+    len += self
         .events
         .iter()
         .filter_map(|e| {
@@ -541,10 +540,6 @@ where
     buf[offset] = LTIME_BYTE;
     offset += 1;
     offset += self.ltime.encode(&mut buf[offset..])?;
-
-    bail!(self(offset, buf_len));
-    buf[offset] = STATUS_LTIMES_BYTE;
-    offset += 1;
 
     self
       .status_ltimes

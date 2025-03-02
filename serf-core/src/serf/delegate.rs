@@ -408,7 +408,10 @@ where
     drop(members);
 
     match crate::types::encode_message_to_bytes(&pp) {
-      Ok(buf) => buf,
+      Ok(buf) => {
+        tracing::debug!(data=?buf.as_ref(), "serf: local state");
+        buf
+      },
       Err(e) => {
         tracing::error!(err=%e, "serf: failed to encode local state");
         Bytes::new()
@@ -421,6 +424,8 @@ where
       tracing::error!("serf: remote state is zero bytes");
       return;
     }
+
+    tracing::debug!(data=?buf, "serf: merge remote state");
 
     // Check the message type
     let msg = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(buf) {

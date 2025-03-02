@@ -465,3 +465,11 @@ encodable_round_trip!(
     <u64, String>,
     <String, u64>,
 );
+
+#[test]
+fn test() {
+  let data = [19, 33, 9, 1, 18, 18, 24, 17, 19, 115, 101, 114, 102, 95, 106, 111, 105, 110, 95, 108, 101, 97, 118, 101, 49, 95, 118, 52, 18, 1, 0, 12, 1, 14, 1];
+
+  let msg = super::decode_message::<smol_str::SmolStr, std::net::SocketAddr>(&data).unwrap();
+  // println!("{:?}", msg);
+}
