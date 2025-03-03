@@ -29,7 +29,7 @@ macro_rules! test_mod {
               [< $rt:camel Runtime >],
             >,
           >(|kr| {
-            (opts, MemberlistOptions::lan().with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(EncryptionAlgorithm::default())))
+            (opts, MemberlistOptions::lan().with_primary_key(kr).with_gossip_verify_outgoing(true).with_encryption_algo(EncryptionAlgorithm::default()))
           }));
         }
 
@@ -48,7 +48,7 @@ macro_rules! test_mod {
               [< $rt:camel Runtime >],
             >,
           >(|kr| {
-            (opts, MemberlistOptions::lan().with_primary_key(Some(kr)).with_gossip_verify_outgoing(true).with_encryption_algo(Some(EncryptionAlgorithm::default())))
+            (opts, MemberlistOptions::lan().with_primary_key(kr).with_gossip_verify_outgoing(true).with_encryption_algo(EncryptionAlgorithm::default()))
           }));
         }
       }
