@@ -10,11 +10,13 @@ use memberlist_core::{
 use crate::{
   delegate::Delegate,
   event::{CrateEvent, InternalQueryEvent, QueryEvent},
-  types::MessageRef,
 };
 
 #[cfg(feature = "encryption")]
-use crate::{error::Error, types::KeyResponseMessage};
+use crate::{
+  error::Error,
+  types::{KeyResponseMessage, MessageRef},
+};
 
 #[cfg(feature = "encryption")]
 use smol_str::SmolStr;

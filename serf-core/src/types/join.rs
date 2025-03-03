@@ -18,7 +18,11 @@ const ID_TAG: u8 = 2;
 pub struct JoinMessage<I> {
   /// The lamport time
   #[viewit(
-    getter(const, attrs(doc = "Returns the lamport time for this message")),
+    getter(
+      const,
+      style = "move",
+      attrs(doc = "Returns the lamport time for this message")
+    ),
     setter(
       const,
       attrs(doc = "Sets the lamport time for this message (Builder pattern)")

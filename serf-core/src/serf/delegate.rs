@@ -200,7 +200,6 @@ where
         match msg {
           MessageRef::Leave(l) => {
             tracing::debug!("serf: leave message: {:?}", l.id());
-            // TODO(al8n): do not read to owned here
             match <LeaveMessage<T::Id> as Data>::from_ref(l) {
               Err(e) => {
                 tracing::error!(err=%e, "serf: failed to decode leave message");
@@ -212,8 +211,6 @@ where
           }
           MessageRef::Join(j) => {
             tracing::debug!("serf: join message: {:?}", j.id());
-            // TODO(al8n): do not read to owned here
-
             match <JoinMessage<T::Id> as Data>::from_ref(j) {
               Err(e) => {
                 tracing::error!(err=%e, "serf: failed to decode join message");
@@ -409,7 +406,7 @@ where
 
     match crate::types::encode_message_to_bytes(&pp) {
       Ok(buf) => {
-        tracing::debug!(data=?buf.as_ref(), "serf: local state");
+        tracing::trace!(data=?buf.as_ref(), "serf: local state");
         buf
       }
       Err(e) => {
@@ -425,7 +422,7 @@ where
       return;
     }
 
-    tracing::debug!(data=?buf, "serf: merge remote state");
+    tracing::trace!(data=?buf, "serf: merge remote state");
 
     // Check the message type
     let msg = match crate::types::decode_message::<T::Id, T::ResolvedAddress>(buf) {

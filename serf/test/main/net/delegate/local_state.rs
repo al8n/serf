@@ -29,7 +29,6 @@ macro_rules! test_mod {
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
               Tcp<[< $rt:camel Runtime >]>,
-
               [< $rt:camel Runtime >],
             >,
           >(opts, opts2));

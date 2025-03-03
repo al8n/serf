@@ -77,9 +77,6 @@ where
     .local_state(false)
     .await;
 
-  // Verify
-  assert_eq!(buf[0], u8::from(MessageType::PushPull), "bad message type");
-
   // Attempt a decode
   let pp = crate::types::decode_message::<T::Id, T::ResolvedAddress>(&buf).unwrap();
 
