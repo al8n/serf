@@ -165,3 +165,26 @@ impl<'a> Arbitrary<'a> for MessageType {
       .map(|val| Self::from(val % Self::ALL.len() as u8))
   }
 }
+
+impl<'a> Arbitrary<'a> for super::coordinate::Coordinate {
+  fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+    Ok(Self {
+      portion: Vec::<f64>::arbitrary(u)?
+        .into_iter()
+        .map(|f| if f.is_nan() { 0.0 } else { f })
+        .collect(),
+      error: rand_f64_not_nan(u)?,
+      adjustment: rand_f64_not_nan(u)?,
+      height: rand_f64_not_nan(u)?,
+    })
+  }
+}
+
+fn rand_f64_not_nan(u: &mut Unstructured<'_>) -> arbitrary::Result<f64> {
+  loop {
+    let f = f64::arbitrary(u)?;
+    if !f.is_nan() {
+      return Ok(f);
+    }
+  }
+}

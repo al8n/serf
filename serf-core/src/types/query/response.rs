@@ -1,7 +1,7 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, WireType,
   bytes::Bytes,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{LamportTime, QueryFlag};
@@ -191,14 +191,7 @@ where
           offset += o;
           payload = Some(v);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("QueryResponseMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("QueryResponseMessage", &buf[offset..])?,
       }
     }
 

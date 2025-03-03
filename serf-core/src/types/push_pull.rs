@@ -1,7 +1,7 @@
 use indexmap::{IndexMap, IndexSet};
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TinyVec, TupleEncoder, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{LamportTime, UserEvents};
@@ -202,35 +202,33 @@ where
           ltime = Some(v);
         }
         STATUS_LTIMES_BYTE => {
-          offset += 1;
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          let readed = skip("PushPull", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = status_ltimes_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            status_ltimes_offsets = Some((offset - 1, offset + readed));
+            status_ltimes_offsets = Some((offset, offset + readed));
           }
           num_status_ltimes += 1;
           offset += readed;
         }
         b if b == left_members_byte => {
-          offset += 1;
-          let readed = skip(I::WIRE_TYPE, &buf[offset..])?;
+          let readed = skip("PushPull", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = left_members_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            left_members_offsets = Some((offset - 1, offset + readed));
+            left_members_offsets = Some((offset, offset + readed));
           }
           num_left_members += 1;
           offset += readed;
@@ -250,18 +248,17 @@ where
           event_ltime = Some(v);
         }
         EVENTS_BYTE => {
-          offset += 1;
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          let readed = skip("PushPull", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = events_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            events_offsets = Some((offset - 1, offset + readed));
+            events_offsets = Some((offset, offset + readed));
           }
           num_events += 1;
           offset += readed;
@@ -280,14 +277,7 @@ where
           offset += o;
           query_ltime = Some(v);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("PushPullMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("PushPull", &buf[offset..])?,
       }
     }
 
@@ -509,13 +499,13 @@ where
       .sum::<usize>();
     len += 1 + self.event_ltime.encoded_len();
     len += self
-        .events
-        .iter()
-        .filter_map(|e| {
-          e.as_ref()
-            .map(|e| 1 + e.encoded_len_with_length_delimited())
-        })
-        .sum::<usize>();
+      .events
+      .iter()
+      .filter_map(|e| {
+        e.as_ref()
+          .map(|e| 1 + e.encoded_len_with_length_delimited())
+      })
+      .sum::<usize>();
     len += 1 + self.query_ltime.encoded_len();
 
     len

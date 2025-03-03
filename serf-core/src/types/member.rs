@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use memberlist_core::proto::{
   CheapClone, Data, DataRef, DecodeError, EncodeError, OneOrMore, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{
@@ -372,14 +372,7 @@ where
           delegate_version = Some(buf[offset].into());
           offset += 1;
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("Member", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("Member", &buf[offset..])?,
       }
     }
 

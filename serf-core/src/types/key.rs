@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, SecretKey, SecretKeys, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 use smol_str::SmolStr;
 
@@ -44,14 +44,7 @@ impl DataRef<'_, Self> for KeyRequestMessage {
           offset += bytes_read;
           key = Some(val);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("KeyRequestMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("KeyRequestMessage", &buf[offset..])?,
       }
     }
 
@@ -231,18 +224,17 @@ impl<'a> DataRef<'a, KeyResponseMessage> for KeyResponseMessageRef<'a> {
           message = Some(val);
         }
         KEY_RESPONSE_KEYS_BYTE => {
-          offset += 1;
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          let readed = skip("KeyResponseMessage", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = keys_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            keys_offsets = Some((offset - 1, offset + readed));
+            keys_offsets = Some((offset, offset + readed));
           }
           num_keys += 1;
           offset += readed;
@@ -261,13 +253,7 @@ impl<'a> DataRef<'a, KeyResponseMessage> for KeyResponseMessageRef<'a> {
           offset += bytes_read;
           primary_key = Some(val);
         }
-        other => {
-          offset += 1;
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("KeyResponseMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("KeyResponseMessage", &buf[offset..])?,
       }
     }
 

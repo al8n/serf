@@ -1,6 +1,6 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, OneOrMore, RepeatedDecoder, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{super::LamportTime, UserEvent};
@@ -77,31 +77,22 @@ impl<'a> DataRef<'a, UserEvents> for UserEventsRef<'a> {
           offset += size;
         }
         EVENTS_BYTE => {
-          offset += 1;
-
-          let readed = super::skip(WireType::LengthDelimited, &buf[offset..])?;
+          let readed = super::skip("UserEvents", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = events_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            events_offsets = Some((offset - 1, offset + readed));
+            events_offsets = Some((offset, offset + readed));
           }
           num_events += 1;
           offset += readed;
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("UserEvents", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("UserEvents", &buf[offset..])?,
       }
     }
 

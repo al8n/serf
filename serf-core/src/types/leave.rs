@@ -1,6 +1,6 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::LamportTime;
@@ -103,14 +103,7 @@ where
           offset += read;
           id = Some(id_ref);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("LeaveMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("LeaveMessage", &buf[offset..])?,
       }
     }
 

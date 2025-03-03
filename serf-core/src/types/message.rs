@@ -1,7 +1,7 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, WireType,
   bytes::Bytes,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{
@@ -299,7 +299,29 @@ where
   }
 }
 
+/// A reference type to a relay message.
+#[viewit::viewit(vis_all = "pub(crate)", getters(vis_all = "pub"), setters(skip))]
+#[derive(Debug, Clone, Copy)]
+pub struct RelayMessageRef<'a, I, A> {
+  /// The node
+  #[viewit(getter(style = "ref", attrs(doc = "Get the node to relay to")))]
+  node: Node<I, A>,
+  /// The offset of the payload to the original buffer
+  #[viewit(getter(
+    style = "move",
+    attrs(doc = "Get the offset of the payload to the original buffer")
+  ))]
+  payload_offset: usize,
+  /// The relay message payload
+  #[viewit(getter(style = "move", attrs(doc = "Get the relay message payload")))]
+  payload: &'a [u8],
+}
+
 /// A reference to a message.
+#[derive(Debug, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+#[non_exhaustive]
 pub enum MessageRef<'a, I, A> {
   /// Leave message
   Leave(LeaveMessage<I>),
@@ -316,14 +338,7 @@ pub enum MessageRef<'a, I, A> {
   /// ConflictResponse message
   ConflictResponse(ConflictResponseMessageRef<'a, I, A>),
   /// Relay message
-  Relay {
-    /// The node
-    node: Node<I, A>,
-    /// The offset of the payload to the original buffer
-    payload_offset: usize,
-    /// The relay message payload
-    payload: &'a [u8],
-  },
+  Relay(RelayMessageRef<'a, I, A>),
   #[cfg(feature = "encryption")]
   /// KeyRequest message
   KeyRequest(KeyRequestMessage),
@@ -626,11 +641,11 @@ where
         offset += 1;
         let (readed, (node, payload)) = decode_relay::<I, A>(&buf[offset..])?;
         offset += readed;
-        msg = Some(MessageRef::Relay {
+        msg = Some(MessageRef::Relay(RelayMessageRef {
           node,
           payload,
           payload_offset: offset - payload.len(),
-        });
+        }));
       }
       #[cfg(feature = "encryption")]
       KEY_REQUEST_MESSAGE_BYTE => {
@@ -668,14 +683,7 @@ where
         offset += len;
         msg = Some(MessageRef::KeyResponse(val));
       }
-      other => {
-        offset += 1;
-
-        let (wire_type, _) = split(other);
-        let wire_type = WireType::try_from(wire_type)
-          .map_err(|v| DecodeError::unknown_wire_type("Message", v))?;
-        offset += skip(wire_type, &buf[offset..])?;
-      }
+      _ => offset += skip("Message", &buf[offset..])?,
     }
   }
 
@@ -739,14 +747,7 @@ where
         offset += length as usize;
         msg = Some(&buf[start_offset..offset]);
       }
-      other => {
-        offset += 1;
-
-        let (wire_type, _) = split(other);
-        let wire_type = WireType::try_from(wire_type)
-          .map_err(|v| DecodeError::unknown_wire_type("RelayMessage", v))?;
-        offset += skip(wire_type, &buf[offset..])?;
-      }
+      _ => offset += skip("RelayMessage", &buf[offset..])?,
     }
   }
 

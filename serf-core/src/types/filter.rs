@@ -1,6 +1,6 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TinyVec, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 pub use tag_filter::*;
@@ -118,18 +118,17 @@ where
     while offset < buf_len {
       match buf[offset] {
         val if val == Filter::<I>::id_byte() => {
-          offset += 1;
-          let readed = skip(I::WIRE_TYPE, &buf[offset..])?;
+          let readed = skip("Filter", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = ids_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            ids_offsets = Some((offset - 1, offset + readed));
+            ids_offsets = Some((offset, offset + readed));
           }
           num_ids += 1;
           offset += readed;
@@ -153,13 +152,7 @@ where
           offset += read;
           f = Some(FilterRef::Tag(tag));
         }
-        b => {
-          let (wire_type, _) = split(b);
-          let wt = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("Filter", v))?;
-          offset += 1;
-          offset += skip(wt, &buf[offset..])?;
-        }
+        _ => offset += skip("Filter", &buf[offset..])?,
       }
     }
 

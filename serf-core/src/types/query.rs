@@ -5,7 +5,7 @@ use std::time::Duration;
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, Node, RepeatedDecoder, TinyVec, WireType,
   bytes::Bytes,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 
 use super::{Filter, LamportTime};
@@ -256,18 +256,17 @@ where
           from = Some(v);
         }
         FILTERS_BYTE => {
-          offset += 1;
-          let readed = skip(WireType::LengthDelimited, &buf[offset..])?;
+          let readed = skip("QueryMessage", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = filters_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            filters_offsets = Some((offset - 1, offset + readed));
+            filters_offsets = Some((offset, offset + readed));
           }
           num_filters += 1;
           offset += readed;
@@ -342,14 +341,7 @@ where
           offset += o;
           payload = Some(v);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("QueryMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("QueryMessage", &buf[offset..])?,
       }
     }
 

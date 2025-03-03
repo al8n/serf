@@ -2,7 +2,7 @@ use core::time::Duration;
 
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 use rand::Rng;
 use smallvec::SmallVec;
@@ -209,7 +209,6 @@ impl CoordinateOptions {
 #[viewit::viewit(getters(style = "move"), setters(prefix = "with"))]
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Coordinate {
   /// The Euclidean portion of the coordinate. This is used along
   /// with the other fields to provide an overall distance estimate. The
@@ -222,7 +221,6 @@ pub struct Coordinate {
     ),
     setter(attrs(doc = "Sets the Euclidean portion of the coordinate."))
   )]
-  #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<f64>, SmallVec<[f64; DEFAULT_DIMENSIONALITY]>>))]
   portion: SmallVec<[f64; DEFAULT_DIMENSIONALITY]>,
   /// Reflects the confidence in the given coordinate and is updated
   /// dynamically by the Vivaldi Client. This is dimensionless.
@@ -435,7 +433,7 @@ const PORTION_TAG: u8 = 1;
 const ERROR_TAG: u8 = 2;
 const ADJUSTMENT_TAG: u8 = 3;
 const HEIGHT_TAG: u8 = 4;
-const PORTION_BYTE: u8 = merge(WireType::LengthDelimited, PORTION_TAG);
+const PORTION_BYTE: u8 = merge(WireType::Fixed64, PORTION_TAG);
 const ERROR_BYTE: u8 = merge(WireType::Fixed64, ERROR_TAG);
 const ADJUSTMENT_BYTE: u8 = merge(WireType::Fixed64, ADJUSTMENT_TAG);
 const HEIGHT_BYTE: u8 = merge(WireType::Fixed64, HEIGHT_TAG);
@@ -465,23 +463,23 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
 
     while offset < buf_len {
       match buf[offset] {
-        PORTION_TAG => {
-          let readed = skip(WireType::Fixed64, &buf[offset..])?;
+        PORTION_BYTE => {
+          let readed = skip("Coordinate", &buf[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = portion_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            portion_offsets = Some((offset - 1, offset + readed));
+            portion_offsets = Some((offset, offset + readed));
           }
           num_portions += 1;
           offset += readed;
         }
-        ERROR_TAG => {
+        ERROR_BYTE => {
           if error.is_some() {
             return Err(DecodeError::duplicate_field(
               "Coordinate",
@@ -489,12 +487,13 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
               ERROR_TAG,
             ));
           }
+          offset += 1;
 
           let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
           offset += len;
           error = Some(val);
         }
-        ADJUSTMENT_TAG => {
+        ADJUSTMENT_BYTE => {
           if adjustment.is_some() {
             return Err(DecodeError::duplicate_field(
               "Coordinate",
@@ -502,12 +501,13 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
               ADJUSTMENT_TAG,
             ));
           }
+          offset += 1;
 
           let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
           offset += len;
           adjustment = Some(val);
         }
-        HEIGHT_TAG => {
+        HEIGHT_BYTE => {
           if height.is_some() {
             return Err(DecodeError::duplicate_field(
               "Coordinate",
@@ -515,19 +515,13 @@ impl<'a> DataRef<'a, Coordinate> for CoordinateRef<'a> {
               HEIGHT_TAG,
             ));
           }
+          offset += 1;
 
           let (len, val) = <f64 as Data>::decode(&buf[offset..])?;
           offset += len;
           height = Some(val);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("Coordinate", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("Coordinate", &buf[offset..])?,
       }
     }
 

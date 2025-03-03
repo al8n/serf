@@ -6,7 +6,7 @@ use memberlist_core::{
 };
 use quickcheck::{Arbitrary, Gen};
 
-use super::*;
+use super::{coordinate::Coordinate, *};
 
 fn data_round_trip<T: Data + PartialEq>(data: &T) {
   let mut buf = vec![0; data.encoded_len() + 2];
@@ -74,6 +74,11 @@ type QueryResponseMessageU64U64 = QueryResponseMessage<u64, u64>;
 type QueryResponseMessageStringU64 = QueryResponseMessage<String, u64>;
 
 data_round_trip! {
+  Coordinate,
+}
+
+data_round_trip! {
+  // Coordinate,
   ConflictResponseMessageStringString,
   ConflictResponseMessageU64U64,
   ConflictResponseMessageStringU64,
@@ -193,7 +198,7 @@ where
       let data = encode_relay(&$input, &$node);
       assert_eq!(data.len(), encoded_relay_message_len(&$input, &$node), "relay message: length mismatch");
       let decoded = super::decode_message :: < $($g),* > (&data).unwrap();
-      let MessageRef::Relay { node, payload, .. } = decoded else { return false };
+      let MessageRef::Relay(RelayMessageRef { node, payload, .. }) = decoded else { return false };
       assert_eq!(<Node<$($g),*> as Data>::from_ref(node).unwrap(), $node, "relay message: node mismatch");
 
       let decoded = super::decode_message :: < $($g),* > (&payload).unwrap();
@@ -468,8 +473,22 @@ encodable_round_trip!(
 
 #[test]
 fn test() {
-  let data = [19, 33, 9, 1, 18, 18, 24, 17, 19, 115, 101, 114, 102, 95, 106, 111, 105, 110, 95, 108, 101, 97, 118, 101, 49, 95, 118, 52, 18, 1, 0, 12, 1, 14, 1];
+  let data = [
+    19, 33, 9, 1, 18, 25, 17, 20, 115, 101, 114, 102, 95, 99, 111, 111, 114, 100, 105, 110, 97,
+    116, 101, 115, 50, 95, 118, 52, 18, 1, 0, 12, 1, 14, 1,
+  ];
 
   let msg = super::decode_message::<smol_str::SmolStr, std::net::SocketAddr>(&data).unwrap();
-  // println!("{:?}", msg);
+  let pp = msg.unwrap_push_pull();
+  let msg = PushPullMessage::<smol_str::SmolStr>::from_ref(pp).unwrap();
+  println!("{:?}", msg);
+}
+
+#[test]
+fn test_3() {
+  let coord = coordinate::Coordinate::new();
+  let data1 = coord.encode_to_vec().unwrap();
+  println!("{:?}", &data1);
+  let (_, coord) = <coordinate::Coordinate as Data>::decode(&data1).unwrap();
+  println!("{:?}", coord);
 }

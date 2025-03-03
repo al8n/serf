@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, TupleEncoder, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 use smol_str::SmolStr;
 
@@ -78,31 +78,22 @@ impl<'a> DataRef<'a, Tags> for TagsRef<'a> {
     while offset < buf_len {
       match src[offset] {
         TAGS_BYTE => {
-          offset += 1;
-
-          let readed = skip(WireType::LengthDelimited, &src[offset..])?;
+          let readed = skip("Tags", &src[offset..])?;
           if let Some((ref mut fnso, ref mut lnso)) = tags_offsets {
             if *fnso > offset {
-              *fnso = offset - 1;
+              *fnso = offset;
             }
 
             if *lnso < offset + readed {
               *lnso = offset + readed;
             }
           } else {
-            tags_offsets = Some((offset - 1, offset + readed));
+            tags_offsets = Some((offset, offset + readed));
           }
           num_tags += 1;
           offset += readed;
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type =
-            WireType::try_from(wire_type).map_err(|v| DecodeError::unknown_wire_type("Tags", v))?;
-          offset += skip(wire_type, &src[offset..])?;
-        }
+        _ => offset += skip("Tags", &src[offset..])?,
       }
     }
 

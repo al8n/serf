@@ -1,7 +1,7 @@
 use memberlist_core::proto::{
   CheapClone, Data, DataRef, DecodeError, EncodeError, WireType,
   bytes::Bytes,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 use smol_str::SmolStr;
 
@@ -171,14 +171,7 @@ impl<'a> DataRef<'a, UserEventMessage> for UserEventMessageRef<'a> {
           offset += o;
           payload = Some(v);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("UserEventMessage", v))?;
-          offset += skip(wire_type, &buf[offset..])?;
-        }
+        _ => offset += skip("UserEventMessage", &buf[offset..])?,
       }
     }
 

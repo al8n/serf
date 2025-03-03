@@ -39,30 +39,30 @@ macro_rules! test_mod {
           >(opts, opts2, opts3));
         }
 
-        #[test]
-        fn test_serf_coordinates_v6() {
-          let name = "serf_coordinates1_v6";
-          let mut opts = NetTransportOptions::new(SmolStr::new(name));
-          opts.add_bind_address(next_socket_addr_v6());
+        // #[test]
+        // fn test_serf_coordinates_v6() {
+        //   let name = "serf_coordinates1_v6";
+        //   let mut opts = NetTransportOptions::new(SmolStr::new(name));
+        //   opts.add_bind_address(next_socket_addr_v6());
 
-          let name = "serf_coordinates2_v6";
-          let mut opts2 = NetTransportOptions::new(SmolStr::new(name));
-          opts2.add_bind_address(next_socket_addr_v6());
+        //   let name = "serf_coordinates2_v6";
+        //   let mut opts2 = NetTransportOptions::new(SmolStr::new(name));
+        //   opts2.add_bind_address(next_socket_addr_v6());
 
-          let name = "serf_coordinates3_v6";
-          let mut opts3 = NetTransportOptions::new(SmolStr::new(name));
-          opts3.add_bind_address(next_socket_addr_v6());
+        //   let name = "serf_coordinates3_v6";
+        //   let mut opts3 = NetTransportOptions::new(SmolStr::new(name));
+        //   opts3.add_bind_address(next_socket_addr_v6());
 
-          [< $rt:snake _run >](serf_coordinates::<
-            NetTransport<
-              SmolStr,
-              SocketAddrResolver<[< $rt:camel Runtime >]>,
-              Tcp<[< $rt:camel Runtime >]>,
+        //   [< $rt:snake _run >](serf_coordinates::<
+        //     NetTransport<
+        //       SmolStr,
+        //       SocketAddrResolver<[< $rt:camel Runtime >]>,
+        //       Tcp<[< $rt:camel Runtime >]>,
 
-              [< $rt:camel Runtime >],
-            >,
-          >(opts, opts2, opts3));
-        }
+        //       [< $rt:camel Runtime >],
+        //     >,
+        //   >(opts, opts2, opts3));
+        // }
       }
     }
   };

@@ -1,6 +1,6 @@
 use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, WireType,
-  utils::{merge, skip, split},
+  utils::{merge, skip},
 };
 use regex::Regex;
 use smol_str::SmolStr;
@@ -54,14 +54,7 @@ impl<'a> DataRef<'a, TagFilter> for TagFilterRef<'a> {
           offset += read;
           expr = Some(value);
         }
-        other => {
-          offset += 1;
-
-          let (wire_type, _) = split(other);
-          let wire_type = WireType::try_from(wire_type)
-            .map_err(|v| DecodeError::unknown_wire_type("TagFilter", v))?;
-          offset += skip(wire_type, &src[offset..])?;
-        }
+        _ => offset += skip("TagFilter", &src[offset..])?,
       }
     }
 

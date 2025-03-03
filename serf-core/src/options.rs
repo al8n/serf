@@ -480,6 +480,7 @@ impl Clone for Options {
   fn clone(&self) -> Self {
     Self {
       memberlist_options: self.memberlist_options.clone(),
+      #[cfg(feature = "encryption")]
       keyring_file: self.keyring_file.clone(),
       snapshot_path: self.snapshot_path.clone(),
       tags: self.tags.clone(),
@@ -522,6 +523,7 @@ impl Options {
       rejoin_after_leave: false,
       enable_id_conflict_resolution: true,
       disable_coordinates: false,
+      #[cfg(feature = "encryption")]
       keyring_file: None,
       max_user_event_size: 512,
     }

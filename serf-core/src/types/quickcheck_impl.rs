@@ -303,10 +303,22 @@ impl Arbitrary for MessageType {
 impl Arbitrary for Coordinate {
   fn arbitrary(g: &mut Gen) -> Self {
     Self {
-      portion: Vec::arbitrary(g).into(),
-      error: Arbitrary::arbitrary(g),
-      adjustment: Arbitrary::arbitrary(g),
-      height: Arbitrary::arbitrary(g),
+      portion: Vec::<f64>::arbitrary(g)
+        .into_iter()
+        .map(|f| if f.is_nan() { 0.0 } else { f })
+        .collect(),
+      error: rand_f64_not_nan(g),
+      adjustment: rand_f64_not_nan(g),
+      height: rand_f64_not_nan(g),
+    }
+  }
+}
+
+fn rand_f64_not_nan(u: &mut Gen) -> f64 {
+  loop {
+    let f = f64::arbitrary(u);
+    if !f.is_nan() {
+      return f;
     }
   }
 }

@@ -6,7 +6,7 @@ use crate::{
   event::QueryMessageExt,
   types::{
     DelegateVersion, JoinMessage, LamportTime, LeaveMessage, Member, MemberStatus, MessageRef,
-    ProtocolVersion, PushPullMessageBorrow, UserEventMessage,
+    ProtocolVersion, PushPullMessageBorrow, RelayMessageRef, UserEventMessage,
   },
 };
 
@@ -260,11 +260,11 @@ where
               tracing::warn!(err=%e, "serf: failed to decode query response message");
             }
           }
-          MessageRef::Relay {
+          MessageRef::Relay(RelayMessageRef {
             node,
             payload,
             payload_offset,
-          } => {
+          }) => {
             tracing::debug!("serf: relaying response to node: {:?}", node);
             match Data::from_ref(*node.address()) {
               Err(e) => {
@@ -411,7 +411,7 @@ where
       Ok(buf) => {
         tracing::debug!(data=?buf.as_ref(), "serf: local state");
         buf
-      },
+      }
       Err(e) => {
         tracing::error!(err=%e, "serf: failed to encode local state");
         Bytes::new()
@@ -692,6 +692,7 @@ where
       if let Err(e) = coord.encode(&mut buf[1..]) {
         tracing::error!(err=%e, "serf: failed to encode coordinate");
       }
+      tracing::trace!(coordinate=?coord, data=?buf.as_ref(), "serf: ack payload");
       buf.into()
     } else {
       Bytes::new()
@@ -709,11 +710,12 @@ where
     }
 
     let this = self.this();
+    tracing::trace!(data=?payload.as_ref(), "serf: receive payload");
 
     if let Some(ref c) = this.inner.coord_core {
       // Verify ping version in the header.
       if payload[0] != PING_VERSION {
-        tracing::error!("serf: unsupported ping version: {}", payload[0]);
+        tracing::error!(version = %payload[0], "serf: unsupported ping version");
         return;
       }
 
