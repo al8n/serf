@@ -470,25 +470,3 @@ encodable_round_trip!(
     <u64, String>,
     <String, u64>,
 );
-
-#[test]
-fn test() {
-  let data = [
-    19, 33, 9, 1, 18, 25, 17, 20, 115, 101, 114, 102, 95, 99, 111, 111, 114, 100, 105, 110, 97,
-    116, 101, 115, 50, 95, 118, 52, 18, 1, 0, 12, 1, 14, 1,
-  ];
-
-  let msg = super::decode_message::<smol_str::SmolStr, std::net::SocketAddr>(&data).unwrap();
-  let pp = msg.unwrap_push_pull();
-  let msg = PushPullMessage::<smol_str::SmolStr>::from_ref(pp).unwrap();
-  println!("{:?}", msg);
-}
-
-#[test]
-fn test_3() {
-  let coord = coordinate::Coordinate::new();
-  let data1 = coord.encode_to_vec().unwrap();
-  println!("{:?}", &data1);
-  let (_, coord) = <coordinate::Coordinate as Data>::decode(&data1).unwrap();
-  println!("{:?}", coord);
-}
