@@ -790,8 +790,6 @@ pub async fn serf_write_keyring_file<T>(
 {
   use std::io::Read;
 
-  use base64::{Engine as _, engine::general_purpose};
-
   const EXISTING: &str = "T9jncgl9mbLus+baTTa7q7nPSUrXwbDi2dhbtqir37s=";
   const NEW_KEY: &str = "HvY8ubRZMgafUOWvrOadwOckVa1wN3QWAo46FVKbVN8=";
 
@@ -799,8 +797,7 @@ pub async fn serf_write_keyring_file<T>(
   let mut p = td.path().join("serf_write_keying_file");
   p.set_extension("json");
 
-  let existing_bytes = general_purpose::STANDARD.decode(EXISTING).unwrap();
-  let sk = memberlist_core::proto::SecretKey::try_from(existing_bytes.as_slice()).unwrap();
+  let sk = crate::types::SecretKey::try_from(EXISTING).unwrap();
 
   let (topts, mopts) = get_transport_opts(sk);
   let serf = Serf::<T>::new(
@@ -817,8 +814,7 @@ pub async fn serf_write_keyring_file<T>(
   );
 
   let manager = serf.key_manager();
-  let new_key = general_purpose::STANDARD.decode(NEW_KEY).unwrap();
-  let new_sk = memberlist_core::proto::SecretKey::try_from(new_key.as_slice()).unwrap();
+  let new_sk = crate::types::SecretKey::try_from(NEW_KEY).unwrap();
   manager.install_key(new_sk, None).await.unwrap();
 
   let mut keyring_file = std::fs::File::open(&p).unwrap();

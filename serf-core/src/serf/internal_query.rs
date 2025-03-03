@@ -458,7 +458,7 @@ where
   #[cfg(feature = "encryption")]
   async fn send_key_response(q: &QueryEvent<T, D>, resp: &mut KeyResponseMessage) {
     match q.name.as_str() {
-      "_serf_list_keys" => {
+      crate::event::INTERNAL_LIST_KEYS => {
         let (raw, qresp) = match Self::key_list_response_with_correct_size(q, resp) {
           Ok((raw, qresp)) => (raw, qresp),
           Err(e) => {

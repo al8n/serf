@@ -252,7 +252,7 @@ where
             }
           }
           MessageRef::QueryResponse(qr) => {
-            tracing::debug!("serf: query response message: {:?}", qr.from());
+            tracing::debug!("serf: query response message");
             if let Err(e) = this.handle_query_response(qr).await {
               tracing::warn!(err=%e, "serf: failed to decode query response message");
             }

@@ -15,7 +15,7 @@ categories.workspace = true
 default = ["metrics"]
 metrics = ["memberlist-core/metrics", "dep:metrics"]
 
-encryption = ["memberlist-core/encryption", "base64", "serde"]
+encryption = ["memberlist-core/encryption", "serde", "serde_json"]
 
 crc32 = ["memberlist-core/crc32"]
 murmur3 = ["memberlist-core/murmur3"]
@@ -73,9 +73,7 @@ metrics = { version = "0.24", optional = true }
 
 serde = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
-serde_json = "1"
-
-base64 = { version = "0.22", optional = true }
+serde_json = { version = "1", optional = true }
 
 arbitrary = { workspace = true, optional = true, default-features = false, features = ["derive"] }
 quickcheck = { workspace = true, optional = true, default-features = false }

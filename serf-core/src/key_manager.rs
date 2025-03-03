@@ -17,7 +17,7 @@ use super::{
   delegate::Delegate,
   error::Error,
   serf::{NodeResponse, QueryResponse},
-  types::{KeyRequestMessage, MessageType},
+  types::KeyRequestMessage,
 };
 
 /// KeyResponse is used to relay a query for a list of all keys in use.
@@ -232,14 +232,10 @@ where
       resp.num_resp += 1;
 
       // Decode the response
-      if r.payload.is_empty() || r.payload[0] != u8::from(MessageType::KeyResponse) {
-        resp.messages.insert(
-          r.from.id().cheap_clone(),
-          SmolStr::new(format!(
-            "Invalid key query response type: {:?}",
-            r.payload.as_ref()
-          )),
-        );
+      if r.payload.is_empty() {
+        resp
+          .messages
+          .insert(r.from.id().cheap_clone(), SmolStr::new("empty payload"));
         resp.num_err += 1;
 
         if resp.num_resp == resp.num_nodes {
@@ -253,9 +249,11 @@ where
           Ok(msg) => match msg {
             MessageRef::KeyResponse(kr) => kr,
             msg => {
+              tracing::error!(type=%msg.ty(), "serf: invalid key query response type");
+
               resp.messages.insert(
                 r.from.id().cheap_clone(),
-                format_smolstr!("Invalid key query response type: {}", msg.ty()),
+                format_smolstr!("invalid key query response: {}", msg.ty()),
               );
               resp.num_err += 1;
 
@@ -266,10 +264,10 @@ where
             }
           },
           Err(e) => {
-            resp.messages.insert(
-              r.from.id().cheap_clone(),
-              SmolStr::new(format!("Failed to decode key query response: {:?}", e)),
-            );
+            tracing::error!(err=%e, "serf: failed to decode key query response");
+            resp
+              .messages
+              .insert(r.from.id().cheap_clone(), format_smolstr!("{e}"));
             resp.num_err += 1;
 
             if resp.num_resp == resp.num_nodes {
@@ -285,7 +283,9 @@ where
           SmolStr::new(node_response.message()),
         );
         resp.num_err += 1;
-      } else if node_response.result() && node_response.message().is_empty() {
+      }
+
+      if node_response.result() && !node_response.message().is_empty() {
         tracing::warn!("serf: {}", node_response.message());
         resp.messages.insert(
           r.from.id().cheap_clone(),

@@ -399,8 +399,6 @@ where
   /// Serialize the current keyring and save it to a file.
   #[cfg(feature = "encryption")]
   pub(crate) async fn write_keyring_file(&self) -> std::io::Result<()> {
-    use base64::{Engine as _, engine::general_purpose};
-
     let Some(path) = self.inner.opts.keyring_file() else {
       return Ok(());
     };
@@ -408,7 +406,7 @@ where
     if let Some(keyring) = self.inner.memberlist.keyring() {
       let encoded_keys = keyring
         .keys()
-        .map(|k| general_purpose::STANDARD.encode(k))
+        .map(|k| k.to_base64())
         .collect::<TinyVec<_>>();
 
       #[cfg(unix)]
