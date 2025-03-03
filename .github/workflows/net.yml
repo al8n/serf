@@ -36,7 +36,6 @@ jobs:
         runtime: [tokio, async-std, smol]
         stream_layer: 
           - tls
-          - native-tls
           - tcp
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +66,7 @@ jobs:
 
       - name: Run Unit Tests for serf based on net transport
         run: |
-          cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }}" -- --test-threads=1
+          cargo test --no-default-features --features "test,encryption,net,metrics,${{ matrix.runtime }},${{ matrix.stream_layer }}" -- --test-threads=1
         working-directory: serf
 
       - name: Cache Cargo registry
