@@ -91,7 +91,7 @@ agnostic-lite = { version = "0.5", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 futures = { workspace = true, features = ["executor"] }
 tempfile = "3"
-memberlist-core = { workspace = true, features = ["quickcheck", "arbitrary"] }
+memberlist-core = { workspace = true, features = ["quickcheck", "arbitrary", "test"] }
 quickcheck_macros = "1"
 quickcheck.workspace = true
 paste = "1"

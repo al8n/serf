@@ -32,10 +32,10 @@ jobs:
       matrix:
         include:
           - crate: core
-            features: "test,metrics,quickcheck,encryption"
+            features: "test,metrics,quickcheck,encryption,tracing"
             name: "serf-core"
           - crate: serf
-            features: "test,tokio,tcp,encryption,metrics"
+            features: "test,tokio,tcp,encryption,metrics,tracing"
             name: "serf-tcp-encryption"
     steps:
       - uses: actions/checkout@v4
