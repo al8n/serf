@@ -32,7 +32,7 @@ jobs:
       matrix:
         include:
           - crate: core
-            features: "test,metrics"
+            features: "test,metrics,quickcheck,encryption"
             name: "serf-core"
           - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
