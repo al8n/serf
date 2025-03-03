@@ -43,7 +43,6 @@ test = ["memberlist-core/test", "paste", "tracing-subscriber", "tempfile"]
 arbitrary = ["dep:arbitrary", "memberlist-core/arbitrary", "smol_str/arbitrary"]
 quickcheck = ["dep:quickcheck", "memberlist-core/quickcheck"]
 
-
 [dependencies]
 auto_impl = "1"
 atomic_refcell = "0.1"

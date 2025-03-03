@@ -31,11 +31,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - crate: core
-            features: "test,metrics,quickcheck,encryption,tracing"
+          - crate: serf-core
+            features: "test,metrics,quickcheck,encryption"
             name: "serf-core"
           - crate: serf
-            features: "test,tokio,tcp,encryption,metrics,tracing"
+            features: "test,tokio,tcp,encryption,metrics"
             name: "serf-tcp-encryption"
     steps:
       - uses: actions/checkout@v4
