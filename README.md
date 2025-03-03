@@ -37,7 +37,70 @@ serf is eventually consistent but converges quickly on average. The speed at whi
 
 serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-unknown-unknown` (need to configure the crate features).
 
-### Design
+## Installation
+
+- By using `TCP/UDP`, `TLS/UDP` transport
+
+  ```toml
+  serf = { version = "0.3", features = [
+    "tcp",
+    # Enable a checksum, as UDP is not reliable.
+    # Built in supports are: "crc32", "xxhash64", "xxhash32", "xxhash3", "murmur3"
+    "crc32",
+    # Enable a compression, this is optional,
+    # and possible values are `snappy`, `brotli`, `zstd` and `lz4`.
+    # You can enable all.
+    "snappy",
+    # Enable encryption, this is optional,
+    "encryption",
+    # Enable a async runtime
+    # Builtin supports are `tokio`, `smol`, `async-std`
+    "tokio",
+    # Enable one tls implementation. This is optional.
+    # Users can just use encryption feature with plain TCP.
+    #
+    # "tls",
+  ] }
+  ```
+
+- By using `QUIC/QUIC` transport
+
+  For `QUIC/QUIC` transport, as QUIC is secure and reliable, so enable checksum or encryption makes no sense.
+
+  ```toml
+  serf = { version = "0.3", features = [
+    # Enable a compression, this is optional,
+    # and possible values are `snappy`, `brotli`, `zstd` and `lz4`.
+    # You can enable all.
+    "snappy",
+    # Enable a async runtime
+    # Builtin supports are `tokio`, `smol`, `async-std`
+    "tokio",
+    # Enable one of the QUIC implementation
+    # Builtin support is `quinn`
+    "quinn",
+  ] }
+  ```
+
+## Protocol
+
+serf is based on ["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://ieeexplore.ieee.org/document/1028914/). However, Hashicorp developers extends the protocol in a number of ways:
+
+Several extensions are made to increase propagation speed and convergence rate.
+Another set of extensions, that Hashicorp developers call Lifeguard, are made to make serf more robust in the presence of slow message processing (due to factors such as CPU starvation, and network delay or loss).
+For details on all of these extensions, please read Hashicorp's paper ["Lifeguard : SWIM-ing with Situational Awareness"](https://arxiv.org/abs/1707.00788), along with the serf source.
+
+## Q & A
+
+- ***Does Rust's serf implemenetation compatible to Go's serf?***
+
+  No! Rust implementation use protobuf-like encoding/decoding whereas Go's implementation uses message pack.
+
+- ***If Go's serf adds more functionalities, will this project also support?***
+  
+  Yes! And this project may also add more functionalities whereas the Go's serf does not have. e.g. wasmer support, bindings to other languages and etc.
+
+## Design
 
 Unlike the original Go implementation, Rust's serf use highly generic and layered architecture, users can easily implement a component by themselves and plug it to the serf. Users can even custom their own `Id` and `Address`.
 
@@ -57,19 +120,17 @@ Here are the layers:
 
   - **[`NetTransport`](https://docs.rs/serf-net/struct.NetTransport.html)**
 
-    Three kinds of different builtin stream layers for `NetTransport`:
+    Builtin stream layers for `NetTransport`:
 
     - [`Tcp`](https://docs.rs/serf-net/stream_layer/tcp/struct.Tcp.html): based on TCP and UDP
     - [`Tls`](https://docs.rs/serf-net/stream_layer/tls/struct.Tls.html): based on [`rustls`](https://docs.rs/rustls) and UDP
-    - [`NativeTls`](https://docs.rs/serf-net/stream_layer/tls/struct.NativeTls.html): based on [`native-tls`](https://docs.rs/native-tls) and UDP
 
   - **[`QuicTransport`](https://docs.rs/serf-quic/struct.QuicTransport.html)**
 
     QUIC transport is an experimental transport implementation, it is well tested but still experimental.
 
-    Two kinds of different builtin stream layers for `QuicTransport`:
+    Builtin stream layers for `QuicTransport`:
     - [`Quinn`](https://docs.rs/serf-quic/stream_layer/quinn/struct.Quinn.html): based on [`quinn`](https://docs.rs/quinn)
-    - [`S2n`](https://docs.rs/serf-quic/stream_layer/s2n/struct.S2n.html): based on [`s2n-quic`](https://docs.rs/s2n-quic)
 
   Users can still implement their own stream layer for different kinds of transport implementations.
 
@@ -87,10 +148,6 @@ Here are the layers:
 
       Used to involve a client in a potential cluster merge operation. Namely, when a node does a promised push/pull (as part of a join), the delegate is involved and allowed to cancel the join based on custom logic. The merge delegate is NOT invoked as part of the push-pull anti-entropy.
 
-    - **``**
-
-      A delegate for encoding and decoding. Used to control how `serf` should encode/decode messages.
-
     - **`ReconnectDelegate`**
 
       Used to custom reconnect behavior, users can implement to allow overriding the reconnect timeout for individual members.
@@ -99,36 +156,10 @@ Here are the layers:
 
     CompositeDelegate is a helpful struct to split the `Delegate` into multiple small delegates, so that users do not need to implement full `Delegate` when they only want to custom some methods in the Delegate.
 
-### Protocol
-
-serf is based on ["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://ieeexplore.ieee.org/document/1028914/). However, Hashicorp developers extends the protocol in a number of ways:
-
-Several extensions are made to increase propagation speed and convergence rate.
-Another set of extensions, that Hashicorp developers call Lifeguard, are made to make serf more robust in the presence of slow message processing (due to factors such as CPU starvation, and network delay or loss).
-For details on all of these extensions, please read Hashicorp's paper ["Lifeguard : SWIM-ing with Situational Awareness"](https://arxiv.org/abs/1707.00788), along with the serf source.
-
-## Installation
-
-```toml
-[dependencies]
-serf = "0.2"
-```
-
-## Q & A
-
-- ***Does Rust's serf implemenetation compatible to Go's serf?***
-
-  No but yes! By default, it is not compatible. But the secret is the serialize/deserilize layer, Go's serf use the msgpack as the serialization/deserialization framework, so in theory, if you can implement a [``](https://docs.rs/serf-core/transport/trait..html) trait which compat to Go's serf, then it becomes compatible.
-
-- ***If Go's serf adds more functionalities, will this project also support?***
-  
-  Yes! And this project may also add more functionalities whereas the Go's serf does not have. e.g. wasmer support, bindings to other languages and etc.
-
 ## Related Projects
 
 - [`agnostic`](https://github.com/al8n/agnostic): helps you to develop runtime agnostic crates
 - [`nodecraft`](https://github.com/al8n/nodecraft): crafting seamless node operations for distributed systems, which provides foundational traits for node identification and address resolution.
-- [`transformable`](https://github.com/al8n/transformable): transform its representation between structured and byte form.
 - [`peekable`](https://github.com/al8n/peekable): peekable reader and async reader
 - [`memberlist`](https://github.com/al8n/memberlist): A highly customable, adaptable, runtime agnostic and WASM/WASI friendly Gossip protocol which helps manage cluster membership and member failure detection.
 
@@ -138,7 +169,7 @@ serf = "0.2"
 
 See [LICENSE](./LICENSE) for details.
 
-Copyright (c) 2024 Al Liu.
+Copyright (c) 2025 Al Liu.
 
 Copyright (c) 2013 HashiCorp, Inc.
 
