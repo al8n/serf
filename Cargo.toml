@@ -38,12 +38,12 @@ quickcheck = { version = "1", default-features = false }
 # memberlist-core = { version = "0.6", path = "../memberlist/memberlist-core", default-features = false }
 # memberlist = { version = "0.6", path = "../memberlist/memberlist", default-features = false }
 
-memberlist-proto = { version = "0.1", default-features = false, git = "https://github.com/al8n/memberlist" }
-memberlist-core = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
-memberlist = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
+# memberlist-proto = { version = "0.1", default-features = false, git = "https://github.com/al8n/memberlist" }
+# memberlist-core = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
+# memberlist = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
 
-# memberlist-proto = { version = "0.1", default-features = false }
-# memberlist-core = { version = "0.6", default-features = false }
-# memberlist = { version = "0.6", default-features = false }
+memberlist-proto = { version = "0.1", default-features = false }
+memberlist-core = { version = "0.6", default-features = false }
+memberlist = { version = "0.6", default-features = false }
 
 serf-core = { path = "serf-core", version = "0.3.0", default-features = false }
