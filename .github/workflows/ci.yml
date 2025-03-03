@@ -68,12 +68,7 @@ jobs:
       - name: Run Unit Tests for core
         run: |
           cargo test --no-default-features --features "test,encryption,serde"
-        working-directory: core
-
-      - name: Run Unit Tests for types
-        run: |
-          cargo test --no-default-features --features "metrics,encryption,serde"
-        working-directory: types
+        working-directory: serf-core
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
