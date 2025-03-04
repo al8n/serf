@@ -2,9 +2,11 @@ codecov:
   require_ci_to_pass: false
 
 ignore:
-  - core/src/serf/base/tests
-  - core/src/serf/base/tests.rs
+  - serf-core/src/serf/base/tests
+  - serf-core/src/serf/base/tests.rs
   - serf/test
+  - fuzz/
+  - examples/
 
 coverage:
   status:
