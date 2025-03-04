@@ -12,7 +12,7 @@
 
 ### Example
 
-- Add [toyconsul](https://github.com/al8n/serf/tree/main/examples/), a toy eventually consistent distributed registry.
+- Add [toyconsul](https://github.com/al8n/serf/tree/main/examples/toyconsul), a toy eventually consistent distributed registry.
 
 ### Breakage
 

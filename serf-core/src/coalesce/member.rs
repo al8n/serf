@@ -115,7 +115,7 @@ where
 #[cfg(all(test, feature = "test"))]
 #[allow(clippy::collapsible_match)]
 mod tests {
-  use std::{net::SocketAddr, time::Duration};
+  use std::time::Duration;
 
   use crate::types::{MemberStatus, UserEventMessage};
   use futures::FutureExt;

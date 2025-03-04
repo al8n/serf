@@ -99,8 +99,6 @@ where
 
 #[cfg(all(test, feature = "test"))]
 mod tests {
-  use std::net::SocketAddr;
-
   use agnostic_lite::tokio::TokioRuntime;
   use memberlist_core::transport::{
     resolver::socket_addr::SocketAddrResolver, unimplemented::UnimplementedTransport,
