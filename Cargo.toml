@@ -2,7 +2,7 @@
 members = [
   "serf",
   "serf-core",
-  "examples/toy-consul",
+  "examples/toyconsul",
 ]
 resolver = "3"
 
