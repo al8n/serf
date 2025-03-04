@@ -32,18 +32,16 @@ metrics = [
   "serf-core/metrics",
 ]
 
-compression = ["memberlist/compression"]
+compression = []
 
 encryption = ["memberlist/encryption", "serf-core/encryption"]
 
 quic = ["memberlist/quic"]
 quinn = ["memberlist/quinn", "quic"]
-s2n = ["memberlist/s2n", "quic"]
 
 net = ["memberlist/net"]
-tcp = ["net"]
+tcp = ["memberlist/tcp", "net"]
 tls = ["memberlist/tls", "net"]
-native-tls = ["memberlist/native-tls", "net"]
 
 # enable DNS node address resolver
 dns = ["memberlist/dns"]

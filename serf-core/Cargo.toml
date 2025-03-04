@@ -1,0 +1,100 @@
+[package]
+name = "serf-core"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["metrics"]
+metrics = ["memberlist-core/metrics", "dep:metrics"]
+
+encryption = ["memberlist-core/encryption", "serde", "serde_json"]
+
+crc32 = ["memberlist-core/crc32"]
+murmur3 = ["memberlist-core/murmur3"]
+xxhash64 = ["memberlist-core/xxhash64"]
+xxhash32 = ["memberlist-core/xxhash32"]
+xxhash3 = ["memberlist-core/xxhash3"]
+
+snappy = ["memberlist-core/snappy"]
+zstd = ["memberlist-core/zstd"]
+lz4 = ["memberlist-core/lz4"]
+brotli = ["memberlist-core/brotli"]
+
+serde = [
+  "dep:serde",
+  "dep:humantime-serde",
+  "bitflags/serde",
+  "memberlist-core/serde",
+  "smol_str/serde",
+  "smallvec/serde",
+  "indexmap/serde",
+]
+
+test = ["memberlist-core/test", "paste", "tracing-subscriber", "tempfile"]
+
+arbitrary = ["dep:arbitrary", "memberlist-core/arbitrary", "smol_str/arbitrary"]
+quickcheck = ["dep:quickcheck", "memberlist-core/quickcheck"]
+
+[dependencies]
+auto_impl = "1"
+atomic_refcell = "0.1"
+arc-swap = "1"
+async-lock = "3"
+async-channel = "2"
+bitflags = "2"
+byteorder.workspace = true
+crossbeam-queue = "0.3"
+derive_more.workspace = true
+futures = { workspace = true, features = ["default"] }
+either = "1"
+indexmap.workspace = true
+once_cell = "1" # remove this dependency when [feature(lazy_cell)] is stabilized
+parking_lot = { version = "0.12", features = ["send_guard"] }
+pin-project = "1"
+rand.workspace = true
+regex.workspace = true
+scopeguard = "1"
+smol_str.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+viewit.workspace = true
+memberlist-core.workspace = true
+
+metrics = { version = "0.24", optional = true }
+
+serde = { workspace = true, optional = true }
+humantime-serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+
+arbitrary = { workspace = true, optional = true, default-features = false, features = ["derive"] }
+quickcheck = { workspace = true, optional = true, default-features = false }
+
+# test features
+paste = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = [
+  "env-filter",
+  "tracing-log",
+] }
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+agnostic-lite = { version = "0.5", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+futures = { workspace = true, features = ["executor"] }
+tempfile = "3"
+memberlist-core = { workspace = true, features = ["quickcheck", "arbitrary", "test"] }
+quickcheck_macros = "1"
+quickcheck.workspace = true
+paste = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -28,9 +28,6 @@ mod query_filter;
 #[path = "./event/query_old_message.rs"]
 mod query_old_message;
 
-#[path = "./event/query_params_encode_filters.rs"]
-mod query_params_encode_filters;
-
 #[path = "./event/query.rs"]
 mod query;
 

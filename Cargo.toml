@@ -1,15 +1,16 @@
 [workspace]
 members = [
-  "core",
   "serf",
-  "types"
+  "serf-core",
+  "examples/toyconsul",
+  "fuzz",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.81.0"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85.0"
 description = "A decentralized solution for service discovery and orchestration that is lightweight, highly available, and fault tolerant."
 repository = "https://github.com/al8n/serf"
 homepage = "https://github.com/al8n/serf"
@@ -20,23 +21,32 @@ readme = "README.md"
 
 [workspace.dependencies]
 byteorder = "1"
-derive_more = { version = "1", features = ["full"] }
+derive_more = { version = "2", features = ["full"] }
 futures = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 humantime-serde = "1"
 indexmap = "2"
-memberlist-types = { version = "0.3", default-features = false }
-memberlist-core = { version = "0.3", default-features = false }
-memberlist = { version = "0.3", default-features = false }
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 viewit = "0.1.5"
+regex = "1"
 smol_str = "0.3"
 smallvec = "1"
-rand = "0.8"
+rand = "0.9"
 
-# memberlist-types = { version = "0.3", path = "../memberlist/types", default-features = false }
-# memberlist-core = { version = "0.3", path = "../memberlist/core", default-features = false }
-# memberlist = { version = "0.3", path = "../memberlist/memberlist", default-features = false }
+arbitrary = { version = "1", default-features = false, features = ["derive"] }
+quickcheck = { version = "1", default-features = false }
 
-serf-core = { path = "core", version = "0.2.0", default-features = false }
-serf-types = { path = "types", version = "0.2.0", default-features = false }
+# memberlist-proto = { version = "0.1", path = "../memberlist/memberlist-proto", default-features = false }
+# memberlist-core = { version = "0.6", path = "../memberlist/memberlist-core", default-features = false }
+# memberlist = { version = "0.6", path = "../memberlist/memberlist", default-features = false }
+
+# memberlist-proto = { version = "0.1", default-features = false, git = "https://github.com/al8n/memberlist" }
+# memberlist-core = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
+# memberlist = { version = "0.6", default-features = false, git = "https://github.com/al8n/memberlist" }
+
+memberlist-proto = { version = "0.1", default-features = false }
+memberlist-core = { version = "0.6", default-features = false }
+memberlist = { version = "0.6", default-features = false }
+
+serf-core = { path = "serf-core", version = "0.3.0", default-features = false }
+serf = { path = "serf", version = "0.3.0", default-features = false }
