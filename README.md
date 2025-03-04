@@ -85,7 +85,7 @@ serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-
 
 ## Examples
 
-See [examples/toyconsul](./examples/toy-consul/).
+See [examples/toyconsul](https://github.com/al8n/serf/tree/main/examples/toyconsul).
 
 ## Protocol
 

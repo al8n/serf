@@ -1,6 +1,6 @@
 # ToyConsul
 
-A toy eventually consensus distributed registry.
+A toy eventually consistent distributed registry.
 
 ## Installation
 
