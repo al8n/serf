@@ -13,7 +13,7 @@ cargo install --path .
 - In the first terminal
 
   ```bash
-  toyconsul start --id instance1 --addr 127.0.0.1:7001 --meta instance1 --rpc-addr toyconsul.instance1.sock
+  toyconsul start --id instance1 --addr 127.0.0.1:7001 --rpc-addr toyconsul.instance1.sock
   ```
 
 - In the second terminal
@@ -21,7 +21,7 @@ cargo install --path .
   - Start instance 2
 
     ```bash
-    toyconsul start --id instance2 --addr 127.0.0.1:7002 --meta instance2 --rpc-addr toyconsul.instance2.sock
+    toyconsul start --id instance2 --addr 127.0.0.1:7002 --rpc-addr toyconsul.instance2.sock
     ```
   
   - Send the join command to instance2 and let it join to instance1
@@ -35,7 +35,7 @@ cargo install --path .
   - Start instance 3
 
     ```bash
-    toyconsul start --id instance3 --addr 127.0.0.1:7003 --meta instance3 --rpc-addr toyconsul.instance3.sock
+    toyconsul start --id instance3 --addr 127.0.0.1:7003 --rpc-addr toyconsul.instance3.sock
     ```
   
   - Send the join command to instance3 and let it join to instance1 (can also join to instance 2)

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use bincode::{deserialize, serialize};
 use clap::Parser;
@@ -6,7 +6,8 @@ use crossbeam_skiplist::SkipMap;
 use serf::{
   MemberlistOptions, Options,
   delegate::CompositeDelegate,
-  net::{NetTransportOptions, Node, NodeId},
+  event::{Event as SerfEvent, EventProducer, EventSubscriber},
+  net::{NetTransportOptions, Node, NodeId, TokioNetTransport},
   tokio::{TokioSocketAddrResolver, TokioTcp, TokioTcpSerf},
   types::{MaybeResolvedAddress, SmolStr},
 };
@@ -46,8 +47,11 @@ impl ToyConsul {
     opts: Options,
     net_opts: NetTransportOptions<NodeId, TokioSocketAddrResolver, TokioTcp>,
   ) -> Result<Self> {
-    let serf = TokioTcpSerf::new(net_opts, opts.with_event_buffer_size(256)).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (producer, subscriber) = EventProducer::unbounded();
+    let serf =
+      TokioTcpSerf::with_event_producer(net_opts, opts.with_event_buffer_size(256), producer)
+        .await?;
 
     let this = Self {
       inner: Inner {
@@ -58,37 +62,89 @@ impl ToyConsul {
       .into(),
     };
 
-    this.clone().handle_events(rx);
+    this.clone().handle_serf_events(subscriber);
+    this.clone().handle_rpc_events(rx);
 
     Ok(this)
   }
 
-  fn handle_events(self, mut rx: UnboundedReceiver<Event>) {
+  fn handle_rpc_events(self, mut rx: UnboundedReceiver<Event>) {
+    tokio::spawn(async move {
+      loop {
+        tokio::select! {
+          _ = tokio::signal::ctrl_c() => {
+            tracing::info!("toyconsul: shutting down rpc listener");
+          }
+          ev = rx.recv() => {
+            match ev {
+              Some(Event::Register { name, addr, tx }) => {
+                let service = Service { name, addr };
+                match bincode::serialize(&service) {
+                  Ok(data) => {
+                    // broadcast a register event to all members
+                    match self.inner.serf.user_event("register", data, false).await {
+                      Ok(_) => {
+                        let _ = tx.send(Ok(()));
+                      }
+                      Err(e) => {
+                        tracing::error!(err=%e, "toyconsul: fail to send register event");
+                        let _ = tx.send(Err(e.into()));
+                      }
+                    }
+                  }
+                  Err(e) => {
+                    tracing::error!(err=%e, "toyconsul: fail to encode register response");
+                    let _ = tx.send(Err(e.into()));
+                  }
+                }
+              }
+              Some(Event::List { tx }) => {
+                let services = self.inner.services.iter().map(|ent| ent.value().clone()).collect();
+                let _ = tx.send(Ok(services));
+              }
+              Some(Event::Join { id, addr, tx }) => {
+                let res = self.inner.serf.join(Node::new(id, MaybeResolvedAddress::Resolved(addr)), false).await;
+                let _ = tx.send(res.map_err(Into::into).map(|_| ()));
+              }
+              None => {
+                break;
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  fn handle_serf_events(
+    self,
+    subscriber: EventSubscriber<
+      TokioNetTransport<NodeId, TokioSocketAddrResolver, TokioTcp>,
+      ConsulDelegate,
+    >,
+  ) {
     tokio::spawn(async move {
       loop {
         tokio::select! {
           _ = tokio::signal::ctrl_c() => {
             tracing::info!("toyconsul: shutting down event listener");
           }
-          ev = rx.recv() => {
-            if let Some(ev) = ev {
-              match ev {
-                Event::Join { id, addr, tx } => {
-                  let res = self.inner.serf.join(Node::new(id, MaybeResolvedAddress::Resolved(addr)), false).await;
-                  let _ = tx.send(res.map_err(Into::into).map(|_| ()));
-                }
-                Event::Register { name, addr, tx } => {
-                  self.inner.services.insert(
-                    name.clone(),
-                    Service {
-                      name,
-                      addr,
-                    });
-                  let _ = tx.send(Ok(()));
-                }
-                Event::List { tx } => {
-                  let services = self.inner.services.iter().map(|ent| ent.value().clone()).collect();
-                  let _ = tx.send(Ok(services));
+          ev = subscriber.recv() => {
+            if let Ok(SerfEvent::User(ev)) = ev {
+              match ev.name().as_str() {
+                "register" => {
+                  let payload = ev.payload();
+                  let service: Service = match bincode::deserialize(payload) {
+                    Ok(service) => service,
+                    Err(e) => {
+                      tracing::error!(err=%e, "toyconsul: fail to decode register event");
+                      continue;
+                    }
+                  };
+                  self.inner.services.insert(service.name.clone(), service);
+                },
+                other => {
+                  tracing::warn!("toyconsul: unknown user event {}", other);
                 }
               }
             }
@@ -259,7 +315,10 @@ enum Commands {
     rpc_addr: std::path::PathBuf,
   },
   /// List all services in the toyconsul
-  List,
+  List {
+    #[clap(short, long)]
+    rpc_addr: std::path::PathBuf,
+  },
 }
 
 #[derive(clap::Parser)]
@@ -323,8 +382,8 @@ async fn main() -> Result<()> {
     Commands::Start(args) => {
       handle_start_cmd(args).await?;
     }
-    Commands::List => {
-      handle_list_cmd().await?;
+    Commands::List { rpc_addr } => {
+      handle_list_cmd(rpc_addr).await?;
     }
   }
 
@@ -479,8 +538,8 @@ async fn handle_start_cmd(args: StartArgs) -> Result<()> {
   Ok(())
 }
 
-async fn handle_list_cmd() -> Result<()> {
-  let conn = UnixStream::connect("/tmp/toyconsul.sock").await?;
+async fn handle_list_cmd(rpc_addr: PathBuf) -> Result<()> {
+  let conn = UnixStream::connect(rpc_addr).await?;
   let data = serialize(&Op::List)?;
 
   let (reader, mut writer) = conn.into_split();

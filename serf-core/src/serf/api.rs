@@ -299,8 +299,7 @@ where
   }
 
   /// Used to broadcast a new query. The query must be fairly small,
-  /// and an error will be returned if the size limit is exceeded. This is only
-  /// available with protocol version 4 and newer. Query parameters are optional,
+  /// and an error will be returned if the size limit is exceeded. Query parameters are optional,
   /// and if not provided, a sane set of defaults will be used.
   pub async fn query(
     &self,
