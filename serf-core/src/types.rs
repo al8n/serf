@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 pub use memberlist_core::proto::{
-  DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr, Node, NodeId, ParseDomainError,
-  ParseHostAddrError, ParseNodeIdError, ProtocolVersion as MemberlistProtocolVersion,
+  DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr, MaybeResolvedAddress, Node,
+  NodeId, ParseDomainError, ParseHostAddrError, ParseNodeIdError,
+  ProtocolVersion as MemberlistProtocolVersion, bytes,
 };
+pub use smol_str::*;
 
 #[cfg(feature = "encryption")]
 #[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]

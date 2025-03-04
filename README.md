@@ -82,6 +82,10 @@ serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-
   ] }
   ```
 
+## Examples
+
+See [examples/toyconsul](./examples/toy-consul/).
+
 ## Protocol
 
 serf is based on ["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://ieeexplore.ieee.org/document/1028914/). However, Hashicorp developers extends the protocol in a number of ways:
@@ -159,6 +163,7 @@ Here are the layers:
 ## Related Projects
 
 - [`agnostic`](https://github.com/al8n/agnostic): helps you to develop runtime agnostic crates
+- [`getifs`](https://github.com/al8n/getifs): A bunch of cross platform network tools for fetching interfaces, multicast addresses, local ip addresses, private ip addresses, public ip addresses and etc.
 - [`nodecraft`](https://github.com/al8n/nodecraft): crafting seamless node operations for distributed systems, which provides foundational traits for node identification and address resolution.
 - [`peekable`](https://github.com/al8n/peekable): peekable reader and async reader
 - [`memberlist`](https://github.com/al8n/memberlist): A highly customable, adaptable, runtime agnostic and WASM/WASI friendly Gossip protocol which helps manage cluster membership and member failure detection.
