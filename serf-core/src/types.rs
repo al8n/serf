@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 pub use memberlist_core::proto::{
-  DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr, MaybeResolvedAddress, Node,
-  NodeId, ParseDomainError, ParseHostAddrError, ParseNodeIdError,
-  ProtocolVersion as MemberlistProtocolVersion, bytes,
+  Data, DataRef, DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr,
+  MaybeResolvedAddress, Node, NodeId, ParseDomainError, ParseHostAddrError, ParseNodeIdError,
+  ProtocolVersion as MemberlistProtocolVersion, bytes, utils,
 };
 pub use smol_str::*;
 
@@ -54,6 +54,7 @@ mod arbitrary_impl;
 mod quickcheck_impl;
 
 #[cfg(test)]
+#[cfg(feature = "quickcheck")]
 mod tests;
 
 mod clock;
@@ -100,6 +101,10 @@ mod key;
 #[cfg(feature = "encryption")]
 #[cfg_attr(docsrs, doc(cfg(feature = "encryption")))]
 pub use key::*;
+
+#[cfg(any(feature = "arbitrary", feature = "quickcheck"))]
+#[doc(hidden)]
+pub mod fuzzy;
 
 #[cfg(debug_assertions)]
 #[inline]

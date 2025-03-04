@@ -3,6 +3,7 @@ members = [
   "serf",
   "serf-core",
   "examples/toyconsul",
+  "fuzz",
 ]
 resolver = "3"
 
