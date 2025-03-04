@@ -5,13 +5,9 @@ use clap::Parser;
 use crossbeam_skiplist::SkipMap;
 use serf::{
   MemberlistOptions, Options,
-  agnostic::tokio::TokioRuntime,
   delegate::CompositeDelegate,
-  net::{
-    NetTransportOptions, Node, NodeId, resolver::socket_addr::SocketAddrResolver,
-    stream_layer::tcp::Tcp,
-  },
-  tokio::TokioTcpSerf,
+  net::{NetTransportOptions, Node, NodeId},
+  tokio::{TokioSocketAddrResolver, TokioTcp, TokioTcpSerf},
   types::{MaybeResolvedAddress, SmolStr},
 };
 
@@ -35,7 +31,7 @@ struct Service {
 }
 
 struct Inner {
-  serf: TokioTcpSerf<NodeId, SocketAddrResolver<TokioRuntime>, ConsulDelegate>,
+  serf: TokioTcpSerf<NodeId, TokioSocketAddrResolver, ConsulDelegate>,
   services: SkipMap<SmolStr, Service>,
   tx: UnboundedSender<Event>,
 }
@@ -48,7 +44,7 @@ struct ToyConsul {
 impl ToyConsul {
   async fn new(
     opts: Options,
-    net_opts: NetTransportOptions<NodeId, SocketAddrResolver<TokioRuntime>, Tcp<TokioRuntime>>,
+    net_opts: NetTransportOptions<NodeId, TokioSocketAddrResolver, TokioTcp>,
   ) -> Result<Self> {
     let serf = TokioTcpSerf::new(net_opts, opts.with_event_buffer_size(256)).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
