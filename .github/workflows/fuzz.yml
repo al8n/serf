@@ -38,4 +38,4 @@ jobs:
       - name: Run fuzzing
         run: |
           cargo fuzz build
-          cargo fuzz run messages -- -max_total_time=300
+          cargo fuzz run messages -- -max_len=4096 -max_total_time=300

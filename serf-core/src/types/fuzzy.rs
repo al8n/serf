@@ -40,24 +40,22 @@ const _: () = {
     A: Arbitrary<'a>,
   {
     fn arbitrary(g: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-      loop {
-        let variant = MessageType::arbitrary(g)?;
+      let variant = MessageType::arbitrary(g)?;
 
-        return Ok(match variant {
-          MessageType::ConflictResponse => Message::ConflictResponse(Arbitrary::arbitrary(g)?),
-          MessageType::Join => Message::Join(Arbitrary::arbitrary(g)?),
-          MessageType::Leave => Message::Leave(Arbitrary::arbitrary(g)?),
-          MessageType::PushPull => Message::PushPull(Arbitrary::arbitrary(g)?),
-          MessageType::Query => Message::Query(Arbitrary::arbitrary(g)?),
-          MessageType::QueryResponse => Message::QueryResponse(Arbitrary::arbitrary(g)?),
-          MessageType::UserEvent => Message::UserEvent(Arbitrary::arbitrary(g)?),
-          #[cfg(feature = "encryption")]
-          MessageType::KeyRequest => Message::KeyRequest(Arbitrary::arbitrary(g)?),
-          #[cfg(feature = "encryption")]
-          MessageType::KeyResponse => Message::KeyResponse(Arbitrary::arbitrary(g)?),
-          _ => continue,
-        });
-      }
+      Ok(match variant {
+        MessageType::ConflictResponse => Message::ConflictResponse(Arbitrary::arbitrary(g)?),
+        MessageType::Join => Message::Join(Arbitrary::arbitrary(g)?),
+        MessageType::Leave => Message::Leave(Arbitrary::arbitrary(g)?),
+        MessageType::PushPull => Message::PushPull(Arbitrary::arbitrary(g)?),
+        MessageType::Query => Message::Query(Arbitrary::arbitrary(g)?),
+        MessageType::QueryResponse => Message::QueryResponse(Arbitrary::arbitrary(g)?),
+        MessageType::UserEvent => Message::UserEvent(Arbitrary::arbitrary(g)?),
+        #[cfg(feature = "encryption")]
+        MessageType::KeyRequest => Message::KeyRequest(Arbitrary::arbitrary(g)?),
+        #[cfg(feature = "encryption")]
+        MessageType::KeyResponse => Message::KeyResponse(Arbitrary::arbitrary(g)?),
+        _ => Message::Query(QueryMessage::arbitrary(g)?),
+      })
     }
   }
 };
