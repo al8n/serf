@@ -18,11 +18,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
 
-cli = ["dep:clap", "async-channel", "config", "futures", "metrics", "serde_json", "serde", "serde_with", "tracing", "regex", "humantime", "humantime-serde", "scopeguard"]
+agent = []
 
-tokio = ["memberlist/tokio"]
-async-std = ["memberlist/async-std"]
-smol = ["memberlist/smol"]
+cli = ["dep:clap", "agnostic/process", "async-channel", "circularbuf", "config", "futures", "metrics", "serde_json", "serde", "serde_with", "tracing", "regex", "humantime", "humantime-serde", "scopeguard", "tokio?/rt-multi-thread", "tokio?/rt", "tracing-subscriber"]
+
+tokio = ["dep:tokio", "memberlist/tokio", "agnostic?/tokio"]
+async-std = ["dep:async-std", "memberlist/async-std", "agnostic?/async-std"]
+smol = ["dep:smol", "memberlist/smol", "agnostic?/smol"]
 
 serde = [
   "dep:serde",
@@ -83,19 +85,31 @@ test = ["memberlist/test", "serf-core/test"]
 memberlist.workspace = true
 serf-core = { workspace = true, default-features = false }
 smol_str.workspace = true
+viewit.workspace = true
 
+tokio = { version = "1", optional = true }
+async-std = { version = "1", optional = true }
+smol = { version = "2", optional = true }
+
+agnostic = { version = "0.7", optional = true }
 async-channel = { version = "2", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive", "env"] }
+circularbuf = { version = "0.1", optional = true, features = ["future"] }
 config = { version = "0.15", optional = true }
+derive_more = { workspace = true, optional = true, features = ["display"] }
 futures = { version = "0.3", optional = true }
 humantime = { version = "2", optional = true }
 humantime-serde = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
-tracing = { version = "0.1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 serde_with = { version = "3", optional = true }
 scopeguard = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = [
+  "env-filter",
+  "tracing-log",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

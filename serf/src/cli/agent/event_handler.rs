@@ -1,4 +1,5 @@
-use futures::lock::Mutex;
+use agnostic::{process::{Child, ChildStdin, Process}, Runtime};
+use futures::{lock::Mutex, AsyncWrite};
 use memberlist::net::Transport;
 use serf_core::{
   Serf,
@@ -7,6 +8,8 @@ use serf_core::{
 };
 use smol_str::{SmolStr, ToSmolStr};
 use std::{future::Future, sync::Arc};
+
+use super::invoke::invoke_event_script;
 
 /// A handler that does things when events happen
 pub trait EventHandler<T, D> {
@@ -32,11 +35,14 @@ where
   serf: Serf<T, D>,
 }
 
-impl<T, D> EventHandler<T, D> for ScriptEventHandler<T, D> {
+impl<T, D> EventHandler<T, D> for ScriptEventHandler<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+  T::Runtime: Runtime,
+  ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>: AsyncWrite + Unpin + Send,
+{
   async fn handle(&self, event: &Event<T, D>)
-  where
-    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
-    T: Transport,
   {
     // Swap in the new scripts if any
     let scripts = {
@@ -55,7 +61,9 @@ impl<T, D> EventHandler<T, D> for ScriptEventHandler<T, D> {
         continue;
       }
 
-      if Err(err) = invoke_event_script().await {}
+      if let Err(e) = invoke_event_script(script.script.clone(), member.clone(), event.clone()).await {
+        tracing::error!(err=%e, "serf agent: invoking script", );
+      }
     }
   }
 }

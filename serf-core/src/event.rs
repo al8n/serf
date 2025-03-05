@@ -123,7 +123,7 @@ where
 {
   /// Returns the lamport time of the query
   #[inline]
-  pub const fn lamport_time(&self) -> LamportTime {
+  pub const fn ltime(&self) -> LamportTime {
     self.ltime
   }
 
@@ -149,6 +149,12 @@ where
   #[inline]
   pub const fn from(&self) -> &Node<T::Id, T::ResolvedAddress> {
     &self.from
+  }
+
+  /// Consumes the message and returns the name and the payload
+  #[inline]
+  pub fn into_components(self) -> (SmolStr, Bytes) {
+    (self.name, self.payload)
   }
 }
 
@@ -437,7 +443,10 @@ impl EventType {
 }
 
 /// The event produced by the Serf instance.
-#[derive(derive_more::From)]
+#[derive(derive_more::From, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[non_exhaustive]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum Event<T, D>
 where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,

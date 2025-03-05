@@ -1,5 +1,5 @@
 use std::{
-  net::{IpAddr, SocketAddr},
+  net::SocketAddr,
   path::PathBuf,
   time::Duration,
 };
@@ -7,8 +7,9 @@ use std::{
 use clap::Args;
 use memberlist::net::Transport;
 use serf_core::{delegate::Delegate, types::ProtocolVersion};
+use smol_str::SmolStr;
 
-use super::{super::parse_key_val, Config, Profile, TraceLevel};
+use super::{super::parse_key_val, Config, Profile};
 
 /// Starts the `Serf` agent and runs until an interrupt is received. The
 /// agent represents a single node in a cluster.
@@ -57,7 +58,7 @@ pub struct AgentArgs {
   pub mdns_disable_ipv6: bool,
   /// Address to advertise to the other cluster members.
   #[arg(short, long)]
-  pub advertise: Option<IpAddr>,
+  pub advertise: Option<SmolStr>,
   /// Path to a JSON or Yaml file to read configuration from.
   /// This can be specified multiple times.
   #[arg(short, long = "config-file")]
@@ -71,11 +72,11 @@ pub struct AgentArgs {
   /// networks that support multicast, this can be used to have
   /// peers join each other without an explicit join.
   #[arg(short, long)]
-  pub discover: Option<String>,
+  pub discover: Option<SmolStr>,
   /// Key for encrypting network traffic within Serf.
   /// Must be a base64-encoded 32-byte key.
   #[arg(long)]
-  pub encrypt: Option<String>,
+  pub encrypt: Option<SmolStr>,
   /// The keyring file is used to store encryption keys used
   /// by Serf. As encryption keys are changed, the content of
   /// this file is updated so that the same keys may be used
@@ -90,13 +91,10 @@ pub struct AgentArgs {
   /// An initial agent to join with. This flag can be
   /// specified multiple times.
   #[arg(short, long = "join")]
-  pub joins: Vec<SocketAddr>,
-  /// Log level of the agent.
-  #[arg(short, long, default_value = "info")]
-  pub log_level: TraceLevel,
+  pub joins: Vec<SmolStr>,
   /// Name of this node. Must be unique in the cluster
   #[arg(short, long)]
-  pub node: String,
+  pub node: SmolStr,
   /// Profile is used to control the timing profiles used in `Serf`.
   #[arg(short, long, default_value = "lan")]
   pub profile: Profile,
@@ -111,7 +109,7 @@ pub struct AgentArgs {
   /// An agent to join with. This flag be specified multiple times.
   /// Does not exit on failure like -join, used to retry until success.
   #[arg(long = "retry-join")]
-  pub retry_joins: Vec<SocketAddr>,
+  pub retry_joins: Vec<SmolStr>,
   /// Sets the interval on which a node will attempt to retry joining
   /// nodes provided by `--retry-join`.
   #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
@@ -131,8 +129,8 @@ pub struct AgentArgs {
   #[arg(short, long)]
   pub snapshot: PathBuf,
   /// Tag can be specified multiple times to attach multiple key/value tag pairs to the given node.
-  #[arg(short, long = "tag", value_parser = parse_key_val::<String, String>)]
-  pub tags: Vec<(String, String)>,
+  #[arg(short, long = "tag", value_parser = parse_key_val::<SmolStr, SmolStr>)]
+  pub tags: Vec<(SmolStr, SmolStr)>,
   /// The tags file is used to persist tag data. As an agent's
   /// can be reloaded during later agent starts. This option
   /// is incompatible with the '-tag' option and requires there

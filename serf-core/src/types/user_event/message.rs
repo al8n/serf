@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use super::super::LamportTime;
 
 /// Used for user-generated events
-#[viewit::viewit(setters(prefix = "with"))]
+#[viewit::viewit(vis_all = "pub(crate)", setters(prefix = "with", vis_all = "pub"), getters(vis_all = "pub"))]
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -28,13 +28,13 @@ pub struct UserEventMessage {
   ltime: LamportTime,
   /// The name of the event
   #[viewit(
-    getter(const, attrs(doc = "Returns the name of the event")),
+    getter(const, style = "ref", attrs(doc = "Returns the name of the event")),
     setter(attrs(doc = "Sets the name of the event (Builder pattern)"))
   )]
   name: SmolStr,
   /// The payload of the event
   #[viewit(
-    getter(const, attrs(doc = "Returns the payload of the event")),
+    getter(const, style = "ref", attrs(doc = "Returns the payload of the event")),
     setter(attrs(doc = "Sets the payload of the event (Builder pattern)"))
   )]
   #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::types::arbitrary_impl::into::<Vec<u8>, Bytes>))]
@@ -52,6 +52,14 @@ pub struct UserEventMessage {
     )
   )]
   cc: bool,
+}
+
+impl UserEventMessage {
+  /// Consumes the message and returns the name and the payload
+  #[inline]
+  pub fn into_components(self) -> (SmolStr, Bytes) {
+    (self.name, self.payload)
+  }
 }
 
 impl CheapClone for UserEventMessage {

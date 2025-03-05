@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/serf/main/art/logo_72x72.png")]
 #![forbid(unsafe_code)]
-#![deny(warnings, missing_docs)]
+// #![deny(warnings, missing_docs)]
 #![allow(clippy::type_complexity)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
@@ -31,7 +31,12 @@ pub mod async_std;
 #[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
 pub mod smol;
 
+/// A simple agent of [`Serf`].
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod agent;
+
 /// Bultin command line tool for `Serf`.
-#[cfg(feature = "cli")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cli")))]
+#[cfg(all(feature = "cli", any(feature = "tokio", feature = "async-std", feature = "smol")))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "cli", any(feature = "tokio", feature = "async-std", feature = "smol")))))]
 pub mod cli;
