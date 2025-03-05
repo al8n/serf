@@ -20,7 +20,7 @@ on:
       - '**.txt'
       - 'art'
   workflow_dispatch:
-  schedule: [cron: "40 1 * * *"]
+  schedule: [cron: "0 1 */7 * *"]
 
 jobs:
   test:
@@ -67,13 +67,8 @@ jobs:
 
       - name: Run Unit Tests for core
         run: |
-          cargo test --no-default-features --features "test,encryption,serde"
-        working-directory: core
-
-      - name: Run Unit Tests for types
-        run: |
-          cargo test --no-default-features --features "metrics,encryption,serde"
-        working-directory: types
+          cargo test --no-default-features --features "test,encryption,serde,quickcheck"
+        working-directory: serf-core
 
       - name: Cache Cargo registry
         uses: actions/cache@v4

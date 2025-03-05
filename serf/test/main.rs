@@ -17,12 +17,12 @@ fn tokio_run(fut: impl Future<Output = ()>) {
 
 #[cfg(feature = "smol")]
 fn smol_run(fut: impl Future<Output = ()>) {
-  use serf::agnostic::{smol::SmolRuntime, RuntimeLite};
+  use serf::agnostic::{RuntimeLite, smol::SmolRuntime};
   run_unit_test(SmolRuntime::block_on, fut);
 }
 
 #[cfg(feature = "async-std")]
 fn async_std_run(fut: impl Future<Output = ()>) {
-  use serf::agnostic::{async_std::AsyncStdRuntime, RuntimeLite};
+  use serf::agnostic::{RuntimeLite, async_std::AsyncStdRuntime};
   run_unit_test(AsyncStdRuntime::block_on, fut);
 }

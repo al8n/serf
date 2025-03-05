@@ -2,8 +2,6 @@ macro_rules! test_mod {
   ($rt:ident) => {
     paste::paste! {
       mod [< $rt:snake >] {
-        use std::net::SocketAddr;
-
         use crate::[< $rt:snake _run >];
         use serf::{
           net::{
@@ -11,7 +9,7 @@ macro_rules! test_mod {
             NetTransportOptions,
           },
           [< $rt:snake >]::[< $rt:camel Runtime >],
-          transport::Lpe,
+
         };
         use serf_core::tests::{snapshot::serf_snapshot_recovery, next_socket_addr_v4, next_socket_addr_v6};
         use smol_str::SmolStr;
@@ -31,7 +29,7 @@ macro_rules! test_mod {
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
               Tcp<[< $rt:camel Runtime >]>,
-              Lpe<SmolStr, SocketAddr>,
+
               [< $rt:camel Runtime >],
             >,
             _
@@ -57,7 +55,7 @@ macro_rules! test_mod {
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
               Tcp<[< $rt:camel Runtime >]>,
-              Lpe<SmolStr, SocketAddr>,
+
               [< $rt:camel Runtime >],
             >,
             _,

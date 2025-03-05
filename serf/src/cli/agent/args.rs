@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Args;
-use memberlist::net::{AddressResolver, Transport};
+use memberlist::net::Transport;
 use serf_core::{delegate::Delegate, types::ProtocolVersion};
 
 use super::{super::parse_key_val, Config, Profile, TraceLevel};
@@ -164,7 +164,7 @@ impl AgentArgs {
   /// Builds the agent from the arguments.
   pub async fn build<T, D>(self) -> std::io::Result<super::Agent<T, D>>
   where
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     todo!()

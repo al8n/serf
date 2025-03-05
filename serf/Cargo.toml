@@ -18,7 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
 
-cli = ["dep:clap", "async-channel", "config", "futures", "metrics", "serde_json", "serde", "serde_with", "tracing", "regex", "serf-core/clap", "humantime", "humantime-serde", "scopeguard"]
+cli = ["dep:clap", "async-channel", "config", "futures", "metrics", "serde_json", "serde", "serde_with", "tracing", "regex", "humantime", "humantime-serde", "scopeguard"]
 
 tokio = ["memberlist/tokio"]
 async-std = ["memberlist/async-std"]
@@ -36,18 +36,16 @@ metrics = [
   "serf-core/metrics",
 ]
 
-compression = ["memberlist/compression"]
+compression = []
 
 encryption = ["memberlist/encryption", "serf-core/encryption"]
 
 quic = ["memberlist/quic"]
 quinn = ["memberlist/quinn", "quic"]
-s2n = ["memberlist/s2n", "quic"]
 
 net = ["memberlist/net"]
-tcp = ["net"]
+tcp = ["memberlist/tcp", "net"]
 tls = ["memberlist/tls", "net"]
-native-tls = ["memberlist/native-tls", "net"]
 
 # enable DNS node address resolver
 dns = ["memberlist/dns"]

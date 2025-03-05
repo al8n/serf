@@ -1,6 +1,6 @@
 use clap::Args;
 
-use super::{parse_key_val, Format, Regex, RpcArgs};
+use super::{Format, Regex, RpcArgs, parse_key_val};
 
 /// Outputs the members of a running Serf agent.
 #[derive(Args, Debug)]

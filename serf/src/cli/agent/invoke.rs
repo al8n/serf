@@ -1,5 +1,8 @@
 use std::{
-  env, io, process::{Command, Stdio}, sync::LazyLock, time::{Duration, Instant}
+  env, io,
+  process::{Command, Stdio},
+  sync::LazyLock,
+  time::{Duration, Instant},
 };
 
 use futures::io::AsyncWriteExt;
@@ -28,7 +31,7 @@ pub(super) fn invoke_event_script<T, D>(
   event: Event<T, D>,
 ) -> Result<(), ()>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   let now = Instant::now();
@@ -73,20 +76,15 @@ where
     }
 
     //http://stackoverflow.com/questions/2821043/allowed-characters-in-linux-environment-variable-names
-		//(http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap08.html for the long version)
-		//says that env var names must be in [A-Z0-9_] and not start with [0-9].
-		//we only care about the first part, so convert all chars not in [A-Z0-9_] to _
+    //(http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap08.html for the long version)
+    //says that env var names must be in [A-Z0-9_] and not start with [0-9].
+    //we only care about the first part, so convert all chars not in [A-Z0-9_] to _
     let sanitized_name = SANITIZE_TAG_REGEXP.replace_all(&name.as_str().to_uppercase(), "_");
     // let tag_env = format!("SERF_TAG_{}", sanitized_name);
     cmd.env(format!("SERF_TAG_{}", sanitized_name), val);
   }
 
-  match event.ty() {
-  
-  }
-
-  
-  
+  match event.ty() {}
 
   // Execute command and capture output
   let output_result = cmd.output()?;
@@ -128,7 +126,6 @@ where
       let mut buffer = Vec::with_capacity(len + 1);
       buffer.extend_from_slice(buf);
       buffer.push(b'\n');
-
     } else {
       let mut buffer = [0; MAX_INLINE_SIZE];
       buffer[..len].copy_from_slice(buf);

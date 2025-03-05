@@ -31,12 +31,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - crate: core
-            features: "test,metrics"
+          - crate: serf-core
+            features: "test,metrics,quickcheck,encryption"
             name: "serf-core"
-          - crate: types 
-            features: "metrics,encryption"
-            name: "serf-types"
           - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
             name: "serf-tcp-encryption"

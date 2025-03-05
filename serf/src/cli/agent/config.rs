@@ -5,9 +5,8 @@ use std::{
   time::Duration,
 };
 
-use memberlist::types::SecretKey;
 use serde::{Deserialize, Serialize};
-use serf_core::types::ProtocolVersion;
+use serf_core::types::{ProtocolVersion, SecretKey};
 use smol_str::SmolStr;
 
 use super::{super::ToPaths, Profile, TraceLevel};

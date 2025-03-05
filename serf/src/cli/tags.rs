@@ -1,6 +1,6 @@
 use clap::Args;
 
-use super::{parse_key_val, RpcArgs};
+use super::{RpcArgs, parse_key_val};
 
 /// Modifies tags on a running `Serf` agent.
 #[derive(Args, Debug)]

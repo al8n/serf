@@ -3,8 +3,8 @@ use clap::ValueEnum;
 
 pub use args::*;
 pub use config::*;
-use memberlist::net::{AddressResolver, Transport};
-use serf_core::{delegate::Delegate, error::Error, Options, Serf};
+use memberlist::net::Transport;
+use serf_core::{Options, Serf, delegate::Delegate};
 
 mod args;
 mod config;
@@ -63,7 +63,7 @@ impl From<TraceLevel> for tracing::Level {
 /// and invoking EventHandlers when events occur.
 pub struct Agent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   // Stores the serf configuration
@@ -79,7 +79,7 @@ where
 
 impl<T, D> Agent<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   // /// Creates a new agent, potentially returning an error

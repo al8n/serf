@@ -1,9 +1,9 @@
 use futures::lock::Mutex;
-use memberlist::net::{AddressResolver, Transport};
+use memberlist::net::Transport;
 use serf_core::{
+  Serf,
   delegate::Delegate,
   event::{Event, MemberEventType},
-  Serf,
 };
 use smol_str::{SmolStr, ToSmolStr};
 use std::{future::Future, sync::Arc};
@@ -13,7 +13,7 @@ pub trait EventHandler<T, D> {
   /// Called when an event occurs
   fn handle(&self, event: &Event<T, D>) -> impl Future<Output = ()>
   where
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport;
 }
 
@@ -25,7 +25,7 @@ struct ScriptEventHandlerInner {
 /// Invokes scripts for the events that it receives.
 pub struct ScriptEventHandler<T, D>
 where
-  D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
   inner: Mutex<ScriptEventHandlerInner>,
@@ -35,7 +35,7 @@ where
 impl<T, D> EventHandler<T, D> for ScriptEventHandler<T, D> {
   async fn handle(&self, event: &Event<T, D>)
   where
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     // Swap in the new scripts if any
@@ -124,7 +124,7 @@ impl EventFilter {
   /// for the given Serf event.
   pub fn invoke<T, D>(&self, e: &Event<T, D>) -> bool
   where
-    D: Delegate<Id = T::Id, Address = <T::Resolver as AddressResolver>::ResolvedAddress>,
+    D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport,
   {
     if self.kind == EventKind::Unspecified {
