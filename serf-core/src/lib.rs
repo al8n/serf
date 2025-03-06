@@ -10,6 +10,8 @@ pub(crate) mod broadcast;
 
 mod coalesce;
 
+pub use memberlist_core::transport;
+
 /// Events for [`Serf`]
 pub mod event;
 

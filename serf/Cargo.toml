@@ -99,8 +99,10 @@ test = ["memberlist/test", "serf-core/test"]
 [dependencies]
 memberlist.workspace = true
 serf-core = { workspace = true, default-features = false }
+parking_lot = { version = "0.12", features = ["send_guard"] }
 smol_str.workspace = true
 viewit.workspace = true
+thiserror.workspace = true
 
 tokio = { version = "1", optional = true }
 async-std = { version = "1", optional = true }
@@ -121,6 +123,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 serde_with = { version = "3", optional = true }
 scopeguard = { version = "1", optional = true }
+
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [
   "env-filter",

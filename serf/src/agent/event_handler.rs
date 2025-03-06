@@ -11,14 +11,20 @@ use serf_core::{
 };
 use smol_str::{SmolStr, ToSmolStr};
 
-use std::{future::Future, str::FromStr, sync::Arc};
+use std::{future::Future, pin::Pin, str::FromStr, sync::Arc};
 
 use super::invoke::invoke_event_script;
 
 /// A handler that does things when events happen
-pub trait EventHandler<T, D> {
+pub trait EventHandler<T, D>: Send + Sync + 'static {
+  /// Returns the unique name of this event handler
+  fn name(&self) -> &SmolStr;
+
   /// Called when an event occurs
-  fn handle(&self, event: &Event<T, D>) -> impl Future<Output = ()>
+  fn handle<'a>(
+    &'a self,
+    event: &'a Event<T, D>,
+  ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
   where
     D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
     T: Transport;
@@ -44,6 +50,7 @@ where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
   T::Runtime: Runtime,
+  <<T::Runtime as Runtime>::Process as Process>::Command: Send,
   ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>:
     AsyncWrite + Unpin + Send,
   ChildStdout<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdout>:
@@ -51,30 +58,41 @@ where
   ChildStderr<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stderr>:
     AsyncRead + Unpin + Send,
 {
-  async fn handle(&self, event: &Event<T, D>) {
-    // Swap in the new scripts if any
-    let scripts = {
-      let mut inner = self.inner.lock().await;
-      if !inner.new_scripts.is_empty() {
-        inner.scripts = inner.new_scripts.clone();
-        inner.new_scripts = Arc::default();
-      }
+  fn name(&self) -> &SmolStr {
+    const NAME: &SmolStr = &SmolStr::new_inline("script");
 
-      inner.scripts.clone()
-    };
+    NAME
+  }
 
-    let member = self.serf.local_member().await;
-    for script in scripts.iter() {
-      if !script.invoke(event) {
-        continue;
-      }
+  fn handle<'a>(
+    &'a self,
+    event: &'a Event<T, D>,
+  ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async {
+      // Swap in the new scripts if any
+      let scripts = {
+        let mut inner = self.inner.lock().await;
+        if !inner.new_scripts.is_empty() {
+          inner.scripts = inner.new_scripts.clone();
+          inner.new_scripts = Arc::default();
+        }
 
-      if let Err(e) =
-        invoke_event_script(script.script.clone(), member.clone(), event.clone()).await
-      {
-        tracing::error!(err=%e, "serf agent: invoking script", );
+        inner.scripts.clone()
+      };
+
+      let member = self.serf.local_member().await;
+      for script in scripts.iter() {
+        if !script.invoke(event) {
+          continue;
+        }
+
+        if let Err(e) =
+          invoke_event_script(script.script.clone(), member.clone(), event.clone()).await
+        {
+          tracing::error!(err=%e, "serf agent: invoking script", );
+        }
       }
-    }
+    })
   }
 }
 

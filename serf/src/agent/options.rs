@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::{Profile, ToPaths};
+use super::Profile;
 
 #[cfg(feature = "serde")]
 mod builder;
@@ -444,4 +444,35 @@ where
   E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
   std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+}
+
+#[cfg(feature = "cli")]
+pub use sealed::ToPaths;
+
+#[cfg(feature = "cli")]
+mod sealed {
+  use std::path::Path;
+
+  pub trait Sealed {}
+
+  impl<P: AsRef<Path>> Sealed for P {}
+  impl<P: AsRef<Path>> Sealed for [P] {}
+
+  /// Convert to a bunch of paths.
+  pub trait ToPaths: Sealed {
+    /// Convert to a path.
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>>;
+  }
+
+  impl<P: AsRef<Path>> ToPaths for P {
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+      std::iter::once(self)
+    }
+  }
+
+  impl<P: AsRef<Path>> ToPaths for [P] {
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+      self.iter()
+    }
+  }
 }

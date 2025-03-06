@@ -3,7 +3,7 @@ use std::time::Duration;
 pub use memberlist_core::proto::{
   Data, DataRef, DelegateVersion as MemberlistDelegateVersion, Domain, HostAddr,
   MaybeResolvedAddress, Node, NodeId, ParseDomainError, ParseHostAddrError, ParseNodeIdError,
-  ProtocolVersion as MemberlistProtocolVersion, bytes, utils,
+  ProtocolVersion as MemberlistProtocolVersion, SmallVec, bytes, utils,
 };
 pub use smol_str::*;
 

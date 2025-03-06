@@ -12,9 +12,7 @@ use smol_str::SmolStr;
 #[cfg(feature = "encryption")]
 use serf_core::types::SecretKey;
 
-use crate::agent::{Profile, ToPaths};
-
-use super::{AgentOptions, MDNSOptions};
+use super::{AgentOptions, MDNSOptions, Profile, ToPaths};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
