@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
+default = ["tokio", "crc32", "snappy", "encryption", "dns", "tcp", "quic"]
 
 agent = []
 
@@ -33,21 +33,36 @@ serde = [
   "humantime-serde",
 ]
 
+encryption = ["memberlist/encryption", "serf-core/encryption"]
+
+# checksum
+crc32 = ["serf-core/crc32"]
+murmur3 = ["serf-core/murmur3"]
+xxhash64 = ["serf-core/xxhash64"]
+xxhash32 = ["serf-core/xxhash32"]
+xxhash3 = ["serf-core/xxhash3"]
+
+# compression
+snappy = ["serf-core/snappy"]
+zstd = ["serf-core/zstd"]
+lz4 = ["serf-core/lz4"]
+brotli = ["serf-core/brotli"]
+
+# QUIC/QUIC transport
+quic = ["memberlist/quic"]
+quinn = ["memberlist/quinn", "quic"]
+
+# TCP/UDP transport
+net = ["memberlist/net"]
+tcp = ["memberlist/tcp", "net"]
+tls = ["memberlist/tls", "net"]
+
+# metrics
 metrics = [
   "memberlist/metrics",
   "serf-core/metrics",
 ]
-
-compression = []
-
-encryption = ["memberlist/encryption", "serf-core/encryption"]
-
-quic = ["memberlist/quic"]
-quinn = ["memberlist/quinn", "quic"]
-
-net = ["memberlist/net"]
-tcp = ["memberlist/tcp", "net"]
-tls = ["memberlist/tls", "net"]
+statsd = ["metrics", "metrics-exporter-statsd"]
 
 # enable DNS node address resolver
 dns = ["memberlist/dns"]
@@ -91,7 +106,7 @@ tokio = { version = "1", optional = true }
 async-std = { version = "1", optional = true }
 smol = { version = "2", optional = true }
 
-agnostic = { version = "0.7", optional = true }
+agnostic = { version = "0.7", optional = true, features = ["std"] }
 async-channel = { version = "2", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive", "env"] }
 circularbuf = { version = "0.1", optional = true, features = ["future"] }
@@ -100,6 +115,7 @@ derive_more = { workspace = true, optional = true, features = ["display"] }
 futures = { version = "0.3", optional = true }
 humantime = { version = "2", optional = true }
 humantime-serde = { workspace = true, optional = true }
+metrics-exporter-statsd = { version = "0.9", optional = true }
 regex = { workspace = true, optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
@@ -110,6 +126,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
   "env-filter",
   "tracing-log",
 ] }
+
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

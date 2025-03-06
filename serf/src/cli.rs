@@ -52,7 +52,10 @@ pub enum Runtime {
   /// The `smol` runtime.
   #[cfg(feature = "smol")]
   #[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
-  #[cfg_attr(all(feature = "smol", not(any(feature = "tokio", feature = "async-std"))), default)]
+  #[cfg_attr(
+    all(feature = "smol", not(any(feature = "tokio", feature = "async-std"))),
+    default
+  )]
   #[display("smol")]
   Smol,
 }
@@ -139,7 +142,16 @@ pub struct RpcArgs {
 
 /// Tracing level is used to control the verbosity of the logs.
 #[derive(
-  Debug, Default, ValueEnum, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize,
+  Debug,
+  Default,
+  ValueEnum,
+  PartialEq,
+  Eq,
+  Clone,
+  Copy,
+  Hash,
+  serde::Serialize,
+  serde::Deserialize,
   derive_more::Display,
 )]
 #[serde(rename_all = "snake_case")]
@@ -194,36 +206,36 @@ pub struct Cli {
 impl Cli {
   /// Executes the command.
   pub fn exec(self) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let Self { commands, runtime, log_level } = self;
+    let Self {
+      commands,
+      runtime,
+      log_level,
+    } = self;
 
     let filter = std::env::var("SERF_LOG").unwrap_or_else(|_| log_level.to_string());
     tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt::fmt()
-          .without_time()
-          .with_line_number(true)
-          .with_env_filter(filter)
-          .with_file(false)
-          .with_target(true)
-          .with_ansi(true)
-          .finish(),
-      )?;
+      tracing_subscriber::fmt::fmt()
+        .without_time()
+        .with_line_number(true)
+        .with_env_filter(filter)
+        .with_file(false)
+        .with_target(true)
+        .with_ansi(true)
+        .finish(),
+    )?;
     match runtime {
       #[cfg(feature = "async-std")]
       Runtime::AsyncStd => {
         async_std::task::block_on(commands.exec::<agnostic::async_std::AsyncStdRuntime>())
-      },
+      }
       #[cfg(feature = "tokio")]
-      Runtime::Tokio => {
-        tokio::runtime::Builder::new_multi_thread()
-          .enable_all()
-          .build()
-          .expect("Failed building the Runtime")
-          .block_on(commands.exec::<agnostic::tokio::TokioRuntime>())
-      },
+      Runtime::Tokio => tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(commands.exec::<agnostic::tokio::TokioRuntime>()),
       #[cfg(feature = "smol")]
-      Runtime::Smol => {
-        smol::block_on(commands.exec::<agnostic::smol::SmolRuntime>())
-      },
+      Runtime::Smol => smol::block_on(commands.exec::<agnostic::smol::SmolRuntime>()),
     }
   }
 }
@@ -253,46 +265,46 @@ impl Commands {
     match self {
       Self::Agent(args) => {
         todo!()
-      },
+      }
       Self::Info(args) => {
         todo!()
-      },
+      }
       Self::Event(args) => {
         todo!()
-      },
+      }
       Self::Join(args) => {
         todo!()
-      },
+      }
       Self::ForceLeave(args) => {
         todo!()
-      },
+      }
       Self::Keygen(args) => {
         todo!()
-      },
+      }
       Self::Keys(args) => {
         todo!()
-      },
+      }
       Self::Leave(args) => {
         todo!()
-      },
+      }
       Self::Members(args) => {
         todo!()
-      },
+      }
       Self::Monitor(args) => {
         todo!()
-      },
+      }
       Self::Query(args) => {
         todo!()
-      },
+      }
       Self::Reachability(args) => {
         todo!()
-      },
+      }
       Self::Rtt(args) => {
         todo!()
-      },
+      }
       Self::Tags(args) => {
         todo!()
-      },
+      }
     }
   }
 }

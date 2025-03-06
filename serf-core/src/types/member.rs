@@ -128,7 +128,11 @@ impl MemberStatus {
 }
 
 /// A single member of the Serf cluster.
-#[viewit::viewit(vis_all = "pub(crate)", getters(vis_all = "pub"), setters(prefix = "with", vis_all = "pub"))]
+#[viewit::viewit(
+  vis_all = "pub(crate)",
+  getters(vis_all = "pub"),
+  setters(prefix = "with", vis_all = "pub")
+)]
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]

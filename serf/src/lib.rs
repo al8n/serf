@@ -37,6 +37,15 @@ pub mod smol;
 pub mod agent;
 
 /// Bultin command line tool for `Serf`.
-#[cfg(all(feature = "cli", any(feature = "tokio", feature = "async-std", feature = "smol")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "cli", any(feature = "tokio", feature = "async-std", feature = "smol")))))]
+#[cfg(all(
+  feature = "cli",
+  any(feature = "tokio", feature = "async-std", feature = "smol")
+))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(
+    feature = "cli",
+    any(feature = "tokio", feature = "async-std", feature = "smol")
+  )))
+)]
 pub mod cli;

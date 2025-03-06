@@ -1,15 +1,27 @@
 use std::{
-  env, io, process::Stdio, sync::LazyLock, time::{Duration, Instant}
+  borrow::Cow,
+  env, io,
+  process::Stdio,
+  sync::LazyLock,
+  time::{Duration, Instant},
 };
 
-use agnostic::{process::{Child, ChildStdin, Command, Process}, AfterHandle, Runtime, RuntimeLite};
-use futures::io::{AsyncWrite, AsyncWriteExt};
-use memberlist::{
-  bytes::Bytes, metrics, net::Transport,
+use agnostic::{
+  AfterHandle, Runtime, RuntimeLite,
+  process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Process},
 };
+use futures::{
+  io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+  lock::BiLock,
+};
+use memberlist::{bytes::Bytes, metrics, net::Transport};
 
-use serf_core::{delegate::Delegate, event::{Event, MemberEvent}, types::Member};
-use smol_str::{format_smolstr, SmolStr, StrExt};
+use serf_core::{
+  delegate::Delegate,
+  event::{Event, MemberEvent},
+  types::Member,
+};
+use smol_str::{SmolStr, StrExt, format_smolstr};
 
 /// Limits how much data we collect from a handler.
 /// This is to prevent Serf's memory from growing to an enormous
@@ -19,7 +31,7 @@ const MAX_BUF_SIZE: usize = 8 * 1024;
 /// Used to warn about a slow handler invocation
 const WARN_SLOW: Duration = Duration::from_secs(1);
 
-const SANITIZE_TAG_REGEXP: LazyLock<regex::Regex> =
+static SANITIZE_TAG_REGEXP: LazyLock<regex::Regex> =
   LazyLock::new(|| regex::Regex::new(r"[^A-Z0-9_]").unwrap());
 
 pub(super) async fn invoke_event_script<T, D>(
@@ -31,14 +43,21 @@ where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
   T::Runtime: Runtime,
-  ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>: AsyncWrite + Unpin + Send,
+  ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>:
+    AsyncWrite + Unpin + Send,
+  ChildStdout<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdout>:
+    AsyncRead + Unpin + Send,
+  ChildStderr<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stderr>:
+    AsyncRead + Unpin + Send,
 {
   let now = Instant::now();
   scopeguard::defer!({
     let h = metrics::histogram!("serf.agent.invoke");
     h.record(now.elapsed().as_millis() as f64);
   });
-  let mut output = circularbuf::Buffer::new(vec![0; MAX_BUF_SIZE]);
+
+  let (output_stdout, output_stderr) =
+    BiLock::new(circularbuf::Buffer::new(vec![0u8; MAX_BUF_SIZE]));
 
   // Determine shell and flag based on OS
   let (shell, flag) = if cfg!(windows) {
@@ -49,7 +68,9 @@ where
 
   // Create command with shell and flag
   let mut cmd = <<<T::Runtime as Runtime>::Process as Process>::Command as Command>::new(shell);
-  cmd.arg(flag).arg(&script)
+  cmd
+    .arg(flag)
+    .arg(&script)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -94,58 +115,94 @@ where
   });
 
   let mut qe = None;
-  match event {
+  let (stdout, stderr) = match event {
     Event::Member(member_event) => {
       let mut process = cmd.spawn()?;
 
-      let mut stdin = process.take_stdin().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
+      let mut stdin = process
+        .take_stdin()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
 
       <T::Runtime as RuntimeLite>::spawn_detach(async move {
         member_event_stdin(&mut stdin, member_event).await;
       });
-    },
+      (
+        process.take_stdout().expect("stdout must be set"),
+        process.take_stderr().expect("stderr must be set"),
+      )
+    }
     Event::User(ue) => {
       cmd.env("SERF_USER_EVENT", ue.name());
       cmd.env("SERF_USER_LTIME", format_smolstr!("{}", ue.ltime()));
 
       let mut process = cmd.spawn()?;
 
-      let mut stdin = process.take_stdin().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
+      let mut stdin = process
+        .take_stdin()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
 
       <T::Runtime as RuntimeLite>::spawn_detach(async move {
         stream_payload(&mut stdin, ue.into_components().1).await;
       });
-    },
+      (
+        process.take_stdout().expect("stdout must be set"),
+        process.take_stderr().expect("stderr must be set"),
+      )
+    }
     Event::Query(query_event) => {
       cmd.env("SERF_QUERY_NAME", query_event.name());
-      cmd.env("SERF_QUERY_LTIME", format_smolstr!("{}", query_event.ltime()));
+      cmd.env(
+        "SERF_QUERY_LTIME",
+        format_smolstr!("{}", query_event.ltime()),
+      );
 
       let mut process = cmd.spawn()?;
 
-      let mut stdin = process.take_stdin().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
+      let mut stdin = process
+        .take_stdin()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no stdin"))?;
 
       let payload = query_event.payload().clone();
       <T::Runtime as RuntimeLite>::spawn_detach(async move {
         stream_payload(&mut stdin, payload).await;
       });
       qe = Some(query_event);
-    },
+      (
+        process.take_stdout().expect("stdout must be set"),
+        process.take_stderr().expect("stderr must be set"),
+      )
+    }
     _ => {
       tracing::warn!("unknown event type: {}", event.ty().as_str());
-      return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown event type"));
-    },
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "unknown event type",
+      ));
+    }
   };
 
-  // Execute command and capture output
-  let output_result = cmd.output().await?;
+  // Write stdout and stderr to the output
+  let (res1, res2) = futures::future::join(
+    <T::Runtime as RuntimeLite>::spawn(io_copy(stdout, output_stdout)),
+    <T::Runtime as RuntimeLite>::spawn(io_copy(stderr, output_stderr)),
+  )
+  .await;
+
+  let output_stdout = res1.map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+  let output_stderr = res2.map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+
   slow_timer.abort();
 
-  // Write stdout and stderr to the output
-  output.write_all(&output_result.stdout).await?;
-  output.write_all(&output_result.stderr).await?;
+  let output = BiLock::reunite(output_stdout, output_stderr)
+    .expect("the two halves must come from the same instance");
 
   if output.written() > output.size() {
-    tracing::warn!("agent: script '{}' generated {} bytes of output, truncated to {}", script, output.written(), output.size());
+    tracing::warn!(
+      "agent: script '{}' generated {} bytes of output, truncated to {}",
+      script,
+      output.written(),
+      output.size()
+    );
   }
 
   tracing::debug!(output = ?output, "agent: event '{}'", script);
@@ -154,8 +211,8 @@ where
   if let Some(qe) = qe {
     if output.written() > 0 {
       let output = match output.read_to_bytes() {
-        std::borrow::Cow::Borrowed(data) => Bytes::copy_from_slice(data),
-        std::borrow::Cow::Owned(data) => data.into(),
+        Cow::Borrowed(data) => Bytes::copy_from_slice(data),
+        Cow::Owned(data) => data.into(),
       };
       if let Err(e) = qe.respond(output).await {
         tracing::warn!(name=%qe.name(), err=%e, "agent: failed to respond to query");
@@ -166,6 +223,28 @@ where
   Ok(())
 }
 
+async fn io_copy<R, W>(mut reader: R, writer: BiLock<W>) -> io::Result<BiLock<W>>
+where
+  R: AsyncRead + Unpin,
+  W: AsyncWrite + Unpin,
+{
+  let mut buf = [0; 1024];
+  loop {
+    match reader.read(&mut buf).await {
+      Ok(0) => break,
+      Ok(n) => {
+        writer.lock().await.write_all(&buf[..n]).await?;
+      }
+      Err(e) => match e.kind() {
+        io::ErrorKind::UnexpectedEof => return Ok(writer),
+        _ => return Err(e),
+      },
+    }
+  }
+
+  Ok(writer)
+}
+
 async fn member_event_stdin<I, A, W>(stdin: &mut W, e: MemberEvent<I, A>)
 where
   W: futures::io::AsyncWrite + Unpin,
@@ -174,10 +253,12 @@ where
 {
   for member in e.members() {
     // Format the tags as tag1=v1,tag2=v2,...
-    let tags = member.tags().iter().map(|(k, v)| {
-      format_smolstr!("{}={}", k, v)
-    })
-    .collect::<Vec<_>>().join(",");
+    let tags = member
+      .tags()
+      .iter()
+      .map(|(k, v)| format_smolstr!("{}={}", k, v))
+      .collect::<Vec<_>>()
+      .join(",");
 
     // Send the entire line
     let node = member.node();
@@ -195,7 +276,7 @@ where
       if let Err(e) = stdin.flush().await {
         tracing::error!(err=%e, "serf: error flushing member event");
       }
-    }    
+    }
 
     let _ = stdin.close().await;
   }
@@ -203,9 +284,10 @@ where
 
 fn event_clean(s: Option<impl Into<SmolStr>>) -> SmolStr {
   match s {
-    Some(s) => {
-      s.into().replace_smolstr("\t", "\\t").replace_smolstr("\n", "\\n")
-    },
+    Some(s) => s
+      .into()
+      .replace_smolstr("\t", "\\t")
+      .replace_smolstr("\n", "\\n"),
     None => SmolStr::default(),
   }
 }

@@ -1,5 +1,8 @@
-use agnostic::{process::{Child, ChildStdin, Process}, Runtime};
-use futures::{lock::Mutex, AsyncWrite};
+use agnostic::{
+  Runtime,
+  process::{Child, ChildStderr, ChildStdin, ChildStdout, Process},
+};
+use futures::{AsyncRead, AsyncWrite, lock::Mutex};
 use memberlist::net::Transport;
 use serf_core::{
   Serf,
@@ -7,7 +10,8 @@ use serf_core::{
   event::{Event, MemberEventType},
 };
 use smol_str::{SmolStr, ToSmolStr};
-use std::{future::Future, sync::Arc};
+
+use std::{future::Future, str::FromStr, sync::Arc};
 
 use super::invoke::invoke_event_script;
 
@@ -40,10 +44,14 @@ where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
   T::Runtime: Runtime,
-  ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>: AsyncWrite + Unpin + Send,
+  ChildStdin<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdin>:
+    AsyncWrite + Unpin + Send,
+  ChildStdout<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stdout>:
+    AsyncRead + Unpin + Send,
+  ChildStderr<<<<T::Runtime as Runtime>::Process as Process>::Child as Child>::Stderr>:
+    AsyncRead + Unpin + Send,
 {
-  async fn handle(&self, event: &Event<T, D>)
-  {
+  async fn handle(&self, event: &Event<T, D>) {
     // Swap in the new scripts if any
     let scripts = {
       let mut inner = self.inner.lock().await;
@@ -61,7 +69,9 @@ where
         continue;
       }
 
-      if let Err(e) = invoke_event_script(script.script.clone(), member.clone(), event.clone()).await {
+      if let Err(e) =
+        invoke_event_script(script.script.clone(), member.clone(), event.clone()).await
+      {
         tracing::error!(err=%e, "serf agent: invoking script", );
       }
     }
@@ -95,11 +105,14 @@ impl EventKind {
       EventKind::Custom(custom) => custom.as_str(),
     }
   }
+}
 
-  /// Converts a str to an event kind.
+impl FromStr for EventKind {
+  type Err = core::convert::Infallible;
+
   #[inline]
-  pub fn from_str(s: &str) -> Self {
-    match s {
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Ok(match s {
       "user" => EventKind::User,
       "query" => EventKind::Query,
       "member-join" => EventKind::Member(MemberEventType::Join),
@@ -109,14 +122,14 @@ impl EventKind {
       "member-reap" => EventKind::Member(MemberEventType::Reap),
       "*" => EventKind::Unspecified,
       _ => EventKind::Custom(s.to_smolstr()),
-    }
+    })
   }
 }
 
 impl From<&str> for EventKind {
   #[inline]
   fn from(s: &str) -> Self {
-    EventKind::from_str(s)
+    EventKind::from_str(s).expect("invalid event kind")
   }
 }
 
@@ -242,7 +255,7 @@ pub fn parse_event_filter(v: &str) -> impl Iterator<Item = EventFilter> + '_ {
     } else if event.eq("*") {
       (EventKind::Unspecified, SmolStr::default())
     } else {
-      let knd = EventKind::from_str(event);
+      let knd = EventKind::from_str(event).expect("invalid event kind");
       if let EventKind::Custom(name) = knd {
         (EventKind::Custom(name), SmolStr::default())
       } else {

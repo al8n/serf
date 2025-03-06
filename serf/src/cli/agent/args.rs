@@ -1,8 +1,4 @@
-use std::{
-  net::SocketAddr,
-  path::PathBuf,
-  time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::Args;
 use memberlist::net::Transport;

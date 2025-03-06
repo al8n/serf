@@ -1,11 +1,11 @@
-use std::path::Path;
+/// The event handler for `Serf` agent.
+pub mod event_handler;
 
+mod invoke;
 mod options;
 
 /// Profile is used to control the timing profiles used in `Serf`.
-#[derive(
-  Debug, Default, PartialEq, Eq, Clone, Copy, Hash,
-)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
@@ -21,24 +21,10 @@ pub enum Profile {
   Local,
 }
 
-/// Convert to a bunch of paths.
-pub trait ToPaths: sealed::Sealed {
-  /// Convert to a path.
-  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>>;
-}
+#[cfg(feature = "cli")]
+pub use sealed::ToPaths;
 
-impl<P: AsRef<Path>> ToPaths for P {
-  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
-    std::iter::once(self)
-  }
-}
-
-impl<P: AsRef<Path>> ToPaths for [P] {
-  fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
-    self.iter()
-  }
-}
-
+#[cfg(feature = "cli")]
 mod sealed {
   use std::path::Path;
 
@@ -46,4 +32,22 @@ mod sealed {
 
   impl<P: AsRef<Path>> Sealed for P {}
   impl<P: AsRef<Path>> Sealed for [P] {}
+
+  /// Convert to a bunch of paths.
+  pub trait ToPaths: Sealed {
+    /// Convert to a path.
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>>;
+  }
+
+  impl<P: AsRef<Path>> ToPaths for P {
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+      std::iter::once(self)
+    }
+  }
+
+  impl<P: AsRef<Path>> ToPaths for [P] {
+    fn to_paths(&self) -> impl Iterator<Item = impl AsRef<Path>> {
+      self.iter()
+    }
+  }
 }

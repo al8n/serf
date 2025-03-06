@@ -8,7 +8,11 @@ use smol_str::SmolStr;
 use super::super::LamportTime;
 
 /// Used for user-generated events
-#[viewit::viewit(vis_all = "pub(crate)", setters(prefix = "with", vis_all = "pub"), getters(vis_all = "pub"))]
+#[viewit::viewit(
+  vis_all = "pub(crate)",
+  setters(prefix = "with", vis_all = "pub"),
+  getters(vis_all = "pub")
+)]
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]

@@ -443,7 +443,9 @@ impl EventType {
 }
 
 /// The event produced by the Serf instance.
-#[derive(derive_more::From, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[derive(
+  derive_more::From, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
 #[non_exhaustive]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]

@@ -8,8 +8,6 @@ use serf_core::{Options, Serf, delegate::Delegate};
 
 mod args;
 mod config;
-mod event_handler;
-mod invoke;
 
 /// Profile is used to control the timing profiles used in `Serf`.
 #[derive(
