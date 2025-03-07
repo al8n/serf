@@ -4,11 +4,10 @@ use agnostic::RuntimeLite;
 use futures::FutureExt;
 use parking_lot::Mutex;
 use serf_core::{
-  Options, Serf,
-  delegate::Delegate,
-  transport::Transport,
-  types::{MaybeResolvedAddress, Node, SmallVec, bytes::Bytes},
+  delegate::Delegate, transport::Transport, types::{bytes::Bytes, MaybeResolvedAddress, Node, SmallVec, Tags}, Options, QueryParam, QueryResponse, Serf
 };
+#[cfg(feature = "encryption")]
+use serf_core::{types::SecretKey, key_manager::KeyResponse};
 use smol_str::SmolStr;
 
 /// The event handler for `Serf` agent.
@@ -155,15 +154,25 @@ where
     &self,
     name: impl Into<SmolStr>,
     payload: impl Into<Bytes>,
-    coalesce: bool,
-  ) -> Result<Bytes, error::Error<T, D>> {
-    // let payload = payload.into();
-    // tracing::debug!(coalesce=%coalesce, payload=?payload.as_ref(), "serf agent: requesting query event send");
-    // self.serf.query(name, payload, coalesce).await.map_err(|e| {
-    //   tracing::warn!(err=%e, "serf agent: failed to send query event");
-    //   e.into()
-    // })
-    todo!()
+    params: Option<QueryParam<T::Id>>,
+  ) -> Result<QueryResponse<T::Id, T::ResolvedAddress>, error::Error<T, D>> {
+    let name = name.into();
+    let payload = payload.into();
+
+    // Prevent the use of the internal prefix
+    if name.starts_with(serf_core::event::INTERNAL_QUERY_PREFIX) {
+      // Allow the special "ping" query
+      if name != "_serf_ping" || !payload.is_empty() {
+        return Err(error::Error::InternalQueryPrefix);
+      }
+    }
+
+    tracing::debug!(params=?params, payload=?payload.as_ref(), "serf agent: requesting query send");
+
+    self.serf.query(name, payload, params).await.map_err(|e| {
+      tracing::warn!(err=%e, "serf agent: failed to start user query");
+      e.into()
+    })
   }
 
   /// Asks the Serf instance to join. See the [`Serf::join`] function.
@@ -225,6 +234,61 @@ where
     registry.handlers_list = registry.handlers.values().cloned().collect();
   }
 
+  /// Used to update the tags. The agent will make sure to
+  /// persist tags if necessary before gossiping to the cluster.
+  pub async fn update_tags(
+    &self,
+    tags: Tags,
+  ) -> Result<(), error::Error<T, D>> {
+    // Update the tags file if we have one
+    if let Some(f) = self.agent_conf.tags_file() {
+      
+    }
+
+    self.serf.update_tags(tags).await.map_err(Into::into)
+  }
+
+  /// Initiates a query to install a new key on all members
+  #[cfg(feature = "encryption")]
+  pub async fn install_key(
+    &self,
+    key: SecretKey,
+  ) -> Result<KeyResponse<T::Id>, error::Error<T, D>> {
+    tracing::info!("serf agent: initiating key installation");
+
+    self.serf.key_manager().install_key(key, None).await.map_err(Into::into)
+  }
+
+  /// Sends a query instructing all members to switch primary keys
+  #[cfg(feature = "encryption")]
+  pub async fn use_key(
+    &self,
+    key: SecretKey,
+  ) -> Result<KeyResponse<T::Id>, error::Error<T, D>> {
+    tracing::info!("serf agent: initiating primary key change");
+
+    self.serf.key_manager().use_key(key, None).await.map_err(Into::into)
+  }
+
+  /// Sends a query instructing all members to remove a key from the keyring
+  #[cfg(feature = "encryption")]
+  pub async fn remove_key(
+    &self,
+    key: SecretKey,
+  ) -> Result<KeyResponse<T::Id>, error::Error<T, D>> {
+    tracing::info!("serf agent: initiating key removal");
+
+    self.serf.key_manager().remove_key(key, None).await.map_err(Into::into)
+  }
+
+  /// Sends a query to all members to return a list of their keys
+  #[cfg(feature = "encryption")]
+  pub async fn list_keys(&self) -> Result<KeyResponse<T::Id>, error::Error<T, D>> {
+    tracing::info!("serf agent: initiating key listing");
+
+    self.serf.key_manager().list_keys().await.map_err(Into::into)
+  }
+
   async fn event_loop(
     registry: Arc<Mutex<EventHandlerRegistry<T, D>>>,
     event_rx: async_channel::Receiver<serf_core::event::Event<T, D>>,
@@ -262,4 +326,65 @@ where
       }
     }
   }
+}
+
+fn load_tags_file(file: &std::path::Path) -> std::io::Result<Tags> {
+  todo!()
+}
+
+fn write_tags_file(
+  tags: &Tags,
+  file: &std::path::Path,
+) -> std::io::Result<()> {
+  use std::{fs::OpenOptions, io::Write};
+
+  fn encode(buf: &mut [u8], tags: &Tags) -> usize {
+    let mut offset = 0;
+    for (k, v) in tags.iter() {
+      buf[offset..offset + k.len()].copy_from_slice(k.as_bytes());
+      offset += k.len();
+      buf[offset] = b'=';
+      offset += 1;
+
+      buf[offset..offset + v.len()].copy_from_slice(v.as_bytes());
+      offset += v.len();
+      buf[offset] = b'\n';
+      offset += 1;
+    }
+
+    #[cfg(debug_assertions)]
+    {
+      assert_eq!(offset, buf.len(), "expect writting {} bytes, but actual write {} bytes", buf.len(), offset);
+    }
+
+    offset
+  }
+
+  let mut opts = OpenOptions::new();
+  opts.write(true).create(true).truncate(true);
+
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600);
+  }
+
+  let encoded_len = tags.iter().fold(0usize, |acc, (k, v)| {
+    // key=value\n
+    acc + (k.len() + v.len() + 2)
+  });
+
+  let mut file = opts.open(file)?;
+
+  if encoded_len > 1024 {
+    let mut buffer = vec![0; encoded_len];
+    let len = encode(&mut buffer, tags);
+    file.write_all(&buffer[..len])?;
+  } else {
+    let mut buffer = [0; 1024];
+    let len = encode(&mut buffer[..encoded_len], tags);
+    file.write_all(&buffer[..len])?;
+  }
+
+  Ok(())
 }

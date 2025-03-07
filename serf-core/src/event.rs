@@ -1,20 +1,19 @@
 use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
 
-use self::error::Error;
+use super::{delegate::Delegate, error::Error, types::{Epoch, LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage}, *};
 
-use super::{delegate::Delegate, types::Epoch, *};
-
-mod crate_event;
-
-use async_channel::Sender;
+pub use crate_event::INTERNAL_QUERY_PREFIX;
 pub use async_channel::{RecvError, TryRecvError};
 
-use crate::types::{LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage};
-use async_lock::Mutex;
 pub(crate) use crate_event::*;
+
+use async_channel::Sender;
+use async_lock::Mutex;
 use futures::Stream;
 use memberlist_core::{CheapClone, bytes::Bytes, proto::TinyVec, transport::Transport};
 use smol_str::SmolStr;
+
+mod crate_event;
 
 pub(crate) struct QueryContext<T, D>
 where

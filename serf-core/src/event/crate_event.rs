@@ -57,6 +57,9 @@ where
   }
 }
 
+/// This is the prefix we use for queries that are internal to [`Serf`].
+/// They are handled internally, and not forwarded to a client.
+pub const INTERNAL_QUERY_PREFIX: &str = "_serf_";
 const INTERNAL_PING: &str = "_serf_ping";
 const INTERNAL_CONFLICT: &str = "_serf_conflict";
 #[cfg(feature = "encryption")]

@@ -25,8 +25,8 @@ mod update;
 #[path = "./net/role.rs"]
 mod role;
 
-#[path = "./net/set_tags.rs"]
-mod set_tags;
+#[path = "./net/update_tags.rs"]
+mod update_tags;
 
 #[path = "./net/get_queue_max.rs"]
 mod get_queue_max;

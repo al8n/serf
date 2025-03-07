@@ -11,20 +11,20 @@ macro_rules! test_mod {
           [< $rt:snake >]::[< $rt:camel Runtime >],
 
         };
-        use serf_core::tests::{serf_set_tags, next_socket_addr_v4, next_socket_addr_v6};
+        use serf_core::tests::{serf_update_tags, next_socket_addr_v4, next_socket_addr_v6};
         use smol_str::SmolStr;
 
         #[test]
-        fn test_serf_set_tags_v4() {
-          let name = "serf_set_tags1_v4";
+        fn test_serf_update_tags_v4() {
+          let name = "serf_update_tags1_v4";
           let mut opts = NetTransportOptions::new(SmolStr::new(name));
           opts.add_bind_address(next_socket_addr_v4(0));
 
-          let name = "serf_set_tags2_v4";
+          let name = "serf_update_tags2_v4";
           let mut opts2 = NetTransportOptions::new(SmolStr::new(name));
           opts2.add_bind_address(next_socket_addr_v4(0));
 
-          [< $rt:snake _run >](serf_set_tags::<
+          [< $rt:snake _run >](serf_update_tags::<
             NetTransport<
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,
@@ -36,16 +36,16 @@ macro_rules! test_mod {
         }
 
         #[test]
-        fn test_serf_set_tags_v6() {
-          let name = "serf_set_tags1_v6";
+        fn test_serf_update_tags_v6() {
+          let name = "serf_update_tags1_v6";
           let mut opts = NetTransportOptions::new(SmolStr::new(name));
           opts.add_bind_address(next_socket_addr_v6());
 
-          let name = "serf_set_tags2_v6";
+          let name = "serf_update_tags2_v6";
           let mut opts2 = NetTransportOptions::new(SmolStr::new(name));
           opts2.add_bind_address(next_socket_addr_v6());
 
-          [< $rt:snake _run >](serf_set_tags::<
+          [< $rt:snake _run >](serf_update_tags::<
             NetTransport<
               SmolStr,
               SocketAddrResolver<[< $rt:camel Runtime >]>,

@@ -13,4 +13,6 @@ where
   Serf(#[from] serf_core::error::Error<T, D>),
   #[error("event handler has {0} already been registered")]
   DuplicatedEventHandler(SmolStr),
+  #[error("queries cannot contain the '{prefix}' prefix", prefix = serf_core::event::INTERNAL_QUERY_PREFIX)]
+  InternalQueryPrefix,
 }

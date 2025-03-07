@@ -216,7 +216,7 @@ where
   /// the local node. This will propagate the change to the rest of
   /// the cluster. Blocks until a the message is broadcast out.
   #[inline]
-  pub async fn set_tags(&self, tags: Tags) -> Result<(), Error<T, D>> {
+  pub async fn update_tags(&self, tags: Tags) -> Result<(), Error<T, D>> {
     // Check that the meta data length is okay
     let tags_encoded_len = tags.encoded_len_with_length_delimited();
     if tags_encoded_len > Meta::MAX_SIZE {

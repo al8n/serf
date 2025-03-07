@@ -339,7 +339,7 @@ where
 }
 
 /// Unit tests for serf set tags
-pub async fn serf_set_tags<T>(transport_opts1: T::Options, transport_opts2: T::Options)
+pub async fn serf_update_tags<T>(transport_opts1: T::Options, transport_opts2: T::Options)
 where
   T: Transport,
 {
@@ -366,12 +366,12 @@ where
 
   // Update the tags
   serfs[0]
-    .set_tags([("port", "8080")].into_iter().collect())
+    .update_tags([("port", "8080")].into_iter().collect())
     .await
     .unwrap();
 
   serfs[1]
-    .set_tags([("datacenter", "east-aws")].into_iter().collect())
+    .update_tags([("datacenter", "east-aws")].into_iter().collect())
     .await
     .unwrap();
 
@@ -756,7 +756,7 @@ where
   let new_tags = [("foo", "bar"), ("test", "ing")]
     .into_iter()
     .collect::<Tags>();
-  s.set_tags(new_tags.clone()).await.unwrap();
+  s.update_tags(new_tags.clone()).await.unwrap();
 
   let local = s.local_member().await;
   assert_eq!(&*local.tags, &new_tags);
