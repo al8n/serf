@@ -822,7 +822,7 @@ pub async fn serf_write_keyring_file<T>(
   keyring_file.read_to_string(&mut s).unwrap();
 
   let lines = s.split('\n').collect::<Vec<_>>();
-  assert_eq!(lines.len(), 4);
+  assert_eq!(lines.len(), 2);
 
   // Ensure both the original key and the new key are present in the file
   assert!(s.contains(EXISTING));
@@ -831,7 +831,7 @@ pub async fn serf_write_keyring_file<T>(
   // Ensure the existing key remains primary. This is in position 1 because
   // the file writer will use json.MarshalIndent(), leaving the first line as
   // the opening bracket.
-  assert!(lines[1].contains(EXISTING));
+  assert!(lines[0].contains(EXISTING));
 
   // Swap primary keys
   manager.use_key(new_sk, None).await.unwrap();
@@ -841,10 +841,10 @@ pub async fn serf_write_keyring_file<T>(
   keyring_file.read_to_string(&mut s).unwrap();
 
   let lines = s.split('\n').collect::<Vec<_>>();
-  assert_eq!(lines.len(), 4);
+  assert_eq!(lines.len(), 2);
 
   // Key order should have changed in keyring file
-  assert!(lines[1].contains(NEW_KEY));
+  assert!(lines[0].contains(NEW_KEY));
 
   // Remove the old key
   manager.remove_key(sk, None).await.unwrap();
@@ -855,9 +855,9 @@ pub async fn serf_write_keyring_file<T>(
 
   let lines = s.split('\n').collect::<Vec<_>>();
   // Only the new key should now be present in the keyring file
-  assert_eq!(lines.len(), 3);
+  assert_eq!(lines.len(), 1);
 
-  assert!(lines[1].contains(NEW_KEY));
+  assert!(lines[0].contains(NEW_KEY));
 
   let resp = manager.list_keys().await.unwrap();
   assert_eq!(resp.primary_keys().len(), 1);

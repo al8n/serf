@@ -414,8 +414,7 @@ impl<I, A> AgentOptions<I, A> {
     self
       .event_handlers
       .iter()
-      .map(|script| parse_event_script(&script))
-      .flatten()
+      .flat_map(|script| parse_event_script(script))
   }
 }
 
@@ -459,10 +458,10 @@ where
   std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
 }
 
-#[cfg(feature = "cli")]
+#[cfg(feature = "clap")]
 pub use sealed::ToPaths;
 
-#[cfg(feature = "cli")]
+#[cfg(feature = "clap")]
 mod sealed {
   use std::path::Path;
 

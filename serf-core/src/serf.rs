@@ -26,6 +26,8 @@ use super::{
   },
 };
 
+pub use api::Stats;
+
 mod api;
 pub(crate) mod base;
 

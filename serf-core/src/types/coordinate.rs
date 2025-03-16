@@ -206,7 +206,11 @@ impl CoordinateOptions {
 /// A specialized structure for holding network coordinates for the
 /// Vivaldi-based coordinate mapping algorithm. All of the fields should be public
 /// to enable this to be serialized. All values in here are in units of seconds.
-#[viewit::viewit(getters(style = "move"), setters(prefix = "with"))]
+#[viewit::viewit(
+  vis_all = "pub(crate)",
+  getters(vis_all = "pub", style = "move"),
+  setters(vis_all = "pub", prefix = "with")
+)]
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Coordinate {

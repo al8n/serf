@@ -1,9 +1,14 @@
 use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
 
-use super::{delegate::Delegate, error::Error, types::{Epoch, LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage}, *};
+use super::{
+  delegate::Delegate,
+  error::Error,
+  types::{Epoch, LamportTime, Member, Node, QueryFlag, QueryResponseMessage, UserEventMessage},
+  *,
+};
 
-pub use crate_event::INTERNAL_QUERY_PREFIX;
 pub use async_channel::{RecvError, TryRecvError};
+pub use crate_event::INTERNAL_QUERY_PREFIX;
 
 pub(crate) use crate_event::*;
 

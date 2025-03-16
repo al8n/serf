@@ -1,7 +1,9 @@
 [workspace]
 members = [
   "serf",
+  "serf-agent",
   "serf-core",
+  # "serf-ipc",
   "examples/toyconsul",
   "fuzz",
 ]
@@ -48,5 +50,6 @@ memberlist-proto = { version = "0.1", default-features = false }
 memberlist-core = { version = "0.6", default-features = false }
 memberlist = { version = "0.6", default-features = false }
 
+serf-agent = { path = "serf-agent", version = "0.1.0", default-features = false }
 serf-core = { path = "serf-core", version = "0.3.0", default-features = false }
 serf = { path = "serf", version = "0.3.0", default-features = false }

@@ -1,0 +1,71 @@
+[package]
+name = "serf-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+
+clap = ["dep:clap", "config"]
+
+ipc = ["bincode", "serde", "serf-core/serde"]
+encryption = ["serf-core/encryption"]
+
+# checksum
+crc32 = ["serf-core/crc32"]
+murmur3 = ["serf-core/murmur3"]
+xxhash64 = ["serf-core/xxhash64"]
+xxhash32 = ["serf-core/xxhash32"]
+xxhash3 = ["serf-core/xxhash3"]
+
+# compression
+snappy = ["serf-core/snappy"]
+zstd = ["serf-core/zstd"]
+lz4 = ["serf-core/lz4"]
+brotli = ["serf-core/brotli"]
+
+# metrics
+metrics = [
+  "dep:metrics",
+  "serf-core/metrics",
+]
+statsd = ["metrics", "metrics-exporter-statsd"]
+
+serde = ["dep:serde", "serf-core/serde", "serde_with", "humantime-serde", "humantime"]
+
+
+[dependencies]
+agnostic = { version = "0.7", features = ["process"] }
+agnostic-mdns = { version = "0.4", features = ["worksteal"] }
+async-channel = "2"
+circularbuf = { version = "0.1", features = ["future"] }
+futures.workspace = true
+getifs = "0.3"
+parking_lot = "0.12"
+regex = "1"
+serf-core = { workspace = true }
+smol_str.workspace = true
+scopeguard = "1"
+tracing = "0.1"
+thiserror = "2"
+viewit.workspace = true
+
+clap = { version = "4.5", optional = true, features = ["derive", "env"] }
+config = { version = "0.15", optional = true }
+
+metrics = { version = "0.24", optional = true }
+metrics-exporter-statsd = { version = "0.9", optional = true }
+
+bincode = { version = "2", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_with = { version = "3", optional = true }
+humantime = { version = "2", optional = true }
+humantime-serde = { workspace = true, optional = true }

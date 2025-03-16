@@ -10,6 +10,8 @@ pub(crate) mod broadcast;
 
 mod coalesce;
 
+#[cfg(feature = "encryption")]
+pub use memberlist_core::keyring;
 pub use memberlist_core::transport;
 
 /// Events for [`Serf`]

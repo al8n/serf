@@ -3,10 +3,10 @@ use agnostic::{
   process::{Child, ChildStderr, ChildStdin, ChildStdout, Process},
 };
 use futures::{AsyncRead, AsyncWrite, lock::Mutex};
-use memberlist::net::Transport;
 use serf_core::{
   Serf,
   delegate::Delegate,
+  transport::Transport,
   event::{Event, MemberEventType},
 };
 use smol_str::{SmolStr, ToSmolStr};

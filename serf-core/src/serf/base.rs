@@ -399,37 +399,44 @@ where
   /// Serialize the current keyring and save it to a file.
   #[cfg(feature = "encryption")]
   pub(crate) async fn write_keyring_file(&self) -> std::io::Result<()> {
+    use std::io::{BufWriter, Write};
+
     let Some(path) = self.inner.opts.keyring_file() else {
       return Ok(());
     };
 
     if let Some(keyring) = self.inner.memberlist.keyring() {
-      let encoded_keys = keyring
-        .keys()
-        .map(|k| k.to_base64())
-        .collect::<TinyVec<_>>();
+      let encoded_keys = keyring.keys();
 
       #[cfg(unix)]
-      {
+      let file = {
         use std::os::unix::fs::OpenOptionsExt;
+
         let mut opts = std::fs::OpenOptions::new();
         opts.truncate(true).write(true).create(true).mode(0o600);
-        return opts.open(path).and_then(|file| {
-          serde_json::to_writer_pretty(file, &encoded_keys)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
-      }
+        opts.open(path)?
+      };
+
       // TODO: I don't know how to set permissions on windows
       // need helps :)
       #[cfg(windows)]
-      {
+      let file = {
         let mut opts = std::fs::OpenOptions::new();
         opts.truncate(true).write(true).create(true);
-        return opts.open(path).and_then(|file| {
-          serde_json::to_writer_pretty(file, &encoded_keys)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
+        opts.open(path)?
+      };
+
+      let mut writer = BufWriter::with_capacity(1024, file);
+      for key in encoded_keys {
+        let mut buf = [0; 64];
+        let len = key
+          .encode_base64(&mut buf)
+          .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        buf[len] = b'\n';
+        writer.write_all(&buf[..len + 1])?;
       }
+
+      writer.flush()?;
     }
 
     Ok(())

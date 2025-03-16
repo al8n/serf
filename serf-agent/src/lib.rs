@@ -1,3 +1,8 @@
+/// The proto types for the Serf agent.
+#[cfg(feature = "ipc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ipc")))]
+mod ipc;
+
 use std::{collections::HashMap, sync::Arc};
 
 use agnostic::RuntimeLite;
@@ -27,15 +32,14 @@ pub mod options;
 pub mod error;
 
 mod invoke;
-mod ipc;
 mod mdns;
 
 /// Profile is used to control the timing profiles used in `Serf`.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
-#[cfg_attr(feature = "cli", clap(rename_all = "snake_case"))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", clap(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum Profile {
   /// Lan is used for local area networks.
@@ -55,6 +59,7 @@ where
   handlers: HashMap<SmolStr, Arc<dyn event_handler::EventHandler<T, D>>>,
   handlers_list: Arc<[Arc<dyn event_handler::EventHandler<T, D>>]>,
 }
+
 
 pub struct Agent<T, D>
 where
@@ -504,7 +509,7 @@ fn load_keyring_file(
 }
 
 #[viewit::viewit(
-  vis_all = "pub(super)",
+  vis_all = "",
   getters(vis_all = "pub", style = "ref"),
   setters(vis_all = "pub", prefix = "with")
 )]

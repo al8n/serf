@@ -586,6 +586,7 @@ where
   }
 }
 
+#[derive(Debug, Copy, Clone)]
 #[viewit::viewit(vis_all = "", getters(vis_all = "pub", prefix = "get"), setters(skip))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Stats {
