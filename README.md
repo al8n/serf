@@ -43,7 +43,7 @@ serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-
 - By using `TCP/UDP`, `TLS/UDP` transport
 
   ```toml
-  serf = { version = "0.3", features = [
+  serf = { version = "0.4", features = [
     "tcp",
     # Enable a checksum, as UDP is not reliable.
     # Built in supports are: "crc32", "xxhash64", "xxhash32", "xxhash3", "murmur3"
@@ -69,7 +69,7 @@ serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-
   For `QUIC/QUIC` transport, as QUIC is secure and reliable, so enable checksum or encryption makes no sense.
 
   ```toml
-  serf = { version = "0.3", features = [
+  serf = { version = "0.4", features = [
     # Enable a compression, this is optional,
     # and possible values are `snappy`, `brotli`, `zstd` and `lz4`.
     # You can enable all.
