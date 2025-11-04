@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
-agnostic-lite = { version = "0.5", features = ["tokio"] }
+agnostic-lite = { version = "0.6", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 futures = { workspace = true, features = ["executor"] }
 tempfile = "3"

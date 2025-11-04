@@ -73,8 +73,5 @@ macro_rules! test_mod {
 #[cfg(feature = "tokio")]
 test_mod!(tokio);
 
-#[cfg(feature = "async-std")]
-test_mod!(async_std);
-
 #[cfg(feature = "smol")]
 test_mod!(smol);

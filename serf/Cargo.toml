@@ -19,7 +19,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["tokio", "compression", "encryption", "dns", "tcp", "quic"]
 
 tokio = ["memberlist/tokio"]
-async-std = ["memberlist/async-std"]
 smol = ["memberlist/smol"]
 
 serde = [

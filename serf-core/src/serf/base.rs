@@ -415,8 +415,7 @@ where
         let mut opts = std::fs::OpenOptions::new();
         opts.truncate(true).write(true).create(true).mode(0o600);
         return opts.open(path).and_then(|file| {
-          serde_json::to_writer_pretty(file, &encoded_keys)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+          serde_json::to_writer_pretty(file, &encoded_keys).map_err(std::io::Error::other)
         });
       }
       // TODO: I don't know how to set permissions on windows
@@ -426,8 +425,7 @@ where
         let mut opts = std::fs::OpenOptions::new();
         opts.truncate(true).write(true).create(true);
         return opts.open(path).and_then(|file| {
-          serde_json::to_writer_pretty(file, &encoded_keys)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+          serde_json::to_writer_pretty(file, &encoded_keys).map_err(std::io::Error::other)
         });
       }
     }
