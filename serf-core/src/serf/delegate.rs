@@ -363,7 +363,6 @@ where
       .await;
     for msg in event_msgs.iter() {
       let (encoded_len, _) = encoded_len(msg.clone());
-      bytes_used += encoded_len;
       #[cfg(feature = "metrics")]
       {
         metrics::histogram!(

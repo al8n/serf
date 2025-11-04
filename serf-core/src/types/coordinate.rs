@@ -698,7 +698,7 @@ where
   #[inline]
   fn update_gravity(&mut self) {
     let dist = self.origin.distance_to(&self.coord).as_secs();
-    let force = -1.0 * f64::powf((dist as f64) / self.opts.gravity_rho, 2.0);
+    let force = -f64::powf((dist as f64) / self.opts.gravity_rho, 2.0);
     self
       .coord
       .apply_force_in_place(self.opts.height_min, force, &self.origin);
