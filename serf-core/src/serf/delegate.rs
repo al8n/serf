@@ -361,9 +361,9 @@ where
       .event_broadcasts
       .get_broadcasts(limit - bytes_used)
       .await;
-    for msg in event_msgs.iter() {
-      #[cfg(feature = "metrics")]
-      {
+    #[cfg(feature = "metrics")]
+    {
+      for msg in event_msgs.iter() {
         let (encoded_len, _) = encoded_len(msg.clone());
         metrics::histogram!(
           "serf.messages.sent",
