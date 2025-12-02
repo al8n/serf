@@ -129,7 +129,12 @@ impl ToyConsul {
             tracing::info!("toyconsul: shutting down event listener");
           }
           ev = subscriber.recv() => {
-            if let Ok(SerfEvent::User(ev)) = ev {
+            let Ok(ev) = ev else {
+              tracing::info!("serf event channel closed, loop quit now");
+              break;
+            };
+
+            if let SerfEvent::User(ev) = ev {
               match ev.name().as_str() {
                 "register" => {
                   let payload = ev.payload();
