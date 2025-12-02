@@ -1,5 +1,5 @@
 use crate::{
-  Serf,
+  Serf, SerfWeakRef,
   broadcast::SerfBroadcast,
   delegate::Delegate,
   error::{SerfDelegateError, SerfError},
@@ -26,7 +26,7 @@ use memberlist_core::{
     AliveDelegate, ConflictDelegate, Delegate as MemberlistDelegate, EventDelegate,
     MergeDelegate as MemberlistMergeDelegate, NodeDelegate, PingDelegate,
   },
-  proto::{Data, Meta, NodeState, State},
+  proto::{Data, Meta, NodeState, State, TinyVec},
   tracing,
   transport::Transport,
 };
@@ -50,7 +50,7 @@ where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  serf: OnceLock<Serf<T, D>>,
+  serf: OnceLock<SerfWeakRef<T, D>>,
   delegate: Option<D>,
   tags: Arc<ArcSwap<Tags>>,
   #[cfg(any(test, feature = "test"))]
@@ -104,13 +104,13 @@ where
     self.delegate.as_ref()
   }
 
-  pub(crate) fn store(&self, s: Serf<T, D>) {
+  pub(crate) fn store(&self, s: SerfWeakRef<T, D>) {
     // No error, we never call this in parallel
     let _ = self.serf.set(s);
   }
 
-  fn this(&self) -> &Serf<T, D> {
-    self.serf.get().unwrap()
+  fn this(&self) -> Option<Serf<T, D>> {
+    self.serf.get().and_then(|weak_ref| weak_ref.upgrade())
   }
 }
 
@@ -167,22 +167,19 @@ where
       return;
     }
 
+    let Some(this) = self.this() else {
+      return;
+    };
+
     #[cfg(feature = "metrics")]
     {
       metrics::histogram!(
         "serf.messages.received",
-        self
-          .this()
-          .inner
-          .opts
-          .memberlist_options
-          .metric_labels
-          .iter()
+        this.inner.opts.memberlist_options.metric_labels.iter()
       )
       .record(buf.len() as f64);
     }
 
-    let this = self.this();
     let mut rebroadcast = false;
     let mut rebroadcast_queue = &this.inner.broadcasts;
     let mut relay = None;
@@ -221,9 +218,16 @@ where
             };
           }
           MessageRef::UserEvent(ue) => {
-            tracing::debug!("serf: user event message: {}", ue.name());
             rebroadcast = this.handle_user_event(either::Either::Left(ue)).await;
             rebroadcast_queue = &this.inner.event_broadcasts;
+            let rebroadcast_queue_num_queued = rebroadcast_queue.num_queued().await;
+            tracing::debug!(
+              name = ue.name(),
+              payload_len = ue.payload().len(),
+              rebroadcast,
+              rebroadcast_queue_num_queued,
+              "serf: user event message",
+            );
           }
           MessageRef::Query(q) => {
             tracing::debug!("serf: query message: {}", q.name());
@@ -318,7 +322,9 @@ where
   where
     F: Fn(Bytes) -> (usize, Bytes) + Send + Sync + 'static,
   {
-    let this = self.this();
+    let Some(this) = self.this() else {
+      return TinyVec::with_capacity(0).into_iter();
+    };
     let mut msgs = this.inner.broadcasts.get_broadcasts(limit).await;
 
     // Determine the bytes used already
@@ -378,7 +384,10 @@ where
   }
 
   async fn local_state(&self, _join: bool) -> Bytes {
-    let this = self.this();
+    let Some(this) = self.this() else {
+      return Bytes::new();
+    };
+
     let members = this.inner.members.read().await;
     let events = this.inner.event_core.read().await;
 
@@ -434,16 +443,11 @@ where
 
     #[cfg(any(test, feature = "test"))]
     {
-      if let Some(ref dropper) = self
-        .this()
-        .inner
-        .memberlist
-        .delegate()
-        .unwrap()
-        .message_dropper
-      {
-        if dropper.should_drop(MessageType::PushPull) {
-          return;
+      if let Some(this) = self.this() {
+        if let Some(ref dropper) = this.inner.memberlist.delegate().unwrap().message_dropper {
+          if dropper.should_drop(MessageType::PushPull) {
+            return;
+          }
         }
       }
     }
@@ -453,7 +457,10 @@ where
         let ltime = pp.ltime();
         let event_ltime = pp.event_ltime();
         let query_ltime = pp.query_ltime();
-        let this = self.this();
+        let Some(this) = self.this() else {
+          return;
+        };
+
         // Witness the Lamport clocks first.
         // We subtract 1 since no message with that clock has been sent yet
         if ltime > LamportTime::ZERO {
@@ -556,17 +563,21 @@ where
   type Address = T::ResolvedAddress;
 
   async fn notify_join(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-    if let Some(serf) = self.serf.get() {
-      serf.handle_node_join(node).await;
+    if let Some(this) = self.this() {
+      this.handle_node_join(node).await;
     }
   }
 
   async fn notify_leave(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-    self.this().handle_node_leave(node).await;
+    if let Some(this) = self.this() {
+      this.handle_node_leave(node).await;
+    }
   }
 
   async fn notify_update(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-    self.this().handle_node_update(node).await;
+    if let Some(this) = self.this() {
+      this.handle_node_update(node).await;
+    }
   }
 }
 
@@ -636,7 +647,9 @@ where
     existing: Arc<NodeState<Self::Id, Self::Address>>,
     other: Arc<NodeState<Self::Id, Self::Address>>,
   ) {
-    self.this().handle_node_conflict(existing, other).await;
+    if let Some(this) = self.this() {
+      this.handle_node_conflict(existing, other).await;
+    }
   }
 }
 
@@ -678,7 +691,11 @@ where
       return buf.freeze();
     }
 
-    if let Some(c) = self.this().inner.coord_core.as_ref() {
+    if let Some(c) = self
+      .this()
+      .as_ref()
+      .and_then(|this| this.inner.coord_core.as_ref())
+    {
       let coord = c.client.get_coordinate();
       let encoded_len = coord.encoded_len() + 1;
       let mut buf = BytesMut::with_capacity(encoded_len);
@@ -705,7 +722,10 @@ where
       return;
     }
 
-    let this = self.this();
+    let Some(this) = self.this() else {
+      return;
+    };
+
     tracing::trace!(data=?payload.as_ref(), "serf: receive payload");
 
     if let Some(ref c) = this.inner.coord_core {

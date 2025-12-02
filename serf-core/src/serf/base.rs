@@ -263,7 +263,7 @@ where
     };
     let this = Serf { inner: Arc::new(c) };
     // update delegate
-    let that = this.clone();
+    let that = this.downgrade();
     let memberlist_delegate = this.inner.memberlist.delegate().unwrap();
     memberlist_delegate.store(that);
     let local_node = this.inner.memberlist.local_state().await;
@@ -274,7 +274,7 @@ where
     // update key manager
     #[cfg(feature = "encryption")]
     {
-      let that = this.clone();
+      let that = this.downgrade();
       this.inner.key_manager.store(that);
     }
 
