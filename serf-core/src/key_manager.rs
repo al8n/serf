@@ -13,7 +13,7 @@ use crate::event::{
 };
 
 use super::{
-  Serf,
+  Serf, SerfWeakRef,
   delegate::Delegate,
   error::Error,
   serf::{NodeResponse, QueryResponse},
@@ -82,7 +82,7 @@ where
   D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
   T: Transport,
 {
-  serf: OnceLock<Serf<T, D>>,
+  serf: OnceLock<SerfWeakRef<T, D>>,
   /// The lock is used to serialize keys related handlers
   l: RwLock<()>,
 }
@@ -99,9 +99,13 @@ where
     }
   }
 
-  pub(crate) fn store(&self, serf: Serf<T, D>) {
+  pub(crate) fn store(&self, serf: SerfWeakRef<T, D>) {
     // No error handling here, because we never call this in parallel
     let _ = self.serf.set(serf);
+  }
+
+  fn this(&self) -> Option<Serf<T, D>> {
+    self.serf.get().and_then(|weak_ref| weak_ref.upgrade())
   }
 
   /// Handles broadcasting a query to all members and gathering
@@ -183,17 +187,27 @@ where
     let kr = KeyRequestMessage { key };
     let buf = crate::types::encode_message_to_bytes(&kr)?;
 
-    let serf = self.serf.get().unwrap();
-    let mut q_param = serf.default_query_param().await;
+    let Some(this) = self.this() else {
+      return Ok(KeyResponse {
+        num_nodes: 0,
+        messages: HashMap::new(),
+        num_resp: 0,
+        num_err: 0,
+        keys: HashMap::new(),
+        primary_keys: HashMap::new(),
+      });
+    };
+
+    let mut q_param = this.default_query_param().await;
     if let Some(opts) = opts {
       q_param.relay_factor = opts.relay_factor;
     }
-    let qresp: QueryResponse<T::Id, T::ResolvedAddress> = serf
+    let qresp: QueryResponse<T::Id, T::ResolvedAddress> = this
       .internal_query(SmolStr::new(ty), buf, Some(q_param), event)
       .await?;
 
     // Handle the response stream and populate the KeyResponse
-    let resp = self.stream_key_response(qresp.response_rx()).await;
+    let resp = Self::stream_key_response(&this, qresp.response_rx()).await;
 
     // Check the response for any reported failure conditions
     if resp.num_err > 0 {
@@ -216,11 +230,11 @@ where
   }
 
   async fn stream_key_response(
-    &self,
+    this: &Serf<T, D>,
     ch: Receiver<NodeResponse<T::Id, T::ResolvedAddress>>,
   ) -> KeyResponse<T::Id> {
     let mut resp = KeyResponse {
-      num_nodes: self.serf.get().unwrap().num_members().await,
+      num_nodes: this.num_members().await,
       messages: HashMap::new(),
       num_resp: 0,
       num_err: 0,

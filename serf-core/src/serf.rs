@@ -1,6 +1,6 @@
 use std::{
   collections::HashMap,
-  sync::{Arc, atomic::AtomicBool},
+  sync::{Arc, Weak, atomic::AtomicBool},
 };
 
 use async_lock::{Mutex, RwLock};
@@ -191,5 +191,65 @@ where
     Self {
       inner: self.inner.clone(),
     }
+  }
+}
+
+impl<T: Transport, D: Delegate> Serf<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  /// Creates a weak reference to this `Serf` instance.
+  ///
+  /// This is used to break reference cycles between `Serf` and components that hold a back-reference,
+  /// such as [`SerfDelegate`] or [`KeyManager`]. Since Rust uses reference counting for ownership,
+  /// strong references would prevent the `Serf` instance from being dropped even when no longer needed.
+  ///
+  /// A weak reference does not keep the inner `SerfCore` alive. It must be upgraded to a strong
+  /// reference using [`SerfWeakRef::upgrade()`] before use, which returns `None` if the `Serf`
+  /// has already been destroyed.
+  ///
+  /// # Returns
+  ///
+  /// A [`SerfWeakRef`] that may be safely stored without preventing cleanup.
+  fn downgrade(&self) -> SerfWeakRef<T, D> {
+    SerfWeakRef {
+      inner: Arc::downgrade(&self.inner),
+    }
+  }
+}
+
+/// A weak reference to a [`Serf`] instance.
+///
+/// This type allows holding a non-owning reference to a `Serf<T, D>` without extending its lifetime.
+/// It is primarily used to break reference cycles.
+///
+/// To access the inner `Serf`, call [`upgrade()`](Self::upgrade), which returns `Some(Serf)` if the
+/// original instance is still alive, or `None` if it has been dropped.
+///
+/// This type is analogous to [`std::sync::Weak`] in relation to [`std::sync::Arc`].
+#[repr(transparent)]
+pub(crate) struct SerfWeakRef<T: Transport, D = DefaultDelegate<T>>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  inner: Weak<SerfCore<T, D>>,
+}
+
+impl<T: Transport, D: Delegate> SerfWeakRef<T, D>
+where
+  D: Delegate<Id = T::Id, Address = T::ResolvedAddress>,
+  T: Transport,
+{
+  /// Attempts to upgrade this weak reference to a strong one.
+  ///
+  /// Returns `Some(Serf<T, D>)` if the referenced `Serf` is still alive, otherwise `None`.
+  ///
+  /// This is typically called within delegate methods or background tasks that need temporary
+  /// access to the `Serf` instance. Always handle the `None` case gracefully, as it indicates
+  /// the `Serf` has already begun shutting down.
+  pub(crate) fn upgrade(&self) -> Option<Serf<T, D>> {
+    self.inner.upgrade().map(|inner| Serf { inner })
   }
 }
