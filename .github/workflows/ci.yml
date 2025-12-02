@@ -39,7 +39,7 @@ jobs:
           # - native-tls
           - tcp
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         run: |
