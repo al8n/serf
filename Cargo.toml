@@ -31,7 +31,7 @@ viewit = "0.1.5"
 regex = "1"
 smol_str = "0.3"
 smallvec = "1"
-rand = "0.9"
+rand = "0.10"
 
 arbitrary = { version = "1", default-features = false, features = ["derive"] }
 quickcheck = { version = "1", default-features = false }
