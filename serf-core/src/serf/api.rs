@@ -312,7 +312,7 @@ where
       .await
   }
 
-  /// Joins an existing Serf cluster. Returns the id of node
+  /// Joins an existing Serf cluster. Returns the resolved address of node
   /// successfully contacted. If `ignore_old` is true, then any
   /// user messages sent prior to the join will be ignored.
   pub async fn join(
@@ -360,7 +360,7 @@ where
     }
   }
 
-  /// Joins an existing Serf cluster. Returns the id of nodes
+  /// Joins an existing Serf cluster. Returns the resolved address of nodes
   /// successfully contacted. If `ignore_old` is true, then any
   /// user messages sent prior to the join will be ignored.
   pub async fn join_many(

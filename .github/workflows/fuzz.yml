@@ -18,7 +18,8 @@ on:
       - "**.md"
       - "**.txt"
       - "art"
-  schedule: [cron: "0 1 */30 * *"]
+  schedule:
+    - cron: "0 1 */30 * *"
 
 jobs:
   fuzz:
