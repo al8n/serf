@@ -38,7 +38,7 @@ jobs:
             features: "test,tokio,tcp,encryption,metrics"
             name: "serf-tcp-encryption"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install latest nightly
         uses: actions-rs/toolchain@v1
         with:
@@ -54,7 +54,7 @@ jobs:
         working-directory: ${{ matrix.crate }}
         continue-on-error: true
       - name: Upload Coverage Report as Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.crate }}/cobertura.xml
@@ -63,9 +63,9 @@ jobs:
     needs: coverage-report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Download all coverage reports
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           path: reports/
       - name: List contents of the reports directory

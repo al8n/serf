@@ -197,9 +197,9 @@ where
   let serfs = [s1, s2];
   wait_until_num_nodes(1, &serfs).await;
 
-  let (id, addr) = serfs[1].inner.memberlist.advertise_node().into_components();
+  let (_, addr) = serfs[1].inner.memberlist.advertise_node().into_components();
   serfs[0]
-    .join(Node::new(id, MaybeResolvedAddress::resolved(addr)), false)
+    .join(MaybeResolvedAddress::resolved(addr), false)
     .await
     .unwrap();
 
@@ -367,7 +367,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -405,7 +405,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -456,7 +456,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let start = Epoch::now();
   loop {
@@ -521,7 +521,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[1].join(node.clone(), true).await.unwrap();
+  serfs[1].join(node.address().clone(), true).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -596,7 +596,10 @@ where
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
 
-  let err = serfs[0].join(node.clone(), false).await.unwrap_err();
+  let err = serfs[0]
+    .join(node.address().clone(), false)
+    .await
+    .unwrap_err();
   assert!(err.to_string().contains("merge canceled"));
 
   wait_until_num_nodes(0, &serfs).await;

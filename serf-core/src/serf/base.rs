@@ -11,7 +11,7 @@ use memberlist_core::{
   proto::{Data, MaybeResolvedAddress, Meta, Node, NodeState, OneOrMore, TinyVec},
   tracing,
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use smol_str::SmolStr;
 
 use crate::{
@@ -663,7 +663,7 @@ where
             drop(mu); // release read lock
             tracing::info!("serf: attempting to reconnect to {}", id);
             // Attempt to join at the memberlist level
-            if let Err(e) = self.memberlist.join(Node::new(id.cheap_clone(), MaybeResolvedAddress::resolved(address))).await {
+            if let Err(e) = self.memberlist.join(MaybeResolvedAddress::resolved(address)).await {
               tracing::warn!("serf: failed to reconnect {}: {}", id, e);
             } else {
               tracing::info!("serf: successfully reconnected to {}", id);
@@ -1791,7 +1791,7 @@ where
         }
 
         tracing::info!("serf: attempting re-join to previously known node {}", prev);
-        if let Err(e) = memberlist.join(prev.cheap_clone()).await {
+        if let Err(e) = memberlist.join(prev.address().cheap_clone()).await {
           tracing::warn!(
             "serf: failed to re-join to previously known node {}: {}",
             prev,

@@ -24,12 +24,12 @@ pub async fn serf_remove_failed_node<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 
@@ -116,12 +116,12 @@ pub async fn serf_remove_failed_node_prune<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 
