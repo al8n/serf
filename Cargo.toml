@@ -15,8 +15,8 @@ description = "A decentralized solution for service discovery and orchestration 
 repository = "https://github.com/al8n/serf"
 homepage = "https://github.com/al8n/serf"
 license = "MPL-2.0"
-keywords = ["swim", "gossip", "service-discovery", "serf", "memberlist"]
-categories = ["network-programming", "asynchronous"]
+keywords = ["gossip", "service-discovery", "cluster", "membership", "distributed"]
+categories = ["network-programming", "asynchronous", "algorithms"]
 readme = "README.md"
 
 [workspace.dependencies]
@@ -37,8 +37,8 @@ arbitrary = { version = "1", default-features = false, features = ["derive"] }
 quickcheck = { version = "1", default-features = false }
 
 memberlist-proto = { version = "0.3", default-features = false }
-memberlist-core = { version = "0.8", default-features = false }
-memberlist = { version = "0.8", default-features = false }
+memberlist-core = { version = "0.8.1", default-features = false }
+memberlist = { version = "0.8.1", default-features = false }
 
 serf-core = { path = "serf-core", version = "0.5", default-features = false }
 serf = { path = "serf", version = "0.5", default-features = false }
