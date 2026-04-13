@@ -312,14 +312,14 @@ where
       .await
   }
 
-  /// Joins an existing Serf cluster. Returns the id of node
+  /// Joins an existing Serf cluster. Returns the resolved address of node
   /// successfully contacted. If `ignore_old` is true, then any
   /// user messages sent prior to the join will be ignored.
   pub async fn join(
     &self,
-    node: Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>,
+    node: MaybeResolvedAddress<T::Address, T::ResolvedAddress>,
     ignore_old: bool,
-  ) -> Result<Node<T::Id, T::ResolvedAddress>, Error<T, D>> {
+  ) -> Result<T::ResolvedAddress, Error<T, D>> {
     // Do a quick state check
     let current_state = self.state();
     if current_state != SerfState::Alive {
@@ -360,17 +360,14 @@ where
     }
   }
 
-  /// Joins an existing Serf cluster. Returns the id of nodes
+  /// Joins an existing Serf cluster. Returns the resolved address of nodes
   /// successfully contacted. If `ignore_old` is true, then any
   /// user messages sent prior to the join will be ignored.
   pub async fn join_many(
     &self,
-    existing: impl Iterator<Item = Node<T::Id, MaybeResolvedAddress<T::Address, T::ResolvedAddress>>>,
+    existing: impl Iterator<Item = MaybeResolvedAddress<T::Address, T::ResolvedAddress>>,
     ignore_old: bool,
-  ) -> Result<
-    SmallVec<Node<T::Id, T::ResolvedAddress>>,
-    (SmallVec<Node<T::Id, T::ResolvedAddress>>, Error<T, D>),
-  > {
+  ) -> Result<SmallVec<T::ResolvedAddress>, (SmallVec<T::ResolvedAddress>, Error<T, D>)> {
     // Do a quick state check
     let current_state = self.state();
     if current_state != SerfState::Alive {

@@ -30,7 +30,7 @@ pub async fn serf_reconnect<T, F>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -109,7 +109,7 @@ pub async fn serf_reconnect_same_ip<T, R, F>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -226,7 +226,7 @@ pub async fn serf_per_node_reconnect_timeout<T>(
   let node = s2
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  s1.join(node, false).await.unwrap();
+  s1.join(node.address().clone(), false).await.unwrap();
 
   let start = Epoch::now();
   let mut cond1 = false;

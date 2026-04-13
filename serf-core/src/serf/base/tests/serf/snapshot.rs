@@ -520,7 +520,7 @@ pub async fn serf_snapshot_recovery<T, F>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 

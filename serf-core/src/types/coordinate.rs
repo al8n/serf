@@ -4,7 +4,7 @@ use memberlist_core::proto::{
   Data, DataRef, DecodeError, EncodeError, RepeatedDecoder, WireType,
   utils::{merge, skip},
 };
-use rand::Rng;
+use rand::RngExt;
 use smallvec::SmallVec;
 
 use std::{

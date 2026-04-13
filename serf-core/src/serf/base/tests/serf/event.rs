@@ -105,7 +105,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -150,7 +150,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -195,7 +195,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -305,9 +305,9 @@ pub async fn serf_events_leave_avoid_infinite_rebroadcast<T, F>(
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
 
-  serfs[0].join(node.clone(), false).await.unwrap();
-  s3.join(node.clone(), false).await.unwrap();
-  s4.join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
+  s3.join(node.address().clone(), false).await.unwrap();
+  s4.join(node.address().clone(), false).await.unwrap();
 
   // S2 leaves gracefully
   serfs[1].leave().await.unwrap();
@@ -333,7 +333,7 @@ pub async fn serf_events_leave_avoid_infinite_rebroadcast<T, F>(
   let s1node = serfs[0]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  s2.join(s1node.clone(), false).await.unwrap();
+  s2.join(s1node.address().clone(), false).await.unwrap();
 
   serfs.push(s2);
   serfs.push(s3);
@@ -422,7 +422,7 @@ pub async fn serf_remove_failed_events_leave<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -487,7 +487,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -827,7 +827,7 @@ where
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -925,7 +925,7 @@ pub async fn serf_query_filter<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -939,7 +939,7 @@ pub async fn serf_query_filter<T>(
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 

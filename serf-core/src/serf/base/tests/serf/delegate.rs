@@ -53,7 +53,7 @@ where
   let (id, addr) = serfs[1].memberlist().advertise_node().into_components();
 
   serfs[0]
-    .join(Node::new(id, MaybeResolvedAddress::resolved(addr)), false)
+    .join(MaybeResolvedAddress::resolved(addr), false)
     .await
     .unwrap();
 
@@ -220,7 +220,7 @@ pub async fn serf_ping_delegate_versioning<T>(
     .memberlist()
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   // They both should show 2 members, but only s1 should know about s2
   // in the cache, since s1 spoke an alien ping protocol.
@@ -302,7 +302,7 @@ pub async fn serf_ping_delegate_rogue_coordinate<T>(
     .memberlist()
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   // They both should show 2 members, but only s1 should know about s2
   // in the cache, since s1 spoke an alien ping protocol.
