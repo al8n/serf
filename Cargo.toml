@@ -8,15 +8,15 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85.0"
 description = "A decentralized solution for service discovery and orchestration that is lightweight, highly available, and fault tolerant."
 repository = "https://github.com/al8n/serf"
 homepage = "https://github.com/al8n/serf"
 license = "MPL-2.0"
-keywords = ["swim", "gossip", "service-discovery", "serf", "memberlist"]
-categories = ["network-programming", "asynchronous"]
+keywords = ["gossip", "service-discovery", "cluster", "membership", "distributed"]
+categories = ["network-programming", "asynchronous", "algorithms"]
 readme = "README.md"
 
 [workspace.dependencies]
@@ -29,24 +29,16 @@ indexmap = "2"
 thiserror = { version = "2", default-features = false }
 viewit = "0.1.5"
 regex = "1"
-smol_str = "0.3"
+smol_str = "^0.3.6"
 smallvec = "1"
-rand = "0.9"
+rand = "0.10"
 
 arbitrary = { version = "1", default-features = false, features = ["derive"] }
 quickcheck = { version = "1", default-features = false }
 
-# memberlist-proto = { version = "0.2", path = "../memberlist/memberlist-proto", default-features = false }
-# memberlist-core = { version = "0.7", path = "../memberlist/memberlist-core", default-features = false }
-# memberlist = { version = "0.7", path = "../memberlist/memberlist", default-features = false }
+memberlist-proto = { version = "0.3", default-features = false }
+memberlist-core = { version = "0.8.1", default-features = false }
+memberlist = { version = "0.8.1", default-features = false }
 
-# memberlist-proto = { version = "0.2", default-features = false, git = "https://github.com/al8n/memberlist" }
-# memberlist-core = { version = "0.7", default-features = false, git = "https://github.com/al8n/memberlist" }
-# memberlist = { version = "0.7", default-features = false, git = "https://github.com/al8n/memberlist" }
-
-memberlist-proto = { version = "0.2", default-features = false }
-memberlist-core = { version = "0.7", default-features = false }
-memberlist = { version = "0.7", default-features = false }
-
-serf-core = { path = "serf-core", version = "0.4", default-features = false }
-serf = { path = "serf", version = "0.4", default-features = false }
+serf-core = { path = "serf-core", version = "0.5", default-features = false }
+serf = { path = "serf", version = "0.5", default-features = false }

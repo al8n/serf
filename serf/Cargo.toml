@@ -44,33 +44,18 @@ tls = ["memberlist/tls", "net"]
 
 # enable DNS node address resolver
 dns = ["memberlist/dns"]
-dns-over-quic = [
-  "memberlist/dns-over-quic",
-]
-dns-over-h3 = ["memberlist/dns-over-h3"]
-dns-over-https-rustls = [
-  "memberlist/dns-over-https-rustls",
-]
-dns-over-rustls = [
-  "memberlist/dns-over-rustls",
-]
-dns-over-openssl = [
-  "memberlist/dns-over-openssl",
-]
-dns-over-native-tls = [
-  "memberlist/dns-over-native-tls",
-]
-dns-webpki-roots = [
-  "memberlist/dns-webpki-roots",
-]
-dns-native-certs = [
-  "memberlist/dns-native-certs",
-]
-dnssec-openssl = [
-  "memberlist/dnssec-openssl",
-]
+quic-ring = ["memberlist/quic-ring"]
+quic-aws-lc-rs = ["memberlist/quic-aws-lc-rs"]
+h3-ring = ["memberlist/h3-ring"]
+h3-aws-lc-rs = ["memberlist/h3-aws-lc-rs"]
+https-ring = ["memberlist/https-ring"]
+https-aws-lc-rs = ["memberlist/https-aws-lc-rs"]
+tls-ring = ["memberlist/tls-ring"]
+tls-aws-lc-rs = ["memberlist/tls-aws-lc-rs"]
+webpki-roots = ["memberlist/webpki-roots"]
+rustls-platform-verifier = ["memberlist/rustls-platform-verifier"]
 dnssec-ring = ["memberlist/dnssec-ring"]
-dnssec = ["memberlist/dnssec"]
+dnssec-aws-lc-rs = ["memberlist/dnssec-aws-lc-rs"]
 
 test = ["memberlist/test", "serf-core/test"]
 

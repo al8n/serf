@@ -159,12 +159,12 @@ pub async fn serf_force_leave_failed<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 
@@ -232,12 +232,12 @@ pub async fn serf_force_leave_leaving<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 
@@ -300,12 +300,12 @@ pub async fn serf_force_leave_left<T>(
   let node = serfs[1]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   let node = serfs[2]
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node, false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(3, &serfs).await;
 
@@ -356,7 +356,7 @@ pub async fn serf_leave_rejoin_different_role<T>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -379,7 +379,7 @@ pub async fn serf_leave_rejoin_different_role<T>(
 
   serfs[1] = s3;
 
-  serfs[1].join(node, false).await.unwrap();
+  serfs[1].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -444,7 +444,7 @@ pub async fn serf_leave_snapshot_recovery<T, F>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 

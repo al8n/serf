@@ -186,7 +186,7 @@ pub async fn serf_update<T, F>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
   // Now force the shutdown of s2 so it appears to fail.
@@ -213,9 +213,15 @@ pub async fn serf_update<T, F>(
   };
 
   let s1node = serfs[0].advertise_node();
-  s2.join(s1node.map_address(MaybeResolvedAddress::resolved), false)
-    .await
-    .unwrap();
+  s2.join(
+    s1node
+      .map_address(MaybeResolvedAddress::resolved)
+      .address()
+      .clone(),
+    false,
+  )
+  .await
+  .unwrap();
   serfs.push(s2);
   wait_until_num_nodes(2, &serfs).await;
 
@@ -276,7 +282,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -360,7 +366,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -469,7 +475,7 @@ where
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 }
@@ -511,7 +517,7 @@ pub async fn serf_coordinates<T>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -620,7 +626,7 @@ pub async fn serf_coordinates<T>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[1].join(node.clone(), false).await.unwrap();
+  serfs[1].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs).await;
 
@@ -690,7 +696,7 @@ pub async fn serf_name_resolution<T>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   wait_until_num_nodes(2, &serfs[..2]).await;
   wait_until_num_nodes(1, &serfs[2..]).await;
@@ -700,7 +706,7 @@ pub async fn serf_name_resolution<T>(
     .memberlist
     .advertise_node()
     .map_address(MaybeResolvedAddress::resolved);
-  serfs[0].join(node.clone(), false).await.unwrap();
+  serfs[0].join(node.address().clone(), false).await.unwrap();
 
   // Wait for the query period to end
   <T::Runtime as RuntimeLite>::sleep(serfs[0].default_query_timeout().await * 30).await;

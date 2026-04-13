@@ -6,7 +6,7 @@ use serf::{
   MemberlistOptions, Options,
   delegate::CompositeDelegate,
   event::{Event as SerfEvent, EventProducer, EventSubscriber},
-  net::{NetTransportOptions, Node, NodeId, TokioNetTransport},
+  net::{NetTransportOptions, NodeId, TokioNetTransport},
   tokio::{TokioSocketAddrResolver, TokioTcp, TokioTcpSerf},
   types::{MaybeResolvedAddress, SmolStr},
 };
@@ -101,8 +101,8 @@ impl ToyConsul {
                 let services = self.inner.services.iter().map(|ent| ent.value().clone()).collect();
                 let _ = tx.send(Ok(services));
               }
-              Some(Event::Join { id, addr, tx }) => {
-                let res = self.inner.serf.join(Node::new(id, MaybeResolvedAddress::Resolved(addr)), false).await;
+              Some(Event::Join { addr, tx }) => {
+                let res = self.inner.serf.join(MaybeResolvedAddress::Resolved(addr), false).await;
                 let _ = tx.send(res.map_err(Into::into).map(|_| ()));
               }
               None => {
@@ -173,7 +173,7 @@ impl ToyConsul {
     let resp = rx.await?;
     tracing::info!(value=?resp, "toyconsul: fetch key");
     match bincode::serde::encode_to_vec(
-      &resp.map_err(|e| e.to_string()),
+      resp.map_err(|e| e.to_string()),
       bincode::config::standard(),
     ) {
       Ok(resp) => {
@@ -195,16 +195,11 @@ impl ToyConsul {
 
   async fn handle_join<W: tokio::io::AsyncWrite + Unpin>(
     &self,
-    id: NodeId,
     addr: SocketAddr,
     stream: &mut W,
   ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    self.inner.tx.send(Event::Join {
-      id: id.clone(),
-      addr,
-      tx,
-    })?;
+    self.inner.tx.send(Event::Join { addr, tx })?;
 
     let resp = rx.await?;
     if let Err(e) = resp {
@@ -306,8 +301,6 @@ enum Commands {
   /// Join to an existing toyconsul cluster
   Join {
     #[clap(short, long)]
-    id: NodeId,
-    #[clap(short, long)]
     addr: SocketAddr,
     #[clap(short, long)]
     rpc_addr: std::path::PathBuf,
@@ -340,7 +333,7 @@ struct Cli {
 enum Op {
   Register { name: SmolStr, addr: SocketAddr },
   List,
-  Join { addr: SocketAddr, id: NodeId },
+  Join { addr: SocketAddr },
 }
 
 enum Event {
@@ -354,7 +347,6 @@ enum Event {
   },
   Join {
     addr: SocketAddr,
-    id: NodeId,
     tx: oneshot::Sender<Result<()>>,
   },
 }
@@ -376,8 +368,8 @@ async fn main() -> Result<()> {
 
   let cli = Cli::parse();
   match cli.command {
-    Commands::Join { addr, id, rpc_addr } => {
-      handle_join_cmd(id, addr, rpc_addr).await?;
+    Commands::Join { addr, rpc_addr } => {
+      handle_join_cmd(addr, rpc_addr).await?;
     }
     Commands::Register {
       name,
@@ -397,9 +389,9 @@ async fn main() -> Result<()> {
   Ok(())
 }
 
-async fn handle_join_cmd(id: NodeId, addr: SocketAddr, rpc_addr: std::path::PathBuf) -> Result<()> {
+async fn handle_join_cmd(addr: SocketAddr, rpc_addr: std::path::PathBuf) -> Result<()> {
   let conn = UnixStream::connect(rpc_addr).await?;
-  let data = bincode::serde::encode_to_vec(&Op::Join { id, addr }, bincode::config::standard())?;
+  let data = bincode::serde::encode_to_vec(&Op::Join { addr }, bincode::config::standard())?;
 
   let (reader, mut writer) = conn.into_split();
 
@@ -528,8 +520,8 @@ async fn handle_start_cmd(args: StartArgs) -> Result<()> {
         };
 
         match op {
-          Op::Join { addr, id } => {
-            consul.handle_join(id, addr, &mut stream).await?;
+          Op::Join { addr } => {
+            consul.handle_join(addr, &mut stream).await?;
           }
           Op::Register {
             name,
