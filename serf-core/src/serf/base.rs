@@ -1011,7 +1011,7 @@ where
     // Check if this message is too old
     let cur_time = self.inner.query_clock.time();
     let q_time = LamportTime::new(query.buffer.len() as u64);
-    if cur_time > q_time && q_time < cur_time - q_time {
+    if cur_time > q_time && qm_ltime < cur_time - q_time {
       tracing::warn!(
         "serf: received old query {} from time {} (current: {})",
         name,
@@ -1023,18 +1023,25 @@ where
 
     // Check if we've already seen this
     let idx = u64::from(qm_ltime % q_time) as usize;
-    let seen = query.buffer[idx].as_mut();
-    if let Some(seen) = seen {
-      if seen.ltime == qm_ltime {
+    let fresh = match query.buffer[idx].as_mut() {
+      // Slot holds this ltime: dedup by query id, then record this id.
+      Some(seen) if seen.ltime == qm_ltime => {
         for &prev in seen.query_ids.iter() {
           if qm_id == prev {
             // Seen this ID already
             return Ok(false);
           }
         }
+        seen.query_ids.push(qm_id);
+        false
       }
-      seen.query_ids.push(qm_id);
-    } else {
+      // Empty slot, or a stale entry from a different ltime that wrapped onto
+      // this ring index: start a fresh record. Appending onto the stale entry
+      // (leaving its `ltime` unchanged) would break dedup for the new ltime and
+      // let a re-gossiped query be reprocessed. Mirrors serf's `handleQuery`.
+      _ => true,
+    };
+    if fresh {
       query.buffer[idx] = Some(Queries {
         ltime: qm_ltime,
         query_ids: MediumVec::from(qm_id),
