@@ -9,6 +9,7 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use crate::LamportTime;
+use memberlist_proto::Node;
 
 /// A user-generated event broadcast through the serf cluster.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -142,4 +143,66 @@ pub enum Filter {
   Id(Vec<SmolStr>),
   /// Restrict responses to nodes whose tag value satisfies the filter.
   Tag(TagFilter),
+}
+
+// ── Membership messages ───────────────────────────────────────────────────────
+
+/// Broadcast after a node joins the cluster to associate it with a lamport clock.
+///
+/// Generic over `I`: the node-id type, which must implement
+/// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
+/// the bridge layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinMessage<I> {
+  /// The lamport clock value at the time the node joined.
+  pub ltime: crate::LamportTime,
+  /// The joining node's identifier.
+  pub id: I,
+}
+
+impl<I> JoinMessage<I> {
+  /// Construct a new `JoinMessage`.
+  pub fn new(ltime: crate::LamportTime, id: I) -> Self {
+    Self { ltime, id }
+  }
+}
+
+/// Broadcast to signal the intent to leave the cluster.
+///
+/// Generic over `I`: the node-id type, which must implement
+/// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
+/// the bridge layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveMessage<I> {
+  /// The lamport clock value at the time the leave was emitted.
+  pub ltime: crate::LamportTime,
+  /// The leaving node's identifier.
+  pub id: I,
+  /// Whether the leave is a prune (permanent removal) rather than a graceful leave.
+  pub prune: bool,
+}
+
+impl<I> LeaveMessage<I> {
+  /// Construct a new `LeaveMessage`.
+  pub fn new(ltime: crate::LamportTime, id: I, prune: bool) -> Self {
+    Self { ltime, id, prune }
+  }
+}
+
+/// Carries the winning node in a node-name conflict tie-breaker.
+///
+/// Generic over `I` and `A`: the node-id and address types, which must
+/// implement `memberlist_proto::Data` so the embedded `Node<I,A>` can be
+/// encoded as opaque proto `bytes` in the bridge layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictResponseMessage<I, A> {
+  /// The winning node in the conflict resolution.
+  pub member: Node<I, A>,
+}
+
+impl<I, A> ConflictResponseMessage<I, A> {
+  /// Construct a new `ConflictResponseMessage`.
+  pub fn new(member: Node<I, A>) -> Self {
+    Self { member }
+  }
 }
