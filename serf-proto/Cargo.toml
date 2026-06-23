@@ -16,5 +16,10 @@ derive_more.workspace = true
 viewit.workspace = true
 thiserror.workspace = true
 bitflags = "2"
+buffa = { version = "0.7", default-features = false }
+smol_str = { workspace = true }
+
+[build-dependencies]
+buffa-build = "0.7"
 
 [dev-dependencies]
