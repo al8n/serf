@@ -52,3 +52,26 @@ message Filter {
 message NodeIdList {
   repeated string ids = 1;
 }
+
+// JoinMessage is broadcast after a node joins to associate it with a lamport clock.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+message JoinMessage {
+  optional uint64 ltime = 1;
+  bytes           id    = 2;
+}
+
+// LeaveMessage is broadcast to signal the intent to leave.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+message LeaveMessage {
+  optional uint64 ltime = 1;
+  bool            prune = 2;
+  bytes           id    = 3;
+}
+
+// ConflictResponseMessage carries the winning member in a node-name conflict.
+// `member` carries the memberlist_proto::Node<I,A> encoded via Data (opaque bytes).
+message ConflictResponseMessage {
+  bytes member = 1;
+}
