@@ -4,9 +4,19 @@
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
 
-pub use bridge::{BridgeError, user_event_from_pb, user_event_to_pb};
+pub use bridge::{
+  BridgeError,
+  coordinate_from_pb,
+  coordinate_to_pb,
+  filter_from_pb,
+  filter_to_pb,
+  tags_from_pb,
+  tags_to_pb,
+  user_event_from_pb,
+  user_event_to_pb,
+};
 pub use framing::{FrameError, MessageType, decode_message, encode_message};
-pub use typed::UserEventMessage;
+pub use typed::{Coordinate, Filter, QueryFlag, TagFilter, Tags, UserEventMessage};
 
 /// A lamport logical clock value — a monotonically increasing counter used to
 /// order serf events.
