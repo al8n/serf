@@ -1,0 +1,16 @@
+// Wire message schemas for the serf gossip protocol.
+//
+// Wire format is standard protobuf (buffa) — not byte-compatible with serf's old hand-rolled codec; new↔new clusters only.
+
+syntax = "proto3";
+
+package serf.v1;
+
+// UserEventMessage is broadcast when a user-generated event is emitted.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+message UserEventMessage {
+  optional uint64 ltime   = 1;
+  bool            cc      = 2;
+  string          name    = 3;
+  bytes           payload = 4;
+}
