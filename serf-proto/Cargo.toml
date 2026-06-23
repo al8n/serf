@@ -1,0 +1,20 @@
+[package]
+name = "serf-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
+bytes = { workspace = true }
+byteorder.workspace = true
+smallvec.workspace = true
+indexmap.workspace = true
+derive_more.workspace = true
+viewit.workspace = true
+thiserror.workspace = true
+bitflags = "2"
+
+[dev-dependencies]

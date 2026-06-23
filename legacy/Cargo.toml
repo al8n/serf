@@ -1,8 +1,10 @@
 [workspace]
 members = [
-  "serf-proto",
+  "serf-core",
+  "serf",
+  "examples/toyconsul",
+  "fuzz",
 ]
-exclude = ["legacy"]
 resolver = "3"
 
 [workspace.package]
