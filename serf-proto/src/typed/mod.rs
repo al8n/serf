@@ -10,6 +10,8 @@ use smol_str::SmolStr;
 
 use crate::LamportTime;
 use memberlist_proto::Node;
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use memberlist_proto::SecretKey;
 
 /// A user-generated event broadcast through the serf cluster.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -215,6 +217,178 @@ impl<I, A> QueryResponseMessage<I, A> {
   /// Returns `true` if the ACK flag is set (this message is an acknowledgement).
   pub fn ack(&self) -> bool {
     self.flags.contains(QueryFlag::ACK)
+  }
+}
+
+// ── Membership messages ───────────────────────────────────────────────────────
+
+// ── UserEvent ─────────────────────────────────────────────────────────────────
+
+/// A single named user event with an optional payload.
+///
+/// Mirrors the legacy `serf-core` `UserEvent` struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEvent {
+  /// Whether the event may be coalesced with later identical events.
+  pub cc: bool,
+  /// The event name.
+  pub name: SmolStr,
+  /// The event payload.
+  pub payload: Bytes,
+}
+
+// ── UserEvents ────────────────────────────────────────────────────────────────
+
+/// A batch of user events associated with a single lamport clock value.
+///
+/// Serf buffers received events in `UserEvents` entries to prevent re-delivery.
+/// Mirrors the legacy `serf-core` `UserEvents` struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEvents {
+  /// The lamport clock value for this event batch.
+  pub ltime: LamportTime,
+  /// The events in this batch.
+  pub events: Vec<UserEvent>,
+}
+
+// ── PushPullMessage ───────────────────────────────────────────────────────────
+
+/// Full cluster state exchanged during a state-sync (push-pull) operation.
+///
+/// This is the largest serf message but is sent infrequently — only during
+/// the anti-entropy state exchange between two nodes.
+///
+/// Generic over `I`: the node-id type, which must implement
+/// `memberlist_proto::Data` so node-ids can be encoded as opaque proto `bytes`
+/// in the bridge layer.
+///
+/// The `status_ltimes` map is transmitted as a `repeated NodeStatusTime` rather
+/// than a proto3 `map<bytes,uint64>` because proto3 forbids `bytes` map keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPullMessage<I> {
+  /// The lamport clock value of the sending node at the time of the exchange.
+  pub ltime: LamportTime,
+  /// Maps each known node-id to its last-seen status lamport time.
+  pub status_ltimes: Vec<(I, LamportTime)>,
+  /// Wire list of node-ids that have left the cluster.
+  ///
+  /// The codec does NOT dedup this list; the consuming machine is responsible
+  /// for treating it as a set (duplicate entries are idempotent leave events).
+  pub left_members: Vec<I>,
+  /// The lamport clock value for the event subsystem.
+  pub event_ltime: LamportTime,
+  /// Buffered user-event batches.
+  pub events: Vec<UserEvents>,
+  /// The lamport clock value for the query subsystem.
+  pub query_ltime: LamportTime,
+}
+
+impl<I> PushPullMessage<I> {
+  /// Construct a new `PushPullMessage`.
+  pub fn new(
+    ltime: LamportTime,
+    status_ltimes: Vec<(I, LamportTime)>,
+    left_members: Vec<I>,
+    event_ltime: LamportTime,
+    events: Vec<UserEvents>,
+    query_ltime: LamportTime,
+  ) -> Self {
+    Self {
+      ltime,
+      status_ltimes,
+      left_members,
+      event_ltime,
+      events,
+      query_ltime,
+    }
+  }
+}
+
+// ── KeyRequestMessage ─────────────────────────────────────────────────────────
+
+/// Encryption key management request, broadcast to all nodes.
+///
+/// `key` is absent for list-keys requests and present for install/use/remove
+/// operations.
+///
+/// Requires the `aes-gcm` or `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRequestMessage {
+  /// The encryption key, or `None` for a list-keys request.
+  pub key: Option<SecretKey>,
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+impl KeyRequestMessage {
+  /// Construct a new `KeyRequestMessage`.
+  pub fn new(key: Option<SecretKey>) -> Self {
+    Self { key }
+  }
+}
+
+// ── KeyResponseMessage ────────────────────────────────────────────────────────
+
+/// Result of a key operation from a single node.
+///
+/// The aggregation type (`KeyResponse<I>`) is machine-side and is NOT part of
+/// the wire codec; only this per-node response message is encoded on the wire.
+///
+/// Requires the `aes-gcm` or `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyResponseMessage {
+  /// `true` if the operation succeeded on this node.
+  pub result: bool,
+  /// Human-readable result or error description.
+  pub message: SmolStr,
+  /// Installed keys (used by list-keys responses).
+  pub keys: Vec<SecretKey>,
+  /// The current primary key, if reporting it.
+  pub primary_key: Option<SecretKey>,
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+impl KeyResponseMessage {
+  /// Construct a default (failure, no keys) `KeyResponseMessage`.
+  pub fn new() -> Self {
+    Self {
+      result: false,
+      message: SmolStr::default(),
+      keys: Vec::new(),
+      primary_key: None,
+    }
+  }
+}
+
+// ── RelayMessage ──────────────────────────────────────────────────────────────
+
+/// A serf message forwarded through an intermediary node.
+///
+/// The `payload` carries the inner serf framed message verbatim
+/// (`[tag][varint_len][buffa_body]`). The relay target re-decodes it with
+/// `decode_message` without this layer parsing the content.
+///
+/// Generic over `I` (node-id) and `A` (node-address). The `memberlist_proto::Data`
+/// bound is enforced at the bridge layer (`relay_to_pb` / `relay_from_pb`) where
+/// the destination is encoded/decoded as opaque `bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayMessage<I, A> {
+  /// The node to forward the message to.
+  pub destination: Node<I, A>,
+  /// The inner serf framed message, carried unparsed.
+  pub payload: Bytes,
+}
+
+impl<I, A> RelayMessage<I, A> {
+  /// Construct a new `RelayMessage`.
+  pub fn new(destination: Node<I, A>, payload: Bytes) -> Self {
+    Self {
+      destination,
+      payload,
+    }
   }
 }
 

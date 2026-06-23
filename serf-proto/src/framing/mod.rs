@@ -28,7 +28,9 @@ const QUERY_TAG: u8 = 5;
 const QUERY_RESPONSE_TAG: u8 = 6;
 const CONFLICT_RESPONSE_TAG: u8 = 7;
 const RELAY_TAG: u8 = 8;
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 const KEY_REQUEST_TAG: u8 = 9;
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 const KEY_RESPONSE_TAG: u8 = 10;
 
 /// One-byte discriminant that opens every serf message frame.
@@ -36,7 +38,8 @@ const KEY_RESPONSE_TAG: u8 = 10;
 /// Numeric values are identical to the legacy `serf-core` tag constants so
 /// that future mixed-version migration tooling can map them trivially.
 /// `Unknown(u8)` provides forward compatibility for tag values not yet
-/// recognised by this build.
+/// recognised by this build, including key-management messages when this build
+/// was compiled without an encryption backend.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MessageType {
@@ -57,8 +60,18 @@ pub enum MessageType {
   /// Relay — message relayed through an intermediary node.
   Relay,
   /// KeyRequest — encryption key management request.
+  ///
+  /// Requires the `aes-gcm` or `chacha20-poly1305` feature; without an
+  /// encryption backend the tag byte decodes as [`MessageType::Unknown`].
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
   KeyRequest,
   /// KeyResponse — encryption key management response.
+  ///
+  /// Requires the `aes-gcm` or `chacha20-poly1305` feature; without an
+  /// encryption backend the tag byte decodes as [`MessageType::Unknown`].
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
   KeyResponse,
   /// A tag not recognised by this build — preserved for forward compatibility.
   Unknown(u8),
@@ -75,7 +88,9 @@ impl From<u8> for MessageType {
       QUERY_RESPONSE_TAG => Self::QueryResponse,
       CONFLICT_RESPONSE_TAG => Self::ConflictResponse,
       RELAY_TAG => Self::Relay,
+      #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
       KEY_REQUEST_TAG => Self::KeyRequest,
+      #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
       KEY_RESPONSE_TAG => Self::KeyResponse,
       val => Self::Unknown(val),
     }
@@ -93,7 +108,9 @@ impl From<MessageType> for u8 {
       MessageType::QueryResponse => QUERY_RESPONSE_TAG,
       MessageType::ConflictResponse => CONFLICT_RESPONSE_TAG,
       MessageType::Relay => RELAY_TAG,
+      #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
       MessageType::KeyRequest => KEY_REQUEST_TAG,
+      #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
       MessageType::KeyResponse => KEY_RESPONSE_TAG,
       MessageType::Unknown(val) => val,
     }
