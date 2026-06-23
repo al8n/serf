@@ -8,6 +8,8 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 use memberlist_proto::{Data, DataRef, data::DecodeError, data::EncodeError};
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use memberlist_proto::SecretKey;
 use smol_str::SmolStr;
 
 use crate::{
@@ -19,14 +21,20 @@ use crate::{
     Filter,
     JoinMessage,
     LeaveMessage,
+    PushPullMessage,
     QueryFlag,
     QueryMessage,
     QueryResponseMessage,
+    RelayMessage,
     TagFilter,
     Tags,
+    UserEvent,
     UserEventMessage,
+    UserEvents,
   },
 };
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use crate::typed::{KeyRequestMessage, KeyResponseMessage};
 
 // ─── BridgeError ─────────────────────────────────────────────────────────────
 
@@ -449,6 +457,325 @@ where
     id,
     from,
     flags,
+    payload: b.payload.clone(),
+  })
+}
+
+// ─── UserEvent ────────────────────────────────────────────────────────────────
+
+/// Convert a typed [`UserEvent`] → `pb::UserEvent`.
+pub fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
+  pb::UserEvent {
+    cc: t.cc,
+    name: t.name.to_string(),
+    payload: t.payload.clone(),
+    ..Default::default()
+  }
+}
+
+/// Convert `pb::UserEvent` → typed [`UserEvent`].
+pub fn user_event_single_from_pb(b: &pb::UserEvent) -> UserEvent {
+  UserEvent {
+    cc: b.cc,
+    name: SmolStr::from(b.name.as_str()),
+    payload: b.payload.clone(),
+  }
+}
+
+// ─── UserEvents ───────────────────────────────────────────────────────────────
+
+/// Convert a typed [`UserEvents`] → `pb::UserEvents`.
+pub fn user_events_to_pb(t: &UserEvents) -> pb::UserEvents {
+  pb::UserEvents {
+    ltime: Some(t.ltime.into()),
+    events: t.events.iter().map(user_event_single_to_pb).collect(),
+    ..Default::default()
+  }
+}
+
+/// Convert `pb::UserEvents` → typed [`UserEvents`].
+///
+/// Rejects a missing `ltime` and an empty `events` list — a batch with zero
+/// events carries no information and would silently consume buffer history
+/// entries. The legacy `serf-core` invariant is `OneOrMore` (at least one event
+/// per batch); this decoder enforces the same constraint.
+pub fn user_events_from_pb(b: &pb::UserEvents) -> Result<UserEvents, BridgeError> {
+  let ltime = b
+    .ltime
+    .ok_or(BridgeError::MissingField("UserEvents.ltime".into()))?;
+  if b.events.is_empty() {
+    return Err(BridgeError::MissingField("UserEvents.events (must be non-empty)".into()));
+  }
+  Ok(UserEvents {
+    ltime: LamportTime::from(ltime),
+    events: b.events.iter().map(user_event_single_from_pb).collect(),
+  })
+}
+
+// ─── PushPullMessage ─────────────────────────────────────────────────────────
+
+/// Convert a typed [`PushPullMessage<I>`] → `pb::PushPullMessage`.
+///
+/// - `status_ltimes`: each `(I, LamportTime)` pair is encoded as a
+///   `pb::NodeStatusTime` with the node-id in the `id` bytes field.
+/// - `left_members`: each `I` is encoded to opaque `bytes` via
+///   `memberlist_proto::Data`.
+/// - `events`: each [`UserEvents`] batch is encoded via [`user_events_to_pb`].
+pub fn push_pull_to_pb<I>(t: &PushPullMessage<I>) -> Result<pb::PushPullMessage, BridgeError>
+where
+  I: Data,
+{
+  let status_ltimes = t
+    .status_ltimes
+    .iter()
+    .map(|(id, ltime)| {
+      data_to_bytes(id).map(|id_bytes| pb::NodeStatusTime {
+        id: id_bytes,
+        ltime: (*ltime).into(),
+        ..Default::default()
+      })
+    })
+    .collect::<Result<Vec<_>, BridgeError>>()?;
+
+  let left_members = t
+    .left_members
+    .iter()
+    .map(|id| data_to_bytes(id))
+    .collect::<Result<Vec<_>, BridgeError>>()?;
+
+  let events = t.events.iter().map(user_events_to_pb).collect();
+
+  Ok(pb::PushPullMessage {
+    ltime: Some(t.ltime.into()),
+    status_ltimes,
+    left_members,
+    event_ltime: Some(t.event_ltime.into()),
+    events,
+    query_ltime: Some(t.query_ltime.into()),
+    ..Default::default()
+  })
+}
+
+/// Convert `pb::PushPullMessage` → typed [`PushPullMessage<I>`].
+///
+/// Rejects missing `ltime`, `event_ltime`, and `query_ltime` (all required by
+/// the legacy protocol). Decodes each `NodeStatusTime.id` and each
+/// `left_members` entry as `I` via `memberlist_proto::DataRef`.
+pub fn push_pull_from_pb<I>(b: &pb::PushPullMessage) -> Result<PushPullMessage<I>, BridgeError>
+where
+  I: Data,
+{
+  let ltime = b
+    .ltime
+    .ok_or(BridgeError::MissingField("PushPullMessage.ltime".into()))?;
+  let event_ltime = b
+    .event_ltime
+    .ok_or(BridgeError::MissingField("PushPullMessage.event_ltime".into()))?;
+  let query_ltime = b
+    .query_ltime
+    .ok_or(BridgeError::MissingField("PushPullMessage.query_ltime".into()))?;
+
+  let status_ltimes = b
+    .status_ltimes
+    .iter()
+    .map(|nst| {
+      let id: I = data_from_bytes(&nst.id)?;
+      Ok((id, LamportTime::from(nst.ltime)))
+    })
+    .collect::<Result<Vec<(I, LamportTime)>, BridgeError>>()?;
+
+  let left_members = b
+    .left_members
+    .iter()
+    .map(|buf| data_from_bytes::<I>(buf))
+    .collect::<Result<Vec<I>, BridgeError>>()?;
+
+  let events = b
+    .events
+    .iter()
+    .map(user_events_from_pb)
+    .collect::<Result<Vec<UserEvents>, BridgeError>>()?;
+
+  Ok(PushPullMessage {
+    ltime: LamportTime::from(ltime),
+    status_ltimes,
+    left_members,
+    event_ltime: LamportTime::from(event_ltime),
+    events,
+    query_ltime: LamportTime::from(query_ltime),
+  })
+}
+
+// ─── SecretKey ↔ Bytes helpers ───────────────────────────────────────────────
+
+/// Encode a [`SecretKey`] as `[algorithm_tag][raw_key_bytes]`.
+///
+/// The leading algorithm tag byte makes the wire encoding self-describing so
+/// decoding is unambiguous even when two ciphers share the same key length
+/// (e.g. AES-256 and ChaCha20-Poly1305 are both 32 bytes).
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn secret_key_to_bytes(key: &SecretKey) -> Bytes {
+  let raw = key.as_bytes();
+  let mut buf = Vec::with_capacity(1 + raw.len());
+  buf.push(key.algorithm().tag());
+  buf.extend_from_slice(raw);
+  Bytes::from(buf)
+}
+
+/// Decode a [`SecretKey`] from `[algorithm_tag][raw_key_bytes]` wire bytes.
+///
+/// Returns [`BridgeError::InvalidValue`] when the tag is unknown to this build
+/// or the byte count does not match the algorithm's expected key length.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn secret_key_from_bytes(buf: &Bytes) -> Result<SecretKey, BridgeError> {
+  if buf.is_empty() {
+    return Err(BridgeError::InvalidValue(
+      "key bytes must carry at least the algorithm tag".into(),
+    ));
+  }
+  let tag = buf[0];
+  let raw = &buf[1..];
+  match tag {
+    #[cfg(feature = "aes-gcm")]
+    1 => {
+      // AES-GCM: length determines the AES variant.
+      match raw.len() {
+        16 => {
+          let k: [u8; 16] = raw.try_into().unwrap();
+          Ok(SecretKey::Aes128(k))
+        }
+        24 => {
+          let k: [u8; 24] = raw.try_into().unwrap();
+          Ok(SecretKey::Aes192(k))
+        }
+        32 => {
+          let k: [u8; 32] = raw.try_into().unwrap();
+          Ok(SecretKey::Aes256(k))
+        }
+        n => Err(BridgeError::InvalidValue(
+          format!("AES-GCM key must be 16, 24, or 32 bytes; got {n}").into(),
+        )),
+      }
+    }
+    #[cfg(feature = "chacha20-poly1305")]
+    2 => {
+      // ChaCha20-Poly1305: always 32 bytes.
+      if raw.len() != 32 {
+        return Err(BridgeError::InvalidValue(
+          format!("ChaCha20-Poly1305 key must be 32 bytes; got {}", raw.len()).into(),
+        ));
+      }
+      let k: [u8; 32] = raw.try_into().unwrap();
+      Ok(SecretKey::ChaCha20Poly1305(k))
+    }
+    other => Err(BridgeError::InvalidValue(
+      format!("unknown or unsupported algorithm tag {other}").into(),
+    )),
+  }
+}
+
+// ─── KeyRequestMessage ────────────────────────────────────────────────────────
+
+/// Convert a typed [`KeyRequestMessage`] → `pb::KeyRequestMessage`.
+///
+/// The key (if present) is encoded as `[algorithm_tag][raw_key_bytes]` so the
+/// wire encoding is self-describing. Requires the `aes-gcm` or
+/// `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+pub fn key_request_to_pb(t: &KeyRequestMessage) -> pb::KeyRequestMessage {
+  pb::KeyRequestMessage {
+    key: t.key.as_ref().map(secret_key_to_bytes),
+    ..Default::default()
+  }
+}
+
+/// Convert `pb::KeyRequestMessage` → typed [`KeyRequestMessage`].
+///
+/// The key bytes (if present) are decoded as `[algorithm_tag][raw_key_bytes]`.
+/// Returns [`BridgeError::InvalidValue`] if the bytes are present but malformed.
+/// Requires the `aes-gcm` or `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+pub fn key_request_from_pb(b: &pb::KeyRequestMessage) -> Result<KeyRequestMessage, BridgeError> {
+  let key = b.key.as_ref().map(secret_key_from_bytes).transpose()?;
+  Ok(KeyRequestMessage { key })
+}
+
+// ─── KeyResponseMessage ───────────────────────────────────────────────────────
+
+/// Convert a typed [`KeyResponseMessage`] → `pb::KeyResponseMessage`.
+///
+/// Each key is encoded as `[algorithm_tag][raw_key_bytes]`. Requires the
+/// `aes-gcm` or `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+pub fn key_response_to_pb(t: &KeyResponseMessage) -> pb::KeyResponseMessage {
+  pb::KeyResponseMessage {
+    result: t.result,
+    message: t.message.to_string(),
+    keys: t.keys.iter().map(secret_key_to_bytes).collect(),
+    primary_key: t.primary_key.as_ref().map(secret_key_to_bytes),
+    ..Default::default()
+  }
+}
+
+/// Convert `pb::KeyResponseMessage` → typed [`KeyResponseMessage`].
+///
+/// Each key bytes entry is decoded as `[algorithm_tag][raw_key_bytes]`.
+/// Returns [`BridgeError::InvalidValue`] if any entry is malformed. Requires
+/// the `aes-gcm` or `chacha20-poly1305` feature.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+pub fn key_response_from_pb(b: &pb::KeyResponseMessage) -> Result<KeyResponseMessage, BridgeError> {
+  let keys = b
+    .keys
+    .iter()
+    .map(secret_key_from_bytes)
+    .collect::<Result<Vec<SecretKey>, BridgeError>>()?;
+  let primary_key = b
+    .primary_key
+    .as_ref()
+    .map(secret_key_from_bytes)
+    .transpose()?;
+  Ok(KeyResponseMessage {
+    result: b.result,
+    message: SmolStr::from(b.message.as_str()),
+    keys,
+    primary_key,
+  })
+}
+
+// ─── RelayMessage ─────────────────────────────────────────────────────────────
+
+/// Convert a typed [`RelayMessage<I,A>`] → `pb::RelayMessage`.
+///
+/// The `destination: Node<I,A>` is serialised to opaque `bytes` via
+/// `memberlist_proto::Data`. The `payload` bytes are copied verbatim.
+pub fn relay_to_pb<I, A>(t: &RelayMessage<I, A>) -> Result<pb::RelayMessage, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  Ok(pb::RelayMessage {
+    destination: data_to_bytes(&t.destination)?,
+    payload: t.payload.clone(),
+    ..Default::default()
+  })
+}
+
+/// Convert `pb::RelayMessage` → typed [`RelayMessage<I,A>`].
+///
+/// Decodes `destination` as `Node<I,A>` via `memberlist_proto::DataRef`.
+/// The `payload` bytes are preserved verbatim without parsing.
+pub fn relay_from_pb<I, A>(b: &pb::RelayMessage) -> Result<RelayMessage<I, A>, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  let destination: memberlist_proto::Node<I, A> = data_from_bytes(&b.destination)?;
+  Ok(RelayMessage {
+    destination,
     payload: b.payload.clone(),
   })
 }

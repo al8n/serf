@@ -18,6 +18,26 @@ fn message_type_tag_round_trip() {
     (MessageType::QueryResponse, 6),
     (MessageType::ConflictResponse, 7),
     (MessageType::Relay, 8),
+  ];
+
+  for &(ref ty, expected_byte) in cases {
+    let byte = u8::from(*ty);
+    assert_eq!(
+      byte, expected_byte,
+      "{ty:?} should have tag byte {expected_byte}"
+    );
+    assert_eq!(
+      MessageType::from(byte),
+      *ty,
+      "u8 {byte} should round-trip to {ty:?}"
+    );
+  }
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn message_type_key_tag_round_trip() {
+  let cases: &[(MessageType, u8)] = &[
     (MessageType::KeyRequest, 9),
     (MessageType::KeyResponse, 10),
   ];
@@ -34,6 +54,14 @@ fn message_type_tag_round_trip() {
       "u8 {byte} should round-trip to {ty:?}"
     );
   }
+}
+
+/// Without an encryption feature, key tag bytes must decode as Unknown.
+#[cfg(not(any(feature = "aes-gcm", feature = "chacha20-poly1305")))]
+#[test]
+fn message_type_key_tags_are_unknown_without_encryption() {
+  assert_eq!(MessageType::from(9u8), MessageType::Unknown(9));
+  assert_eq!(MessageType::from(10u8), MessageType::Unknown(10));
 }
 
 #[test]

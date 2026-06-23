@@ -100,3 +100,66 @@ message LeaveMessage {
 message ConflictResponseMessage {
   bytes member = 1;
 }
+
+// NodeStatusTime is one entry in the PushPullMessage.status_ltimes repeated field.
+// proto3 map<bytes,...> is not allowed (bytes keys are forbidden), so the
+// status-times map is transmitted as a repeated message instead.
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+message NodeStatusTime {
+  bytes  id    = 1;
+  uint64 ltime = 2;
+}
+
+// UserEvent is a single named event with an optional payload.
+// Mirrors legacy serf-core UserEvent.
+message UserEvent {
+  bool  cc      = 1;
+  string name   = 2;
+  bytes  payload = 3;
+}
+
+// UserEvents is a batch of user events associated with a single lamport clock.
+// Mirrors legacy serf-core UserEvents.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+message UserEvents {
+  optional uint64        ltime  = 1;
+  repeated UserEvent     events = 2;
+}
+
+// PushPullMessage carries the full cluster state during a state-sync exchange.
+// `optional` on the three lamport clocks because the decoder must reject missing values.
+// `status_ltimes` is a repeated NodeStatusTime rather than map<bytes,...> because
+// proto3 map keys cannot be bytes.
+message PushPullMessage {
+  optional uint64            ltime         = 1;
+  repeated NodeStatusTime    status_ltimes = 2;
+  repeated bytes             left_members  = 3;
+  optional uint64            event_ltime   = 4;
+  repeated UserEvents        events        = 5;
+  optional uint64            query_ltime   = 6;
+}
+
+// KeyRequestMessage is broadcast to all nodes as part of a key query operation.
+// `key` is absent for list-keys requests; present for install/use/remove operations.
+message KeyRequestMessage {
+  optional bytes key = 1;
+}
+
+// KeyResponseMessage carries the result of a key operation from one node.
+// `keys` carries encoded SecretKey values (each as opaque bytes).
+// `primary_key` is absent when the primary key is not being reported.
+message KeyResponseMessage {
+  bool             result      = 1;
+  string           message     = 2;
+  repeated bytes   keys        = 3;
+  optional bytes   primary_key = 4;
+}
+
+// RelayMessage wraps a serf message for forwarding to a destination node.
+// `destination` carries the Node<I,A> encoded via memberlist_proto::Data (opaque bytes).
+// `payload` carries the inner serf framed message verbatim (tag + varint-len + buffa body);
+// the relay target re-decodes it with decode_message.
+message RelayMessage {
+  bytes destination = 1;
+  bytes payload     = 2;
+}
