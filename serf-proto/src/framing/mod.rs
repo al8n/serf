@@ -64,14 +64,20 @@ pub enum MessageType {
   /// Requires the `aes-gcm` or `chacha20-poly1305` feature; without an
   /// encryption backend the tag byte decodes as [`MessageType::Unknown`].
   #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-  #[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
   KeyRequest,
   /// KeyResponse — encryption key management response.
   ///
   /// Requires the `aes-gcm` or `chacha20-poly1305` feature; without an
   /// encryption backend the tag byte decodes as [`MessageType::Unknown`].
   #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-  #[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
   KeyResponse,
   /// A tag not recognised by this build — preserved for forward compatibility.
   Unknown(u8),
@@ -119,8 +125,8 @@ impl From<MessageType> for u8 {
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
-/// The `(available, required)` byte-count pair carried by
-/// [`FrameError::Incomplete`].
+/// The `(available, required)` byte-count pair carried by the
+/// `FrameError::Incomplete` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("incomplete frame: {available} bytes available, {required} required")]
 pub struct IncompleteFrame {
@@ -132,7 +138,10 @@ impl IncompleteFrame {
   /// Construct an incomplete-frame payload.
   #[inline(always)]
   pub const fn new(available: usize, required: usize) -> Self {
-    Self { available, required }
+    Self {
+      available,
+      required,
+    }
   }
 
   /// Bytes available in the buffer.
@@ -148,7 +157,9 @@ impl IncompleteFrame {
   }
 }
 
-/// Errors returned by [`encode_message`] and [`decode_message`].
+/// Errors returned by the serf plain-frame encoder / decoder underlying
+/// [`AnyMessage::encode`](crate::AnyMessage::encode) and
+/// [`AnyMessage::decode`](crate::AnyMessage::decode).
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum FrameError {
@@ -164,7 +175,9 @@ pub enum FrameError {
   /// The buffa `encoded_len` / actual-write lengths disagree, which would
   /// desynchronize the receiver's length prefix. Carries the actual number of
   /// bytes written by `buffa::Message::encode`.
-  #[error("frame encode length mismatch: encoded_len predicted {0} bytes but encode wrote a different count")]
+  #[error(
+    "frame encode length mismatch: encoded_len predicted {0} bytes but encode wrote a different count"
+  )]
   FrameTooLarge(usize),
   /// The buffa decoder rejected the body bytes.
   #[error("buffa decode error: body bytes could not be decoded")]
@@ -201,7 +214,10 @@ fn decode_varint_u32(buf: &[u8]) -> Result<(u32, usize), FrameError> {
     shift += 7;
   }
   // Fell through without a terminating byte — truncated length prefix.
-  Err(FrameError::Incomplete(IncompleteFrame::new(buf.len(), buf.len() + 1)))
+  Err(FrameError::Incomplete(IncompleteFrame::new(
+    buf.len(),
+    buf.len() + 1,
+  )))
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -211,7 +227,7 @@ fn decode_varint_u32(buf: &[u8]) -> Result<(u32, usize), FrameError> {
 /// Returns a freshly allocated `Vec<u8>` containing the complete frame.
 /// Fails only when the buffa body length exceeds `u32::MAX` (which buffa's
 /// `u32` return type for `encoded_len` already guarantees cannot happen).
-pub fn encode_message<M>(ty: MessageType, msg: &M) -> Result<Vec<u8>, FrameError>
+pub(crate) fn encode_message<M>(ty: MessageType, msg: &M) -> Result<Vec<u8>, FrameError>
 where
   M: buffa::Message,
 {
@@ -245,7 +261,7 @@ where
 ///
 /// `bytes_consumed` is the total number of bytes read (tag + varint + body),
 /// allowing a streaming caller to advance its read cursor.
-pub fn decode_message(frame: &Bytes) -> Result<(MessageType, Bytes, usize), FrameError> {
+pub(crate) fn decode_message(frame: &Bytes) -> Result<(MessageType, Bytes, usize), FrameError> {
   let buf = frame.as_ref();
   if buf.is_empty() {
     return Err(FrameError::Empty);
@@ -256,16 +272,24 @@ pub fn decode_message(frame: &Bytes) -> Result<(MessageType, Bytes, usize), Fram
   let (body_len, varint_bytes) = match decode_varint_u32(&buf[1..]) {
     Ok(v) => v,
     Err(FrameError::Incomplete(_)) => {
-      return Err(FrameError::Incomplete(IncompleteFrame::new(buf.len(), buf.len() + 1)));
+      return Err(FrameError::Incomplete(IncompleteFrame::new(
+        buf.len(),
+        buf.len() + 1,
+      )));
     }
     Err(e) => return Err(e),
   };
 
   let header_len = 1 + varint_bytes;
-  let frame_end = header_len + body_len as usize;
+  let frame_end = header_len
+    .checked_add(body_len as usize)
+    .ok_or(FrameError::VarintOverflow)?;
 
   if buf.len() < frame_end {
-    return Err(FrameError::Incomplete(IncompleteFrame::new(buf.len(), frame_end)));
+    return Err(FrameError::Incomplete(IncompleteFrame::new(
+      buf.len(),
+      frame_end,
+    )));
   }
 
   // Zero-copy slice of the body out of the `Bytes` allocation.

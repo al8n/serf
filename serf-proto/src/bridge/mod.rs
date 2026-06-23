@@ -7,34 +7,27 @@
 use std::borrow::Cow;
 
 use bytes::Bytes;
-use memberlist_proto::{Data, DataRef, data::DecodeError, data::EncodeError};
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 use memberlist_proto::SecretKey;
+use memberlist_proto::{
+  Data, DataRef,
+  data::{DecodeError, EncodeError},
+};
 use smol_str::SmolStr;
 
+#[cfg(test)]
+use crate::typed::{Coordinate, Tags};
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use crate::typed::{KeyRequestMessage, KeyResponseMessage};
 use crate::{
   LamportTime,
   messages::serf::v1 as pb,
   typed::{
-    Coordinate,
-    ConflictResponseMessage,
-    Filter,
-    JoinMessage,
-    LeaveMessage,
-    PushPullMessage,
-    QueryFlag,
-    QueryMessage,
-    QueryResponseMessage,
-    RelayMessage,
-    TagFilter,
-    Tags,
-    UserEvent,
-    UserEventMessage,
+    ConflictResponseMessage, Filter, JoinMessage, LeaveMessage, PushPullMessage, QueryFlag,
+    QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, UserEvent, UserEventMessage,
     UserEvents,
   },
 };
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-use crate::typed::{KeyRequestMessage, KeyResponseMessage};
 
 // ─── BridgeError ─────────────────────────────────────────────────────────────
 
@@ -62,7 +55,7 @@ pub enum BridgeError {
 // ─── UserEventMessage ────────────────────────────────────────────────────────
 
 /// Convert a typed [`UserEventMessage`] → `pb::UserEventMessage`.
-pub fn user_event_to_pb(t: &UserEventMessage) -> pb::UserEventMessage {
+pub(crate) fn user_event_to_pb(t: &UserEventMessage) -> pb::UserEventMessage {
   pb::UserEventMessage {
     ltime: Some(t.ltime.into()),
     cc: t.cc,
@@ -73,7 +66,9 @@ pub fn user_event_to_pb(t: &UserEventMessage) -> pb::UserEventMessage {
 }
 
 /// Convert `pb::UserEventMessage` → typed [`UserEventMessage`].
-pub fn user_event_from_pb(b: &pb::UserEventMessage) -> Result<UserEventMessage, BridgeError> {
+pub(crate) fn user_event_from_pb(
+  b: &pb::UserEventMessage,
+) -> Result<UserEventMessage, BridgeError> {
   let ltime = b
     .ltime
     .ok_or(BridgeError::MissingField("UserEventMessage.ltime".into()))?;
@@ -88,7 +83,8 @@ pub fn user_event_from_pb(b: &pb::UserEventMessage) -> Result<UserEventMessage, 
 // ─── Coordinate ──────────────────────────────────────────────────────────────
 
 /// Convert a typed [`Coordinate`] → `pb::Coordinate`.
-pub fn coordinate_to_pb(t: &Coordinate) -> pb::Coordinate {
+#[cfg(test)]
+pub(crate) fn coordinate_to_pb(t: &Coordinate) -> pb::Coordinate {
   pb::Coordinate {
     portion: t.vec.clone(),
     error: t.error,
@@ -99,7 +95,8 @@ pub fn coordinate_to_pb(t: &Coordinate) -> pb::Coordinate {
 }
 
 /// Convert `pb::Coordinate` → typed [`Coordinate`].
-pub fn coordinate_from_pb(b: &pb::Coordinate) -> Coordinate {
+#[cfg(test)]
+pub(crate) fn coordinate_from_pb(b: &pb::Coordinate) -> Coordinate {
   Coordinate {
     vec: b.portion.clone(),
     error: b.error,
@@ -111,15 +108,21 @@ pub fn coordinate_from_pb(b: &pb::Coordinate) -> Coordinate {
 // ─── Tags ─────────────────────────────────────────────────────────────────────
 
 /// Convert typed [`Tags`] → `pb::Tags`.
-pub fn tags_to_pb(t: &Tags) -> pb::Tags {
+#[cfg(test)]
+pub(crate) fn tags_to_pb(t: &Tags) -> pb::Tags {
   pb::Tags {
-    entries: t.0.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    entries: t
+      .0
+      .iter()
+      .map(|(k, v)| (k.to_string(), v.to_string()))
+      .collect(),
     ..Default::default()
   }
 }
 
 /// Convert `pb::Tags` → typed [`Tags`].
-pub fn tags_from_pb(b: &pb::Tags) -> Tags {
+#[cfg(test)]
+pub(crate) fn tags_from_pb(b: &pb::Tags) -> Tags {
   Tags(
     b.entries
       .iter()
@@ -134,7 +137,7 @@ pub fn tags_from_pb(b: &pb::Tags) -> Tags {
 ///
 /// The node-id type `I` is encoded as opaque `bytes` via `memberlist_proto::Data`
 /// for the `Id` variant; `Tag` variants encode as before.
-pub fn filter_to_pb<I>(t: &Filter<I>) -> Result<pb::Filter, BridgeError>
+pub(crate) fn filter_to_pb<I>(t: &Filter<I>) -> Result<pb::Filter, BridgeError>
 where
   I: Data,
 {
@@ -164,7 +167,7 @@ where
 /// Convert `pb::Filter` → typed [`Filter<I>`].
 ///
 /// The `Id` variant decodes each `bytes` entry as `I` via `memberlist_proto::DataRef`.
-pub fn filter_from_pb<I>(b: &pb::Filter) -> Result<Filter<I>, BridgeError>
+pub(crate) fn filter_from_pb<I>(b: &pb::Filter) -> Result<Filter<I>, BridgeError>
 where
   I: Data,
 {
@@ -189,27 +192,28 @@ where
 
 /// Encode a `memberlist_proto::Data` value to a raw `Bytes` buffer (no length prefix).
 ///
-/// Allocates a buffer sized by `encoded_len`, writes the encoding via
-/// `encode`, and wraps it in `Bytes`. This mirrors the pattern in
+/// Delegates to [`Data::encode_to_bytes`], which allocates a correctly-sized
+/// buffer and returns it as `Bytes`. This mirrors the pattern in
 /// `memberlist_proto::bridge` for serialising opaque `I`/`A` fields.
 fn data_to_bytes<T>(val: &T) -> Result<Bytes, BridgeError>
 where
   T: Data,
 {
-  let mut buf = vec![0u8; val.encoded_len()];
-  val.encode(&mut buf)?;
-  Ok(Bytes::from(buf))
+  Ok(val.encode_to_bytes()?)
 }
 
 /// Decode a `memberlist_proto::Data` value from raw bytes (no length prefix).
 ///
+/// Accepts any `&[u8]` slice — the caller may pass a `Bytes` ref via
+/// `buf.as_ref()` or a plain slice directly.
+///
 /// Rejects trailing data: the whole slice must be consumed so a malformed
 /// wire field is caught at the wire→machine boundary.
-fn data_from_bytes<T>(buf: &Bytes) -> Result<T, BridgeError>
+fn data_from_bytes<T>(buf: &[u8]) -> Result<T, BridgeError>
 where
   T: Data,
 {
-  let (bytes_read, val) = <T::Ref<'_> as DataRef<'_, T>>::decode(buf.as_ref())?;
+  let (bytes_read, val) = <T::Ref<'_> as DataRef<'_, T>>::decode(buf)?;
   if bytes_read != buf.len() {
     return Err(BridgeError::Decode(DecodeError::custom(format!(
       "trailing data in encoded field: decoder consumed {bytes_read} of {} bytes",
@@ -224,29 +228,33 @@ where
 /// Convert a typed [`JoinMessage<I>`] → `pb::JoinMessage`.
 ///
 /// The node-id `I` is serialised to opaque `bytes` via `memberlist_proto::Data`.
-pub fn join_to_pb<I>(t: &JoinMessage<I>) -> Result<pb::JoinMessage, BridgeError>
+pub(crate) fn join_to_pb<I>(t: &JoinMessage<I>) -> Result<pb::JoinMessage, BridgeError>
 where
   I: Data,
 {
   Ok(pb::JoinMessage {
     ltime: Some(t.ltime.into()),
-    id: data_to_bytes(&t.id)?,
+    id: Some(data_to_bytes(&t.id)?),
     ..Default::default()
   })
 }
 
 /// Convert `pb::JoinMessage` → typed [`JoinMessage<I>`].
 ///
-/// Rejects a missing `ltime` (required field). The `id` bytes are decoded via
-/// `memberlist_proto::DataRef`.
-pub fn join_from_pb<I>(b: &pb::JoinMessage) -> Result<JoinMessage<I>, BridgeError>
+/// Rejects a missing `ltime` and a missing `id` (both required fields). The
+/// `id` bytes are decoded via `memberlist_proto::DataRef`.
+pub(crate) fn join_from_pb<I>(b: &pb::JoinMessage) -> Result<JoinMessage<I>, BridgeError>
 where
   I: Data,
 {
   let ltime = b
     .ltime
     .ok_or(BridgeError::MissingField("JoinMessage.ltime".into()))?;
-  let id: I = data_from_bytes(&b.id)?;
+  let id_bytes = b
+    .id
+    .as_ref()
+    .ok_or(BridgeError::MissingField("JoinMessage.id".into()))?;
+  let id: I = data_from_bytes(id_bytes)?;
   Ok(JoinMessage {
     ltime: LamportTime::from(ltime),
     id,
@@ -258,30 +266,34 @@ where
 /// Convert a typed [`LeaveMessage<I>`] → `pb::LeaveMessage`.
 ///
 /// The node-id `I` is serialised to opaque `bytes` via `memberlist_proto::Data`.
-pub fn leave_to_pb<I>(t: &LeaveMessage<I>) -> Result<pb::LeaveMessage, BridgeError>
+pub(crate) fn leave_to_pb<I>(t: &LeaveMessage<I>) -> Result<pb::LeaveMessage, BridgeError>
 where
   I: Data,
 {
   Ok(pb::LeaveMessage {
     ltime: Some(t.ltime.into()),
     prune: t.prune,
-    id: data_to_bytes(&t.id)?,
+    id: Some(data_to_bytes(&t.id)?),
     ..Default::default()
   })
 }
 
 /// Convert `pb::LeaveMessage` → typed [`LeaveMessage<I>`].
 ///
-/// Rejects a missing `ltime` (required field). The `id` bytes are decoded via
-/// `memberlist_proto::DataRef`.
-pub fn leave_from_pb<I>(b: &pb::LeaveMessage) -> Result<LeaveMessage<I>, BridgeError>
+/// Rejects a missing `ltime` and a missing `id` (both required fields). The
+/// `id` bytes are decoded via `memberlist_proto::DataRef`.
+pub(crate) fn leave_from_pb<I>(b: &pb::LeaveMessage) -> Result<LeaveMessage<I>, BridgeError>
 where
   I: Data,
 {
   let ltime = b
     .ltime
     .ok_or(BridgeError::MissingField("LeaveMessage.ltime".into()))?;
-  let id: I = data_from_bytes(&b.id)?;
+  let id_bytes = b
+    .id
+    .as_ref()
+    .ok_or(BridgeError::MissingField("LeaveMessage.id".into()))?;
+  let id: I = data_from_bytes(id_bytes)?;
   Ok(LeaveMessage {
     ltime: LamportTime::from(ltime),
     id,
@@ -295,7 +307,7 @@ where
 ///
 /// The `Node<I,A>` member is serialised to opaque `bytes` via
 /// `memberlist_proto::Data`.
-pub fn conflict_response_to_pb<I, A>(
+pub(crate) fn conflict_response_to_pb<I, A>(
   t: &ConflictResponseMessage<I, A>,
 ) -> Result<pb::ConflictResponseMessage, BridgeError>
 where
@@ -303,22 +315,26 @@ where
   A: Data,
 {
   Ok(pb::ConflictResponseMessage {
-    member: data_to_bytes(&t.member)?,
+    member: Some(data_to_bytes(&t.member)?),
     ..Default::default()
   })
 }
 
 /// Convert `pb::ConflictResponseMessage` → typed [`ConflictResponseMessage<I,A>`].
 ///
-/// The `member` bytes are decoded as a `Node<I,A>` via `memberlist_proto::DataRef`.
-pub fn conflict_response_from_pb<I, A>(
+/// Rejects a missing `member` (required field). The `member` bytes are decoded
+/// as a `Node<I,A>` via `memberlist_proto::DataRef`.
+pub(crate) fn conflict_response_from_pb<I, A>(
   b: &pb::ConflictResponseMessage,
 ) -> Result<ConflictResponseMessage<I, A>, BridgeError>
 where
   I: Data,
   A: Data,
 {
-  let member: memberlist_proto::Node<I, A> = data_from_bytes(&b.member)?;
+  let member_bytes = b.member.as_ref().ok_or(BridgeError::MissingField(
+    "ConflictResponseMessage.member".into(),
+  ))?;
+  let member: memberlist_proto::Node<I, A> = data_from_bytes(member_bytes)?;
   Ok(ConflictResponseMessage { member })
 }
 
@@ -330,7 +346,7 @@ where
 /// - Each `Filter<I>` in `filters` is encoded via [`filter_to_pb`].
 /// - `timeout` is stored as nanoseconds in a `uint64`.
 /// - `flags` is stored as the raw `u32` bit-pattern.
-pub fn query_to_pb<I, A>(t: &QueryMessage<I, A>) -> Result<pb::QueryMessage, BridgeError>
+pub(crate) fn query_to_pb<I, A>(t: &QueryMessage<I, A>) -> Result<pb::QueryMessage, BridgeError>
 where
   I: Data,
   A: Data,
@@ -341,14 +357,18 @@ where
     .map(|f| filter_to_pb::<I>(f))
     .collect::<Result<Vec<pb::Filter>, BridgeError>>()?;
 
+  let timeout_nanos = u64::try_from(t.timeout.as_nanos()).map_err(|_| {
+    BridgeError::InvalidValue("QueryMessage.timeout exceeds u64::MAX nanoseconds".into())
+  })?;
+
   Ok(pb::QueryMessage {
     ltime: Some(t.ltime.into()),
     id: Some(t.id),
-    from: data_to_bytes(&t.from)?,
+    from: Some(data_to_bytes(&t.from)?),
     filters,
     flags: Some(t.flags.bits()),
     relay_factor: Some(t.relay_factor as u32),
-    timeout_nanos: Some(t.timeout.as_nanos() as u64),
+    timeout_nanos: Some(timeout_nanos),
     name: t.name.to_string(),
     payload: t.payload.clone(),
     ..Default::default()
@@ -357,10 +377,11 @@ where
 
 /// Convert `pb::QueryMessage` → typed [`QueryMessage<I,A>`].
 ///
-/// Rejects missing `ltime`, `id`, `flags`, `relay_factor`, and `timeout_nanos`
-/// (all required by the legacy protocol). Rejects `relay_factor` values that
-/// exceed `u8::MAX`. Decodes `from` as `Node<I,A>` and each `Filter` via [`filter_from_pb`].
-pub fn query_from_pb<I, A>(b: &pb::QueryMessage) -> Result<QueryMessage<I, A>, BridgeError>
+/// Rejects missing `ltime`, `id`, `from`, `flags`, `relay_factor`, and
+/// `timeout_nanos` (all required by the legacy protocol). Rejects `relay_factor`
+/// values that exceed `u8::MAX`. Decodes `from` as `Node<I,A>` and each `Filter`
+/// via [`filter_from_pb`].
+pub(crate) fn query_from_pb<I, A>(b: &pb::QueryMessage) -> Result<QueryMessage<I, A>, BridgeError>
 where
   I: Data,
   A: Data,
@@ -371,7 +392,11 @@ where
   let id = b
     .id
     .ok_or(BridgeError::MissingField("QueryMessage.id".into()))?;
-  let from: memberlist_proto::Node<I, A> = data_from_bytes(&b.from)?;
+  let from_bytes = b
+    .from
+    .as_ref()
+    .ok_or(BridgeError::MissingField("QueryMessage.from".into()))?;
+  let from: memberlist_proto::Node<I, A> = data_from_bytes(from_bytes)?;
   let filters = b
     .filters
     .iter()
@@ -381,16 +406,14 @@ where
     b.flags
       .ok_or(BridgeError::MissingField("QueryMessage.flags".into()))?,
   );
-  let relay_factor = u8::try_from(
-    b.relay_factor
-      .ok_or(BridgeError::MissingField("QueryMessage.relay_factor".into()))?,
-  )
+  let relay_factor = u8::try_from(b.relay_factor.ok_or(BridgeError::MissingField(
+    "QueryMessage.relay_factor".into(),
+  ))?)
   .map_err(|_| BridgeError::InvalidValue("QueryMessage.relay_factor exceeds u8::MAX".into()))?;
   // Safe: query timeouts are measured in seconds to minutes, well within u64::MAX nanoseconds.
-  let timeout = std::time::Duration::from_nanos(
-    b.timeout_nanos
-      .ok_or(BridgeError::MissingField("QueryMessage.timeout_nanos".into()))?,
-  );
+  let timeout = std::time::Duration::from_nanos(b.timeout_nanos.ok_or(
+    BridgeError::MissingField("QueryMessage.timeout_nanos".into()),
+  )?);
 
   Ok(QueryMessage {
     ltime: LamportTime::from(ltime),
@@ -411,7 +434,7 @@ where
 ///
 /// - `from: Node<I,A>` is serialised to opaque `bytes` via `memberlist_proto::Data`.
 /// - `flags` is stored as the raw `u32` bit-pattern.
-pub fn query_response_to_pb<I, A>(
+pub(crate) fn query_response_to_pb<I, A>(
   t: &QueryResponseMessage<I, A>,
 ) -> Result<pb::QueryResponseMessage, BridgeError>
 where
@@ -421,7 +444,7 @@ where
   Ok(pb::QueryResponseMessage {
     ltime: Some(t.ltime.into()),
     id: Some(t.id),
-    from: data_to_bytes(&t.from)?,
+    from: Some(data_to_bytes(&t.from)?),
     flags: Some(t.flags.bits()),
     payload: t.payload.clone(),
     ..Default::default()
@@ -430,27 +453,29 @@ where
 
 /// Convert `pb::QueryResponseMessage` → typed [`QueryResponseMessage<I,A>`].
 ///
-/// Rejects missing `ltime`, `id`, and `flags` (all required by the legacy protocol).
-/// Decodes `from` as `Node<I,A>` via `memberlist_proto::DataRef`. Flags are
-/// decoded with `from_bits_retain` to preserve any future extension bits.
-pub fn query_response_from_pb<I, A>(
+/// Rejects missing `ltime`, `id`, `from`, and `flags` (all required by the
+/// legacy protocol). Decodes `from` as `Node<I,A>` via `memberlist_proto::DataRef`.
+/// Flags are decoded with `from_bits_retain` to preserve any future extension bits.
+pub(crate) fn query_response_from_pb<I, A>(
   b: &pb::QueryResponseMessage,
 ) -> Result<QueryResponseMessage<I, A>, BridgeError>
 where
   I: Data,
   A: Data,
 {
-  let ltime = b
-    .ltime
-    .ok_or(BridgeError::MissingField("QueryResponseMessage.ltime".into()))?;
+  let ltime = b.ltime.ok_or(BridgeError::MissingField(
+    "QueryResponseMessage.ltime".into(),
+  ))?;
   let id = b
     .id
     .ok_or(BridgeError::MissingField("QueryResponseMessage.id".into()))?;
-  let from: memberlist_proto::Node<I, A> = data_from_bytes(&b.from)?;
-  let flags = QueryFlag::from_bits_retain(
-    b.flags
-      .ok_or(BridgeError::MissingField("QueryResponseMessage.flags".into()))?,
-  );
+  let from_bytes = b.from.as_ref().ok_or(BridgeError::MissingField(
+    "QueryResponseMessage.from".into(),
+  ))?;
+  let from: memberlist_proto::Node<I, A> = data_from_bytes(from_bytes)?;
+  let flags = QueryFlag::from_bits_retain(b.flags.ok_or(BridgeError::MissingField(
+    "QueryResponseMessage.flags".into(),
+  ))?);
 
   Ok(QueryResponseMessage {
     ltime: LamportTime::from(ltime),
@@ -464,9 +489,8 @@ where
 // ─── UserEvent ────────────────────────────────────────────────────────────────
 
 /// Convert a typed [`UserEvent`] → `pb::UserEvent`.
-pub fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
+pub(crate) fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
   pb::UserEvent {
-    cc: t.cc,
     name: t.name.to_string(),
     payload: t.payload.clone(),
     ..Default::default()
@@ -474,9 +498,8 @@ pub fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
 }
 
 /// Convert `pb::UserEvent` → typed [`UserEvent`].
-pub fn user_event_single_from_pb(b: &pb::UserEvent) -> UserEvent {
+pub(crate) fn user_event_single_from_pb(b: &pb::UserEvent) -> UserEvent {
   UserEvent {
-    cc: b.cc,
     name: SmolStr::from(b.name.as_str()),
     payload: b.payload.clone(),
   }
@@ -485,7 +508,7 @@ pub fn user_event_single_from_pb(b: &pb::UserEvent) -> UserEvent {
 // ─── UserEvents ───────────────────────────────────────────────────────────────
 
 /// Convert a typed [`UserEvents`] → `pb::UserEvents`.
-pub fn user_events_to_pb(t: &UserEvents) -> pb::UserEvents {
+pub(crate) fn user_events_to_pb(t: &UserEvents) -> pb::UserEvents {
   pb::UserEvents {
     ltime: Some(t.ltime.into()),
     events: t.events.iter().map(user_event_single_to_pb).collect(),
@@ -499,12 +522,14 @@ pub fn user_events_to_pb(t: &UserEvents) -> pb::UserEvents {
 /// events carries no information and would silently consume buffer history
 /// entries. The legacy `serf-core` invariant is `OneOrMore` (at least one event
 /// per batch); this decoder enforces the same constraint.
-pub fn user_events_from_pb(b: &pb::UserEvents) -> Result<UserEvents, BridgeError> {
+pub(crate) fn user_events_from_pb(b: &pb::UserEvents) -> Result<UserEvents, BridgeError> {
   let ltime = b
     .ltime
     .ok_or(BridgeError::MissingField("UserEvents.ltime".into()))?;
   if b.events.is_empty() {
-    return Err(BridgeError::MissingField("UserEvents.events (must be non-empty)".into()));
+    return Err(BridgeError::MissingField(
+      "UserEvents.events (must be non-empty)".into(),
+    ));
   }
   Ok(UserEvents {
     ltime: LamportTime::from(ltime),
@@ -521,7 +546,7 @@ pub fn user_events_from_pb(b: &pb::UserEvents) -> Result<UserEvents, BridgeError
 /// - `left_members`: each `I` is encoded to opaque `bytes` via
 ///   `memberlist_proto::Data`.
 /// - `events`: each [`UserEvents`] batch is encoded via [`user_events_to_pb`].
-pub fn push_pull_to_pb<I>(t: &PushPullMessage<I>) -> Result<pb::PushPullMessage, BridgeError>
+pub(crate) fn push_pull_to_pb<I>(t: &PushPullMessage<I>) -> Result<pb::PushPullMessage, BridgeError>
 where
   I: Data,
 {
@@ -530,8 +555,8 @@ where
     .iter()
     .map(|(id, ltime)| {
       data_to_bytes(id).map(|id_bytes| pb::NodeStatusTime {
-        id: id_bytes,
-        ltime: (*ltime).into(),
+        id: Some(id_bytes),
+        ltime: Some((*ltime).into()),
         ..Default::default()
       })
     })
@@ -558,29 +583,39 @@ where
 
 /// Convert `pb::PushPullMessage` → typed [`PushPullMessage<I>`].
 ///
-/// Rejects missing `ltime`, `event_ltime`, and `query_ltime` (all required by
-/// the legacy protocol). Decodes each `NodeStatusTime.id` and each
-/// `left_members` entry as `I` via `memberlist_proto::DataRef`.
-pub fn push_pull_from_pb<I>(b: &pb::PushPullMessage) -> Result<PushPullMessage<I>, BridgeError>
+/// Rejects missing `ltime`, `event_ltime`, `query_ltime`, and each
+/// `NodeStatusTime.id` / `NodeStatusTime.ltime` (all required by the legacy
+/// protocol). Decodes each `NodeStatusTime.id` and each `left_members` entry as
+/// `I` via `memberlist_proto::DataRef`.
+pub(crate) fn push_pull_from_pb<I>(
+  b: &pb::PushPullMessage,
+) -> Result<PushPullMessage<I>, BridgeError>
 where
   I: Data,
 {
   let ltime = b
     .ltime
     .ok_or(BridgeError::MissingField("PushPullMessage.ltime".into()))?;
-  let event_ltime = b
-    .event_ltime
-    .ok_or(BridgeError::MissingField("PushPullMessage.event_ltime".into()))?;
-  let query_ltime = b
-    .query_ltime
-    .ok_or(BridgeError::MissingField("PushPullMessage.query_ltime".into()))?;
+  let event_ltime = b.event_ltime.ok_or(BridgeError::MissingField(
+    "PushPullMessage.event_ltime".into(),
+  ))?;
+  let query_ltime = b.query_ltime.ok_or(BridgeError::MissingField(
+    "PushPullMessage.query_ltime".into(),
+  ))?;
 
   let status_ltimes = b
     .status_ltimes
     .iter()
     .map(|nst| {
-      let id: I = data_from_bytes(&nst.id)?;
-      Ok((id, LamportTime::from(nst.ltime)))
+      let id_bytes = nst
+        .id
+        .as_ref()
+        .ok_or(BridgeError::MissingField("NodeStatusTime.id".into()))?;
+      let id: I = data_from_bytes(id_bytes)?;
+      let ltime = nst
+        .ltime
+        .ok_or(BridgeError::MissingField("NodeStatusTime.ltime".into()))?;
+      Ok((id, LamportTime::from(ltime)))
     })
     .collect::<Result<Vec<(I, LamportTime)>, BridgeError>>()?;
 
@@ -613,13 +648,19 @@ where
 /// The leading algorithm tag byte makes the wire encoding self-describing so
 /// decoding is unambiguous even when two ciphers share the same key length
 /// (e.g. AES-256 and ChaCha20-Poly1305 are both 32 bytes).
+///
+/// The transient plaintext buffer is zeroed before it is freed so the raw key
+/// material does not linger in heap memory after this call returns.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 fn secret_key_to_bytes(key: &SecretKey) -> Bytes {
+  use zeroize::Zeroize as _;
   let raw = key.as_bytes();
   let mut buf = Vec::with_capacity(1 + raw.len());
   buf.push(key.algorithm().tag());
   buf.extend_from_slice(raw);
-  Bytes::from(buf)
+  let out = Bytes::copy_from_slice(&buf);
+  buf.zeroize();
+  out
 }
 
 /// Decode a [`SecretKey`] from `[algorithm_tag][raw_key_bytes]` wire bytes.
@@ -682,8 +723,7 @@ fn secret_key_from_bytes(buf: &Bytes) -> Result<SecretKey, BridgeError> {
 /// wire encoding is self-describing. Requires the `aes-gcm` or
 /// `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-pub fn key_request_to_pb(t: &KeyRequestMessage) -> pb::KeyRequestMessage {
+pub(crate) fn key_request_to_pb(t: &KeyRequestMessage) -> pb::KeyRequestMessage {
   pb::KeyRequestMessage {
     key: t.key.as_ref().map(secret_key_to_bytes),
     ..Default::default()
@@ -696,8 +736,9 @@ pub fn key_request_to_pb(t: &KeyRequestMessage) -> pb::KeyRequestMessage {
 /// Returns [`BridgeError::InvalidValue`] if the bytes are present but malformed.
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-pub fn key_request_from_pb(b: &pb::KeyRequestMessage) -> Result<KeyRequestMessage, BridgeError> {
+pub(crate) fn key_request_from_pb(
+  b: &pb::KeyRequestMessage,
+) -> Result<KeyRequestMessage, BridgeError> {
   let key = b.key.as_ref().map(secret_key_from_bytes).transpose()?;
   Ok(KeyRequestMessage { key })
 }
@@ -709,8 +750,7 @@ pub fn key_request_from_pb(b: &pb::KeyRequestMessage) -> Result<KeyRequestMessag
 /// Each key is encoded as `[algorithm_tag][raw_key_bytes]`. Requires the
 /// `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-pub fn key_response_to_pb(t: &KeyResponseMessage) -> pb::KeyResponseMessage {
+pub(crate) fn key_response_to_pb(t: &KeyResponseMessage) -> pb::KeyResponseMessage {
   pb::KeyResponseMessage {
     result: t.result,
     message: t.message.to_string(),
@@ -726,8 +766,9 @@ pub fn key_response_to_pb(t: &KeyResponseMessage) -> pb::KeyResponseMessage {
 /// Returns [`BridgeError::InvalidValue`] if any entry is malformed. Requires
 /// the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-pub fn key_response_from_pb(b: &pb::KeyResponseMessage) -> Result<KeyResponseMessage, BridgeError> {
+pub(crate) fn key_response_from_pb(
+  b: &pb::KeyResponseMessage,
+) -> Result<KeyResponseMessage, BridgeError> {
   let keys = b
     .keys
     .iter()
@@ -752,13 +793,13 @@ pub fn key_response_from_pb(b: &pb::KeyResponseMessage) -> Result<KeyResponseMes
 ///
 /// The `destination: Node<I,A>` is serialised to opaque `bytes` via
 /// `memberlist_proto::Data`. The `payload` bytes are copied verbatim.
-pub fn relay_to_pb<I, A>(t: &RelayMessage<I, A>) -> Result<pb::RelayMessage, BridgeError>
+pub(crate) fn relay_to_pb<I, A>(t: &RelayMessage<I, A>) -> Result<pb::RelayMessage, BridgeError>
 where
   I: Data,
   A: Data,
 {
   Ok(pb::RelayMessage {
-    destination: data_to_bytes(&t.destination)?,
+    destination: Some(data_to_bytes(&t.destination)?),
     payload: t.payload.clone(),
     ..Default::default()
   })
@@ -766,14 +807,19 @@ where
 
 /// Convert `pb::RelayMessage` → typed [`RelayMessage<I,A>`].
 ///
-/// Decodes `destination` as `Node<I,A>` via `memberlist_proto::DataRef`.
-/// The `payload` bytes are preserved verbatim without parsing.
-pub fn relay_from_pb<I, A>(b: &pb::RelayMessage) -> Result<RelayMessage<I, A>, BridgeError>
+/// Rejects a missing `destination` (required field). Decodes `destination` as
+/// `Node<I,A>` via `memberlist_proto::DataRef`. The `payload` bytes are
+/// preserved verbatim without parsing.
+pub(crate) fn relay_from_pb<I, A>(b: &pb::RelayMessage) -> Result<RelayMessage<I, A>, BridgeError>
 where
   I: Data,
   A: Data,
 {
-  let destination: memberlist_proto::Node<I, A> = data_from_bytes(&b.destination)?;
+  let destination_bytes = b
+    .destination
+    .as_ref()
+    .ok_or(BridgeError::MissingField("RelayMessage.destination".into()))?;
+  let destination: memberlist_proto::Node<I, A> = data_from_bytes(destination_bytes)?;
   Ok(RelayMessage {
     destination,
     payload: b.payload.clone(),

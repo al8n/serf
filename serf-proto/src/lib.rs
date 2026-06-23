@@ -4,58 +4,19 @@
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
 
-pub use bridge::{
-  BridgeError,
-  conflict_response_from_pb,
-  conflict_response_to_pb,
-  coordinate_from_pb,
-  coordinate_to_pb,
-  filter_from_pb,
-  filter_to_pb,
-  join_from_pb,
-  join_to_pb,
-  leave_from_pb,
-  leave_to_pb,
-  push_pull_from_pb,
-  push_pull_to_pb,
-  query_from_pb,
-  query_response_from_pb,
-  query_response_to_pb,
-  query_to_pb,
-  relay_from_pb,
-  relay_to_pb,
-  tags_from_pb,
-  tags_to_pb,
-  user_event_from_pb,
-  user_event_to_pb,
-  user_event_single_from_pb,
-  user_event_single_to_pb,
-  user_events_from_pb,
-  user_events_to_pb,
-};
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-pub use bridge::{key_request_from_pb, key_request_to_pb, key_response_from_pb, key_response_to_pb};
-pub use framing::{FrameError, MessageType, decode_message, encode_message};
+pub use any::{AnyMessage, DecodeError, EncodeError};
+pub use bridge::BridgeError;
+pub use framing::{FrameError, IncompleteFrame, MessageType};
 pub use typed::{
-  Coordinate,
-  ConflictResponseMessage,
-  Filter,
-  JoinMessage,
-  LeaveMessage,
-  PushPullMessage,
-  QueryFlag,
-  QueryMessage,
-  QueryResponseMessage,
-  RelayMessage,
-  TagFilter,
-  Tags,
-  UserEvent,
-  UserEventMessage,
-  UserEvents,
+  ConflictResponseMessage, Coordinate, Filter, JoinMessage, LeaveMessage, PushPullMessage,
+  QueryFlag, QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, Tags, UserEvent,
+  UserEventMessage, UserEvents,
 };
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
 pub use typed::{KeyRequestMessage, KeyResponseMessage};
 
 /// A lamport logical clock value — a monotonically increasing counter used to
@@ -92,7 +53,8 @@ impl LamportTime {
   }
 }
 
-pub mod bridge;
-pub mod framing;
-pub mod messages;
+pub mod any;
+pub(crate) mod bridge;
+pub(crate) mod framing;
+pub(crate) mod messages;
 pub mod typed;

@@ -5,78 +5,35 @@ use memberlist_proto::Node;
 use smol_str::SmolStr;
 
 use super::serf::v1::{
-  ConflictResponseMessage as PbConflictResponseMessage,
-  Coordinate as PbCoordinate,
-  Filter as PbFilter,
-  JoinMessage as PbJoinMessage,
-  LeaveMessage as PbLeaveMessage,
-  PushPullMessage as PbPushPullMessage,
-  QueryMessage as PbQueryMessage,
-  QueryResponseMessage as PbQueryResponseMessage,
-  RelayMessage as PbRelayMessage,
-  Tags as PbTags,
-  UserEvent as PbUserEvent,
-  UserEventMessage as PbUserEventMessage,
-  UserEvents as PbUserEvents,
+  ConflictResponseMessage as PbConflictResponseMessage, Coordinate as PbCoordinate,
+  Filter as PbFilter, JoinMessage as PbJoinMessage, LeaveMessage as PbLeaveMessage,
+  PushPullMessage as PbPushPullMessage, QueryMessage as PbQueryMessage,
+  QueryResponseMessage as PbQueryResponseMessage, RelayMessage as PbRelayMessage, Tags as PbTags,
+  UserEvent as PbUserEvent, UserEventMessage as PbUserEventMessage, UserEvents as PbUserEvents,
 };
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 use super::serf::v1::{
-  KeyRequestMessage as PbKeyRequestMessage,
-  KeyResponseMessage as PbKeyResponseMessage,
-};
-use crate::{
-  ConflictResponseMessage,
-  Coordinate,
-  Filter,
-  JoinMessage,
-  LamportTime,
-  LeaveMessage,
-  PushPullMessage,
-  QueryFlag,
-  QueryMessage,
-  QueryResponseMessage,
-  RelayMessage,
-  TagFilter,
-  Tags,
-  UserEvent,
-  UserEventMessage,
-  UserEvents,
-  conflict_response_from_pb,
-  conflict_response_to_pb,
-  coordinate_from_pb,
-  coordinate_to_pb,
-  filter_from_pb,
-  filter_to_pb,
-  join_from_pb,
-  join_to_pb,
-  leave_from_pb,
-  leave_to_pb,
-  push_pull_from_pb,
-  push_pull_to_pb,
-  query_from_pb,
-  query_response_from_pb,
-  query_response_to_pb,
-  query_to_pb,
-  relay_from_pb,
-  relay_to_pb,
-  tags_from_pb,
-  tags_to_pb,
-  user_event_from_pb,
-  user_event_single_from_pb,
-  user_event_single_to_pb,
-  user_event_to_pb,
-  user_events_from_pb,
-  user_events_to_pb,
+  KeyRequestMessage as PbKeyRequestMessage, KeyResponseMessage as PbKeyResponseMessage,
 };
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-use crate::{
-  KeyRequestMessage,
-  KeyResponseMessage,
-  key_request_from_pb,
-  key_request_to_pb,
-  key_response_from_pb,
-  key_response_to_pb,
+use crate::bridge::{
+  key_request_from_pb, key_request_to_pb, key_response_from_pb, key_response_to_pb,
 };
+use crate::{
+  ConflictResponseMessage, Coordinate, Filter, JoinMessage, LamportTime, LeaveMessage,
+  PushPullMessage, QueryFlag, QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, Tags,
+  UserEvent, UserEventMessage, UserEvents,
+  bridge::{
+    conflict_response_from_pb, conflict_response_to_pb, coordinate_from_pb, coordinate_to_pb,
+    filter_from_pb, filter_to_pb, join_from_pb, join_to_pb, leave_from_pb, leave_to_pb,
+    push_pull_from_pb, push_pull_to_pb, query_from_pb, query_response_from_pb,
+    query_response_to_pb, query_to_pb, relay_from_pb, relay_to_pb, tags_from_pb, tags_to_pb,
+    user_event_from_pb, user_event_single_from_pb, user_event_single_to_pb, user_event_to_pb,
+    user_events_from_pb, user_events_to_pb,
+  },
+};
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use crate::{KeyRequestMessage, KeyResponseMessage};
 #[cfg(feature = "aes-gcm")]
 use memberlist_proto::SecretKey;
 
@@ -94,8 +51,8 @@ fn user_event_message_roundtrip_pb() {
   // typed → pb → bytes → pb → typed
   let pb = user_event_to_pb(&typed);
   let encoded = pb.encode_to_vec();
-  let decoded_pb = PbUserEventMessage::decode_from_slice(encoded.as_slice())
-    .expect("decode_from_slice failed");
+  let decoded_pb =
+    PbUserEventMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
   let roundtripped = user_event_from_pb(&decoded_pb).expect("user_event_from_pb failed");
 
   assert_eq!(roundtripped, typed);
@@ -195,7 +152,9 @@ fn tags_empty_roundtrip() {
 
 #[test]
 fn tags_multi_entry_roundtrip() {
-  let typed: Tags = [("role", "web"), ("env", "prod"), ("dc", "us-east")].into_iter().collect();
+  let typed: Tags = [("role", "web"), ("env", "prod"), ("dc", "us-east")]
+    .into_iter()
+    .collect();
 
   let pb = tags_to_pb(&typed);
   let encoded = pb.encode_to_vec();
@@ -213,8 +172,7 @@ fn tags_multi_entry_roundtrip() {
 #[test]
 fn filter_node_ids_roundtrip() {
   // I = SmolStr (the default generic parameter).
-  let typed: Filter<SmolStr> =
-    Filter::Id(vec![SmolStr::from("node-1"), SmolStr::from("node-2")]);
+  let typed: Filter<SmolStr> = Filter::Id(vec![SmolStr::from("node-1"), SmolStr::from("node-2")]);
 
   let pb = filter_to_pb(&typed).expect("filter_to_pb");
   let encoded = pb.encode_to_vec();
@@ -297,7 +255,7 @@ fn join_message_roundtrip_pb() {
 fn join_message_ltime_required() {
   let pb = PbJoinMessage {
     ltime: None,
-    id: bytes::Bytes::new(),
+    id: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
@@ -351,7 +309,7 @@ fn leave_message_ltime_required() {
   let pb = PbLeaveMessage {
     ltime: None,
     prune: false,
-    id: bytes::Bytes::new(),
+    id: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
@@ -470,7 +428,7 @@ fn query_message_ltime_required() {
   let pb = PbQueryMessage {
     ltime: None,
     id: Some(1),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
@@ -484,12 +442,35 @@ fn query_message_id_required() {
   let pb = PbQueryMessage {
     ltime: Some(1),
     id: None,
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
     query_from_pb::<I, A>(&pb).is_err(),
     "expected BridgeError::MissingField for absent id"
+  );
+}
+
+#[test]
+fn query_to_pb_timeout_overflow_is_error() {
+  // A duration whose nanosecond count exceeds u64::MAX (requires u128) must
+  // produce BridgeError::InvalidValue, not a silent truncation.
+  // u64::MAX nanos ≈ 584 years; add one second to guarantee overflow.
+  let huge_timeout = std::time::Duration::from_nanos(u64::MAX) + std::time::Duration::from_secs(1);
+  let typed: QueryMessage<I, A> = QueryMessage {
+    ltime: LamportTime::new(1),
+    id: 1,
+    from: Node::new(SmolStr::from("n"), sample_addr()),
+    filters: vec![],
+    flags: QueryFlag::empty(),
+    relay_factor: 0,
+    timeout: huge_timeout,
+    name: SmolStr::from("q"),
+    payload: bytes::Bytes::new(),
+  };
+  assert!(
+    query_to_pb(&typed).is_err(),
+    "timeout exceeding u64::MAX nanoseconds must yield BridgeError::InvalidValue"
   );
 }
 
@@ -507,8 +488,8 @@ fn query_response_message_roundtrip_pb_ack() {
 
   let pb = query_response_to_pb(&typed).expect("query_response_to_pb failed");
   let encoded = pb.encode_to_vec();
-  let decoded_pb =
-    PbQueryResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let decoded_pb = PbQueryResponseMessage::decode_from_slice(encoded.as_slice())
+    .expect("decode_from_slice failed");
   let roundtripped: QueryResponseMessage<I, A> =
     query_response_from_pb(&decoded_pb).expect("query_response_from_pb failed");
 
@@ -533,15 +514,18 @@ fn query_response_message_roundtrip_pb_with_payload() {
 
   let pb = query_response_to_pb(&typed).expect("query_response_to_pb failed");
   let encoded = pb.encode_to_vec();
-  let decoded_pb =
-    PbQueryResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let decoded_pb = PbQueryResponseMessage::decode_from_slice(encoded.as_slice())
+    .expect("decode_from_slice failed");
   let roundtripped: QueryResponseMessage<I, A> =
     query_response_from_pb(&decoded_pb).expect("query_response_from_pb failed");
 
   assert_eq!(roundtripped.ltime, typed.ltime);
   assert_eq!(roundtripped.id, typed.id);
   assert!(!roundtripped.ack());
-  assert_eq!(roundtripped.payload, bytes::Bytes::from_static(b"response-data"));
+  assert_eq!(
+    roundtripped.payload,
+    bytes::Bytes::from_static(b"response-data")
+  );
 }
 
 #[test]
@@ -549,7 +533,7 @@ fn query_response_message_ltime_required() {
   let pb = PbQueryResponseMessage {
     ltime: None,
     id: Some(1),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
@@ -563,7 +547,7 @@ fn query_response_message_id_required() {
   let pb = PbQueryResponseMessage {
     ltime: Some(1),
     id: None,
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     ..Default::default()
   };
   assert!(
@@ -578,7 +562,7 @@ fn query_response_message_flags_required() {
   let pb = PbQueryResponseMessage {
     ltime: Some(1),
     id: Some(42),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     flags: None,
     ..Default::default()
   };
@@ -594,7 +578,7 @@ fn query_message_required_fields() {
   let pb_no_flags = PbQueryMessage {
     ltime: Some(1),
     id: Some(1),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     flags: None,
     relay_factor: Some(0),
     timeout_nanos: Some(1_000_000_000),
@@ -609,7 +593,7 @@ fn query_message_required_fields() {
   let pb_no_relay = PbQueryMessage {
     ltime: Some(1),
     id: Some(1),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     flags: Some(0),
     relay_factor: None,
     timeout_nanos: Some(1_000_000_000),
@@ -624,7 +608,7 @@ fn query_message_required_fields() {
   let pb_no_timeout = PbQueryMessage {
     ltime: Some(1),
     id: Some(1),
-    from: bytes::Bytes::new(),
+    from: Some(bytes::Bytes::new()),
     flags: Some(0),
     relay_factor: Some(0),
     timeout_nanos: None,
@@ -641,7 +625,6 @@ fn query_message_required_fields() {
 #[test]
 fn user_event_single_roundtrip_pb() {
   let typed = UserEvent {
-    cc: true,
     name: SmolStr::from("deploy"),
     payload: bytes::Bytes::from_static(b"ev-payload"),
   };
@@ -652,7 +635,6 @@ fn user_event_single_roundtrip_pb() {
     PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
   let roundtripped = user_event_single_from_pb(&decoded_pb);
 
-  assert_eq!(roundtripped.cc, typed.cc);
   assert_eq!(roundtripped.name, typed.name);
   assert_eq!(roundtripped.payload, typed.payload);
 }
@@ -660,7 +642,6 @@ fn user_event_single_roundtrip_pb() {
 #[test]
 fn user_event_single_empty_payload_roundtrip() {
   let typed = UserEvent {
-    cc: false,
     name: SmolStr::from("ping"),
     payload: bytes::Bytes::new(),
   };
@@ -671,7 +652,6 @@ fn user_event_single_empty_payload_roundtrip() {
     PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
   let roundtripped = user_event_single_from_pb(&decoded_pb);
 
-  assert_eq!(roundtripped.cc, typed.cc);
   assert_eq!(roundtripped.name, typed.name);
   assert!(roundtripped.payload.is_empty());
 }
@@ -684,12 +664,10 @@ fn user_events_roundtrip_pb() {
     ltime: LamportTime::new(7),
     events: vec![
       UserEvent {
-        cc: true,
         name: SmolStr::from("deploy"),
         payload: bytes::Bytes::from_static(b"v1"),
       },
       UserEvent {
-        cc: false,
         name: SmolStr::from("alert"),
         payload: bytes::Bytes::from_static(b"critical"),
       },
@@ -752,7 +730,6 @@ fn push_pull_message_roundtrip_pb_full() {
     events: vec![UserEvents {
       ltime: LamportTime::new(49),
       events: vec![UserEvent {
-        cc: false,
         name: SmolStr::from("deploy"),
         payload: bytes::Bytes::from_static(b"v2"),
       }],
@@ -783,7 +760,10 @@ fn push_pull_message_roundtrip_pb_full() {
   assert_eq!(roundtripped.events.len(), 1);
   assert_eq!(roundtripped.events[0].ltime, LamportTime::new(49));
   assert_eq!(roundtripped.events[0].events.len(), 1);
-  assert_eq!(roundtripped.events[0].events[0].name, SmolStr::from("deploy"));
+  assert_eq!(
+    roundtripped.events[0].events[0].name,
+    SmolStr::from("deploy")
+  );
 }
 
 #[test]
@@ -851,6 +831,27 @@ fn push_pull_message_query_ltime_required() {
   assert!(
     push_pull_from_pb::<I>(&pb).is_err(),
     "expected BridgeError::MissingField for absent query_ltime"
+  );
+}
+
+#[test]
+fn push_pull_node_status_time_ltime_required() {
+  // A status_ltimes entry with ltime absent must cause push_pull_from_pb to reject the message.
+  use super::serf::v1::NodeStatusTime;
+  let pb = PbPushPullMessage {
+    ltime: Some(1),
+    event_ltime: Some(1),
+    query_ltime: Some(1),
+    status_ltimes: vec![NodeStatusTime {
+      id: Some(bytes::Bytes::new()),
+      ltime: None, // absent ltime — must be rejected
+      ..Default::default()
+    }],
+    ..Default::default()
+  };
+  assert!(
+    push_pull_from_pb::<SmolStr>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent NodeStatusTime.ltime"
   );
 }
 
@@ -967,11 +968,16 @@ fn relay_message_roundtrip_pb() {
   let encoded = pb.encode_to_vec();
   let decoded_pb =
     PbRelayMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
-  let roundtripped: RelayMessage<I, A> =
-    relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
+  let roundtripped: RelayMessage<I, A> = relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
 
-  assert_eq!(roundtripped.destination.id_ref(), typed.destination.id_ref());
-  assert_eq!(roundtripped.destination.addr_ref(), typed.destination.addr_ref());
+  assert_eq!(
+    roundtripped.destination.id_ref(),
+    typed.destination.id_ref()
+  );
+  assert_eq!(
+    roundtripped.destination.addr_ref(),
+    typed.destination.addr_ref()
+  );
   assert_eq!(roundtripped.payload, payload);
 }
 
@@ -984,8 +990,7 @@ fn relay_message_empty_payload_roundtrip() {
   let encoded = pb.encode_to_vec();
   let decoded_pb =
     PbRelayMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
-  let roundtripped: RelayMessage<I, A> =
-    relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
+  let roundtripped: RelayMessage<I, A> = relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
 
   assert!(roundtripped.payload.is_empty());
 }
@@ -996,7 +1001,7 @@ fn relay_message_empty_destination_rejected() {
   // relay_from_pb: an empty byte slice is not a valid encoded Node<I,A>,
   // so data_from_bytes returns a Data decode error.
   let pb = PbRelayMessage {
-    destination: bytes::Bytes::new(),
+    destination: Some(bytes::Bytes::new()),
     payload: bytes::Bytes::from_static(b"some-payload"),
     ..Default::default()
   };

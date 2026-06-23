@@ -2,8 +2,11 @@ use buffa::Message as _;
 use bytes::Bytes;
 
 use super::{FrameError, MessageType, decode_message, encode_message};
-use crate::messages::serf::v1::UserEventMessage as PbUserEventMessage;
-use crate::{LamportTime, UserEventMessage, user_event_from_pb, user_event_to_pb};
+use crate::{
+  LamportTime, UserEventMessage,
+  bridge::{user_event_from_pb, user_event_to_pb},
+  messages::serf::v1::UserEventMessage as PbUserEventMessage,
+};
 
 // ── MessageType round-trips ───────────────────────────────────────────────────
 
@@ -37,10 +40,7 @@ fn message_type_tag_round_trip() {
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 #[test]
 fn message_type_key_tag_round_trip() {
-  let cases: &[(MessageType, u8)] = &[
-    (MessageType::KeyRequest, 9),
-    (MessageType::KeyResponse, 10),
-  ];
+  let cases: &[(MessageType, u8)] = &[(MessageType::KeyRequest, 9), (MessageType::KeyResponse, 10)];
 
   for &(ref ty, expected_byte) in cases {
     let byte = u8::from(*ty);
@@ -88,10 +88,7 @@ fn user_event_frame_round_trip() {
   // Encode into a serf frame.
   let frame_vec =
     encode_message(MessageType::UserEvent, &pb).expect("encode_message should succeed");
-  assert!(
-    !frame_vec.is_empty(),
-    "encoded frame must not be empty"
-  );
+  assert!(!frame_vec.is_empty(), "encoded frame must not be empty");
 
   // The leading byte must be the UserEvent tag.
   assert_eq!(
@@ -123,7 +120,10 @@ fn user_event_frame_round_trip() {
 #[test]
 fn decode_message_empty_errors() {
   let empty = Bytes::new();
-  assert!(matches!(decode_message(&empty), Err(super::FrameError::Empty)));
+  assert!(matches!(
+    decode_message(&empty),
+    Err(super::FrameError::Empty)
+  ));
 }
 
 #[test]
@@ -159,7 +159,11 @@ fn decode_varint_overflow_is_error_not_panic() {
   // Byte sequence: 4 continuation bytes (all 0x80) + one final byte > 0x0f.
   let buf: &[u8] = &[
     u8::from(MessageType::UserEvent), // tag
-    0x80, 0x80, 0x80, 0x80, 0x10, // 5-byte LEB128 with 5th byte = 0x10 > 0x0f
+    0x80,
+    0x80,
+    0x80,
+    0x80,
+    0x10, // 5-byte LEB128 with 5th byte = 0x10 > 0x0f
   ];
   let frame = Bytes::copy_from_slice(buf);
   assert!(
@@ -194,10 +198,13 @@ fn unknown_tag_round_trips_encode_decode() {
   // An Unknown(200) tag must survive encode + decode: the tag byte is
   // preserved and the body (empty default message) is recovered intact.
   let pb = PbUserEventMessage::default();
-  let frame_vec =
-    encode_message(MessageType::Unknown(200), &pb).expect("encode_message with Unknown tag should succeed");
+  let frame_vec = encode_message(MessageType::Unknown(200), &pb)
+    .expect("encode_message with Unknown tag should succeed");
   let frame = Bytes::from(frame_vec);
-  assert_eq!(frame[0], 200, "first byte must be the Unknown tag value 200");
+  assert_eq!(
+    frame[0], 200,
+    "first byte must be the Unknown tag value 200"
+  );
   let (recovered_ty, body, consumed) =
     decode_message(&frame).expect("decode_message with Unknown tag should succeed");
   assert_eq!(recovered_ty, MessageType::Unknown(200));
