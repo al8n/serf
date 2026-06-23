@@ -6,6 +6,18 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Encryption key management messages (KeyRequestMessage / KeyResponseMessage).
+# Pulls in the memberlist-proto encryption backend (at least one AEAD cipher
+# must be selected; both are forwarded here so the caller can pick).
+# Activating this feature makes the key message types available and ensures
+# key material is held in memberlist_proto::SecretKey (typed, cipher-tagged)
+# rather than raw bytes.
+aes-gcm = ["memberlist-proto/aes-gcm"]
+chacha20-poly1305 = ["memberlist-proto/chacha20-poly1305"]
+# Umbrella that activates both backends (convenient for tests / CI).
+encryption = ["aes-gcm", "chacha20-poly1305"]
+
 [dependencies]
 memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
 bytes = { workspace = true }

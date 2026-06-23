@@ -10,10 +10,19 @@ use super::serf::v1::{
   Filter as PbFilter,
   JoinMessage as PbJoinMessage,
   LeaveMessage as PbLeaveMessage,
+  PushPullMessage as PbPushPullMessage,
   QueryMessage as PbQueryMessage,
   QueryResponseMessage as PbQueryResponseMessage,
+  RelayMessage as PbRelayMessage,
   Tags as PbTags,
+  UserEvent as PbUserEvent,
   UserEventMessage as PbUserEventMessage,
+  UserEvents as PbUserEvents,
+};
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use super::serf::v1::{
+  KeyRequestMessage as PbKeyRequestMessage,
+  KeyResponseMessage as PbKeyResponseMessage,
 };
 use crate::{
   ConflictResponseMessage,
@@ -22,12 +31,16 @@ use crate::{
   JoinMessage,
   LamportTime,
   LeaveMessage,
+  PushPullMessage,
   QueryFlag,
   QueryMessage,
   QueryResponseMessage,
+  RelayMessage,
   TagFilter,
   Tags,
+  UserEvent,
   UserEventMessage,
+  UserEvents,
   conflict_response_from_pb,
   conflict_response_to_pb,
   coordinate_from_pb,
@@ -38,15 +51,34 @@ use crate::{
   join_to_pb,
   leave_from_pb,
   leave_to_pb,
+  push_pull_from_pb,
+  push_pull_to_pb,
   query_from_pb,
   query_response_from_pb,
   query_response_to_pb,
   query_to_pb,
+  relay_from_pb,
+  relay_to_pb,
   tags_from_pb,
   tags_to_pb,
   user_event_from_pb,
+  user_event_single_from_pb,
+  user_event_single_to_pb,
   user_event_to_pb,
+  user_events_from_pb,
+  user_events_to_pb,
 };
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use crate::{
+  KeyRequestMessage,
+  KeyResponseMessage,
+  key_request_from_pb,
+  key_request_to_pb,
+  key_response_from_pb,
+  key_response_to_pb,
+};
+#[cfg(feature = "aes-gcm")]
+use memberlist_proto::SecretKey;
 
 // ── UserEventMessage ─────────────────────────────────────────────────────────
 
@@ -601,5 +633,375 @@ fn query_message_required_fields() {
   assert!(
     query_from_pb::<I, A>(&pb_no_timeout).is_err(),
     "expected error for absent timeout_nanos"
+  );
+}
+
+// ── UserEvent (single) ────────────────────────────────────────────────────────
+
+#[test]
+fn user_event_single_roundtrip_pb() {
+  let typed = UserEvent {
+    cc: true,
+    name: SmolStr::from("deploy"),
+    payload: bytes::Bytes::from_static(b"ev-payload"),
+  };
+
+  let pb = user_event_single_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = user_event_single_from_pb(&decoded_pb);
+
+  assert_eq!(roundtripped.cc, typed.cc);
+  assert_eq!(roundtripped.name, typed.name);
+  assert_eq!(roundtripped.payload, typed.payload);
+}
+
+#[test]
+fn user_event_single_empty_payload_roundtrip() {
+  let typed = UserEvent {
+    cc: false,
+    name: SmolStr::from("ping"),
+    payload: bytes::Bytes::new(),
+  };
+
+  let pb = user_event_single_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = user_event_single_from_pb(&decoded_pb);
+
+  assert_eq!(roundtripped.cc, typed.cc);
+  assert_eq!(roundtripped.name, typed.name);
+  assert!(roundtripped.payload.is_empty());
+}
+
+// ── UserEvents (batch) ────────────────────────────────────────────────────────
+
+#[test]
+fn user_events_roundtrip_pb() {
+  let typed = UserEvents {
+    ltime: LamportTime::new(7),
+    events: vec![
+      UserEvent {
+        cc: true,
+        name: SmolStr::from("deploy"),
+        payload: bytes::Bytes::from_static(b"v1"),
+      },
+      UserEvent {
+        cc: false,
+        name: SmolStr::from("alert"),
+        payload: bytes::Bytes::from_static(b"critical"),
+      },
+    ],
+  };
+
+  let pb = user_events_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbUserEvents::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = user_events_from_pb(&decoded_pb).expect("user_events_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.events.len(), 2);
+  assert_eq!(roundtripped.events[0].name, SmolStr::from("deploy"));
+  assert_eq!(roundtripped.events[1].name, SmolStr::from("alert"));
+}
+
+#[test]
+fn user_events_ltime_required() {
+  let pb = PbUserEvents {
+    ltime: None,
+    events: vec![],
+    ..Default::default()
+  };
+  assert!(
+    user_events_from_pb(&pb).is_err(),
+    "expected BridgeError::MissingField for absent ltime"
+  );
+}
+
+#[test]
+fn user_events_empty_events_rejected() {
+  // A UserEvents batch with an empty events list must be rejected — the legacy
+  // invariant is OneOrMore (at least one event per batch). An empty batch
+  // carries no information and would silently consume a buffer history slot.
+  let pb = PbUserEvents {
+    ltime: Some(1),
+    events: vec![],
+    ..Default::default()
+  };
+  assert!(
+    user_events_from_pb(&pb).is_err(),
+    "expected BridgeError::MissingField for empty events list"
+  );
+}
+
+// ── PushPullMessage ───────────────────────────────────────────────────────────
+
+#[test]
+fn push_pull_message_roundtrip_pb_full() {
+  let typed: PushPullMessage<I> = PushPullMessage {
+    ltime: LamportTime::new(100),
+    status_ltimes: vec![
+      (SmolStr::from("node-a"), LamportTime::new(10)),
+      (SmolStr::from("node-b"), LamportTime::new(20)),
+    ],
+    left_members: vec![SmolStr::from("node-gone")],
+    event_ltime: LamportTime::new(50),
+    events: vec![UserEvents {
+      ltime: LamportTime::new(49),
+      events: vec![UserEvent {
+        cc: false,
+        name: SmolStr::from("deploy"),
+        payload: bytes::Bytes::from_static(b"v2"),
+      }],
+    }],
+    query_ltime: LamportTime::new(75),
+  };
+
+  let pb = push_pull_to_pb(&typed).expect("push_pull_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbPushPullMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: PushPullMessage<I> =
+    push_pull_from_pb(&decoded_pb).expect("push_pull_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.event_ltime, typed.event_ltime);
+  assert_eq!(roundtripped.query_ltime, typed.query_ltime);
+
+  assert_eq!(roundtripped.status_ltimes.len(), 2);
+  assert_eq!(roundtripped.status_ltimes[0].0, SmolStr::from("node-a"));
+  assert_eq!(roundtripped.status_ltimes[0].1, LamportTime::new(10));
+  assert_eq!(roundtripped.status_ltimes[1].0, SmolStr::from("node-b"));
+  assert_eq!(roundtripped.status_ltimes[1].1, LamportTime::new(20));
+
+  assert_eq!(roundtripped.left_members.len(), 1);
+  assert_eq!(roundtripped.left_members[0], SmolStr::from("node-gone"));
+
+  assert_eq!(roundtripped.events.len(), 1);
+  assert_eq!(roundtripped.events[0].ltime, LamportTime::new(49));
+  assert_eq!(roundtripped.events[0].events.len(), 1);
+  assert_eq!(roundtripped.events[0].events[0].name, SmolStr::from("deploy"));
+}
+
+#[test]
+fn push_pull_message_roundtrip_pb_empty() {
+  let typed: PushPullMessage<I> = PushPullMessage {
+    ltime: LamportTime::new(1),
+    status_ltimes: vec![],
+    left_members: vec![],
+    event_ltime: LamportTime::new(2),
+    events: vec![],
+    query_ltime: LamportTime::new(3),
+  };
+
+  let pb = push_pull_to_pb(&typed).expect("push_pull_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbPushPullMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: PushPullMessage<I> =
+    push_pull_from_pb(&decoded_pb).expect("push_pull_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.event_ltime, typed.event_ltime);
+  assert_eq!(roundtripped.query_ltime, typed.query_ltime);
+  assert!(roundtripped.status_ltimes.is_empty());
+  assert!(roundtripped.left_members.is_empty());
+  assert!(roundtripped.events.is_empty());
+}
+
+#[test]
+fn push_pull_message_ltime_required() {
+  let pb = PbPushPullMessage {
+    ltime: None,
+    event_ltime: Some(1),
+    query_ltime: Some(1),
+    ..Default::default()
+  };
+  assert!(
+    push_pull_from_pb::<I>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent ltime"
+  );
+}
+
+#[test]
+fn push_pull_message_event_ltime_required() {
+  let pb = PbPushPullMessage {
+    ltime: Some(1),
+    event_ltime: None,
+    query_ltime: Some(1),
+    ..Default::default()
+  };
+  assert!(
+    push_pull_from_pb::<I>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent event_ltime"
+  );
+}
+
+#[test]
+fn push_pull_message_query_ltime_required() {
+  let pb = PbPushPullMessage {
+    ltime: Some(1),
+    event_ltime: Some(1),
+    query_ltime: None,
+    ..Default::default()
+  };
+  assert!(
+    push_pull_from_pb::<I>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent query_ltime"
+  );
+}
+
+// ── KeyRequestMessage ─────────────────────────────────────────────────────────
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn key_request_roundtrip_pb_with_key() {
+  let key = SecretKey::Aes256([0xABu8; 32]);
+  let typed = KeyRequestMessage { key: Some(key) };
+
+  let pb = key_request_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbKeyRequestMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = key_request_from_pb(&decoded_pb).expect("key_request_from_pb failed");
+
+  assert_eq!(roundtripped.key, typed.key);
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_request_roundtrip_pb_no_key() {
+  let typed = KeyRequestMessage { key: None };
+
+  let pb = key_request_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbKeyRequestMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = key_request_from_pb(&decoded_pb).expect("key_request_from_pb failed");
+
+  assert!(roundtripped.key.is_none());
+}
+
+// ── KeyResponseMessage ────────────────────────────────────────────────────────
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn key_response_roundtrip_pb_success_with_keys() {
+  let k1 = SecretKey::Aes128([0x11u8; 16]);
+  let k2 = SecretKey::Aes256([0x22u8; 32]);
+  let primary = SecretKey::Aes128([0x11u8; 16]);
+  let typed = KeyResponseMessage {
+    result: true,
+    message: SmolStr::from("ok"),
+    keys: vec![k1, k2],
+    primary_key: Some(primary),
+  };
+
+  let pb = key_response_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbKeyResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = key_response_from_pb(&decoded_pb).expect("key_response_from_pb failed");
+
+  assert!(roundtripped.result);
+  assert_eq!(roundtripped.message, SmolStr::from("ok"));
+  assert_eq!(roundtripped.keys.len(), 2);
+  assert_eq!(roundtripped.keys[0], typed.keys[0]);
+  assert_eq!(roundtripped.keys[1], typed.keys[1]);
+  assert_eq!(roundtripped.primary_key, typed.primary_key);
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_response_roundtrip_pb_failure_no_keys() {
+  let typed = KeyResponseMessage {
+    result: false,
+    message: SmolStr::from("permission denied"),
+    keys: vec![],
+    primary_key: None,
+  };
+
+  let pb = key_response_to_pb(&typed);
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbKeyResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped = key_response_from_pb(&decoded_pb).expect("key_response_from_pb failed");
+
+  assert!(!roundtripped.result);
+  assert_eq!(roundtripped.message, SmolStr::from("permission denied"));
+  assert!(roundtripped.keys.is_empty());
+  assert!(roundtripped.primary_key.is_none());
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_response_malformed_bytes_rejected() {
+  // A key entry with no algorithm tag byte must be rejected.
+  let pb = PbKeyResponseMessage {
+    result: true,
+    message: String::from("ok"),
+    keys: vec![bytes::Bytes::new()], // empty — missing algorithm tag
+    primary_key: None,
+    ..Default::default()
+  };
+  assert!(
+    key_response_from_pb(&pb).is_err(),
+    "expected BridgeError::InvalidValue for empty key bytes"
+  );
+}
+
+// ── RelayMessage ──────────────────────────────────────────────────────────────
+
+#[test]
+fn relay_message_roundtrip_pb() {
+  let destination: Node<I, A> = Node::new(SmolStr::from("relay-target"), sample_addr());
+  // The payload carries a raw framed serf message; here we use arbitrary bytes
+  // to verify the passthrough without interpreting the content.
+  let payload = bytes::Bytes::from_static(b"\x04\x05hello");
+  let typed: RelayMessage<I, A> = RelayMessage::new(destination.clone(), payload.clone());
+
+  let pb = relay_to_pb(&typed).expect("relay_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbRelayMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: RelayMessage<I, A> =
+    relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
+
+  assert_eq!(roundtripped.destination.id_ref(), typed.destination.id_ref());
+  assert_eq!(roundtripped.destination.addr_ref(), typed.destination.addr_ref());
+  assert_eq!(roundtripped.payload, payload);
+}
+
+#[test]
+fn relay_message_empty_payload_roundtrip() {
+  let destination: Node<I, A> = Node::new(SmolStr::from("target"), sample_addr());
+  let typed: RelayMessage<I, A> = RelayMessage::new(destination, bytes::Bytes::new());
+
+  let pb = relay_to_pb(&typed).expect("relay_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbRelayMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: RelayMessage<I, A> =
+    relay_from_pb(&decoded_pb).expect("relay_from_pb failed");
+
+  assert!(roundtripped.payload.is_empty());
+}
+
+#[test]
+fn relay_message_empty_destination_rejected() {
+  // A RelayMessage pb with `destination = b""` must be rejected by
+  // relay_from_pb: an empty byte slice is not a valid encoded Node<I,A>,
+  // so data_from_bytes returns a Data decode error.
+  let pb = PbRelayMessage {
+    destination: bytes::Bytes::new(),
+    payload: bytes::Bytes::from_static(b"some-payload"),
+    ..Default::default()
+  };
+  assert!(
+    relay_from_pb::<I, A>(&pb).is_err(),
+    "expected a BridgeError for empty destination bytes"
   );
 }
