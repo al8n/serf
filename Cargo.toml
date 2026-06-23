@@ -8,7 +8,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.85.0"
 description = "A decentralized solution for service discovery and orchestration that is lightweight, highly available, and fault tolerant."
@@ -37,8 +37,8 @@ arbitrary = { version = "1", default-features = false, features = ["derive"] }
 quickcheck = { version = "1", default-features = false }
 
 memberlist-proto = { version = "0.3", default-features = false }
-memberlist-core = { version = "0.8.1", default-features = false }
-memberlist = { version = "0.8.1", default-features = false }
+memberlist-core = { version = "0.8.5", default-features = false }
+memberlist = { version = "0.8.5", default-features = false }
 
 serf-core = { path = "serf-core", version = "0.5", default-features = false }
 serf = { path = "serf", version = "0.5", default-features = false }
