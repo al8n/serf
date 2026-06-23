@@ -137,12 +137,85 @@ pub struct TagFilter {
 /// Exactly one variant is active per `Filter`.  The `Id` variant restricts
 /// the query to the listed node ids; the `Tag` variant restricts it to nodes
 /// whose tag satisfies the [`TagFilter`].
+///
+/// Generic over `I`: the node-id type.  When `I = SmolStr` this mirrors the
+/// legacy hand-rolled codec; when `I` is a custom type it encodes each id via
+/// `memberlist_proto::Data` (opaque `bytes` on the wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Filter {
+pub enum Filter<I> {
   /// Restrict responses to the listed node ids.
-  Id(Vec<SmolStr>),
+  Id(Vec<I>),
   /// Restrict responses to nodes whose tag value satisfies the filter.
   Tag(TagFilter),
+}
+
+// ── QueryMessage ──────────────────────────────────────────────────────────────
+
+/// A query broadcast through the cluster, optionally scoped by filters.
+///
+/// Generic over `I` (node-id) and `A` (node-address); both must implement
+/// `memberlist_proto::Data` so the embedded `Node<I,A>` and any `Filter<I>`
+/// node-ids can be encoded as opaque `bytes` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMessage<I, A> {
+  /// The lamport clock value when the query was issued.
+  pub ltime: LamportTime,
+  /// Randomly generated query identifier used to correlate responses.
+  pub id: u32,
+  /// The node that originated the query.
+  pub from: memberlist_proto::Node<I, A>,
+  /// Optional list of node-id / tag predicates that scope which nodes respond.
+  pub filters: Vec<Filter<I>>,
+  /// Control flags (ACK, NO_BROADCAST, …).
+  pub flags: QueryFlag,
+  /// Number of relayed duplicate responses requested.
+  pub relay_factor: u8,
+  /// Maximum time allowed between delivery and response.
+  pub timeout: std::time::Duration,
+  /// Query name.
+  pub name: SmolStr,
+  /// Query payload.
+  pub payload: Bytes,
+}
+
+impl<I, A> QueryMessage<I, A> {
+  /// Returns `true` if the ACK flag is set.
+  pub fn ack(&self) -> bool {
+    self.flags.contains(QueryFlag::ACK)
+  }
+
+  /// Returns `true` if the NO_BROADCAST flag is set.
+  pub fn no_broadcast(&self) -> bool {
+    self.flags.contains(QueryFlag::NO_BROADCAST)
+  }
+}
+
+// ── QueryResponseMessage ──────────────────────────────────────────────────────
+
+/// A response to a [`QueryMessage`], sent back to the originator.
+///
+/// Generic over `I` (node-id) and `A` (node-address); both must implement
+/// `memberlist_proto::Data` so the embedded `Node<I,A>` can be encoded as
+/// opaque `bytes` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryResponseMessage<I, A> {
+  /// The lamport clock value when the response was emitted.
+  pub ltime: LamportTime,
+  /// Identifier of the query being responded to.
+  pub id: u32,
+  /// The node sending this response.
+  pub from: memberlist_proto::Node<I, A>,
+  /// Control flags (e.g. ACK to acknowledge the query).
+  pub flags: QueryFlag,
+  /// Optional response payload.
+  pub payload: Bytes,
+}
+
+impl<I, A> QueryResponseMessage<I, A> {
+  /// Returns `true` if the ACK flag is set (this message is an acknowledgement).
+  pub fn ack(&self) -> bool {
+    self.flags.contains(QueryFlag::ACK)
+  }
 }
 
 // ── Membership messages ───────────────────────────────────────────────────────

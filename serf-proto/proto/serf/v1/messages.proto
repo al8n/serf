@@ -41,7 +41,7 @@ message TagFilter {
 // Exactly one of the oneof alternatives is set per Filter message.
 message Filter {
   oneof kind {
-    // node_ids is a list of node-id strings; only those nodes respond.
+    // node_ids is a list of opaque byte-encoded node ids; only those nodes respond.
     NodeIdList node_ids = 1;
     // tag is a tag-name / optional-regex pair.
     TagFilter  tag      = 2;
@@ -49,8 +49,33 @@ message Filter {
 }
 
 // NodeIdList is the payload for a node-id filter.
+// Each `id` entry is a node-id encoded via memberlist_proto::Data (opaque bytes).
 message NodeIdList {
-  repeated string ids = 1;
+  repeated bytes ids = 1;
+}
+
+// QueryMessage is a query broadcast to the cluster, optionally scoped by filters.
+// Field numbers match the legacy serf-core tag constants.
+message QueryMessage {
+  optional uint64 ltime        = 1;
+  optional uint32 id           = 2;
+  bytes           from         = 3;
+  repeated Filter filters      = 4;
+  optional uint32 flags        = 5;
+  optional uint32 relay_factor = 6;
+  optional uint64 timeout_nanos = 7;
+  string          name         = 8;
+  bytes           payload      = 9;
+}
+
+// QueryResponseMessage is sent back to the query originator.
+// Field numbers match the legacy serf-core tag constants.
+message QueryResponseMessage {
+  optional uint64 ltime   = 1;
+  optional uint32 id      = 2;
+  bytes           from    = 3;
+  optional uint32 flags   = 4;
+  bytes           payload = 5;
 }
 
 // JoinMessage is broadcast after a node joins to associate it with a lamport clock.
