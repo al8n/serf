@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 
 pub use bridge::{BridgeError, user_event_from_pb, user_event_to_pb};
+pub use framing::{FrameError, MessageType, decode_message, encode_message};
 pub use typed::UserEventMessage;
 
 /// A lamport logical clock value — a monotonically increasing counter used to
@@ -42,5 +43,6 @@ impl LamportTime {
 }
 
 pub mod bridge;
+pub mod framing;
 pub mod messages;
 pub mod typed;
