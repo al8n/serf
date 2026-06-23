@@ -10,6 +10,8 @@ use super::serf::v1::{
   Filter as PbFilter,
   JoinMessage as PbJoinMessage,
   LeaveMessage as PbLeaveMessage,
+  QueryMessage as PbQueryMessage,
+  QueryResponseMessage as PbQueryResponseMessage,
   Tags as PbTags,
   UserEventMessage as PbUserEventMessage,
 };
@@ -21,6 +23,8 @@ use crate::{
   LamportTime,
   LeaveMessage,
   QueryFlag,
+  QueryMessage,
+  QueryResponseMessage,
   TagFilter,
   Tags,
   UserEventMessage,
@@ -34,6 +38,10 @@ use crate::{
   join_to_pb,
   leave_from_pb,
   leave_to_pb,
+  query_from_pb,
+  query_response_from_pb,
+  query_response_to_pb,
+  query_to_pb,
   tags_from_pb,
   tags_to_pb,
   user_event_from_pb,
@@ -172,42 +180,44 @@ fn tags_multi_entry_roundtrip() {
 
 #[test]
 fn filter_node_ids_roundtrip() {
-  let typed = Filter::Id(vec![SmolStr::from("node-1"), SmolStr::from("node-2")]);
+  // I = SmolStr (the default generic parameter).
+  let typed: Filter<SmolStr> =
+    Filter::Id(vec![SmolStr::from("node-1"), SmolStr::from("node-2")]);
 
-  let pb = filter_to_pb(&typed);
+  let pb = filter_to_pb(&typed).expect("filter_to_pb");
   let encoded = pb.encode_to_vec();
   let decoded_pb = PbFilter::decode_from_slice(encoded.as_slice()).expect("decode_from_slice");
-  let roundtripped = filter_from_pb(&decoded_pb).expect("filter_from_pb");
+  let roundtripped: Filter<SmolStr> = filter_from_pb(&decoded_pb).expect("filter_from_pb");
 
   assert_eq!(roundtripped, typed);
 }
 
 #[test]
 fn filter_tag_with_expr_roundtrip() {
-  let typed = Filter::Tag(TagFilter {
+  let typed: Filter<SmolStr> = Filter::Tag(TagFilter {
     tag: SmolStr::from("role"),
     expr: Some(SmolStr::from("^web.*")),
   });
 
-  let pb = filter_to_pb(&typed);
+  let pb = filter_to_pb(&typed).expect("filter_to_pb");
   let encoded = pb.encode_to_vec();
   let decoded_pb = PbFilter::decode_from_slice(encoded.as_slice()).expect("decode_from_slice");
-  let roundtripped = filter_from_pb(&decoded_pb).expect("filter_from_pb");
+  let roundtripped: Filter<SmolStr> = filter_from_pb(&decoded_pb).expect("filter_from_pb");
 
   assert_eq!(roundtripped, typed);
 }
 
 #[test]
 fn filter_tag_without_expr_roundtrip() {
-  let typed = Filter::Tag(TagFilter {
+  let typed: Filter<SmolStr> = Filter::Tag(TagFilter {
     tag: SmolStr::from("dc"),
     expr: None,
   });
 
-  let pb = filter_to_pb(&typed);
+  let pb = filter_to_pb(&typed).expect("filter_to_pb");
   let encoded = pb.encode_to_vec();
   let decoded_pb = PbFilter::decode_from_slice(encoded.as_slice()).expect("decode_from_slice");
-  let roundtripped = filter_from_pb(&decoded_pb).expect("filter_from_pb");
+  let roundtripped: Filter<SmolStr> = filter_from_pb(&decoded_pb).expect("filter_from_pb");
 
   assert_eq!(roundtripped, typed);
 }
@@ -220,7 +230,7 @@ fn filter_missing_kind_is_error() {
     ..Default::default()
   };
   assert!(
-    filter_from_pb(&pb).is_err(),
+    filter_from_pb::<SmolStr>(&pb).is_err(),
     "expected BridgeError::UnknownVariant for missing kind"
   );
 }
@@ -334,4 +344,262 @@ fn conflict_response_roundtrip_pb() {
 
   assert_eq!(roundtripped.member.id_ref(), typed.member.id_ref());
   assert_eq!(roundtripped.member.addr_ref(), typed.member.addr_ref());
+}
+
+// ── QueryMessage ──────────────────────────────────────────────────────────────
+
+#[test]
+fn query_message_roundtrip_pb_no_filters() {
+  let typed: QueryMessage<I, A> = QueryMessage {
+    ltime: LamportTime::new(5),
+    id: 1234,
+    from: Node::new(SmolStr::from("node-q"), sample_addr()),
+    filters: vec![],
+    flags: QueryFlag::ACK,
+    relay_factor: 3,
+    timeout: std::time::Duration::from_millis(500),
+    name: smol_str::SmolStr::from("my-query"),
+    payload: bytes::Bytes::from_static(b"query-payload"),
+  };
+
+  let pb = query_to_pb(&typed).expect("query_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbQueryMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: QueryMessage<I, A> = query_from_pb(&decoded_pb).expect("query_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.id, typed.id);
+  assert_eq!(roundtripped.from.id_ref(), typed.from.id_ref());
+  assert_eq!(roundtripped.from.addr_ref(), typed.from.addr_ref());
+  assert_eq!(roundtripped.filters.len(), 0);
+  assert_eq!(roundtripped.flags, typed.flags);
+  assert_eq!(roundtripped.relay_factor, typed.relay_factor);
+  assert_eq!(roundtripped.timeout, typed.timeout);
+  assert_eq!(roundtripped.name, typed.name);
+  assert_eq!(roundtripped.payload, typed.payload);
+}
+
+#[test]
+fn query_message_roundtrip_pb_with_filters() {
+  let typed: QueryMessage<I, A> = QueryMessage {
+    ltime: LamportTime::new(10),
+    id: 9999,
+    from: Node::new(SmolStr::from("node-q2"), sample_addr()),
+    filters: vec![
+      Filter::Id(vec![SmolStr::from("target-1"), SmolStr::from("target-2")]),
+      Filter::Tag(TagFilter {
+        tag: SmolStr::from("role"),
+        expr: Some(SmolStr::from("^db.*")),
+      }),
+    ],
+    flags: QueryFlag::ACK | QueryFlag::NO_BROADCAST,
+    relay_factor: 0,
+    timeout: std::time::Duration::from_secs(2),
+    name: smol_str::SmolStr::from("filtered-query"),
+    payload: bytes::Bytes::new(),
+  };
+
+  let pb = query_to_pb(&typed).expect("query_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbQueryMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: QueryMessage<I, A> = query_from_pb(&decoded_pb).expect("query_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.id, typed.id);
+  assert_eq!(roundtripped.flags, typed.flags);
+  assert_eq!(roundtripped.timeout, typed.timeout);
+  assert_eq!(roundtripped.name, typed.name);
+  assert_eq!(roundtripped.filters.len(), 2);
+
+  // Check Id filter
+  match &roundtripped.filters[0] {
+    Filter::Id(ids) => {
+      assert_eq!(ids.len(), 2);
+      assert_eq!(ids[0], SmolStr::from("target-1"));
+      assert_eq!(ids[1], SmolStr::from("target-2"));
+    }
+    other => panic!("expected Filter::Id, got {:?}", other),
+  }
+
+  // Check Tag filter
+  match &roundtripped.filters[1] {
+    Filter::Tag(tf) => {
+      assert_eq!(tf.tag, SmolStr::from("role"));
+      assert_eq!(tf.expr, Some(SmolStr::from("^db.*")));
+    }
+    other => panic!("expected Filter::Tag, got {:?}", other),
+  }
+}
+
+#[test]
+fn query_message_ltime_required() {
+  let pb = PbQueryMessage {
+    ltime: None,
+    id: Some(1),
+    from: bytes::Bytes::new(),
+    ..Default::default()
+  };
+  assert!(
+    query_from_pb::<I, A>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent ltime"
+  );
+}
+
+#[test]
+fn query_message_id_required() {
+  let pb = PbQueryMessage {
+    ltime: Some(1),
+    id: None,
+    from: bytes::Bytes::new(),
+    ..Default::default()
+  };
+  assert!(
+    query_from_pb::<I, A>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent id"
+  );
+}
+
+// ── QueryResponseMessage ──────────────────────────────────────────────────────
+
+#[test]
+fn query_response_message_roundtrip_pb_ack() {
+  let typed: QueryResponseMessage<I, A> = QueryResponseMessage {
+    ltime: LamportTime::new(3),
+    id: 42,
+    from: Node::new(SmolStr::from("node-resp"), sample_addr()),
+    flags: QueryFlag::ACK,
+    payload: bytes::Bytes::new(),
+  };
+
+  let pb = query_response_to_pb(&typed).expect("query_response_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbQueryResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: QueryResponseMessage<I, A> =
+    query_response_from_pb(&decoded_pb).expect("query_response_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.id, typed.id);
+  assert_eq!(roundtripped.from.id_ref(), typed.from.id_ref());
+  assert_eq!(roundtripped.from.addr_ref(), typed.from.addr_ref());
+  assert_eq!(roundtripped.flags, typed.flags);
+  assert!(roundtripped.ack());
+  assert_eq!(roundtripped.payload, typed.payload);
+}
+
+#[test]
+fn query_response_message_roundtrip_pb_with_payload() {
+  let typed: QueryResponseMessage<I, A> = QueryResponseMessage {
+    ltime: LamportTime::new(7),
+    id: 100,
+    from: Node::new(SmolStr::from("node-resp2"), sample_addr()),
+    flags: QueryFlag::empty(),
+    payload: bytes::Bytes::from_static(b"response-data"),
+  };
+
+  let pb = query_response_to_pb(&typed).expect("query_response_to_pb failed");
+  let encoded = pb.encode_to_vec();
+  let decoded_pb =
+    PbQueryResponseMessage::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
+  let roundtripped: QueryResponseMessage<I, A> =
+    query_response_from_pb(&decoded_pb).expect("query_response_from_pb failed");
+
+  assert_eq!(roundtripped.ltime, typed.ltime);
+  assert_eq!(roundtripped.id, typed.id);
+  assert!(!roundtripped.ack());
+  assert_eq!(roundtripped.payload, bytes::Bytes::from_static(b"response-data"));
+}
+
+#[test]
+fn query_response_message_ltime_required() {
+  let pb = PbQueryResponseMessage {
+    ltime: None,
+    id: Some(1),
+    from: bytes::Bytes::new(),
+    ..Default::default()
+  };
+  assert!(
+    query_response_from_pb::<I, A>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent ltime"
+  );
+}
+
+#[test]
+fn query_response_message_id_required() {
+  let pb = PbQueryResponseMessage {
+    ltime: Some(1),
+    id: None,
+    from: bytes::Bytes::new(),
+    ..Default::default()
+  };
+  assert!(
+    query_response_from_pb::<I, A>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent id"
+  );
+}
+
+#[test]
+fn query_response_message_flags_required() {
+  // A QueryResponseMessage pb with flags absent must be rejected.
+  let pb = PbQueryResponseMessage {
+    ltime: Some(1),
+    id: Some(42),
+    from: bytes::Bytes::new(),
+    flags: None,
+    ..Default::default()
+  };
+  assert!(
+    query_response_from_pb::<I, A>(&pb).is_err(),
+    "expected BridgeError::MissingField for absent flags"
+  );
+}
+
+#[test]
+fn query_message_required_fields() {
+  // flags absent — must be rejected.
+  let pb_no_flags = PbQueryMessage {
+    ltime: Some(1),
+    id: Some(1),
+    from: bytes::Bytes::new(),
+    flags: None,
+    relay_factor: Some(0),
+    timeout_nanos: Some(1_000_000_000),
+    ..Default::default()
+  };
+  assert!(
+    query_from_pb::<I, A>(&pb_no_flags).is_err(),
+    "expected error for absent flags"
+  );
+
+  // relay_factor absent — must be rejected.
+  let pb_no_relay = PbQueryMessage {
+    ltime: Some(1),
+    id: Some(1),
+    from: bytes::Bytes::new(),
+    flags: Some(0),
+    relay_factor: None,
+    timeout_nanos: Some(1_000_000_000),
+    ..Default::default()
+  };
+  assert!(
+    query_from_pb::<I, A>(&pb_no_relay).is_err(),
+    "expected error for absent relay_factor"
+  );
+
+  // timeout_nanos absent — must be rejected.
+  let pb_no_timeout = PbQueryMessage {
+    ltime: Some(1),
+    id: Some(1),
+    from: bytes::Bytes::new(),
+    flags: Some(0),
+    relay_factor: Some(0),
+    timeout_nanos: None,
+    ..Default::default()
+  };
+  assert!(
+    query_from_pb::<I, A>(&pb_no_timeout).is_err(),
+    "expected error for absent timeout_nanos"
+  );
 }
