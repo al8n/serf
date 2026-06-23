@@ -111,11 +111,12 @@ message NodeStatusTime {
 }
 
 // UserEvent is a single named event with an optional payload.
-// Mirrors legacy serf-core UserEvent.
+// Mirrors legacy serf-core UserEvent (name + payload only).
+// The "can coalesce" flag lives on the broadcast UserEventMessage wrapper,
+// not on individual buffered entries.
 message UserEvent {
-  bool  cc      = 1;
-  string name   = 2;
-  bytes  payload = 3;
+  string name    = 1;
+  bytes  payload = 2;
 }
 
 // UserEvents is a batch of user events associated with a single lamport clock.

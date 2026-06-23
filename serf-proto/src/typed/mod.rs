@@ -226,11 +226,11 @@ impl<I, A> QueryResponseMessage<I, A> {
 
 /// A single named user event with an optional payload.
 ///
-/// Mirrors the legacy `serf-core` `UserEvent` struct.
+/// Mirrors the legacy `serf-core` `UserEvent` struct (name + payload only).
+/// The "can coalesce" flag lives on the broadcast wrapper [`UserEventMessage`],
+/// not on individual buffered entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEvent {
-  /// Whether the event may be coalesced with later identical events.
-  pub cc: bool,
   /// The event name.
   pub name: SmolStr,
   /// The event payload.
@@ -338,7 +338,7 @@ impl KeyRequestMessage {
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyResponseMessage {
   /// `true` if the operation succeeded on this node.
   pub result: bool,
@@ -354,12 +354,7 @@ pub struct KeyResponseMessage {
 impl KeyResponseMessage {
   /// Construct a default (failure, no keys) `KeyResponseMessage`.
   pub fn new() -> Self {
-    Self {
-      result: false,
-      message: SmolStr::default(),
-      keys: Vec::new(),
-      primary_key: None,
-    }
+    Self::default()
   }
 }
 

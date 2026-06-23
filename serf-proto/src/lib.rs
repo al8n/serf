@@ -4,6 +4,7 @@
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
 
+pub use any::{AnyMessage, DecodeError};
 pub use bridge::{
   BridgeError,
   conflict_response_from_pb,
@@ -92,6 +93,7 @@ impl LamportTime {
   }
 }
 
+pub mod any;
 pub mod bridge;
 pub mod framing;
 pub mod messages;

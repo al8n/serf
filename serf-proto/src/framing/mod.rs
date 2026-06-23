@@ -262,7 +262,9 @@ pub fn decode_message(frame: &Bytes) -> Result<(MessageType, Bytes, usize), Fram
   };
 
   let header_len = 1 + varint_bytes;
-  let frame_end = header_len + body_len as usize;
+  let frame_end = header_len
+    .checked_add(body_len as usize)
+    .ok_or(FrameError::VarintOverflow)?;
 
   if buf.len() < frame_end {
     return Err(FrameError::Incomplete(IncompleteFrame::new(buf.len(), frame_end)));

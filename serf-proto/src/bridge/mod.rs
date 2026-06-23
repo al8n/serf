@@ -189,27 +189,28 @@ where
 
 /// Encode a `memberlist_proto::Data` value to a raw `Bytes` buffer (no length prefix).
 ///
-/// Allocates a buffer sized by `encoded_len`, writes the encoding via
-/// `encode`, and wraps it in `Bytes`. This mirrors the pattern in
+/// Delegates to [`Data::encode_to_bytes`], which allocates a correctly-sized
+/// buffer and returns it as `Bytes`. This mirrors the pattern in
 /// `memberlist_proto::bridge` for serialising opaque `I`/`A` fields.
 fn data_to_bytes<T>(val: &T) -> Result<Bytes, BridgeError>
 where
   T: Data,
 {
-  let mut buf = vec![0u8; val.encoded_len()];
-  val.encode(&mut buf)?;
-  Ok(Bytes::from(buf))
+  Ok(val.encode_to_bytes()?)
 }
 
 /// Decode a `memberlist_proto::Data` value from raw bytes (no length prefix).
 ///
+/// Accepts any `&[u8]` slice — the caller may pass a `Bytes` ref via
+/// `buf.as_ref()` or a plain slice directly.
+///
 /// Rejects trailing data: the whole slice must be consumed so a malformed
 /// wire field is caught at the wire→machine boundary.
-fn data_from_bytes<T>(buf: &Bytes) -> Result<T, BridgeError>
+fn data_from_bytes<T>(buf: &[u8]) -> Result<T, BridgeError>
 where
   T: Data,
 {
-  let (bytes_read, val) = <T::Ref<'_> as DataRef<'_, T>>::decode(buf.as_ref())?;
+  let (bytes_read, val) = <T::Ref<'_> as DataRef<'_, T>>::decode(buf)?;
   if bytes_read != buf.len() {
     return Err(BridgeError::Decode(DecodeError::custom(format!(
       "trailing data in encoded field: decoder consumed {bytes_read} of {} bytes",
@@ -466,7 +467,6 @@ where
 /// Convert a typed [`UserEvent`] → `pb::UserEvent`.
 pub fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
   pb::UserEvent {
-    cc: t.cc,
     name: t.name.to_string(),
     payload: t.payload.clone(),
     ..Default::default()
@@ -476,7 +476,6 @@ pub fn user_event_single_to_pb(t: &UserEvent) -> pb::UserEvent {
 /// Convert `pb::UserEvent` → typed [`UserEvent`].
 pub fn user_event_single_from_pb(b: &pb::UserEvent) -> UserEvent {
   UserEvent {
-    cc: b.cc,
     name: SmolStr::from(b.name.as_str()),
     payload: b.payload.clone(),
   }

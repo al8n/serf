@@ -641,7 +641,6 @@ fn query_message_required_fields() {
 #[test]
 fn user_event_single_roundtrip_pb() {
   let typed = UserEvent {
-    cc: true,
     name: SmolStr::from("deploy"),
     payload: bytes::Bytes::from_static(b"ev-payload"),
   };
@@ -652,7 +651,6 @@ fn user_event_single_roundtrip_pb() {
     PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
   let roundtripped = user_event_single_from_pb(&decoded_pb);
 
-  assert_eq!(roundtripped.cc, typed.cc);
   assert_eq!(roundtripped.name, typed.name);
   assert_eq!(roundtripped.payload, typed.payload);
 }
@@ -660,7 +658,6 @@ fn user_event_single_roundtrip_pb() {
 #[test]
 fn user_event_single_empty_payload_roundtrip() {
   let typed = UserEvent {
-    cc: false,
     name: SmolStr::from("ping"),
     payload: bytes::Bytes::new(),
   };
@@ -671,7 +668,6 @@ fn user_event_single_empty_payload_roundtrip() {
     PbUserEvent::decode_from_slice(encoded.as_slice()).expect("decode_from_slice failed");
   let roundtripped = user_event_single_from_pb(&decoded_pb);
 
-  assert_eq!(roundtripped.cc, typed.cc);
   assert_eq!(roundtripped.name, typed.name);
   assert!(roundtripped.payload.is_empty());
 }
@@ -684,12 +680,10 @@ fn user_events_roundtrip_pb() {
     ltime: LamportTime::new(7),
     events: vec![
       UserEvent {
-        cc: true,
         name: SmolStr::from("deploy"),
         payload: bytes::Bytes::from_static(b"v1"),
       },
       UserEvent {
-        cc: false,
         name: SmolStr::from("alert"),
         payload: bytes::Bytes::from_static(b"critical"),
       },
@@ -752,7 +746,6 @@ fn push_pull_message_roundtrip_pb_full() {
     events: vec![UserEvents {
       ltime: LamportTime::new(49),
       events: vec![UserEvent {
-        cc: false,
         name: SmolStr::from("deploy"),
         payload: bytes::Bytes::from_static(b"v2"),
       }],

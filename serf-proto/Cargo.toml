@@ -21,11 +21,6 @@ encryption = ["aes-gcm", "chacha20-poly1305"]
 [dependencies]
 memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
 bytes = { workspace = true }
-byteorder.workspace = true
-smallvec.workspace = true
-indexmap.workspace = true
-derive_more.workspace = true
-viewit.workspace = true
 thiserror.workspace = true
 bitflags = "2"
 buffa = { version = "0.7", default-features = false }
