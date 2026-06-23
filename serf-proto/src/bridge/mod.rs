@@ -19,6 +19,9 @@ use crate::{
     Filter,
     JoinMessage,
     LeaveMessage,
+    QueryFlag,
+    QueryMessage,
+    QueryResponseMessage,
     TagFilter,
     Tags,
     UserEventMessage,
@@ -34,6 +37,9 @@ pub enum BridgeError {
   /// A required field was absent in the wire message.
   #[error("missing required field: {0}")]
   MissingField(Cow<'static, str>),
+  /// A field value was present but outside the accepted range or domain.
+  #[error("invalid field value: {0}")]
+  InvalidValue(Cow<'static, str>),
   /// A `oneof` field held no recognised variant.
   #[error("unknown or missing oneof variant in {0}")]
   UnknownVariant(Cow<'static, str>),
@@ -116,30 +122,51 @@ pub fn tags_from_pb(b: &pb::Tags) -> Tags {
 
 // ─── Filter ──────────────────────────────────────────────────────────────────
 
-/// Convert a typed [`Filter`] → `pb::Filter`.
-pub fn filter_to_pb(t: &Filter) -> pb::Filter {
+/// Convert a typed [`Filter<I>`] → `pb::Filter`.
+///
+/// The node-id type `I` is encoded as opaque `bytes` via `memberlist_proto::Data`
+/// for the `Id` variant; `Tag` variants encode as before.
+pub fn filter_to_pb<I>(t: &Filter<I>) -> Result<pb::Filter, BridgeError>
+where
+  I: Data,
+{
   let kind = match t {
-    Filter::Id(ids) => pb::filter::Kind::NodeIds(Box::new(pb::NodeIdList {
-      ids: ids.iter().map(|s| s.to_string()).collect(),
-      ..Default::default()
-    })),
+    Filter::Id(ids) => {
+      let mut encoded_ids = Vec::with_capacity(ids.len());
+      for id in ids {
+        encoded_ids.push(data_to_bytes(id)?);
+      }
+      pb::filter::Kind::NodeIds(Box::new(pb::NodeIdList {
+        ids: encoded_ids,
+        ..Default::default()
+      }))
+    }
     Filter::Tag(tf) => pb::filter::Kind::Tag(Box::new(pb::TagFilter {
       tag: tf.tag.to_string(),
       expr: tf.expr.as_deref().map(str::to_owned),
       ..Default::default()
     })),
   };
-  pb::Filter {
+  Ok(pb::Filter {
     kind: Some(kind),
     ..Default::default()
-  }
+  })
 }
 
-/// Convert `pb::Filter` → typed [`Filter`].
-pub fn filter_from_pb(b: &pb::Filter) -> Result<Filter, BridgeError> {
+/// Convert `pb::Filter` → typed [`Filter<I>`].
+///
+/// The `Id` variant decodes each `bytes` entry as `I` via `memberlist_proto::DataRef`.
+pub fn filter_from_pb<I>(b: &pb::Filter) -> Result<Filter<I>, BridgeError>
+where
+  I: Data,
+{
   match b.kind.as_ref() {
     Some(pb::filter::Kind::NodeIds(list)) => {
-      let ids = list.ids.iter().map(|s| SmolStr::from(s.as_str())).collect();
+      let ids = list
+        .ids
+        .iter()
+        .map(|buf| data_from_bytes::<I>(buf))
+        .collect::<Result<Vec<I>, BridgeError>>()?;
       Ok(Filter::Id(ids))
     }
     Some(pb::filter::Kind::Tag(tf)) => Ok(Filter::Tag(TagFilter {
@@ -285,4 +312,143 @@ where
 {
   let member: memberlist_proto::Node<I, A> = data_from_bytes(&b.member)?;
   Ok(ConflictResponseMessage { member })
+}
+
+// ─── QueryMessage ─────────────────────────────────────────────────────────────
+
+/// Convert a typed [`QueryMessage<I,A>`] → `pb::QueryMessage`.
+///
+/// - `from: Node<I,A>` is serialised to opaque `bytes` via `memberlist_proto::Data`.
+/// - Each `Filter<I>` in `filters` is encoded via [`filter_to_pb`].
+/// - `timeout` is stored as nanoseconds in a `uint64`.
+/// - `flags` is stored as the raw `u32` bit-pattern.
+pub fn query_to_pb<I, A>(t: &QueryMessage<I, A>) -> Result<pb::QueryMessage, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  let filters = t
+    .filters
+    .iter()
+    .map(|f| filter_to_pb::<I>(f))
+    .collect::<Result<Vec<pb::Filter>, BridgeError>>()?;
+
+  Ok(pb::QueryMessage {
+    ltime: Some(t.ltime.into()),
+    id: Some(t.id),
+    from: data_to_bytes(&t.from)?,
+    filters,
+    flags: Some(t.flags.bits()),
+    relay_factor: Some(t.relay_factor as u32),
+    timeout_nanos: Some(t.timeout.as_nanos() as u64),
+    name: t.name.to_string(),
+    payload: t.payload.clone(),
+    ..Default::default()
+  })
+}
+
+/// Convert `pb::QueryMessage` → typed [`QueryMessage<I,A>`].
+///
+/// Rejects missing `ltime`, `id`, `flags`, `relay_factor`, and `timeout_nanos`
+/// (all required by the legacy protocol). Rejects `relay_factor` values that
+/// exceed `u8::MAX`. Decodes `from` as `Node<I,A>` and each `Filter` via [`filter_from_pb`].
+pub fn query_from_pb<I, A>(b: &pb::QueryMessage) -> Result<QueryMessage<I, A>, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  let ltime = b
+    .ltime
+    .ok_or(BridgeError::MissingField("QueryMessage.ltime".into()))?;
+  let id = b
+    .id
+    .ok_or(BridgeError::MissingField("QueryMessage.id".into()))?;
+  let from: memberlist_proto::Node<I, A> = data_from_bytes(&b.from)?;
+  let filters = b
+    .filters
+    .iter()
+    .map(|f| filter_from_pb::<I>(f))
+    .collect::<Result<Vec<Filter<I>>, BridgeError>>()?;
+  let flags = QueryFlag::from_bits_truncate(
+    b.flags
+      .ok_or(BridgeError::MissingField("QueryMessage.flags".into()))?,
+  );
+  let relay_factor = u8::try_from(
+    b.relay_factor
+      .ok_or(BridgeError::MissingField("QueryMessage.relay_factor".into()))?,
+  )
+  .map_err(|_| BridgeError::InvalidValue("QueryMessage.relay_factor exceeds u8::MAX".into()))?;
+  // Safe: query timeouts are measured in seconds to minutes, well within u64::MAX nanoseconds.
+  let timeout = std::time::Duration::from_nanos(
+    b.timeout_nanos
+      .ok_or(BridgeError::MissingField("QueryMessage.timeout_nanos".into()))?,
+  );
+
+  Ok(QueryMessage {
+    ltime: LamportTime::from(ltime),
+    id,
+    from,
+    filters,
+    flags,
+    relay_factor,
+    timeout,
+    name: SmolStr::from(b.name.as_str()),
+    payload: b.payload.clone(),
+  })
+}
+
+// ─── QueryResponseMessage ─────────────────────────────────────────────────────
+
+/// Convert a typed [`QueryResponseMessage<I,A>`] → `pb::QueryResponseMessage`.
+///
+/// - `from: Node<I,A>` is serialised to opaque `bytes` via `memberlist_proto::Data`.
+/// - `flags` is stored as the raw `u32` bit-pattern.
+pub fn query_response_to_pb<I, A>(
+  t: &QueryResponseMessage<I, A>,
+) -> Result<pb::QueryResponseMessage, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  Ok(pb::QueryResponseMessage {
+    ltime: Some(t.ltime.into()),
+    id: Some(t.id),
+    from: data_to_bytes(&t.from)?,
+    flags: Some(t.flags.bits()),
+    payload: t.payload.clone(),
+    ..Default::default()
+  })
+}
+
+/// Convert `pb::QueryResponseMessage` → typed [`QueryResponseMessage<I,A>`].
+///
+/// Rejects missing `ltime`, `id`, and `flags` (all required by the legacy protocol).
+/// Decodes `from` as `Node<I,A>` via `memberlist_proto::DataRef`. Flags are
+/// decoded with `from_bits_retain` to preserve any future extension bits.
+pub fn query_response_from_pb<I, A>(
+  b: &pb::QueryResponseMessage,
+) -> Result<QueryResponseMessage<I, A>, BridgeError>
+where
+  I: Data,
+  A: Data,
+{
+  let ltime = b
+    .ltime
+    .ok_or(BridgeError::MissingField("QueryResponseMessage.ltime".into()))?;
+  let id = b
+    .id
+    .ok_or(BridgeError::MissingField("QueryResponseMessage.id".into()))?;
+  let from: memberlist_proto::Node<I, A> = data_from_bytes(&b.from)?;
+  let flags = QueryFlag::from_bits_retain(
+    b.flags
+      .ok_or(BridgeError::MissingField("QueryResponseMessage.flags".into()))?,
+  );
+
+  Ok(QueryResponseMessage {
+    ltime: LamportTime::from(ltime),
+    id,
+    from,
+    flags,
+    payload: b.payload.clone(),
+  })
 }
