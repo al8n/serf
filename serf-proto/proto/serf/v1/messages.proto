@@ -14,3 +14,41 @@ message UserEventMessage {
   string          name    = 3;
   bytes           payload = 4;
 }
+
+// Coordinate is the Vivaldi network-coordinate wire point.
+// All values are in units of seconds.
+// `portion` is the Euclidean part (variable-length vector of f64).
+message Coordinate {
+  repeated double portion    = 1;
+  double          error      = 2;
+  double          adjustment = 3;
+  double          height     = 4;
+}
+
+// Tags encodes node metadata as a string→string map gossiped via node meta.
+message Tags {
+  map<string, string> entries = 1;
+}
+
+// TagFilter matches nodes whose tag value satisfies an optional regex.
+message TagFilter {
+  string tag  = 1;
+  // expr is omitted when no regex constraint is needed (match-any).
+  optional string expr = 2;
+}
+
+// Filter is a single query-scoping predicate.
+// Exactly one of the oneof alternatives is set per Filter message.
+message Filter {
+  oneof kind {
+    // node_ids is a list of node-id strings; only those nodes respond.
+    NodeIdList node_ids = 1;
+    // tag is a tag-name / optional-regex pair.
+    TagFilter  tag      = 2;
+  }
+}
+
+// NodeIdList is the payload for a node-id filter.
+message NodeIdList {
+  repeated string ids = 1;
+}
