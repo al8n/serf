@@ -975,7 +975,7 @@ where
   /// Post-inner-timer phase of the composed tick: drain inner events then fire
   /// serf's own deadlines.
   ///
-  /// Tick order (H1b / decision 5 step 4):
+  /// Tick order:
   ///
   /// 1. Drain all inner events produced by the coordinator's timer via
   ///    `drain_inner`, processing NodeJoined / NodeLeft / UserPacket / etc.
@@ -987,7 +987,7 @@ where
   /// prevents tombstoning a member whose `NodeJoined` event is still queued in
   /// the inner machine at the time the reap deadline would otherwise fire.
   /// Without this ordering, a member that reconnects exactly at the reap
-  /// boundary could be incorrectly pruned.  Decision 5 step 4 / pin H1b.
+  /// boundary could be incorrectly pruned.
   pub(crate) fn after_inner_timeout<T>(&mut self, t: &mut T, now: Instant)
   where
     T: Reliable<I, A>,

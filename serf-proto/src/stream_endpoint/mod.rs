@@ -80,6 +80,7 @@ where
 }
 
 #[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
 where
   I: Clone + Eq + core::hash::Hash,
@@ -114,6 +115,7 @@ where
 // the serf-logic sieve over the coordinator.
 
 #[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
 where
   I: Id + Clone,
