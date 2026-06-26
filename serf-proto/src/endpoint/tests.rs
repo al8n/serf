@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  AnyMessage, JoinMessage, LamportTime, LeaveMessage,
+  AnyMessage, JoinMessage, LamportTime, LeaveMessage, StreamEndpoint,
   event::{Event, MemberEventKind},
   members::{MemberStatus, SerfState},
   typed::{Filter, QueryFlag, QueryMessage, RelayMessage, UserEventMessage},
@@ -13,7 +13,7 @@ use memberlist_proto::{EndpointOptions, SeedableRng, SmallRng};
 ///
 /// Uses `u32` node ids and `SocketAddr` addresses with a deterministically
 /// seeded `SmallRng` so tests are reproducible.
-fn ep() -> Endpoint<u32, std::net::SocketAddr> {
+fn ep() -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -21,12 +21,12 @@ fn ep() -> Endpoint<u32, std::net::SocketAddr> {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  Endpoint::new(inner, Options::new())
+  StreamEndpoint::new(inner, Options::new())
 }
 
 /// Build a serf `Endpoint` with coordinates enabled (for coordinate-gated tests).
 #[cfg(feature = "coordinates")]
-fn ep_with_coords() -> Endpoint<u32, std::net::SocketAddr> {
+fn ep_with_coords() -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -35,7 +35,7 @@ fn ep_with_coords() -> Endpoint<u32, std::net::SocketAddr> {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_disable_coordinates(false);
-  Endpoint::new(inner, opts)
+  StreamEndpoint::new(inner, opts)
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn leave_from_already_left_is_idempotent() {
 fn leave_from_shutdown_is_rejected() {
   let mut e = ep();
   // Force state to Shutdown.
-  e.state = SerfState::Shutdown;
+  e.core_mut().state = SerfState::Shutdown;
   let err = e
     .leave(memberlist_proto::Instant::ORIGIN)
     .expect_err("leave from Shutdown must fail");
@@ -435,7 +435,7 @@ fn shutdown_prevents_leaving_to_left_transition() {
   e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
   e.test_inner_left_cluster();
   // Force Shutdown before the deadline fires.
-  e.state = SerfState::Shutdown;
+  e.core_mut().state = SerfState::Shutdown;
   let after_delay = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(2);
   e.handle_timeout(after_delay);
   // Must remain Shutdown, not Left.
@@ -465,7 +465,7 @@ fn leave_arms_broadcast_deadline() {
 #[test]
 fn force_leave_from_shutdown_is_rejected() {
   let mut e = ep();
-  e.state = SerfState::Shutdown;
+  e.core_mut().state = SerfState::Shutdown;
   let err = e
     .force_leave(2u32, false, memberlist_proto::Instant::ORIGIN)
     .expect_err("force_leave from Shutdown must fail");
@@ -520,7 +520,7 @@ fn poll_timeout_includes_leave_deadlines_when_armed() {
 // Helper: seed a failed member with an explicit address so we can assert what
 // addr is dialled by the reconnector.
 fn seed_failed(
-  e: &mut Endpoint<u32, std::net::SocketAddr>,
+  e: &mut StreamEndpoint<u32, std::net::SocketAddr>,
   id: u32,
   addr: std::net::SocketAddr,
   leave_time: memberlist_proto::Instant,
@@ -530,7 +530,7 @@ fn seed_failed(
 
 // Helper: seed the endpoint's one alive member (the local node) explicitly so
 // the probability computation has a stable num_alive value.
-fn seed_alive(e: &mut Endpoint<u32, std::net::SocketAddr>, id: u32) {
+fn seed_alive(e: &mut StreamEndpoint<u32, std::net::SocketAddr>, id: u32) {
   e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(0));
 }
 
@@ -1106,7 +1106,7 @@ fn push_pull_local_state_bytes_deterministic() {
   // produce byte-identical push-pull wire output after resync_local_state.
   // This verifies that HashMap iteration order in `members.states` does NOT
   // leak into the encoded PushPullMessage.
-  fn build_ep_asc() -> Endpoint<u32, std::net::SocketAddr> {
+  fn build_ep_asc() -> StreamEndpoint<u32, std::net::SocketAddr> {
     let mut e = ep();
     e.test_set_clocks(5, 10, 15);
     // Insert members in ascending id order: 1, 2, 3, 4, 5.
@@ -1116,7 +1116,7 @@ fn push_pull_local_state_bytes_deterministic() {
     e.resync_local_state();
     e
   }
-  fn build_ep_desc() -> Endpoint<u32, std::net::SocketAddr> {
+  fn build_ep_desc() -> StreamEndpoint<u32, std::net::SocketAddr> {
     let mut e = ep();
     e.test_set_clocks(5, 10, 15);
     // Insert members in descending id order: 5, 4, 3, 2, 1.
@@ -1412,7 +1412,7 @@ fn invalid_tag_regex_does_not_advance_rng() {
       memberlist_proto::Instant::ORIGIN,
       SmallRng::seed_from_u64(0),
     );
-    Endpoint::new_with_rng(inner, Options::new(), SmallRng::seed_from_u64(seed))
+    StreamEndpoint::new_with_rng(inner, Options::new(), SmallRng::seed_from_u64(seed))
   };
 
   let mut ep_a = make_ep(42);
@@ -1817,16 +1817,9 @@ fn relay_response_picks_alive_non_self_member_and_sends() {
   let mut e = ep();
   // Seed Alive members with ports 1010 and 1011.
   e.test_seed_member(10u32, MemberStatus::Alive, LamportTime::new(1));
-  // test_seed_member uses port 0; override by using test_seed_failed_member
-  // approach for an explicit address:
-  {
-    let node = memberlist_proto::Node::new(11u32, addr(1011));
-    let member = crate::members::Member::new(node, crate::typed::Tags::new(), MemberStatus::Alive);
-    e.members.states.insert(
-      11u32,
-      crate::members::MemberState::new(member, LamportTime::new(1), None),
-    );
-  }
+  // test_seed_member uses port 0; seed id 11 at an explicit address so the
+  // relay-peer selection has two distinct addresses to choose between.
+  e.test_seed_member_at(11u32, addr(1011), MemberStatus::Alive, LamportTime::new(1));
 
   let querier = relay_node(2000);
   let frame = bytes::Bytes::from_static(b"\x06relay-payload");
@@ -1919,10 +1912,10 @@ fn relay_sieve_arm_decodes_relay_message_from_user_packet() {
   assert_eq!(sent, inner_payload);
 }
 
-/// Build a serf `Endpoint<u32, SocketAddr>` with an explicit RNG seed for the
+/// Build a serf `StreamEndpoint<u32, SocketAddr>` with an explicit RNG seed for the
 /// serf-level RNG (the relay/reconnect draws).  The inner Endpoint uses a fixed
 /// seed 0; the serf-level seed is the caller-supplied `serf_seed`.
-fn ep_with_serf_seed(serf_seed: u64) -> Endpoint<u32, std::net::SocketAddr> {
+fn ep_with_serf_seed(serf_seed: u64) -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -1930,7 +1923,7 @@ fn ep_with_serf_seed(serf_seed: u64) -> Endpoint<u32, std::net::SocketAddr> {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  Endpoint::new_with_rng(inner, Options::new(), SmallRng::seed_from_u64(serf_seed))
+  StreamEndpoint::new_with_rng(inner, Options::new(), SmallRng::seed_from_u64(serf_seed))
 }
 
 #[test]
@@ -2454,7 +2447,7 @@ fn reap_forgets_coordinate() {
 //
 // Use a tiny buffer (size=4) so ltime=1 and ltime=5 map to the same ring index
 // without needing a high clock that would make ltime=1 "too old".
-fn ep_tiny_event_buf() -> Endpoint<u32, std::net::SocketAddr> {
+fn ep_tiny_event_buf() -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2462,7 +2455,7 @@ fn ep_tiny_event_buf() -> Endpoint<u32, std::net::SocketAddr> {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  Endpoint::new(inner, Options::new().with_event_buffer_size(4))
+  StreamEndpoint::new(inner, Options::new().with_event_buffer_size(4))
 }
 
 #[test]
@@ -2539,7 +2532,7 @@ fn ack_query_produces_immediate_ack_directed_send() {
 }
 
 // Bug 3: Oversized query responses silently consumed.
-fn ep_small_resp_limit() -> Endpoint<u32, std::net::SocketAddr> {
+fn ep_small_resp_limit() -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2547,7 +2540,7 @@ fn ep_small_resp_limit() -> Endpoint<u32, std::net::SocketAddr> {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  Endpoint::new(inner, Options::new().with_query_response_size_limit(10))
+  StreamEndpoint::new(inner, Options::new().with_query_response_size_limit(10))
 }
 
 #[test]
@@ -2759,7 +2752,7 @@ fn respond_send_failure_returns_err_and_leaves_responded_false() {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_query_response_size_limit(50_000);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   let qid = QueryId {
     ltime: LamportTime::new(1),
@@ -3192,7 +3185,7 @@ fn resync_keeps_dirty_when_inner_snapshot_rejects() {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  let mut e = Endpoint::new(inner, Options::new());
+  let mut e = StreamEndpoint::new(inner, Options::new());
 
   // Force dirty and call resync.
   e.test_set_clocks(1, 2, 3);
@@ -3978,7 +3971,7 @@ fn zero_event_buffer_size_does_not_panic_on_first_event() {
   );
   // event_buffer_size = 0 should be clamped to 1 internally.
   let opts = crate::options::Options::new().with_event_buffer_size(0);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   // Must NOT panic.
   e.user_event("test", bytes::Bytes::new(), false)
@@ -4000,7 +3993,7 @@ fn zero_event_buffer_size_does_not_panic_on_merge_remote_state() {
     SmallRng::seed_from_u64(0),
   );
   let opts = crate::options::Options::new().with_event_buffer_size(0);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   let pp = PushPullMessage::<u32> {
     ltime: LamportTime::new(1),
@@ -4223,7 +4216,7 @@ fn inbound_query_oversized_is_dropped_before_state_mutation() {
     memberlist_proto::SmallRng::seed_from_u64(0),
   );
   let opts = crate::options::Options::new().with_query_size_limit(64);
-  let mut e: Endpoint<u32, std::net::SocketAddr> = Endpoint::new(inner, opts);
+  let mut e: StreamEndpoint<u32, std::net::SocketAddr> = StreamEndpoint::new(inner, opts);
 
   // Encode a QueryMessage whose payload pushes the wire encoding over 64 bytes.
   let oversized_payload = bytes::Bytes::from(vec![0u8; 100]);
@@ -4340,7 +4333,7 @@ fn ack_for_non_ack_query_is_dropped() {
     ltime: LamportTime::new(1),
     id: 42,
   };
-  e.pending_queries.push(PendingQuery {
+  e.core_mut().pending_queries.push(PendingQuery {
     kind: QueryPurpose::App,
     deadline,
     responses: std::collections::HashMap::new(),
@@ -4381,7 +4374,7 @@ fn ack_for_ack_query_is_delivered() {
     ltime: LamportTime::new(1),
     id: 42,
   };
-  e.pending_queries.push(PendingQuery {
+  e.core_mut().pending_queries.push(PendingQuery {
     kind: QueryPurpose::App,
     deadline,
     responses: std::collections::HashMap::new(),
@@ -4657,7 +4650,7 @@ fn zero_reap_interval_advances_deadline() {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_reap_interval(std::time::Duration::ZERO);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   // Advance time past the first reap deadline so handle_timeout fires it.
   let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
@@ -4687,7 +4680,7 @@ fn zero_reconnect_interval_advances_deadline() {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_reconnect_interval(std::time::Duration::ZERO);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
   e.handle_timeout(now);
@@ -4715,7 +4708,7 @@ fn zero_queue_check_interval_advances_deadline() {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_queue_check_interval(std::time::Duration::ZERO);
-  let mut e = Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
   e.handle_timeout(now);
@@ -4745,7 +4738,7 @@ fn user_event_total_packet_with_junk_exceeding_size_limit_is_dropped() {
   );
   // Set a tight size limit: 32 bytes.
   let opts = crate::options::Options::new().with_max_user_event_size(32);
-  let mut e = super::Endpoint::new(inner, opts);
+  let mut e = StreamEndpoint::new(inner, opts);
 
   // A small valid UserEvent that fits within 32 bytes on its own.
   let valid = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
@@ -4791,7 +4784,7 @@ fn pre_decode_fence_drops_oversized_valid_query_frame() {
   );
   // Small limit (64 bytes) so that a query with a 100-byte payload exceeds it.
   let opts = crate::options::Options::new().with_query_size_limit(64);
-  let mut e: Endpoint<u32, std::net::SocketAddr> = Endpoint::new(inner, opts);
+  let mut e: StreamEndpoint<u32, std::net::SocketAddr> = StreamEndpoint::new(inner, opts);
 
   // Construct a syntactically valid Query whose encoded frame exceeds 64 bytes.
   let q = QueryMessage::<u32, std::net::SocketAddr> {
@@ -4856,7 +4849,7 @@ fn pre_decode_fence_drops_oversized_valid_user_event_frame() {
   );
   // Tight limit: 32 bytes.
   let opts = crate::options::Options::new().with_max_user_event_size(32);
-  let mut e: Endpoint<u32, std::net::SocketAddr> = Endpoint::new(inner, opts);
+  let mut e: StreamEndpoint<u32, std::net::SocketAddr> = StreamEndpoint::new(inner, opts);
 
   // Construct a syntactically valid UserEvent whose encoded frame exceeds 32 bytes.
   let frame = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
@@ -5371,7 +5364,7 @@ mod tag_filter_regex {
 
   /// Seed the local node (id=1) with the given tags and return an endpoint
   /// ready for tag-filter query tests.
-  fn ep_with_tags(tags: Tags) -> Endpoint<u32, std::net::SocketAddr> {
+  fn ep_with_tags(tags: Tags) -> StreamEndpoint<u32, std::net::SocketAddr> {
     let mut e = ep();
     e.test_seed_member_with_tags(1u32, tags, MemberStatus::Alive, LamportTime::new(0));
     e

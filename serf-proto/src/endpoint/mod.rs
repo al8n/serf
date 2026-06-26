@@ -1,14 +1,19 @@
-//! The serf `Endpoint` — a pure Sans-I/O super-machine.
+//! The serf `Endpoint` — the transport-agnostic serf-logic core of a
+//! Sans-I/O super-machine.
 //!
-//! Owns a [`memberlist_proto::Endpoint`] by value and drives it, intercepting
-//! its gossip to implement serf's membership FSM, three Lamport clocks, user
-//! events, queries/responses/relays, push-pull anti-entropy, and network
-//! coordinates.
+//! Holds serf's membership FSM, three Lamport clocks, user events,
+//! queries/responses/relays, push-pull anti-entropy, and network coordinates,
+//! but **no** transport reference.  It reaches a memberlist reliable
+//! coordinator only through the narrow [`Reliable`](reliable::Reliable) seam:
+//! every serf-logic method that touches the membership transport takes a
+//! `&mut impl Reliable<I, A>` (named `t`).  The composing super-machine
+//! ([`crate::StreamEndpoint`]) owns both the core and the coordinator as
+//! separate fields and threads the latter into the former on each call.
 //!
-//! The driver moves opaque `Bytes` in (`handle_packet`) and
+//! The composing super-machine moves opaque `Bytes` in (`handle_packet`) and
 //! `Transmit`/`Bytes` out (`poll_transmit`) and ticks `poll_timeout(now)`;
-//! it carries zero serf logic.  All wall-clock reads are threaded in as a
-//! `now: Instant` parameter — no clock reads occur inside this module.
+//! this core carries zero transport I/O.  All wall-clock reads are threaded in
+//! as a `now: Instant` parameter — no clock reads occur inside this module.
 //!
 //! # Threat model
 //!
@@ -55,9 +60,10 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use memberlist_proto::{
-  CheapClone, Data, EndpointEvent, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng,
-  StreamCommand, Transmit, parse_message, typed::NodeState,
+  CheapClone, Data, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng, typed::NodeState,
 };
+
+use self::reliable::Reliable;
 use rand::RngExt;
 use smol_str::SmolStr;
 
@@ -622,7 +628,17 @@ fn next_ltime(clock: &mut u64) -> u64 {
 
 // ── Endpoint ──────────────────────────────────────────────────────────────────
 
-/// The serf Sans-I/O super-machine.
+/// The serf-logic core of the Sans-I/O super-machine.
+///
+/// Holds all serf state — the three Lamport clocks, membership store, options,
+/// event ring, query bookkeeping, deadlines, and (feature-gated) the coordinate
+/// client — and **no** transport reference.  It reaches a memberlist reliable
+/// coordinator only through the narrow [`Reliable`](reliable::Reliable) seam:
+/// every serf-logic method that must touch the membership transport takes a
+/// `&mut impl Reliable<I, A>` (named `t`), borrowed disjointly from the core's
+/// own state.  The composing super-machine
+/// ([`crate::StreamEndpoint`]) owns both the core and the coordinator as
+/// separate fields and threads the latter into the former.
 ///
 /// `I` is the node-id type; `A` is the (resolved) address type; `R` is the
 /// random number generator injected at construction time (default: `SmallRng`).
@@ -633,8 +649,6 @@ pub struct Endpoint<I, A, R = SmallRng>
 where
   I: Eq + core::hash::Hash,
 {
-  /// The inner memberlist Endpoint (SWIM state machine + gossip transport).
-  inner: memberlist_proto::Endpoint<I, A, R>,
   /// serf configuration knobs.
   opts: Options,
   /// Member (SWIM membership) Lamport clock — plain `u64`, no atomics.
@@ -773,16 +787,17 @@ where
   I: Clone + Eq + core::hash::Hash,
   R: SeedableRng,
 {
-  /// Construct a serf `Endpoint` wrapping `inner`, using `opts` for serf-level
-  /// knobs, and `rng` as serf's own injected selection entropy.
+  /// Construct a serf `Endpoint` core using `opts` for serf-level knobs and
+  /// `rng` as serf's own injected selection entropy.
   ///
-  /// The inner `Endpoint` must already have been configured with
+  /// The core holds no transport; the composing super-machine pairs it with a
+  /// memberlist coordinator that must already have been configured with
   /// `EndpointOptions::with_user_broadcast_tiers(NonZeroU8::new(3))` so that
   /// serf's three broadcast tiers (intent=0, query=1, event=2) are available.
   ///
-  /// `rng` is **separate** from the inner Endpoint's `R`.  Seed it from the
+  /// `rng` is **separate** from the coordinator's `R`.  Seed it from the
   /// driver's own entropy source; do not share the same `R` instance.
-  pub fn new_with_rng(inner: memberlist_proto::Endpoint<I, A, R>, opts: Options, rng: R) -> Self {
+  pub fn new_with_rng(opts: Options, rng: R) -> Self {
     // Arm the first reap/reconnect/queue-check deadlines relative to the ORIGIN instant.
     // The driver calls handle_timeout(now) and the deadlines fire when now >= deadline.
     let first_reap = Instant::ORIGIN + opts.reap_interval();
@@ -802,7 +817,6 @@ where
       };
 
     Self {
-      inner,
       opts,
       clock: 0,
       event_clock: 0,
@@ -845,8 +859,8 @@ where
   /// Suitable for tests and environments where determinism or an explicit seed
   /// is acceptable.  Production drivers should use `new_with_rng` and seed from
   /// a cryptographically-secure source.
-  pub fn new(inner: memberlist_proto::Endpoint<I, A, R>, opts: Options) -> Self {
-    Self::new_with_rng(inner, opts, R::seed_from_u64(0))
+  pub fn new(opts: Options) -> Self {
+    Self::new_with_rng(opts, R::seed_from_u64(0))
   }
 
   // ── read accessors ────────────────────────────────────────────────────────
@@ -887,31 +901,25 @@ where
 {
   /// Drain one serf event.
   ///
-  /// Pumps the inner `Endpoint` to exhaustion, sieving each inner `Event`
+  /// Pumps the coordinator `t` to exhaustion, sieving each inner `Event`
   /// into serf state, then returns the next queued serf `Event`.  Call in a
   /// loop until `None` before blocking.
-  pub fn poll_event(&mut self) -> Option<Event<I, A>> {
-    self.drain_inner();
+  pub(crate) fn poll_event<T>(&mut self, t: &mut T) -> Option<Event<I, A>>
+  where
+    T: Reliable<I, A>,
+  {
+    self.drain_inner(t);
     self.pending_events.pop_front()
   }
 
-  /// Drain one outgoing transmit.
+  /// The earliest serf-level deadline requiring a `handle_timeout` call.
   ///
-  /// Passes through to the inner `Endpoint`; serf adds no additional
-  /// transmit framing at this layer.
-  pub fn poll_transmit(&mut self) -> Option<Transmit<I, A>> {
-    self.inner.poll_transmit()
-  }
-
-  /// The earliest deadline requiring a `handle_timeout` call.
-  ///
-  /// Returns the minimum of the inner Endpoint's deadline and serf's own
-  /// periodic deadlines (reap, reconnect, queue-check, leave-broadcast,
-  /// leave-complete).
-  pub fn poll_timeout(&self) -> Option<Instant> {
-    let inner = self.inner.poll_timeout();
+  /// Returns the minimum of serf's own periodic deadlines (reap, reconnect,
+  /// queue-check, leave-broadcast, leave-complete, and pending-query closes).
+  /// The composing super-machine folds in the coordinator's own deadline.
+  pub fn serf_poll_timeout(&self) -> Option<Instant> {
     let query_min = self.pending_queries.iter().map(|pq| pq.deadline).min();
-    let serf = [
+    [
       self.next_reap,
       self.next_reconnect,
       self.next_queue_check,
@@ -921,71 +929,58 @@ where
     ]
     .into_iter()
     .flatten()
-    .min();
-    match (inner, serf) {
-      (Some(a), Some(b)) => Some(a.min(b)),
-      (Some(a), None) => Some(a),
-      (None, Some(b)) => Some(b),
-      (None, None) => None,
+    .min()
+  }
+
+  /// Sieve the coordinator's inner events after a transport ingress.
+  ///
+  /// The composing super-machine hands inbound bytes to its coordinator (which
+  /// runs the SWIM machine and emits inner events: `UserPacket`,
+  /// `RemoteStateReceived`, `NodeJoined`, …), then calls this to fold those
+  /// inner events into serf state.  Latches `now` so inner events that need a
+  /// wall-clock reference (e.g. `NodeLeft` leave-time) use the ingress instant.
+  pub(crate) fn drain_after_ingress<T>(&mut self, t: &mut T, now: Instant)
+  where
+    T: Reliable<I, A>,
+  {
+    self.drain_now = now;
+    self.drain_inner(t);
+  }
+
+  /// Pre-inner-timer phase of the composed tick (H6).
+  ///
+  /// Latches `now` and, if the local-state snapshot is dirty, resyncs it so the
+  /// coordinator echoes a fresh serf-clock / member-status snapshot on this
+  /// tick's anti-entropy exchange rather than a snapshot from a previous tick.
+  /// The dirty flag is cleared inside `resync_local_state` on success.
+  ///
+  /// The composing super-machine calls this, then drives the coordinator's own
+  /// `handle_timeout(now)` (the SWIM gossip / probe / push-pull scheduler), then
+  /// [`Endpoint::after_inner_timeout`].  This three-phase ordering keeps the
+  /// load-bearing sequence (resync → inner timer → drain → serf deadlines)
+  /// structural; the trait deliberately excludes the inner timer so the core
+  /// cannot drive it directly.
+  pub(crate) fn before_inner_timeout<T>(&mut self, t: &mut T, now: Instant)
+  where
+    T: Reliable<I, A>,
+    I: Clone,
+    A: Clone,
+  {
+    self.drain_now = now;
+    if self.local_state_dirty {
+      self.resync_local_state(t);
     }
   }
 
-  /// Deliver an inbound datagram or packet to the machine.
-  ///
-  /// Decodes the memberlist wire `Message<I, A>` from `data` and dispatches it
-  /// to the inner `Endpoint`.  SWIM messages (Ping, Alive, Dead, Suspect, …)
-  /// are handled by the inner machine; when the inner encounters a
-  /// `Message::UserData` payload it emits `Event::UserPacket`, which the serf
-  /// sieve (`on_inner_event`) then decodes as a serf `AnyMessage<I, A>` and
-  /// routes to the appropriate serf handler (join/leave intent, user event,
-  /// query, relay).
-  ///
-  /// Malformed or unrecognised bytes are silently dropped — the machine must
-  /// not panic on bad input from the network.
-  pub fn handle_packet(&mut self, from: A, data: Bytes, now: Instant) {
-    // Malformed frame or unrecognised tag: drop silently.  The inner endpoint
-    // logs its own decode errors; serf takes no serf-level action here.
-    self.drain_now = now;
-    if let Ok(msg) = parse_message::<I, A>(data) {
-      self.inner.handle_packet(from, msg, now);
-    }
-    self.drain_inner();
-  }
-
-  /// Deliver a stream event to the machine.
-  ///
-  /// Forwards to the inner `Endpoint`, then drains resulting inner events.
-  pub fn handle_stream_event(
-    &mut self,
-    ev: EndpointEvent<I, A>,
-    now: Instant,
-  ) -> Option<StreamCommand<I, A>> {
-    self.drain_now = now;
-    let cmd = self.inner.handle_stream_event(ev, now);
-    self.drain_inner();
-    cmd
-  }
-
-  /// Accept an inbound stream connection.
-  ///
-  /// Passes directly to the inner `Endpoint`.
-  pub fn accept_stream(&mut self, from: A, now: Instant) -> Option<memberlist_proto::Stream<I, A>> {
-    self.inner.accept_stream(from, now)
-  }
-
-  /// Advance time and fire any expired serf or inner deadlines.
+  /// Post-inner-timer phase of the composed tick: drain inner events then fire
+  /// serf's own deadlines.
   ///
   /// Tick order (H1b / decision 5 step 4):
   ///
-  /// 1. Resync the push-pull local-state snapshot if dirty (H6) so the inner
-  ///    echoes a fresh serf-clock / member-status snapshot on this tick's
-  ///    anti-entropy exchange — not a snapshot from a previous tick.
-  /// 2. Run `inner.handle_timeout(now)` first — the inner gossip scheduler
-  ///    produces any pending SWIM transitions and SWIM piggyback gossip.
-  /// 3. Drain all inner events produced by the inner tick via `drain_inner()`,
-  ///    processing NodeJoined / NodeLeft / UserPacket / etc. through the serf
-  ///    sieve before any serf deadline fires.
-  /// 4. Then fire serf's own deadlines: reap → reconnect → queue-check →
+  /// 1. Drain all inner events produced by the coordinator's timer via
+  ///    `drain_inner`, processing NodeJoined / NodeLeft / UserPacket / etc.
+  ///    through the serf sieve **before** any serf deadline fires.
+  /// 2. Fire serf's own deadlines: reap → reconnect → queue-check →
   ///    query-closes → leave-complete.
   ///
   /// **Why this order:** firing serf deadlines after draining the inner's events
@@ -993,30 +988,19 @@ where
   /// the inner machine at the time the reap deadline would otherwise fire.
   /// Without this ordering, a member that reconnects exactly at the reap
   /// boundary could be incorrectly pruned.  Decision 5 step 4 / pin H1b.
-  pub fn handle_timeout(&mut self, now: Instant)
+  pub(crate) fn after_inner_timeout<T>(&mut self, t: &mut T, now: Instant)
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
     self.drain_now = now;
 
-    // H6: resync the push-pull snapshot before the inner tick so the next
-    // anti-entropy exchange carries the current serf state (not a stale one
-    // from a previous mutation burst).  The dirty flag is cleared inside
-    // resync_local_state on success.
-    if self.local_state_dirty {
-      self.resync_local_state();
-    }
-
-    // Step 2: drive the inner memberlist machine (SWIM gossip + probe + push-pull).
-    // This may produce NodeJoined / NodeLeft / UserPacket inner events.
-    self.inner.handle_timeout(now);
-
-    // Step 3: drain all inner events produced by the tick through the serf sieve.
+    // Step 1: drain all inner events produced by the tick through the serf sieve.
     // NodeJoined / NodeLeft / etc. are processed NOW, before any serf deadline fires.
-    self.drain_inner();
+    self.drain_inner(t);
 
-    // Step 4: fire serf's own deadlines in deterministic order.
+    // Step 2: fire serf's own deadlines in deterministic order.
 
     // Reaper: remove tombstoned left/failed nodes and stale intents.
     if let Some(dl) = self.next_reap {
@@ -1029,7 +1013,7 @@ where
     // Reconnector: probabilistically re-dial a random failed peer.
     if let Some(dl) = self.next_reconnect {
       if now >= dl {
-        self.fire_reconnect(now);
+        self.fire_reconnect(t, now);
         self.next_reconnect = Some(now + self.opts.reconnect_interval());
       }
     }
@@ -1073,18 +1057,21 @@ where
 
   // ── inner-event sieve ─────────────────────────────────────────────────────
 
-  /// Pump the inner Endpoint to exhaustion, routing each event through the
-  /// serf sieve.
+  /// Pump the coordinator `t` to exhaustion, routing each inner event through
+  /// the serf sieve.
   ///
   /// After all inner events are drained, if the local-state snapshot is dirty
   /// (H6), `resync_local_state` is called so the next push-pull egress ships
   /// the current serf clock / member-status state, not a stale snapshot.
-  fn drain_inner(&mut self) {
-    while let Some(ev) = self.inner.poll_event() {
-      self.on_inner_event(ev);
+  fn drain_inner<T>(&mut self, t: &mut T)
+  where
+    T: Reliable<I, A>,
+  {
+    while let Some(ev) = t.poll_inner_event() {
+      self.on_inner_event(t, ev);
     }
     if self.local_state_dirty {
-      self.resync_local_state();
+      self.resync_local_state(t);
     }
   }
 
@@ -1092,9 +1079,10 @@ where
   /// handler.
   ///
   /// Every variant of the inner `Event` enum is covered (totality / H4).
-  /// Unimplemented handlers are stubs that will be filled in by later
-  /// sub-stages.
-  fn on_inner_event(&mut self, ev: memberlist_proto::Event<I, A>) {
+  fn on_inner_event<T>(&mut self, t: &mut T, ev: memberlist_proto::Event<I, A>)
+  where
+    T: Reliable<I, A>,
+  {
     use memberlist_proto::Event as IE;
     match ev {
       // ── membership ───────────────────────────────────────────────────────
@@ -1115,7 +1103,7 @@ where
       IE::NodeConflict(_c) => {
         if self.opts.enable_id_conflict_resolution() {
           let now = self.drain_now;
-          self.resolve_node_conflict(now);
+          self.resolve_node_conflict(t, now);
         }
       }
 
@@ -1126,12 +1114,12 @@ where
         // fresh `now` for the current call site.
         let now = self.drain_now;
         let (from, data, _reliability) = p.into_parts();
-        self.handle_user_packet(from, data, now);
+        self.handle_user_packet(t, from, data, now);
       }
       IE::RemoteStateReceived(r) => {
         let (_peer, user_data, is_join) = r.into_parts();
         if !user_data.is_empty() {
-          self.merge_remote_state(user_data, is_join);
+          self.merge_remote_state(t, user_data, is_join);
         }
       }
 
@@ -1168,7 +1156,7 @@ where
           let node_id = p.node_ref().id_ref().clone();
           let rtt = p.rtt();
           let payload = p.payload_ref().clone();
-          self.handle_ping_completed(&node_id, rtt, &payload);
+          self.handle_ping_completed(t, &node_id, rtt, &payload);
         }
         // When the feature is disabled, suppress the unused-variable warning.
         #[cfg(not(feature = "coordinates"))]
@@ -1232,8 +1220,9 @@ where
   /// (a transient alloc failure should not permanently corrupt the snapshot).
   ///
   /// Mirrors Go serf `delegate.go` `local_state` (~line 386).
-  pub fn resync_local_state(&mut self)
+  pub(crate) fn resync_local_state<T>(&mut self, t: &mut T)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Data,
   {
@@ -1290,11 +1279,11 @@ where
       }
     };
 
-    // Push to the inner Endpoint.  On cap-exceeded errors keep dirty for retry;
-    // the operator must raise max_stream_frame_size if the serf state is too large
-    // to fit in one push-pull frame.  The snapshot is stale but the machine
-    // continues operating — the next drain attempt will retry.
-    if self.inner.set_local_state_snapshot(encoded).is_ok() {
+    // Push to the coordinator's inner Endpoint.  On cap-exceeded errors keep
+    // dirty for retry; the operator must raise max_stream_frame_size if the serf
+    // state is too large to fit in one push-pull frame.  The snapshot is stale
+    // but the machine continues operating — the next drain attempt will retry.
+    if t.set_local_state_snapshot(encoded).is_ok() {
       self.local_state_dirty = false;
     }
   }
@@ -1346,8 +1335,9 @@ where
   ///
   /// Decoding errors in the `user_data` bytes are silently dropped —
   /// the machine must not panic on bad network input.
-  fn merge_remote_state(&mut self, user_data: Bytes, is_join: bool)
+  fn merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes, is_join: bool)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Data,
   {
@@ -1429,7 +1419,7 @@ where
     for node_id in &pp.left_members {
       if let Some(&status_ltime) = status_map.get(node_id) {
         let leave_ltime = LamportTime(status_ltime.0.saturating_add(1));
-        self.handle_node_leave_intent(leave_ltime, node_id, false, now);
+        self.handle_node_leave_intent(t, leave_ltime, node_id, false, now);
       }
     }
 
@@ -1713,14 +1703,16 @@ where
   /// Returns `true` if the intent should be rebroadcast.
   ///
   /// Mirrors Go serf `base.go` `handleNodeLeaveIntent` (lines 1449-1579).
-  pub(crate) fn handle_node_leave_intent(
+  pub(crate) fn handle_node_leave_intent<T>(
     &mut self,
+    t: &mut T,
     ltime: LamportTime,
     id: &I,
     prune: bool,
     now: Instant,
   ) -> bool
   where
+    T: Reliable<I, A>,
     I: Clone,
   {
     // Whole-message drop gate: reject unacceptable Lamport times before any
@@ -1753,12 +1745,12 @@ where
     // endpoint is Alive, push back with a join broadcast and suppress the rebroadcast.
     // We check this AFTER the stale guard so stale self-leaves do not trigger refutes.
     // broadcast_join calls handle_node_join_intent which marks dirty when it buffers.
-    let is_local = id == self.inner.local_id_ref();
+    let is_local = id == t.endpoint_ref().local_id_ref();
     if is_local && self.state == SerfState::Alive {
       // Refute the leave by re-announcing our own Join intent so every peer
       // clears the spurious Leaving status; the rebroadcast of the leave itself
       // is suppressed.
-      self.broadcast_join(LamportTime(self.clock));
+      self.broadcast_join(t, LamportTime(self.clock));
       return false;
     }
 
@@ -1979,8 +1971,9 @@ where
   ///    to the driver as `Event::DialRequested(DialPassthrough { .. })`.
   ///
   /// H3: serf emits a dial request; it does NO dial itself.
-  fn fire_reconnect(&mut self, now: Instant)
+  fn fire_reconnect<T>(&mut self, t: &mut T, now: Instant)
   where
+    T: Reliable<I, A>,
     A: Clone,
   {
     let num_failed = self.members.failed_members.len();
@@ -2013,10 +2006,10 @@ where
     };
     let addr = ms.member().node().addr_ref().clone();
 
-    // Call inner.start_push_pull; the inner queues Event::DialRequested.
+    // Call start_push_pull; the inner queues Event::DialRequested.
     // The sieve (on_inner_event) passes it through as Event::DialRequested.
-    self.inner.start_push_pull(addr, PushPullKind::Join, now);
-    self.drain_inner();
+    t.start_push_pull(addr, PushPullKind::Join, now);
+    self.drain_inner(t);
   }
 
   // ── join ─────────────────────────────────────────────────────────────────
@@ -2032,14 +2025,15 @@ where
   ///
   /// State gate: only `Alive` announces a join; any other lifecycle state
   /// returns [`Error::BadJoinState`].
-  pub fn join(&mut self) -> Result<(), Error>
+  pub(crate) fn join<T>(&mut self, t: &mut T) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone,
   {
     if self.state != SerfState::Alive {
       return Err(Error::BadJoinState(self.state));
     }
-    self.broadcast_join(LamportTime(self.clock));
+    self.broadcast_join(t, LamportTime(self.clock));
     Ok(())
   }
 
@@ -2050,11 +2044,12 @@ where
   /// locally via `handle_node_join_intent`, then enqueues the encoded
   /// `JoinMessage` on the intent tier (rank 0, highest priority).  Mirrors
   /// serf-core `base.rs` `broadcast_join`.
-  fn broadcast_join(&mut self, ltime: LamportTime)
+  fn broadcast_join<T>(&mut self, t: &mut T, ltime: LamportTime)
   where
+    T: Reliable<I, A>,
     I: Clone,
   {
-    let local_id = self.inner.local_id_ref().clone();
+    let local_id = t.endpoint_ref().local_id_ref().clone();
 
     // Witness the member clock, then apply the intent locally so the local node
     // is recorded at this ltime (handle_node_join_intent also witnesses, but the
@@ -2069,7 +2064,7 @@ where
     // construction; a dropped intent is re-announced by the next push-pull.
     let jm = JoinMessage::new(ltime, local_id);
     if let Ok(encoded) = AnyMessage::<I, A>::Join(jm).encode() {
-      let _ = self.inner.queue_user_broadcast_ranked(0, encoded);
+      let _ = t.queue_user_broadcast_ranked(0, encoded);
     }
   }
 
@@ -2100,8 +2095,9 @@ where
   /// The `Leaving → Left` transition happens later in `handle_timeout` when
   /// `leave_complete_deadline` (armed on inner `LeftCluster` + `leave_propagate_delay`)
   /// elapses.  `Event::LeftCluster` is emitted at that point.
-  pub fn leave(&mut self, now: Instant) -> Result<(), Error>
+  pub(crate) fn leave<T>(&mut self, t: &mut T, now: Instant) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
@@ -2118,26 +2114,26 @@ where
 
     // 2. Local leave intent — marks the local node as Leaving in the store
     //    and witnesses the member clock.
-    let local_id = self.inner.local_id_ref().clone();
+    let local_id = t.endpoint_ref().local_id_ref().clone();
     // next_ltime stamps the current clock value (clamped to < LTIME_MAX) and
     // advances the clock in one atomic step, closing the local-emission hole.
     let ltime = LamportTime(next_ltime(&mut self.clock));
     self.mark_local_state_dirty();
     // We are setting state = Leaving above so the self-refute guard in
     // handle_node_leave_intent will NOT fire (it only fires when state == Alive).
-    self.handle_node_leave_intent(ltime, &local_id, false, now);
+    self.handle_node_leave_intent(t, ltime, &local_id, false, now);
 
     // 4. Broadcast the leave intent on the intent tier (rank 0) so peers learn
     //    the local node is leaving without waiting for anti-entropy.  The
     //    driver bounds the flush via the broadcast deadline below.
-    self.broadcast_leave(ltime, local_id, false);
+    self.broadcast_leave(t, ltime, local_id, false);
 
     // 5. Arm the broadcast-timeout deadline so the driver always has a finite
     //    wait; it can short-circuit by watching `user_broadcast_queue_len()`.
     self.leave_broadcast_deadline = Some(now + self.opts.broadcast_timeout());
 
     // 5. Call inner leave; this queues the dead-self fan-out packets.
-    self.inner.leave(now)?;
+    t.leave(now)?;
 
     Ok(())
   }
@@ -2151,8 +2147,15 @@ where
   ///
   /// Does not require the local endpoint to be `Alive` (callers may want to
   /// clean up failed nodes before leaving themselves), but rejects `Shutdown`.
-  pub fn force_leave(&mut self, id: I, prune: bool, now: Instant) -> Result<(), Error>
+  pub(crate) fn force_leave<T>(
+    &mut self,
+    t: &mut T,
+    id: I,
+    prune: bool,
+    now: Instant,
+  ) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
@@ -2166,11 +2169,11 @@ where
     self.clock = self.clock.saturating_add(1);
     let ltime = LamportTime(self.clock);
     self.mark_local_state_dirty();
-    self.handle_node_leave_intent(ltime, &id, prune, now);
+    self.handle_node_leave_intent(t, ltime, &id, prune, now);
 
     // Broadcast the leave intent (carrying the prune flag) so peers apply the
     // same forced removal.
-    self.broadcast_leave(ltime, id, prune);
+    self.broadcast_leave(t, ltime, id, prune);
 
     // Arm the broadcast deadline so the driver knows how long to wait.
     self.leave_broadcast_deadline = Some(now + self.opts.broadcast_timeout());
@@ -2190,14 +2193,17 @@ where
   /// unconditionally — the inner gossip layer only transmits when peers exist,
   /// so an enqueue against an empty cluster is a harmless no-op rather than a
   /// special case.
-  fn broadcast_leave(&mut self, ltime: LamportTime, id: I, prune: bool) {
+  fn broadcast_leave<T>(&mut self, t: &mut T, ltime: LamportTime, id: I, prune: bool)
+  where
+    T: Reliable<I, A>,
+  {
     let lm = LeaveMessage::new(ltime, id, prune);
     // Ignoring Err: a `Leave` carrying a single id never approaches the gossip
     // MTU, so the only error path is an encode failure on a degenerate id type
     // (a construction-time concern the driver surfaces); a dropped intent is
     // re-announced by the next anti-entropy round.
     if let Ok(encoded) = AnyMessage::<I, A>::Leave(lm).encode() {
-      let _ = self.inner.queue_user_broadcast_ranked(0, encoded);
+      let _ = t.queue_user_broadcast_ranked(0, encoded);
     }
   }
 
@@ -2218,12 +2224,16 @@ where
   /// Go serf checks `max_user_event_size` in three places; this port
   /// consolidates to two (pre-name+payload-len, post-encoded-len), matching
   /// the oracle's intent without the redundant intermediate check.
-  pub fn user_event(
+  pub(crate) fn user_event<T>(
     &mut self,
+    t: &mut T,
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
-  ) -> Result<(), Error> {
+  ) -> Result<(), Error>
+  where
+    T: Reliable<I, A>,
+  {
     let name: smol_str::SmolStr = name.into();
     let max_size = self.opts.max_user_event_size();
 
@@ -2269,9 +2279,7 @@ where
     // the only remaining path to an error is a frame larger than the inner's
     // gossip MTU — a configuration mismatch the driver should detect at
     // startup.  We propagate it back rather than silently drop.
-    self
-      .inner
-      .queue_user_broadcast_ranked(2, encoded)
+    t.queue_user_broadcast_ranked(2, encoded)
       .map_err(Error::InnerLeave)?;
 
     Ok(())
@@ -2351,8 +2359,9 @@ where
   /// H4: both `Reliability::Reliable` and `Reliability::Unreliable` dispatch
   /// identically; the reliability value affects delivery guarantees at the
   /// memberlist layer but not the serf handler logic.
-  fn handle_user_packet(&mut self, _from: A, data: Bytes, now: Instant)
+  fn handle_user_packet<T>(&mut self, t: &mut T, _from: A, data: Bytes, now: Instant)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -2398,21 +2407,21 @@ where
         // decoded `ue` is consumed by handle_user_event for dedup + emission.
         let is_new = self.handle_user_event(ue);
         if is_new {
-          self.rebroadcast(MessageType::UserEvent, data);
+          self.rebroadcast(t, MessageType::UserEvent, data);
         }
       }
       AnyMessage::Join(join) => {
         // handle_node_join_intent takes ltime + id reference.
         let rebroadcast = self.handle_node_join_intent(join.ltime, &join.id.clone(), now);
         if rebroadcast {
-          self.rebroadcast(MessageType::Join, data);
+          self.rebroadcast(t, MessageType::Join, data);
         }
       }
       AnyMessage::Leave(leave) => {
         let id = leave.id.clone();
-        let rebroadcast = self.handle_node_leave_intent(leave.ltime, &id, leave.prune, now);
+        let rebroadcast = self.handle_node_leave_intent(t, leave.ltime, &id, leave.prune, now);
         if rebroadcast {
-          self.rebroadcast(MessageType::Leave, data);
+          self.rebroadcast(t, MessageType::Leave, data);
         }
       }
       // Sub-stage 3: push-pull is not valid on a UserPacket; drop.
@@ -2424,18 +2433,18 @@ where
         if data.len() > self.opts.query_size_limit() {
           return;
         }
-        let rebroadcast = self.handle_query(q, QueryOrigin::Inbound);
+        let rebroadcast = self.handle_query(t, q, QueryOrigin::Inbound);
         if rebroadcast {
-          self.rebroadcast(MessageType::Query, data);
+          self.rebroadcast(t, MessageType::Query, data);
         }
       }
       // Fold the query response into the matching PendingQuery.
       AnyMessage::QueryResponse(resp) => {
-        self.handle_query_response(resp);
+        self.handle_query_response(t, resp);
       }
       // Relay: forward the inner payload verbatim to the destination (decision 4).
       AnyMessage::Relay(relay) => {
-        self.handle_relay(relay);
+        self.handle_relay(t, relay);
       }
       // ConflictResponse and Key* bare packets arrive only as payloads inside
       // QueryResponseMessage; bare arrivals here are unexpected — drop silently.
@@ -2460,7 +2469,10 @@ where
   ///
   /// Errors from `queue_user_broadcast_ranked` are silently dropped — the
   /// inner already applies its own back-pressure and queue-depth limits.
-  fn rebroadcast(&mut self, ty: MessageType, original: Bytes) {
+  fn rebroadcast<T>(&mut self, t: &mut T, ty: MessageType, original: Bytes)
+  where
+    T: Reliable<I, A>,
+  {
     let rank: u8 = match ty {
       MessageType::Join | MessageType::Leave => 0, // intent tier
       MessageType::UserEvent => 2,                 // event tier
@@ -2471,12 +2483,12 @@ where
     // cap.  This prevents unbounded memory growth under a flood of unique first-seen
     // messages.  The gate mirrors Go serf's `getQueueMax` / `checkQueueDepth`
     // logic applied inline at the rebroadcast site.
-    if self.inner.user_broadcast_queue_len() >= self.queue_max() {
+    if t.endpoint_ref().user_broadcast_queue_len() >= self.queue_max() {
       return;
     }
     // Ignoring Err: the inner applies its own MTU back-pressure; a rejected
     // broadcast is a flow-control decision, not a fatal error.
-    let _ = self.inner.queue_user_broadcast_ranked(rank, original);
+    let _ = t.queue_user_broadcast_ranked(rank, original);
   }
 
   /// Compute the effective broadcast queue depth cap (mirrors Go serf `getQueueMax`).
@@ -2491,15 +2503,6 @@ where
     } else {
       self.opts.max_queue_depth()
     }
-  }
-
-  /// Returns the number of unsent items in the user broadcast queue.
-  ///
-  /// The driver may poll this during a graceful leave to detect when the
-  /// leave-intent broadcast has been flushed without waiting the full
-  /// `broadcast_timeout`.
-  pub fn user_broadcast_queue_len(&self) -> usize {
-    self.inner.user_broadcast_queue_len()
   }
 
   // ── Query issue + ingress (G8: read-not-increment) ────────────────────────
@@ -2518,14 +2521,16 @@ where
   /// 7. Encode and enqueue on the **query tier** (rank 1).
   ///
   /// Returns the `QueryId` so the caller can correlate responses.
-  pub fn query(
+  pub(crate) fn query<T>(
     &mut self,
+    t: &mut T,
     name: impl Into<SmolStr>,
     payload: Bytes,
     params: QueryParams<I>,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -2580,8 +2585,8 @@ where
       ltime,
       id,
       from: memberlist_proto::Node::new(
-        self.inner.local_id_ref().clone(),
-        self.inner.advertise_ref().clone(),
+        t.endpoint_ref().local_id_ref().clone(),
+        t.endpoint_ref().advertise_ref().clone(),
       ),
       filters: params.filters,
       flags,
@@ -2626,12 +2631,12 @@ where
     // QueryOrigin::Local bypasses the inbound cap so the initiating node always
     // self-processes its own query.
     self.drain_now = now;
-    self.handle_query(q, QueryOrigin::Local);
+    self.handle_query(t, q, QueryOrigin::Local);
 
     // Enqueue on the query tier (rank 1).
     // Ignoring Err: the inner applies queue-depth / MTU back-pressure; a rejected
     // broadcast is a flow-control decision, not a fatal error.
-    let _ = self.inner.queue_user_broadcast_ranked(1, encoded);
+    let _ = t.queue_user_broadcast_ranked(1, encoded);
 
     Ok(query_id)
   }
@@ -2661,8 +2666,9 @@ where
   ///
   /// Returns `true` if the query should be rebroadcast (i.e., first sight AND
   /// not `NO_BROADCAST`), even when the filter rejects local processing (G6).
-  fn handle_query(&mut self, msg: QueryMessage<I, A>, origin: QueryOrigin) -> bool
+  fn handle_query<T>(&mut self, t: &mut T, msg: QueryMessage<I, A>, origin: QueryOrigin) -> bool
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone,
   {
@@ -2782,7 +2788,7 @@ where
     }
 
     // Filter check (G6): even if the local node is not targeted, still rebroadcast.
-    if !self.should_process_query(&msg.filters) {
+    if !self.should_process_query(t, &msg.filters) {
       return rebroadcast;
     }
 
@@ -2811,8 +2817,8 @@ where
     // emitting Event::Query.  The ACK carries no payload; it signals receipt.
     if msg.ack() {
       let local_node = memberlist_proto::Node::new(
-        self.inner.local_id_ref().clone(),
-        self.inner.advertise_ref().clone(),
+        t.endpoint_ref().local_id_ref().clone(),
+        t.endpoint_ref().advertise_ref().clone(),
       );
       let ack_resp = QueryResponseMessage {
         ltime: msg.ltime,
@@ -2825,16 +2831,14 @@ where
         let from_addr = msg.from.addr_ref().clone();
         // Ignoring Err: directed ACK sends are best-effort; a missing ACK is
         // handled by the querier's timeout on its acks set.
-        let _ = self
-          .inner
-          .send_user_packet(from_addr.clone(), ack_encoded.clone());
+        let _ = t.send_user_packet(from_addr.clone(), ack_encoded.clone());
         #[cfg(test)]
         {
           self.last_directed_send = Some((from_addr, ack_encoded.clone()));
         }
         // Relay the ACK through relay_factor random intermediary nodes when requested.
         if msg.relay_factor > 0 {
-          self.relay_response(msg.from.clone(), ack_encoded, msg.relay_factor);
+          self.relay_response(t, msg.from.clone(), ack_encoded, msg.relay_factor);
         }
       }
     }
@@ -2846,7 +2850,7 @@ where
     // point when the id was already decoded and exactly consumed.
     if let Some(conflict_id) = pre_decoded_conflict_id {
       self.received_queries.remove(&query_id);
-      self.handle_conflict_query(&msg, conflict_id);
+      self.handle_conflict_query(t, &msg, conflict_id);
       return rebroadcast;
     }
 
@@ -2905,11 +2909,12 @@ where
   /// Returns `true` if the node should respond locally, `false` if filtered out.
   /// A `false` return suppresses `Event::Query` but does NOT affect rebroadcast
   /// (rebroadcast is decided by the caller, not by this function).
-  fn should_process_query(&self, filters: &[Filter<I>]) -> bool
+  fn should_process_query<T>(&self, t: &T, filters: &[Filter<I>]) -> bool
   where
+    T: Reliable<I, A>,
     I: Clone,
   {
-    let local_id = self.inner.local_id_ref();
+    let local_id = t.endpoint_ref().local_id_ref();
     for filter in filters {
       match filter {
         Filter::Id(ids) => {
@@ -2922,7 +2927,7 @@ where
           // The local node's tags live in `members.states` under the local id.
           // If the local node is not yet in the store (before the first join
           // event has been processed), we conservatively return `false`.
-          let local_id = self.inner.local_id_ref();
+          let local_id = t.endpoint_ref().local_id_ref();
           let empty_tags = Tags::new();
           let tags = self
             .members
@@ -2978,13 +2983,15 @@ where
   /// both checks).  This port uses three distinct guards in order — size,
   /// already-responded, deadline — which is strictly more informative to
   /// callers that need to distinguish the error cases.
-  pub fn respond(
+  pub(crate) fn respond<T>(
     &mut self,
+    t: &mut T,
     token: &QueryEvent<I, A>,
     payload: Bytes,
     now: Instant,
   ) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -3004,8 +3011,8 @@ where
 
     // Build and encode the `QueryResponseMessage`.
     let local_node = memberlist_proto::Node::new(
-      self.inner.local_id_ref().clone(),
-      self.inner.advertise_ref().clone(),
+      t.endpoint_ref().local_id_ref().clone(),
+      t.endpoint_ref().advertise_ref().clone(),
     );
     let resp = QueryResponseMessage {
       ltime: token.ltime(),
@@ -3019,6 +3026,7 @@ where
       .map_err(Error::RespondEncode)?;
 
     self.respond_inner(
+      t,
       query_id,
       to,
       relay_factor,
@@ -3040,8 +3048,9 @@ where
   // All parameters are distinct routing / payload values with no natural sub-grouping;
   // a wrapper struct would add churn without clarity.
   #[allow(clippy::too_many_arguments)]
-  fn respond_inner(
+  fn respond_inner<T>(
     &mut self,
+    t: &mut T,
     query_id: QueryId,
     to: A,
     relay_factor: u8,
@@ -3051,6 +3060,7 @@ where
     now: Instant,
   ) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
@@ -3066,9 +3076,7 @@ where
     }
 
     // Directed send — never broadcast.
-    self
-      .inner
-      .send_user_packet(to.clone(), encoded.clone())
+    t.send_user_packet(to.clone(), encoded.clone())
       .map_err(Error::RespondSend)?;
 
     #[cfg(test)]
@@ -3081,7 +3089,7 @@ where
 
     // Relay when requested.
     if relay_factor > 0 {
-      self.relay_response(relay_querier, encoded, relay_factor);
+      self.relay_response(t, relay_querier, encoded, relay_factor);
     }
 
     Ok(())
@@ -3102,13 +3110,15 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn respond_key(
+  pub(crate) fn respond_key<T>(
     &mut self,
+    t: &mut T,
     req: &crate::event::KeyRequest<I, A>,
     resp: KeyResponseArgs,
     now: Instant,
   ) -> Result<(), Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -3136,8 +3146,8 @@ where
       .map_err(Error::RespondEncode)?;
 
     let local_node = memberlist_proto::Node::new(
-      self.inner.local_id_ref().clone(),
-      self.inner.advertise_ref().clone(),
+      t.endpoint_ref().local_id_ref().clone(),
+      t.endpoint_ref().advertise_ref().clone(),
     );
     let qresp = QueryResponseMessage {
       ltime: req.ltime,
@@ -3151,6 +3161,7 @@ where
       .map_err(Error::RespondEncode)?;
 
     self.respond_inner(
+      t,
       query_id,
       to,
       relay_factor,
@@ -3181,8 +3192,9 @@ where
   ///    - `App` → emit `Event::QueryResponse { id, from, payload }`.
   ///    - `Conflict` → tally: decode `ConflictResponseMessage`, compare addr to local advertise.
   ///    - `Key` → tally: decode `KeyResponseMessage`, fold into the `KeyResponseTally`.
-  fn handle_query_response(&mut self, msg: QueryResponseMessage<I, A>)
+  fn handle_query_response<T>(&mut self, t: &mut T, msg: QueryResponseMessage<I, A>)
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
@@ -3298,7 +3310,7 @@ where
         self.pending_events.push_back(Event::QueryResponse(ev));
       }
       QueryPurpose::Conflict => {
-        self.handle_conflict_response_fold(query_id, msg.payload);
+        self.handle_conflict_response_fold(t, query_id, msg.payload);
       }
       #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
       QueryPurpose::Key => {
@@ -3336,8 +3348,14 @@ where
   /// - The destination querier IS reselectable as a relay peer (the relay dedup
   ///   is the query-response dedup at the querier, not here).
   /// - Only `Alive` non-self members are eligible relay peers.
-  fn relay_response(&mut self, querier: Node<I, A>, relay_frame: Bytes, relay_factor: u8)
-  where
+  fn relay_response<T>(
+    &mut self,
+    t: &mut T,
+    querier: Node<I, A>,
+    relay_frame: Bytes,
+    relay_factor: u8,
+  ) where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -3384,7 +3402,7 @@ where
     // establishes a total, stable input order so the shuffle is a deterministic
     // function of the RNG state (Go serf `random_members` uses a slice with a
     // stable iteration order for the same reason).
-    let local_id = self.inner.local_id_ref();
+    let local_id = t.endpoint_ref().local_id_ref();
     let mut candidates: Vec<(Vec<u8>, A)> = self
       .members
       .states
@@ -3414,9 +3432,7 @@ where
 
     // Directed-send to each chosen relay peer.  On failure emit RelayDropped.
     for (_, peer_addr) in candidates {
-      let result = self
-        .inner
-        .send_user_packet(peer_addr.clone(), relay_encoded.clone());
+      let result = t.send_user_packet(peer_addr.clone(), relay_encoded.clone());
       #[cfg(test)]
       {
         // Track the last directed send for test assertions.
@@ -3456,13 +3472,14 @@ where
   /// we omit it as well to keep faithful oracle correspondence — if a relay chain
   /// were constructed, the recipient would decode an AnyMessage::Relay and call
   /// handle_relay again, naturally bounding by TTL at the network layer).
-  fn handle_relay(&mut self, relay: RelayMessage<I, A>)
+  fn handle_relay<T>(&mut self, t: &mut T, relay: RelayMessage<I, A>)
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
     let dest_id = relay.destination.id_ref();
-    let local_id = self.inner.local_id_ref();
+    let local_id = t.endpoint_ref().local_id_ref();
 
     // Self-destination guard: relay to self is always a no-op failure.
     if dest_id == local_id {
@@ -3477,9 +3494,7 @@ where
     let dest_addr = relay.destination.addr_ref().clone();
     let payload = relay.payload;
 
-    let result = self
-      .inner
-      .send_user_packet(dest_addr.clone(), payload.clone());
+    let result = t.send_user_packet(dest_addr.clone(), payload.clone());
     #[cfg(test)]
     {
       self.last_directed_send = Some((dest_addr.clone(), payload.clone()));
@@ -3549,8 +3564,9 @@ where
   /// Seed a member with explicit tags into the membership store (test fixture).
   ///
   /// Like `test_seed_member` but lets the caller supply a `Tags` map, enabling
-  /// tag-filter unit tests to place a known value under a known key.
-  #[cfg(test)]
+  /// tag-filter unit tests to place a known value under a known key.  Only the
+  /// `tag-regex` test module exercises tag filtering, so this is gated on it.
+  #[cfg(all(test, feature = "tag-regex"))]
   pub(crate) fn test_seed_member_with_tags(
     &mut self,
     id: I,
@@ -3623,11 +3639,18 @@ where
 
   /// Invoke `handle_node_leave_intent` with bare parameters (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_handle_leave_intent(&mut self, id: I, ltime: LamportTime, now: Instant) -> bool
+  pub(crate) fn test_handle_leave_intent<T>(
+    &mut self,
+    t: &mut T,
+    id: I,
+    ltime: LamportTime,
+    now: Instant,
+  ) -> bool
   where
+    T: Reliable<I, A>,
     I: Clone,
   {
-    self.handle_node_leave_intent(ltime, &id, false, now)
+    self.handle_node_leave_intent(t, ltime, &id, false, now)
   }
 
   /// Synthesise an inner `NodeJoined` event for node `id` and drive it
@@ -3709,8 +3732,11 @@ where
   /// finished its dead-self fan-out.  Used by leave-chain tests that do not
   /// have a live inner endpoint to drive.
   #[cfg(test)]
-  pub(crate) fn test_inner_left_cluster(&mut self) {
-    self.on_inner_event(memberlist_proto::Event::LeftCluster);
+  pub(crate) fn test_inner_left_cluster<T>(&mut self, t: &mut T)
+  where
+    T: Reliable<I, A>,
+  {
+    self.on_inner_event(t, memberlist_proto::Event::LeftCluster);
   }
 
   /// Seed a `Failed` member with an explicit address into both `states` and
@@ -3732,11 +3758,12 @@ where
 
   /// Directly invoke `fire_reconnect` (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_fire_reconnect(&mut self, now: Instant)
+  pub(crate) fn test_fire_reconnect<T>(&mut self, t: &mut T, now: Instant)
   where
+    T: Reliable<I, A>,
     A: Clone,
   {
-    self.fire_reconnect(now);
+    self.fire_reconnect(t, now);
   }
 
   /// Directly invoke `fire_reap` (test adapter).
@@ -3818,18 +3845,18 @@ where
   /// `Event::UserPacket` carrying the given bytes and `Unreliable` reliability
   /// (mirrors the gossip-plane delivery path).
   #[cfg(test)]
-  pub(crate) fn test_inject_user_packet(&mut self, from: A, data: Bytes, now: Instant)
+  pub(crate) fn test_inject_user_packet<T>(&mut self, t: &mut T, from: A, data: Bytes, now: Instant)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     use memberlist_proto::{Reliability, UserPacket};
     self.drain_now = now;
-    self.on_inner_event(memberlist_proto::Event::UserPacket(UserPacket::new(
-      from,
-      data,
-      Reliability::Unreliable,
-    )));
+    self.on_inner_event(
+      t,
+      memberlist_proto::Event::UserPacket(UserPacket::new(from, data, Reliability::Unreliable)),
+    );
   }
 
   // ── Clock + intent test helpers ───────────────────────────────────────────
@@ -3864,11 +3891,14 @@ where
     self.mark_local_state_dirty();
   }
 
-  /// Read back the bytes currently stored in the inner Endpoint's
+  /// Read back the bytes currently stored in the coordinator's inner Endpoint
   /// `local_state_snapshot` (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_inner_local_state_snapshot(&self) -> Bytes {
-    self.inner.local_state_snapshot_bytes()
+  pub(crate) fn test_inner_local_state_snapshot<T>(&self, t: &T) -> Bytes
+  where
+    T: Reliable<I, A>,
+  {
+    t.endpoint_ref().local_state_snapshot_bytes()
   }
 
   /// Decode `bytes` as a `PushPullMessage<u32>` for assertion (test adapter).
@@ -3919,12 +3949,13 @@ where
   /// receive a stable `now`.  Use `test_set_drain_now` to override the
   /// timestamp when wall-clock values matter.
   #[cfg(test)]
-  pub(crate) fn test_merge_remote_state(&mut self, user_data: Bytes, is_join: bool)
+  pub(crate) fn test_merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes, is_join: bool)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Data,
   {
-    self.merge_remote_state(user_data, is_join);
+    self.merge_remote_state(t, user_data, is_join);
   }
 
   /// Return the `ltime` of the most recently buffered intent for `id` of `kind`,
@@ -3943,12 +3974,13 @@ where
   /// it should rebroadcast (test adapter).  Always passes `QueryOrigin::Inbound`
   /// so the inbound cap and all inbound semantics are exercised.
   #[cfg(test)]
-  pub(crate) fn test_handle_query(&mut self, msg: QueryMessage<I, A>) -> bool
+  pub(crate) fn test_handle_query<T>(&mut self, t: &mut T, msg: QueryMessage<I, A>) -> bool
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
-    self.handle_query(msg, QueryOrigin::Inbound)
+    self.handle_query(t, msg, QueryOrigin::Inbound)
   }
 
   /// Return the `QueryId` of the last pending query entry (test adapter).
@@ -4024,12 +4056,13 @@ where
 
   /// Call `handle_query_response` directly (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_handle_query_response(&mut self, msg: QueryResponseMessage<I, A>)
+  pub(crate) fn test_handle_query_response<T>(&mut self, t: &mut T, msg: QueryResponseMessage<I, A>)
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
-    self.handle_query_response(msg);
+    self.handle_query_response(t, msg);
   }
 
   /// Return `true` if the received-query entry for `query_id` has been
@@ -4069,22 +4102,29 @@ where
   /// guard can pass when `relay_factor == 1`.  The caller is responsible for
   /// ensuring the membership store is populated to satisfy the guard.
   #[cfg(test)]
-  pub(crate) fn test_relay_response(&mut self, querier: Node<I, A>, frame: Bytes, relay_factor: u8)
-  where
+  pub(crate) fn test_relay_response<T>(
+    &mut self,
+    t: &mut T,
+    querier: Node<I, A>,
+    frame: Bytes,
+    relay_factor: u8,
+  ) where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
-    self.relay_response(querier, frame, relay_factor);
+    self.relay_response(t, querier, frame, relay_factor);
   }
 
   /// Directly invoke `handle_relay` (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_handle_relay(&mut self, relay: RelayMessage<I, A>)
+  pub(crate) fn test_handle_relay<T>(&mut self, t: &mut T, relay: RelayMessage<I, A>)
   where
+    T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
-    self.handle_relay(relay);
+    self.handle_relay(t, relay);
   }
 
   /// Return the most recent `(address, bytes)` pair sent via a directed
@@ -4152,14 +4192,16 @@ where
   /// uses the oracle's `defaultQueryTimeout` heuristic unconditionally.  The
   /// registered `PendingQuery` will have `kind = purpose` so responses are
   /// routed to the appropriate fold path.
-  fn internal_query(
+  fn internal_query<T>(
     &mut self,
+    t: &mut T,
     name: SmolStr,
     payload: Bytes,
     purpose: QueryPurpose,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
@@ -4177,8 +4219,8 @@ where
       ltime,
       id,
       from: memberlist_proto::Node::new(
-        self.inner.local_id_ref().clone(),
-        self.inner.advertise_ref().clone(),
+        t.endpoint_ref().local_id_ref().clone(),
+        t.endpoint_ref().advertise_ref().clone(),
       ),
       filters: vec![],
       flags: QueryFlag::empty(),
@@ -4237,10 +4279,10 @@ where
     // QueryOrigin::Local bypasses the inbound cap so the initiating node always
     // self-processes its own internal query.
     self.drain_now = now;
-    self.handle_query(q, QueryOrigin::Local);
+    self.handle_query(t, q, QueryOrigin::Local);
 
     // Ignoring Err: queue back-pressure is a flow-control decision, not fatal.
-    let _ = self.inner.queue_user_broadcast_ranked(1, encoded);
+    let _ = t.queue_user_broadcast_ranked(1, encoded);
 
     Ok(query_id)
   }
@@ -4252,12 +4294,13 @@ where
   /// query carrying the local id; peers respond with their view of that id's
   /// address.  When the deadline fires, `close_conflict_query` tallies votes and
   /// emits `Event::Shutdown` if the local node lost the majority.
-  fn resolve_node_conflict(&mut self, now: Instant)
+  fn resolve_node_conflict<T>(&mut self, t: &mut T, now: Instant)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
-    let local_id = self.inner.local_id_ref().clone();
+    let local_id = t.endpoint_ref().local_id_ref().clone();
     let payload = match local_id.encode_to_bytes() {
       Ok(b) => b,
       Err(_) => return,
@@ -4265,6 +4308,7 @@ where
     // Ignoring Err: encoding or queue failures are best-effort; if we cannot
     // broadcast the conflict query the cluster will simply time out the conflict.
     let _ = self.internal_query(
+      t,
       SmolStr::new("_serf_conflict"),
       payload,
       QueryPurpose::Conflict,
@@ -4281,13 +4325,14 @@ where
   ///
   /// `conflict_id` is pre-decoded and exact-consumption-validated by the
   /// internal-query payload gate in `handle_query`; it is NOT re-decoded here.
-  fn handle_conflict_query(&mut self, msg: &QueryMessage<I, A>, conflict_id: I)
+  fn handle_conflict_query<T>(&mut self, t: &mut T, msg: &QueryMessage<I, A>, conflict_id: I)
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     // The originator does not respond to its own conflict query.
-    if &conflict_id == self.inner.local_id_ref() {
+    if &conflict_id == t.endpoint_ref().local_id_ref() {
       return;
     }
 
@@ -4306,8 +4351,8 @@ where
 
     // Build and encode the QueryResponseMessage to send to the originator.
     let local_node = memberlist_proto::Node::new(
-      self.inner.local_id_ref().clone(),
-      self.inner.advertise_ref().clone(),
+      t.endpoint_ref().local_id_ref().clone(),
+      t.endpoint_ref().advertise_ref().clone(),
     );
     let qresp = QueryResponseMessage {
       ltime: msg.ltime,
@@ -4325,7 +4370,7 @@ where
     let dest_addr = msg.from.addr_ref().clone();
     // Ignoring Err: directed-send failure on the conflict-response path is
     // best-effort; the originator will simply count this node as non-responding.
-    let _ = self.inner.send_user_packet(dest_addr, qresp_encoded);
+    let _ = t.send_user_packet(dest_addr, qresp_encoded);
   }
 
   /// Fold a conflict-resolution response into the matching `PendingQuery`.
@@ -4333,8 +4378,9 @@ where
   /// The payload is a serf-framed `ConflictResponseMessage`.  If the reported
   /// member's address matches the local advertise address, `conflict_matching`
   /// is incremented.
-  fn handle_conflict_response_fold(&mut self, query_id: QueryId, payload: Bytes)
+  fn handle_conflict_response_fold<T>(&mut self, t: &mut T, query_id: QueryId, payload: Bytes)
   where
+    T: Reliable<I, A>,
     A: PartialEq,
   {
     // Exact-consumption decode: the validation gate in handle_query_response
@@ -4346,7 +4392,7 @@ where
       _ => return,
     };
 
-    let local_addr = self.inner.advertise_ref().clone();
+    let local_addr = t.endpoint_ref().advertise_ref().clone();
     let pending = match self
       .pending_queries
       .iter_mut()
@@ -4503,17 +4549,20 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn install_key(
+  pub(crate) fn install_key<T>(
     &mut self,
+    t: &mut T,
     key: memberlist_proto::SecretKey,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     let payload = self.encode_key_request(Some(key))?;
     self.internal_query(
+      t,
       SmolStr::new("_serf_install_key"),
       payload,
       QueryPurpose::Key,
@@ -4529,17 +4578,20 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn use_key(
+  pub(crate) fn use_key<T>(
     &mut self,
+    t: &mut T,
     key: memberlist_proto::SecretKey,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     let payload = self.encode_key_request(Some(key))?;
     self.internal_query(
+      t,
       SmolStr::new("_serf_use_key"),
       payload,
       QueryPurpose::Key,
@@ -4555,17 +4607,20 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn remove_key(
+  pub(crate) fn remove_key<T>(
     &mut self,
+    t: &mut T,
     key: memberlist_proto::SecretKey,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     let payload = self.encode_key_request(Some(key))?;
     self.internal_query(
+      t,
       SmolStr::new("_serf_remove_key"),
       payload,
       QueryPurpose::Key,
@@ -4581,13 +4636,15 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn list_keys(&mut self, now: Instant) -> Result<QueryId, Error>
+  pub(crate) fn list_keys<T>(&mut self, t: &mut T, now: Instant) -> Result<QueryId, Error>
   where
+    T: Reliable<I, A>,
     I: Clone + Data,
     A: Clone + Data,
   {
     let payload = self.encode_key_request(None)?;
     self.internal_query(
+      t,
       SmolStr::new("_serf_list_keys"),
       payload,
       QueryPurpose::Key,
@@ -4758,16 +4815,22 @@ where
 
   /// Enqueue raw `bytes` on the intent broadcast tier (rank 0, highest priority).
   #[cfg(test)]
-  pub(crate) fn test_enqueue_intent_broadcast(&mut self, bytes: Bytes) {
+  pub(crate) fn test_enqueue_intent_broadcast<T>(&mut self, t: &mut T, bytes: Bytes)
+  where
+    T: Reliable<I, A>,
+  {
     // Ignoring Err: test helper; queue back-pressure is not exercised here.
-    let _ = self.inner.queue_user_broadcast_ranked(0, bytes);
+    let _ = t.queue_user_broadcast_ranked(0, bytes);
   }
 
   /// Enqueue raw `bytes` on the query broadcast tier (rank 1).
   #[cfg(test)]
-  pub(crate) fn test_enqueue_query_broadcast(&mut self, bytes: Bytes) {
+  pub(crate) fn test_enqueue_query_broadcast<T>(&mut self, t: &mut T, bytes: Bytes)
+  where
+    T: Reliable<I, A>,
+  {
     // Ignoring Err: test helper; queue back-pressure is not exercised here.
-    let _ = self.inner.queue_user_broadcast_ranked(1, bytes);
+    let _ = t.queue_user_broadcast_ranked(1, bytes);
   }
 
   // ── Snapshot replay → Endpoint load (G5 + G10) ───────────────────────────
@@ -4798,8 +4861,13 @@ where
   ///
   /// The local state is marked dirty so the next push-pull egress ships the
   /// recovered clock state.
-  pub fn load_snapshot(&mut self, replay: crate::snapshot::ReplayResult<I, A>, now: Instant)
-  where
+  pub(crate) fn load_snapshot<T>(
+    &mut self,
+    t: &mut T,
+    replay: crate::snapshot::ReplayResult<I, A>,
+    now: Instant,
+  ) where
+    T: Reliable<I, A>,
     A: Clone,
   {
     // G5: advance the member clock to at least last_clock.
@@ -4836,7 +4904,7 @@ where
     // G10: dial each alive peer (skip self) so the node re-joins the cluster.
     // The inner emits Event::DialRequested; the sieve passes it through to the
     // driver.  The driver owns the actual network dial.
-    let local_id = self.inner.local_id_ref().clone();
+    let local_id = t.endpoint_ref().local_id_ref().clone();
     for node in replay.alive_nodes {
       if node.id_ref() == &local_id {
         // Self-skip: the local node is already "alive" by definition.
@@ -4846,8 +4914,8 @@ where
       // Capture for test assertions before calling start_push_pull.
       #[cfg(test)]
       self.rejoin_dials.push(addr.clone());
-      self.inner.start_push_pull(addr, PushPullKind::Join, now);
-      self.drain_inner();
+      t.start_push_pull(addr, PushPullKind::Join, now);
+      self.drain_inner(t);
     }
   }
 
@@ -4872,7 +4940,15 @@ where
   ///
   /// No-op when `coord_client` is `None` (coordinates disabled at construction).
   #[cfg(feature = "coordinates")]
-  fn handle_ping_completed(&mut self, node_id: &I, rtt: std::time::Duration, payload: &Bytes) {
+  fn handle_ping_completed<T>(
+    &mut self,
+    t: &mut T,
+    node_id: &I,
+    rtt: std::time::Duration,
+    payload: &Bytes,
+  ) where
+    T: Reliable<I, A>,
+  {
     use crate::{bridge::coordinate_from_pb, messages::serf::v1 as pb};
     use buffa::Message as _;
 
@@ -4907,7 +4983,7 @@ where
     let ack_payload = coord_ack_payload(new_local_coord);
     // Ignoring Err: set_ack_payload only fails when Leaving/Left/Shutdown.
     // PingCompleted arrives on the probe path, active only while Alive.
-    let _ = self.inner.set_ack_payload(ack_payload);
+    let _ = t.set_ack_payload(ack_payload);
   }
 
   // ── Snapshot replay test helpers ─────────────────────────────────────────
@@ -4931,14 +5007,17 @@ where
   ///
   /// Sets `drain_now = Instant::ORIGIN` before the call.
   #[cfg(all(feature = "coordinates", test))]
-  pub(crate) fn test_ping_completed(
+  pub(crate) fn test_ping_completed<T>(
     &mut self,
+    t: &mut T,
     node_id: I,
     rtt: std::time::Duration,
     payload: Bytes,
-  ) {
+  ) where
+    T: Reliable<I, A>,
+  {
     self.drain_now = memberlist_proto::Instant::ORIGIN;
-    self.handle_ping_completed(&node_id, rtt, &payload);
+    self.handle_ping_completed(t, &node_id, rtt, &payload);
   }
 }
 

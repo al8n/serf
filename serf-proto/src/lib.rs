@@ -70,6 +70,10 @@ pub mod event;
 pub mod members;
 pub mod options;
 pub mod snapshot;
+pub mod stream_endpoint;
+
+#[doc(inline)]
+pub use stream_endpoint::StreamEndpoint;
 
 #[cfg(feature = "coordinates")]
 #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]

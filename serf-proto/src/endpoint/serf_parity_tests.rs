@@ -10,20 +10,19 @@ use bytes::Bytes;
 use memberlist_proto::{EndpointOptions, Instant, SeedableRng, SmallRng};
 
 use crate::{
-  AnyMessage, LamportTime,
-  endpoint::Endpoint,
+  AnyMessage, LamportTime, StreamEndpoint,
   event::{Event, MemberEventKind},
   members::{IntentKind, MemberStatus},
   options::Options,
   typed::{PushPullMessage, UserEvent, UserEvents},
 };
 
-fn ep() -> Endpoint<u32, std::net::SocketAddr> {
+fn ep() -> StreamEndpoint<u32, std::net::SocketAddr> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner =
     memberlist_proto::Endpoint::new_at(inner_opts, Instant::ORIGIN, SmallRng::seed_from_u64(0));
-  Endpoint::new(inner, Options::new())
+  StreamEndpoint::new(inner, Options::new())
 }
 
 // ── base.rs handle_node_join invariants ───────────────────────────────────────

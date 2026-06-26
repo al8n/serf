@@ -6,9 +6,9 @@ use memberlist_proto::{EndpointOptions, Instant, PushPullKind, SeedableRng, Smal
 /// the impls are exercised at the trait boundary, not just as concrete calls.
 ///
 /// Exercises `endpoint_ref` (read-only accessors), `queue_user_broadcast_ranked`,
-/// `set_ack_payload`, `set_local_state_snapshot`, `poll_inner_event`, and
-/// `start_push_pull` — methods that run on a fresh, un-started endpoint
-/// without requiring a live network peer.
+/// `set_ack_payload` (coordinates only), `set_local_state_snapshot`,
+/// `poll_inner_event`, and `start_push_pull` — methods that run on a fresh,
+/// un-started endpoint without requiring a live network peer.
 fn drive<I, A>(t: &mut impl Reliable<I, A>, addr: A)
 where
   I: Eq + core::hash::Hash + Clone,
@@ -25,9 +25,13 @@ where
     "queue_user_broadcast_ranked failed: {result:?}"
   );
 
-  // Mutating: set ack payload.
-  let result = t.set_ack_payload(Bytes::from_static(b"coord"));
-  assert!(result.is_ok(), "set_ack_payload failed: {result:?}");
+  // Mutating: set ack payload (the coordinates-only seam serf uses to
+  // piggyback its Vivaldi coordinate on probe acks).
+  #[cfg(feature = "coordinates")]
+  {
+    let result = t.set_ack_payload(Bytes::from_static(b"coord"));
+    assert!(result.is_ok(), "set_ack_payload failed: {result:?}");
+  }
 
   // Mutating: set local state snapshot.
   let result = t.set_local_state_snapshot(Bytes::from_static(b"state"));
