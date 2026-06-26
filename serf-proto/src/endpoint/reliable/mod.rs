@@ -3,8 +3,8 @@
 //! [`Reliable`] is the only serf-to-coordinator boundary: every call serf's
 //! `Endpoint` makes into memberlist passes through one of these methods.
 //! It hides the concrete coordinator type (`StreamEndpoint` vs `QuicEndpoint`)
-//! so that Tasks 3–6 can wire serf logic against a generic `&mut impl
-//! Reliable<I, A>` without knowing which transport is in use.
+//! so the serf-logic core wires against a generic `&mut impl Reliable<I, A>`
+//! without knowing which transport is in use.
 //!
 //! # Method classification
 //!
@@ -32,13 +32,6 @@ use memberlist_proto::{Endpoint, Instant, PushPullKind, Rng, StreamId};
 ///
 /// The trait is `pub(crate)` because it is a serf-internal composition
 /// boundary, not part of the public API.
-// No production call site exists yet: the serf-logic core still reaches its inner
-// endpoint directly. This trait is the seam it routes through once composed with a
-// reliable coordinator.
-#[expect(
-  dead_code,
-  reason = "the serf-logic core has not yet been routed through this seam"
-)]
 pub(crate) trait Reliable<I, A>
 where
   I: Eq + core::hash::Hash,
@@ -115,21 +108,6 @@ where
   /// `poll_inner_event`).
   fn start_push_pull(&mut self, peer: A, kind: PushPullKind, now: Instant) -> StreamId;
 
-  /// Update the local node's metadata advertised to peers.
-  ///
-  /// Serf stores its tag set (and, when relevant, the coordinate bytes) in
-  /// the memberlist meta field.  This call propagates the change through the
-  /// coordinator so peers learn the new metadata on the next gossip cycle.
-  ///
-  /// # Errors
-  ///
-  /// Returns [`memberlist_proto::Error::MetaExceedsLimit`] if the serialised
-  /// metadata exceeds the memberlist wire limit.
-  fn update_meta(
-    &mut self,
-    meta: memberlist_proto::typed::Meta,
-  ) -> Result<(), memberlist_proto::Error>;
-
   /// Signal that the local node intends to leave the cluster gracefully.
   ///
   /// The coordinator disseminates a Leave message, transitions the inner
@@ -151,18 +129,23 @@ where
   /// its per-node coordinate so peers can compute network-distance estimates
   /// without a separate round-trip.
   ///
+  /// Only the `coordinates` feature drives this seam (serf piggybacks its
+  /// Vivaldi coordinate on probe acks); it is compiled out otherwise.
+  ///
   /// # Errors
   ///
   /// Returns [`memberlist_proto::Error::AckPayloadExceedsMtu`] if the framed
   /// Ack would not fit the gossip packet budget.
+  #[cfg(feature = "coordinates")]
   fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error>;
 }
 
 // ── impl for the raw memberlist_proto::Endpoint ───────────────────────────────
 //
-// Covers the transitional period where the serf `Endpoint` still holds a raw
-// `memberlist_proto::Endpoint` as its `inner` field. It is removed once the
-// concrete coordinator super-machines own the transport.
+// The transitional `StreamEndpoint` super-machine uses the raw packet
+// `memberlist_proto::Endpoint` as its reliable transport, so the serf-logic
+// core can drive it through this seam before the full stream/QUIC coordinators
+// are wired in as the transport.
 
 impl<I, A, R> Reliable<I, A> for Endpoint<I, A, R>
 where
@@ -209,18 +192,11 @@ where
   }
 
   #[inline]
-  fn update_meta(
-    &mut self,
-    meta: memberlist_proto::typed::Meta,
-  ) -> Result<(), memberlist_proto::Error> {
-    Endpoint::update_meta(self, meta)
-  }
-
-  #[inline]
   fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
     Endpoint::leave(self, now)
   }
 
+  #[cfg(feature = "coordinates")]
   #[inline]
   fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error> {
     Endpoint::set_ack_payload(self, payload)
@@ -279,18 +255,11 @@ where
   }
 
   #[inline]
-  fn update_meta(
-    &mut self,
-    meta: memberlist_proto::typed::Meta,
-  ) -> Result<(), memberlist_proto::Error> {
-    self.update_meta(meta)
-  }
-
-  #[inline]
   fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
     self.leave(now)
   }
 
+  #[cfg(feature = "coordinates")]
   #[inline]
   fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error> {
     self.set_ack_payload(payload)
@@ -355,18 +324,11 @@ where
   }
 
   #[inline]
-  fn update_meta(
-    &mut self,
-    meta: memberlist_proto::typed::Meta,
-  ) -> Result<(), memberlist_proto::Error> {
-    self.update_meta(meta)
-  }
-
-  #[inline]
   fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
     self.leave(now)
   }
 
+  #[cfg(feature = "coordinates")]
   #[inline]
   fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error> {
     self.set_ack_payload(payload)
