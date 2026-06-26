@@ -5015,6 +5015,8 @@ where
   }
 }
 
+pub(crate) mod reliable;
+
 #[cfg(test)]
 mod serf_parity_tests;
 #[cfg(test)]

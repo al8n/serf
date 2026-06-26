@@ -30,6 +30,18 @@ coordinates = []
 # `tag-regex` is the forward-compatible preparation for a future no_std port,
 # not current no_std support.
 tag-regex = ["dep:regex"]
+# Plain-TCP reliable coordinator — enables `memberlist_proto::streams::StreamEndpoint`
+# (record-layer-shaped, label-prefixed stream transport).  Activating this feature
+# makes `Reliable` implementable for `memberlist_proto::TcpEndpoint` and friends.
+tcp = ["memberlist-proto/tcp"]
+# TLS-over-TCP reliable coordinator — enables the TLS record layer on top of the
+# plain-TCP stream transport.  Implies `tcp`.
+tls = ["tcp", "memberlist-proto/tls"]
+# QUIC coordinator — enables `memberlist_proto::QuicEndpoint` (unreliable datagram +
+# reliable stream over a single QUIC connection per peer).  Requires a TLS backend;
+# at least one of `quic-rustls-ring` / `quic-rustls-aws-lc-rs` must be selected.
+quic = ["memberlist-proto/quic"]
+quic-rustls-ring = ["quic", "memberlist-proto/quic-rustls-ring"]
 
 [dependencies]
 memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
