@@ -11,7 +11,6 @@
 //! `memberlist_proto::Instant` threaded in from the driver — no wall-clock
 //! reads occur inside the pure machine.
 
-#[cfg(any(feature = "tcp", feature = "quic"))]
 use std::collections::HashMap;
 
 /// Hard cardinality cap on `Members::recent_intents`.
@@ -28,7 +27,6 @@ use std::collections::HashMap;
 /// recently observed intents, which are the ones most likely to still be
 /// relevant when the corresponding inner event fires.  Normal clusters will
 /// never approach this limit; it is only reachable under adversarial flood.
-#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) const MAX_RECENT_INTENTS: usize = 8192;
 
 use memberlist_proto::Instant;
@@ -290,7 +288,6 @@ impl NodeIntent {
 ///
 /// `left_members` and `failed_members` are index lists of ids for the reaper;
 /// the full state lives in `states`.
-#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) struct Members<I, A>
 where
   I: Eq + core::hash::Hash,
@@ -312,7 +309,6 @@ where
   pub(crate) recent_intent_seq: u64,
 }
 
-#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I, A> Default for Members<I, A>
 where
   I: Eq + core::hash::Hash,
@@ -328,7 +324,6 @@ where
   }
 }
 
-#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I, A> Members<I, A>
 where
   I: Eq + core::hash::Hash + Clone,
