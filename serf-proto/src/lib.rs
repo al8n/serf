@@ -82,6 +82,8 @@ pub mod endpoint;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub mod event;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub mod members;
 pub mod options;
 pub mod snapshot;

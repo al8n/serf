@@ -85,6 +85,8 @@ jobs:
           - { name: "coords-chacha", flags: "--features coordinates,chacha20-poly1305" }
           - { name: "all-features", flags: "--all-features" }
           - { name: "no-default", flags: "--no-default-features" }
+          - { name: "coords-aes-gcm-tcp", flags: "--features coordinates,aes-gcm,tcp" }
+          - { name: "quic-rustls-ring", flags: "--no-default-features --features quic-rustls-ring" }
     steps:
       - uses: actions/checkout@v6
 
