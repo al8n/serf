@@ -16,10 +16,11 @@
 //! **Mutating operations** are trait methods; each has a single, unambiguous
 //! entry point whose contract is documented below.
 //!
-//! **Coordinator-internal surfaces** (`handle_packet`, `handle_stream_event`,
-//! `accept_stream`, `handle_timeout`, `poll_timeout`, `poll_transmit`) are
-//! NOT part of this trait — the coordinators own the stream / transport
-//! lifecycle, and serf should not reach into it.
+//! **Coordinator-internal surfaces** (`handle_packet`, `handle_gossip`,
+//! `handle_transport_data`, `accept_connection`, `handle_timeout`,
+//! `poll_timeout`, `poll_action`, `poll_transport_transmit`,
+//! `poll_memberlist_transmit`) are NOT part of this trait — the coordinators own
+//! the stream / transport lifecycle, and serf should not reach into it.
 
 use bytes::Bytes;
 use memberlist_proto::{Endpoint, Instant, PushPullKind, Rng, StreamId};

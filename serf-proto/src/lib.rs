@@ -70,8 +70,13 @@ pub mod event;
 pub mod members;
 pub mod options;
 pub mod snapshot;
+
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 pub mod stream_endpoint;
 
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 #[doc(inline)]
 pub use stream_endpoint::StreamEndpoint;
 

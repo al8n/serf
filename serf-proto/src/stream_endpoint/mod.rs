@@ -1,21 +1,34 @@
-//! The serf `StreamEndpoint` super-machine — serf logic composed with a
-//! memberlist reliable coordinator over a stream transport.
+//! The serf `StreamEndpoint` super-machine — serf logic composed with the
+//! memberlist reliable stream coordinator.
 //!
-//! `StreamEndpoint` owns the serf-logic [`Endpoint`] core and a memberlist
-//! coordinator (`transport`) as **two disjoint fields**, and drives the core
-//! over `&mut transport` through the [`Reliable`](crate::endpoint::reliable)
-//! seam.  It exposes the coordinator's transport-facing driver surface
-//! (`handle_packet`, `handle_timeout`, `poll_transmit`, `poll_timeout`, …) plus
-//! serf's own commands and events (`poll_event`, `join`, `leave`, `user_event`,
+//! `StreamEndpoint` owns the serf-logic [`Endpoint`] core and the memberlist
+//! reliable coordinator ([`memberlist_proto::streams::StreamEndpoint`]) as
+//! **two disjoint fields**, and drives the core over `&mut transport` through
+//! the [`Reliable`](crate::endpoint::reliable) seam.  It exposes the
+//! coordinator's transport-facing driver surface (`handle_packet`,
+//! `handle_gossip`, `accept_connection`, `handle_transport_data`,
+//! `poll_action`, `poll_transport_transmit`, `handle_timeout`, …) plus serf's
+//! own commands and events (`poll_event`, `join`, `leave`, `user_event`,
 //! `query`, key ops, …), forwarding each to the right field.
 //!
 //! The composed `handle_timeout` is where the load-bearing tick ordering lives:
-//! the reliable coordinator is drained, the coordinator's SWIM timer fires, the
-//! resulting inner events are sieved into serf, then serf's own deadlines fire —
-//! all in one place, so no per-runtime driver has to re-establish the order.
+//! the coordinator's SWIM timer fires between serf's pre-tick snapshot resync
+//! and serf's post-tick drain + deadline pass, so no per-runtime driver has to
+//! re-establish the order.
+//!
+//! The coordinator owns the reliable stream lifecycle internally: it dials
+//! peers, runs the label / record-layer handshake, and exchanges the membership
+//! state blob in both directions, surfacing only its transport I/O intents
+//! (`poll_action` → `Connect`, `poll_transport_transmit`) to the driver.  Serf
+//! observes the merged outcome as [`memberlist_proto::RemoteStateReceived`] on
+//! the core's drain over `poll_inner_event`, and never reaches into the stream
+//! lifecycle itself.
 
 use bytes::Bytes;
-use memberlist_proto::{CheapClone, Data, Id, Instant, Rng, SeedableRng, Transmit, parse_message};
+use memberlist_proto::{
+  CheapClone, Data, Id, Instant, Rng, SeedableRng, SmallRng, Transmit, parse_message,
+  streams::{ExchangeId, StreamAction, StreamEndpoint as Coordinator, StreamTransport},
+};
 use smol_str::SmolStr;
 
 use crate::{
@@ -41,36 +54,44 @@ use crate::event::KeyResponseArgs;
 
 /// The serf `StreamEndpoint` super-machine.
 ///
-/// Composes the serf-logic [`Endpoint`] `core` with a memberlist reliable
-/// coordinator (`transport`).  The driver pumps **one** machine: it feeds the
-/// transport ingress, ticks `handle_timeout`, and drains the serf and transport
-/// poll surfaces.
-pub struct StreamEndpoint<I, A, R = memberlist_proto::SmallRng>
+/// Composes the serf-logic [`Endpoint`] `core` with the memberlist reliable
+/// stream coordinator ([`memberlist_proto::streams::StreamEndpoint`]) as the
+/// `transport`.  The driver pumps **one** machine: it feeds the transport
+/// ingress, ticks `handle_timeout`, and drains the serf and transport poll
+/// surfaces.
+///
+/// The serf-logic core carries its **own** injected RNG `R`, distinct from the
+/// coordinator's RNG `G`; the two are seeded independently so serf's gossip
+/// choices and memberlist's probe choices do not share a stream.  `RT` is the
+/// record-layer ([`StreamTransport`]) — `RawRecords` for plain-TCP,
+/// `Labeled<TlsRecords>` for TLS.
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+pub struct StreamEndpoint<I, A, RT, G = SmallRng, R = SmallRng>
 where
   I: Eq + core::hash::Hash,
+  RT: StreamTransport,
 {
   /// The serf-logic core, holding all serf state and no transport reference.
   core: Endpoint<I, A, R>,
   /// The memberlist reliable coordinator serf drives through the `Reliable`
   /// seam.  Holds the single membership `Endpoint`.
-  transport: memberlist_proto::Endpoint<I, A, R>,
+  transport: Coordinator<I, A, RT, G>,
 }
 
-impl<I, A, R> StreamEndpoint<I, A, R>
+#[cfg(feature = "tcp")]
+impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
 where
   I: Clone + Eq + core::hash::Hash,
+  RT: StreamTransport,
   R: SeedableRng,
 {
-  /// Construct a `StreamEndpoint` from a memberlist coordinator `transport`,
-  /// serf `opts`, and serf's own injected `rng`.
+  /// Construct a `StreamEndpoint` from a memberlist reliable coordinator
+  /// `transport`, serf `opts`, and serf's own injected `rng`.
   ///
-  /// `rng` is **separate** from the coordinator's `R`; seed it from the
+  /// `rng` is **separate** from the coordinator's RNG `G`; seed it from the
   /// driver's own entropy source.
-  pub fn new_with_rng(
-    transport: memberlist_proto::Endpoint<I, A, R>,
-    opts: Options,
-    rng: R,
-  ) -> Self {
+  pub fn new_with_rng(transport: Coordinator<I, A, RT, G>, opts: Options, rng: R) -> Self {
     Self {
       core: Endpoint::new_with_rng(opts, rng),
       transport,
@@ -81,7 +102,7 @@ where
   ///
   /// Suitable for tests and deterministic environments.  Production drivers
   /// should use `new_with_rng` and seed from a cryptographically-secure source.
-  pub fn new(transport: memberlist_proto::Endpoint<I, A, R>, opts: Options) -> Self {
+  pub fn new(transport: Coordinator<I, A, RT, G>, opts: Options) -> Self {
     Self::new_with_rng(transport, opts, R::seed_from_u64(0))
   }
 }
@@ -92,42 +113,81 @@ where
 // deliberately excludes transport ingress / timer / poll operations — then drive
 // the serf-logic sieve over the coordinator.
 
-impl<I, A, R> StreamEndpoint<I, A, R>
+#[cfg(feature = "tcp")]
+impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
 where
   I: Id + Clone,
   A: CheapClone + Data + PartialEq + Clone + 'static,
+  RT: StreamTransport,
+  G: Rng,
   R: Rng + SeedableRng,
 {
-  /// Deliver an inbound datagram or packet to the machine.
+  /// Feed one decoded unreliable memberlist `Message<I, A>` into the
+  /// coordinator, then sieve the resulting inner events into serf.
   ///
-  /// Decodes the memberlist wire `Message<I, A>` and hands it to the
-  /// coordinator's inner endpoint, then sieves the resulting inner events into
-  /// serf.  Malformed or unrecognised bytes are silently dropped — the machine
-  /// must not panic on bad input from the network.
+  /// The composed unit's unreliable ingress is `handle_gossip` →
+  /// `poll_memberlist_ingress` → (codec decode) → `handle_packet`.  This method
+  /// is the decode-then-feed convenience: it parses the memberlist wire frame
+  /// and hands the typed message to the coordinator.  Malformed or unrecognised
+  /// bytes are silently dropped — the machine must not panic on bad input from
+  /// the network.
   pub fn handle_packet(&mut self, from: A, data: Bytes, now: Instant) {
-    // Malformed frame or unrecognised tag: drop silently. The inner endpoint
-    // logs its own decode errors; serf takes no serf-level action here.
+    // Malformed frame or unrecognised tag: drop silently. The coordinator logs
+    // its own decode errors; serf takes no serf-level action here.
     if let Ok(msg) = parse_message::<I, A>(data) {
       self.transport.handle_packet(from, msg, now);
     }
     self.core.drain_after_ingress(&mut self.transport, now);
   }
 
-  /// Deliver a stream event to the coordinator, then sieve resulting inner
-  /// events into serf.
-  pub fn handle_stream_event(
-    &mut self,
-    ev: memberlist_proto::EndpointEvent<I, A>,
-    now: Instant,
-  ) -> Option<memberlist_proto::StreamCommand<I, A>> {
-    let cmd = self.transport.handle_stream_event(ev, now);
-    self.core.drain_after_ingress(&mut self.transport, now);
-    cmd
+  /// Buffer one inbound gossip datagram on the coordinator's ingress queue.
+  ///
+  /// The codec-owning driver drains the raw frames via
+  /// [`Self::poll_memberlist_ingress`], decodes each, and feeds the typed
+  /// messages back through [`Self::handle_packet`] before ticking
+  /// [`Self::handle_timeout`].
+  pub fn handle_gossip(&mut self, from: A, datagram: &[u8], now: Instant) {
+    self.transport.handle_gossip(from, datagram, now);
   }
 
-  /// Accept an inbound stream connection on the coordinator.
-  pub fn accept_stream(&mut self, from: A, now: Instant) -> Option<memberlist_proto::Stream<I, A>> {
-    self.transport.accept_stream(from, now)
+  /// Admit an inbound reliable stream connection from `from`.
+  ///
+  /// Returns the [`ExchangeId`] the coordinator allocated for the accepted
+  /// exchange, or `None` if the connection was rejected (e.g. the inbound
+  /// stream cap is exceeded or the node is leaving).  The driver feeds the
+  /// connection's bytes back through [`Self::handle_transport_data`] under this
+  /// id.
+  pub fn accept_connection(&mut self, from: A, now: Instant) -> Option<ExchangeId> {
+    self.transport.accept_connection(from, now)
+  }
+
+  /// Deliver inbound transport bytes for the reliable exchange `id`, then sieve
+  /// the resulting inner events into serf.
+  ///
+  /// `eof` signals the peer half-closed the connection (a transport read of
+  /// zero).  A completed push-pull exchange surfaces as
+  /// [`memberlist_proto::RemoteStateReceived`] on the core's drain, which serf
+  /// folds into its membership via `merge_remote_state`.
+  pub fn handle_transport_data(&mut self, id: ExchangeId, bytes: &[u8], eof: bool, now: Instant) {
+    self.transport.handle_transport_data(id, bytes, eof, now);
+    self.core.drain_after_ingress(&mut self.transport, now);
+  }
+
+  /// Report that the driver's outbound dial for reliable exchange `id` failed,
+  /// then sieve the resulting inner events into serf.
+  ///
+  /// The coordinator retires the exchange (no bridge is opened) and may emit a
+  /// terminal `ExchangeCompleted`; serf takes no action on it.
+  pub fn handle_dial_failed(&mut self, id: ExchangeId, now: Instant) {
+    self.transport.handle_dial_failed(id, now);
+    self.core.drain_after_ingress(&mut self.transport, now);
+  }
+
+  /// Report a transport-level error on reliable exchange `id`, then sieve the
+  /// resulting inner events into serf.
+  pub fn handle_transport_error(&mut self, id: ExchangeId, now: Instant) {
+    self.transport.handle_transport_error(id, now);
+    self.core.drain_after_ingress(&mut self.transport, now);
   }
 
   /// Advance time and fire any expired serf or coordinator deadlines.
@@ -137,6 +197,11 @@ where
   /// drain + deadline pass, so the load-bearing
   /// `resync → inner timer → drain → serf deadlines` sequence is established
   /// here, once, rather than in each runtime driver.
+  ///
+  /// The coordinator's own `handle_timeout` services its dial queue and bridge
+  /// schedule internally; any `DialRequested` the inner endpoint emits is
+  /// sieved into the coordinator's private dial queue (surfaced to the driver as
+  /// a `poll_action` → `Connect`), so it never reaches serf's drain.
   pub fn handle_timeout(&mut self, now: Instant) {
     // Pre-inner-timer: latch `now` and resync the push-pull snapshot if dirty,
     // so the coordinator ships current serf state on this tick's anti-entropy.
@@ -148,16 +213,38 @@ where
     self.core.after_inner_timeout(&mut self.transport, now);
   }
 
-  /// Drain one outgoing transmit from the coordinator.
-  pub fn poll_transmit(&mut self) -> Option<Transmit<I, A>> {
-    self.transport.poll_transmit()
+  /// Drain one outbound transport directive ([`StreamAction`]) from the
+  /// coordinator — a `Connect` to dial a peer, or a `Shutdown` / `Close` /
+  /// `Abort` to tear an exchange's connection down.
+  pub fn poll_action(&mut self) -> Option<StreamAction> {
+    self.transport.poll_action()
+  }
+
+  /// Drain one outbound per-exchange transport chunk `(exchange, peer, bytes)`
+  /// from the coordinator; the driver writes `bytes` on `exchange`'s connection.
+  pub fn poll_transport_transmit(&mut self) -> Option<(ExchangeId, core::net::SocketAddr, Bytes)> {
+    self.transport.poll_transport_transmit()
+  }
+
+  /// Drain one raw inbound gossip datagram `(from, bytes)` the coordinator
+  /// buffered from [`Self::handle_gossip`]; the codec layer decodes it and feeds
+  /// the typed messages back through [`Self::handle_packet`].
+  pub fn poll_memberlist_ingress(&mut self) -> Option<(A, Bytes)> {
+    self.transport.poll_memberlist_ingress()
+  }
+
+  /// Drain one outgoing unreliable (gossip-plane) memberlist [`Transmit`] from
+  /// the coordinator; the driver encodes and sends it on the UDP socket.
+  pub fn poll_memberlist_transmit(&mut self) -> Option<Transmit<I, A>> {
+    self.transport.poll_memberlist_transmit()
   }
 
   /// The earliest deadline requiring a `handle_timeout` call.
   ///
   /// The minimum of the coordinator's own deadline and serf's periodic
-  /// deadlines.
-  pub fn poll_timeout(&self) -> Option<Instant> {
+  /// deadlines.  Takes `&mut self` because the coordinator folds in
+  /// immediate-due dial wakes that it tracks mutably.
+  pub fn poll_timeout(&mut self) -> Option<Instant> {
     let inner = self.transport.poll_timeout();
     let serf = self.core.serf_poll_timeout();
     match (inner, serf) {
@@ -174,7 +261,7 @@ where
   /// leave-intent broadcast has been flushed without waiting the full
   /// `broadcast_timeout`.
   pub fn user_broadcast_queue_len(&self) -> usize {
-    self.transport.user_broadcast_queue_len()
+    self.transport.endpoint_ref().user_broadcast_queue_len()
   }
 
   // ── serf-logic + serf-command forwarders ────────────────────────────────────
@@ -1011,4 +1098,15 @@ where
   pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, A, R> {
     &mut self.core
   }
+
+  /// Mutable access to the memberlist reliable coordinator, for tests that
+  /// drive a two-endpoint loopback (relay one side's transport transmits into
+  /// the other's `handle_transport_data`).
+  #[cfg(test)]
+  pub(crate) fn transport_mut(&mut self) -> &mut Coordinator<I, A, RT, G> {
+    &mut self.transport
+  }
 }
+
+#[cfg(all(test, feature = "tcp"))]
+mod tests;
