@@ -1,23 +1,22 @@
-//! The serf wire codec — pure, no-I/O message types shared by the serf driver crates.
+//! The serf wire codec and Sans-I/O state machine — pure, no-I/O types shared
+//! by the serf driver crates.
 //!
 //! Depends on `memberlist-proto` for the `Data`/`DataRef` codec primitives; defines serf's
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
 
-pub use any::{AnyMessage, DecodeError, EncodeError};
-pub use bridge::BridgeError;
-pub use framing::{FrameError, IncompleteFrame, MessageType};
+pub(crate) use any::{AnyMessage, EncodeError};
+pub(crate) use bridge::BridgeError;
+pub(crate) use framing::{FrameError, MessageType};
+pub(crate) use typed::{
+  ConflictResponseMessage, JoinMessage, LeaveMessage, PushPullMessage, RelayMessage,
+};
 pub use typed::{
-  ConflictResponseMessage, Coordinate, Filter, JoinMessage, LeaveMessage, PushPullMessage,
-  QueryFlag, QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, Tags, UserEvent,
+  Coordinate, Filter, QueryFlag, QueryMessage, QueryResponseMessage, TagFilter, Tags, UserEvent,
   UserEventMessage, UserEvents,
 };
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
-)]
-pub use typed::{KeyRequestMessage, KeyResponseMessage};
+pub(crate) use typed::{KeyRequestMessage, KeyResponseMessage};
 
 /// A lamport logical clock value — a monotonically increasing counter used to
 /// order serf events.
@@ -53,8 +52,40 @@ impl LamportTime {
   }
 }
 
-pub mod any;
+pub(crate) mod any;
 pub(crate) mod bridge;
 pub(crate) mod framing;
 pub(crate) mod messages;
 pub mod typed;
+
+#[cfg(feature = "coordinates")]
+mod coordinate_client;
+#[cfg(feature = "coordinates")]
+pub use coordinate_client::{
+  CoordinateClient, CoordinateClientStats, CoordinateError, CoordinateOptions,
+};
+
+pub mod endpoint;
+pub mod event;
+pub mod members;
+pub mod options;
+pub mod snapshot;
+
+#[cfg(feature = "coordinates")]
+#[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+pub use snapshot::CoordinateRecord;
+pub use snapshot::{ReplayResult, SnapshotError, SnapshotRecord};
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub use event::{KeyRequest, KeyRequestOperation, KeyResponseArgs};
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub use memberlist_proto::SecretKey;

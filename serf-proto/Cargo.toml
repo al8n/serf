@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["tag-regex"]
 # Encryption key management messages (KeyRequestMessage / KeyResponseMessage).
 # Pulls in the memberlist-proto encryption backend (at least one AEAD cipher
 # must be selected; both are forwarded here so the caller can pick).
@@ -17,15 +18,30 @@ aes-gcm = ["memberlist-proto/aes-gcm", "dep:zeroize"]
 chacha20-poly1305 = ["memberlist-proto/chacha20-poly1305", "dep:zeroize"]
 # Umbrella that activates both backends (convenient for tests / CI).
 encryption = ["aes-gcm", "chacha20-poly1305"]
+# Vivaldi network coordinate estimation.  Enabled by default under std.
+# Disable for embedded / no_std targets or when the coordinate overhead is
+# not desired.
+coordinates = []
+# Regex-backed tag-filter matching (mirrors Go serf `regexp.MatchString`).
+# When enabled (default), a `Filter::Tag` expression is compiled as a regex
+# and matched with partial (anywhere-in-value) semantics.  When disabled
+# (`--no-default-features`), tag matching falls back to exact string equality.
+# This crate currently requires std regardless of this flag; disabling
+# `tag-regex` is the forward-compatible preparation for a future no_std port,
+# not current no_std support.
+tag-regex = ["dep:regex"]
 
 [dependencies]
 memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
 bytes = { workspace = true }
+derive_more = { workspace = true }
+rand = { workspace = true }
 thiserror.workspace = true
 bitflags = "2"
 buffa = { version = "0.7", default-features = false }
 smol_str = { workspace = true }
 zeroize = { version = "1", optional = true }
+regex = { version = "1", optional = true }
 
 [build-dependencies]
 buffa-build = "0.7"

@@ -252,6 +252,43 @@ where
   Ok(out)
 }
 
+/// Peek the header of the leading plain frame in `buf` without allocating the body.
+///
+/// Returns `(MessageType, total_frame_len)` on success, where `total_frame_len`
+/// is the full encoded length of the frame (tag byte + varint + body).  The body
+/// bytes are NOT extracted — the caller can use this to apply a cheap size gate
+/// before doing a full decode.
+///
+/// # Errors
+///
+/// Returns the same [`FrameError`] variants as [`decode_message`] — `Empty`,
+/// `Incomplete`, or `VarintOverflow`.
+pub(crate) fn peek_frame_header(buf: &[u8]) -> Result<(MessageType, usize), FrameError> {
+  if buf.is_empty() {
+    return Err(FrameError::Empty);
+  }
+
+  let ty = MessageType::from(buf[0]);
+
+  let (body_len, varint_bytes) = match decode_varint_u32(&buf[1..]) {
+    Ok(v) => v,
+    Err(FrameError::Incomplete(_)) => {
+      return Err(FrameError::Incomplete(IncompleteFrame::new(
+        buf.len(),
+        buf.len() + 1,
+      )));
+    }
+    Err(e) => return Err(e),
+  };
+
+  let header_len = 1 + varint_bytes;
+  let frame_end = header_len
+    .checked_add(body_len as usize)
+    .ok_or(FrameError::VarintOverflow)?;
+
+  Ok((ty, frame_end))
+}
+
 /// Decode the leading plain frame from `buf`.
 ///
 /// Returns `(MessageType, body_bytes, bytes_consumed)` on success.

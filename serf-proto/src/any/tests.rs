@@ -457,6 +457,19 @@ fn any_message_encode_key_response_round_trip() {
   }
 }
 
+// ─── Visibility seal test ─────────────────────────────────────────────────────
+
+#[test]
+fn sealed_types_are_crate_internal() {
+  // In-crate: the sealed types still EXIST after the seal (resolve here),
+  // while no longer being `pub` to dependents.
+  fn _assert_crate_visible(
+    _: core::marker::PhantomData<super::AnyMessage<u32, std::net::SocketAddr>>,
+  ) {
+  }
+  fn _assert_public(_: core::marker::PhantomData<crate::QueryFlag>) {}
+}
+
 // ─── Error cases ──────────────────────────────────────────────────────────────
 
 #[test]

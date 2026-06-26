@@ -132,6 +132,7 @@ where
   A: Data,
 {
   /// Returns the [`MessageType`] tag for this message variant.
+  #[cfg(test)]
   pub fn message_type(&self) -> MessageType {
     match self {
       Self::Leave(_) => MessageType::Leave,
@@ -216,10 +217,33 @@ where
     Ok(Bytes::from(frame_vec))
   }
 
+  /// Decode the leading serf frame in `buf` into an [`AnyMessage`], also
+  /// returning the number of bytes consumed from `buf`.
+  ///
+  /// Same as [`AnyMessage::decode`] but surfaces the consumed byte count so
+  /// callers can verify that the frame is the only content in the buffer
+  /// (exact-consumption check: `consumed == buf.len()` must hold on the gossip
+  /// ingress path to reject packets with trailing junk).
+  ///
+  /// # Errors
+  ///
+  /// See [`AnyMessage::decode`].
+  pub(crate) fn decode_with_consumed(buf: &Bytes) -> Result<(Self, usize), DecodeError>
+  where
+    I: Data,
+    A: Data,
+  {
+    let (ty, body, consumed) = decode_message(buf)?;
+    let msg = Self::decode_body(ty, body)?;
+    Ok((msg, consumed))
+  }
+
   /// Decode the leading serf frame in `buf` into an [`AnyMessage`].
   ///
-  /// Splits the tag byte and body with the crate-internal frame decoder, then
-  /// dispatches on the tag to the appropriate buffa decoder and bridge function.
+  /// All production decode sites use [`AnyMessage::decode_with_consumed`] for
+  /// exact-consumption enforcement; this convenience wrapper is retained for
+  /// round-trip tests in `any/tests.rs` and the test adapter in
+  /// `endpoint/mod.rs`.
   ///
   /// # Errors
   ///
@@ -231,14 +255,27 @@ where
   ///   was out of range.
   /// - [`DecodeError::UnknownTag`] — the tag byte is not recognised by this
   ///   build.
+  #[cfg(test)]
   pub fn decode(buf: &Bytes) -> Result<Self, DecodeError>
   where
     I: Data,
     A: Data,
   {
-    use buffa::Message as _;
-
     let (ty, body, _consumed) = decode_message(buf)?;
+    Self::decode_body(ty, body)
+  }
+
+  /// Dispatch-decode a typed body given the tag and the raw body bytes.
+  ///
+  /// Shared implementation used by both [`AnyMessage::decode`] and
+  /// [`AnyMessage::decode_with_consumed`] to avoid duplicating the match arm
+  /// logic.
+  fn decode_body(ty: MessageType, body: Bytes) -> Result<Self, DecodeError>
+  where
+    I: Data,
+    A: Data,
+  {
+    use buffa::Message as _;
 
     match ty {
       MessageType::Leave => {

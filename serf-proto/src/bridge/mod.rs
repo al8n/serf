@@ -15,8 +15,8 @@ use memberlist_proto::{
 };
 use smol_str::SmolStr;
 
-#[cfg(test)]
-use crate::typed::{Coordinate, Tags};
+#[cfg(any(feature = "coordinates", test))]
+use crate::typed::Coordinate;
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 use crate::typed::{KeyRequestMessage, KeyResponseMessage};
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
   messages::serf::v1 as pb,
   typed::{
     ConflictResponseMessage, Filter, JoinMessage, LeaveMessage, PushPullMessage, QueryFlag,
-    QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, UserEvent, UserEventMessage,
+    QueryMessage, QueryResponseMessage, RelayMessage, TagFilter, Tags, UserEvent, UserEventMessage,
     UserEvents,
   },
 };
@@ -83,7 +83,7 @@ pub(crate) fn user_event_from_pb(
 // ─── Coordinate ──────────────────────────────────────────────────────────────
 
 /// Convert a typed [`Coordinate`] → `pb::Coordinate`.
-#[cfg(test)]
+#[cfg(any(feature = "coordinates", test))]
 pub(crate) fn coordinate_to_pb(t: &Coordinate) -> pb::Coordinate {
   pb::Coordinate {
     portion: t.vec.clone(),
@@ -95,7 +95,7 @@ pub(crate) fn coordinate_to_pb(t: &Coordinate) -> pb::Coordinate {
 }
 
 /// Convert `pb::Coordinate` → typed [`Coordinate`].
-#[cfg(test)]
+#[cfg(any(feature = "coordinates", test))]
 pub(crate) fn coordinate_from_pb(b: &pb::Coordinate) -> Coordinate {
   Coordinate {
     vec: b.portion.clone(),
@@ -121,7 +121,6 @@ pub(crate) fn tags_to_pb(t: &Tags) -> pb::Tags {
 }
 
 /// Convert `pb::Tags` → typed [`Tags`].
-#[cfg(test)]
 pub(crate) fn tags_from_pb(b: &pb::Tags) -> Tags {
   Tags(
     b.entries
