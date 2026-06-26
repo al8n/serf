@@ -77,13 +77,12 @@ fn tcp_stream_endpoint_impl_compiles_and_wires_up() {
 
   // Plain-TCP label options: no cluster label, Passthrough inner transport.
   let cfg: LabelOptions<()> = LabelOptions::new_in(None, ());
-  let sni_provider: Box<dyn Fn(&core::net::SocketAddr) -> Option<String> + Send + Sync> =
-    Box::new(|_| Some("localhost".to_string()));
-  let peer_to_socket: Box<dyn Fn(&core::net::SocketAddr) -> core::net::SocketAddr + Send + Sync> =
-    Box::new(|a| *a);
-
-  let mut coord: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
-    StreamEndpoint::new(inner, cfg, sni_provider, peer_to_socket);
+  let mut coord: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> = StreamEndpoint::new(
+    inner,
+    cfg,
+    Box::new(|_| Some("localhost".to_string())),
+    Box::new(|a| *a),
+  );
 
   drive(&mut coord, addr);
 }

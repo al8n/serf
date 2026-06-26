@@ -1109,9 +1109,9 @@ where
 
       // ── user gossip ───────────────────────────────────────────────────────
       IE::UserPacket(p) => {
-        // `drain_now` was latched by handle_packet / handle_stream_event /
-        // handle_timeout before drain_inner was called, so it is always a
-        // fresh `now` for the current call site.
+        // `drain_now` was latched by the ingress entry point (handle_packet /
+        // handle_transport_data / handle_timeout) before drain_inner was called,
+        // so it is always a fresh `now` for the current call site.
         let now = self.drain_now;
         let (from, data, _reliability) = p.into_parts();
         self.handle_user_packet(t, from, data, now);
@@ -1172,18 +1172,15 @@ where
       // serf takes no action on undecodable inner messages.
       IE::DecodeError(_) => {}
 
-      // ── reconnect / dial passthrough (H3) ────────────────────────────────
-      // The inner emits DialRequested when serf calls inner.start_push_pull()
-      // (from fire_reconnect) or when the inner initiates its own anti-entropy
-      // push/pull.  The driver must dial the given peer and report back via
-      // dial_succeeded / dial_failed.  serf passes this through to the driver
-      // as Event::DialRequested so the driver's event loop can perform the dial.
-      //
-      // H3: the reconnector is machine OUTPUT — serf does NO I/O itself.
+      // ── reconnect / dial passthrough ─────────────────────────────────────
+      // The reliable coordinator (`StreamEndpoint`/`QuicEndpoint`) sieves the
+      // inner `DialRequested` into its own dial queue and dials itself, so this
+      // event never reaches serf's drain over a real coordinator.  The arm
+      // remains for totality over `memberlist_proto::Event` and to re-emit a
+      // serf-level passthrough for any transport that does surface the dial to
+      // serf (the driver then performs the dial and reports back via
+      // dial_succeeded / dial_failed).
       IE::DialRequested(d) => {
-        // Re-emit as a serf-level event so the driver sees it from poll_event.
-        // DialPassthrough carries the StreamId and peer address; the driver uses
-        // StreamId to call inner.dial_succeeded / inner.dial_failed.
         let (stream_id, peer, _deadline) = d.into_parts();
         // Track the dialled address for test assertions.
         #[cfg(test)]
@@ -2006,8 +2003,14 @@ where
     };
     let addr = ms.member().node().addr_ref().clone();
 
-    // Call start_push_pull; the inner queues Event::DialRequested.
-    // The sieve (on_inner_event) passes it through as Event::DialRequested.
+    // Capture the dialled address for test assertions at the call site. The
+    // reliable coordinator sieves the inner `DialRequested` into its own dial
+    // queue (it IS the driver and dials itself), so the event never reaches the
+    // serf sieve — the call site is the only place serf observes the choice.
+    #[cfg(test)]
+    {
+      self.last_dial_addr = Some(addr.clone());
+    }
     t.start_push_pull(addr, PushPullKind::Join, now);
     self.drain_inner(t);
   }
@@ -5096,7 +5099,9 @@ where
 
 pub(crate) mod reliable;
 
-#[cfg(test)]
+// These suites drive the serf logic through `crate::StreamEndpoint`, which
+// composes the plain-TCP reliable coordinator and is therefore `tcp`-gated.
+#[cfg(all(test, feature = "tcp"))]
 mod serf_parity_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "tcp"))]
 mod tests;

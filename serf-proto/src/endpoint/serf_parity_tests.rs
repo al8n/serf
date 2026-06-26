@@ -7,7 +7,9 @@
 //! Each test is named after the invariant it checks.
 
 use bytes::Bytes;
-use memberlist_proto::{EndpointOptions, Instant, SeedableRng, SmallRng};
+use memberlist_proto::{
+  EndpointOptions, Instant, RawRecords, SeedableRng, SmallRng, streams::LabelOptions,
+};
 
 use crate::{
   AnyMessage, LamportTime, StreamEndpoint,
@@ -17,12 +19,18 @@ use crate::{
   typed::{PushPullMessage, UserEvent, UserEvents},
 };
 
-fn ep() -> StreamEndpoint<u32, std::net::SocketAddr> {
+fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner =
     memberlist_proto::Endpoint::new_at(inner_opts, Instant::ORIGIN, SmallRng::seed_from_u64(0));
-  StreamEndpoint::new(inner, Options::new())
+  let coord = memberlist_proto::streams::StreamEndpoint::<_, _, RawRecords>::new(
+    inner,
+    LabelOptions::new_in(Some(b"serf-test".to_vec()), ()),
+    Box::new(|_addr: &std::net::SocketAddr| None),
+    Box::new(|addr: &std::net::SocketAddr| *addr),
+  );
+  StreamEndpoint::new(coord, Options::new())
 }
 
 // ── base.rs handle_node_join invariants ───────────────────────────────────────
