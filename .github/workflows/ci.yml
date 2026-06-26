@@ -72,3 +72,44 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.runtime }}-${{ matrix.stream_layer }}
+
+  serf-proto:
+    name: serf-proto - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "default", flags: "" }
+          - { name: "coords-aes-gcm", flags: "--features coordinates,aes-gcm" }
+          - { name: "coords-chacha", flags: "--features coordinates,chacha20-poly1305" }
+          - { name: "all-features", flags: "--all-features" }
+          - { name: "no-default", flags: "--no-default-features" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup update stable && rustup default stable
+          rustup component add clippy
+          rustup component add rustfmt
+
+      - name: Format check
+        if: matrix.name == 'default'
+        run: cargo fmt --check
+        working-directory: serf-proto
+
+      - name: Clippy
+        run: cargo clippy -p serf-proto --all-targets ${{ matrix.flags }} -- -D warnings
+
+      - name: Test
+        run: cargo test -p serf-proto ${{ matrix.flags }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-serf-proto-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.name }}

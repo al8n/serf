@@ -37,20 +37,20 @@ jobs:
           - crate: serf
             features: "test,tokio,tcp,encryption,metrics"
             name: "serf-tcp-encryption"
+          - crate: serf-proto
+            features: "encryption,coordinates,tag-regex"
+            name: "serf-proto"
     steps:
       - uses: actions/checkout@v6
       - name: Install latest nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          override: true
+        run: rustup toolchain install nightly && rustup default nightly
       - name: Setup loopback interface
         run: ci/setup_subnet_ubuntu.sh
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Run Coverage and Generate Report
         run: |
-          cargo tarpaulin --out xml --no-default-features --features ${{ matrix.features }} --no-fail-fast --output-dir $PWD -j 1
+          cargo tarpaulin --out xml --no-default-features --features ${{ matrix.features }} --no-fail-fast --output-dir "$PWD" -j 1
         working-directory: ${{ matrix.crate }}
         continue-on-error: true
       - name: Upload Coverage Report as Artifact
