@@ -4,7 +4,7 @@
 //! `StreamEndpoint` owns the serf-logic [`Endpoint`] core and the memberlist
 //! reliable coordinator ([`memberlist_proto::streams::StreamEndpoint`]) as
 //! **two disjoint fields**, and drives the core over `&mut transport` through
-//! the [`Reliable`](crate::endpoint::reliable) seam.  It exposes the
+//! the `Reliable` seam.  It exposes the
 //! coordinator's transport-facing driver surface (`handle_packet`,
 //! `handle_gossip`, `accept_connection`, `handle_transport_data`,
 //! `poll_action`, `poll_transport_transmit`, `handle_timeout`, …) plus serf's

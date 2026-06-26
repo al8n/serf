@@ -1,11 +1,11 @@
 //! The serf `QuicEndpoint` super-machine — serf logic composed with the
 //! memberlist QUIC coordinator.
 //!
-//! `QuicEndpoint` is the QUIC sibling of [`StreamEndpoint`](crate::StreamEndpoint):
+//! `QuicEndpoint` is the QUIC sibling of the stream super-machine `StreamEndpoint`:
 //! it owns the same serf-logic [`Endpoint`] core but pairs it with the memberlist
 //! QUIC coordinator ([`memberlist_proto::QuicEndpoint`]) instead of the reliable
 //! stream coordinator.  The two live as **disjoint fields**, and the core is
-//! driven over `&mut transport` through the [`Reliable`](crate::endpoint::reliable)
+//! driven over `&mut transport` through the `Reliable`
 //! seam — identical to the stream super-machine; only the transport surface
 //! differs.
 //!

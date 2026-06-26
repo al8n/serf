@@ -141,69 +141,6 @@ where
   fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error>;
 }
 
-// ── impl for the raw memberlist_proto::Endpoint ───────────────────────────────
-//
-// The transitional `StreamEndpoint` super-machine uses the raw packet
-// `memberlist_proto::Endpoint` as its reliable transport, so the serf-logic
-// core can drive it through this seam before the full stream/QUIC coordinators
-// are wired in as the transport.
-
-impl<I, A, R> Reliable<I, A> for Endpoint<I, A, R>
-where
-  I: memberlist_proto::Id,
-  A: memberlist_proto::CheapClone + memberlist_proto::Data + PartialEq + 'static,
-  R: Rng,
-{
-  type Rng = R;
-
-  #[inline]
-  fn endpoint_ref(&self) -> &Endpoint<I, A, R> {
-    self
-  }
-
-  #[inline]
-  fn poll_inner_event(&mut self) -> Option<memberlist_proto::Event<I, A>> {
-    // Fully-qualified call to reach the inherent method; the trait method has
-    // the same name and would recurse without the explicit path.
-    Endpoint::poll_event(self)
-  }
-
-  #[inline]
-  fn queue_user_broadcast_ranked(
-    &mut self,
-    rank: u8,
-    data: Bytes,
-  ) -> Result<(), memberlist_proto::Error> {
-    Endpoint::queue_user_broadcast_ranked(self, rank, data)
-  }
-
-  #[inline]
-  fn send_user_packet(&mut self, to: A, data: Bytes) -> Result<(), memberlist_proto::Error> {
-    Endpoint::send_user_packet(self, to, data)
-  }
-
-  #[inline]
-  fn set_local_state_snapshot(&mut self, bytes: Bytes) -> Result<(), memberlist_proto::Error> {
-    Endpoint::set_local_state_snapshot(self, bytes)
-  }
-
-  #[inline]
-  fn start_push_pull(&mut self, peer: A, kind: PushPullKind, now: Instant) -> StreamId {
-    Endpoint::start_push_pull(self, peer, kind, now)
-  }
-
-  #[inline]
-  fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
-    Endpoint::leave(self, now)
-  }
-
-  #[cfg(feature = "coordinates")]
-  #[inline]
-  fn set_ack_payload(&mut self, payload: Bytes) -> Result<(), memberlist_proto::Error> {
-    Endpoint::set_ack_payload(self, payload)
-  }
-}
-
 // ── impl for memberlist_proto::streams::StreamEndpoint ────────────────────────
 //
 // Enabled when the `tcp` or `tls` feature is active (which enables

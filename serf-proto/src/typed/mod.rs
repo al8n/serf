@@ -9,8 +9,12 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use crate::LamportTime;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 use memberlist_proto::Node;
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 use memberlist_proto::SecretKey;
 
 /// A user-generated event broadcast through the serf cluster.
@@ -269,6 +273,7 @@ pub struct UserEvents {
 ///
 /// The `status_ltimes` map is transmitted as a `repeated NodeStatusTime` rather
 /// than a proto3 `map<bytes,uint64>` because proto3 forbids `bytes` map keys.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PushPullMessage<I> {
   /// The lamport clock value of the sending node at the time of the exchange.
@@ -288,6 +293,7 @@ pub(crate) struct PushPullMessage<I> {
   pub(crate) query_ltime: LamportTime,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I> PushPullMessage<I> {
   /// Construct a new `PushPullMessage`.
   pub(crate) fn new(
@@ -317,14 +323,20 @@ impl<I> PushPullMessage<I> {
 /// operations.
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyRequestMessage {
   /// The encryption key, or `None` for a list-keys request.
   pub(crate) key: Option<SecretKey>,
 }
 
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 impl KeyRequestMessage {
   /// Construct a new `KeyRequestMessage`.
   pub(crate) fn new(key: Option<SecretKey>) -> Self {
@@ -340,7 +352,10 @@ impl KeyRequestMessage {
 /// the wire codec; only this per-node response message is encoded on the wire.
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct KeyResponseMessage {
   /// `true` if the operation succeeded on this node.
@@ -364,6 +379,7 @@ pub(crate) struct KeyResponseMessage {
 /// Generic over `I` (node-id) and `A` (node-address). The `memberlist_proto::Data`
 /// bound is enforced at the bridge layer (`relay_to_pb` / `relay_from_pb`) where
 /// the destination is encoded/decoded as opaque `bytes`.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayMessage<I, A> {
   /// The node to forward the message to.
@@ -372,6 +388,7 @@ pub(crate) struct RelayMessage<I, A> {
   pub(crate) payload: Bytes,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I, A> RelayMessage<I, A> {
   /// Construct a new `RelayMessage`.
   pub(crate) fn new(destination: Node<I, A>, payload: Bytes) -> Self {
@@ -389,6 +406,7 @@ impl<I, A> RelayMessage<I, A> {
 /// Generic over `I`: the node-id type, which must implement
 /// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
 /// the bridge layer.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JoinMessage<I> {
   /// The lamport clock value at the time the node joined.
@@ -397,6 +415,7 @@ pub(crate) struct JoinMessage<I> {
   pub(crate) id: I,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I> JoinMessage<I> {
   /// Construct a new `JoinMessage`.
   pub(crate) fn new(ltime: crate::LamportTime, id: I) -> Self {
@@ -409,6 +428,7 @@ impl<I> JoinMessage<I> {
 /// Generic over `I`: the node-id type, which must implement
 /// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
 /// the bridge layer.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeaveMessage<I> {
   /// The lamport clock value at the time the leave was emitted.
@@ -419,6 +439,7 @@ pub(crate) struct LeaveMessage<I> {
   pub(crate) prune: bool,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I> LeaveMessage<I> {
   /// Construct a new `LeaveMessage`.
   pub(crate) fn new(ltime: crate::LamportTime, id: I, prune: bool) -> Self {
@@ -431,12 +452,14 @@ impl<I> LeaveMessage<I> {
 /// Generic over `I` and `A`: the node-id and address types, which must
 /// implement `memberlist_proto::Data` so the embedded `Node<I,A>` can be
 /// encoded as opaque proto `bytes` in the bridge layer.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConflictResponseMessage<I, A> {
   /// The winning node in the conflict resolution.
   pub(crate) member: Node<I, A>,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<I, A> ConflictResponseMessage<I, A> {
   /// Construct a new `ConflictResponseMessage`.
   pub(crate) fn new(member: Node<I, A>) -> Self {

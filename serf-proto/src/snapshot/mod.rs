@@ -440,7 +440,7 @@ where
 ///
 /// The driver reads the snapshot file into [`SnapshotRecord`] values (via
 /// [`SnapshotRecord::decode`]) and calls [`ReplayResult::replay`]; serf's
-/// [`Endpoint::load_snapshot`][crate::endpoint::Endpoint::load_snapshot] then
+/// `Endpoint::load_snapshot` then
 /// applies the result to the machine state.  This type owns no file handles or
 /// I/O state — it is a pure data carrier.
 ///
@@ -457,7 +457,7 @@ pub struct ReplayResult<I, A> {
   /// The member Lamport clock high-water mark seen in the snapshot.
   ///
   /// The `Endpoint` will set its member clock to at least this value + 1
-  /// on [`load_snapshot`][crate::endpoint::Endpoint::load_snapshot] (G5).
+  /// on `load_snapshot` (G5).
   pub last_clock: LamportTime,
   /// The event Lamport clock high-water mark seen in the snapshot.
   ///
