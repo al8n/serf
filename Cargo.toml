@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "serf-proto",
+  "serf-driver",
 ]
 exclude = ["legacy"]
 resolver = "3"
