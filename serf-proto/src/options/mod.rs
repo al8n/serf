@@ -1,4 +1,4 @@
-//! Configuration knobs for the serf [`crate::endpoint::Endpoint`].
+//! Configuration knobs for the serf `Endpoint`.
 //!
 //! All timer defaults are taken verbatim from Go serf `options.go` / the legacy
 //! `serf-core/src/options.rs` port.  The struct itself is a plain value type

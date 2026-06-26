@@ -4,11 +4,11 @@
 //! Holds serf's membership FSM, three Lamport clocks, user events,
 //! queries/responses/relays, push-pull anti-entropy, and network coordinates,
 //! but **no** transport reference.  It reaches a memberlist reliable
-//! coordinator only through the narrow [`Reliable`](reliable::Reliable) seam:
+//! coordinator only through the narrow `Reliable` seam:
 //! every serf-logic method that touches the membership transport takes a
 //! `&mut impl Reliable<I, A>` (named `t`).  The composing super-machine
-//! ([`crate::StreamEndpoint`]) owns both the core and the coordinator as
-//! separate fields and threads the latter into the former on each call.
+//! (`StreamEndpoint` or `QuicEndpoint`) owns both the core and the coordinator
+//! as separate fields and threads the latter into the former on each call.
 //!
 //! The composing super-machine moves opaque `Bytes` in (`handle_packet`) and
 //! `Transmit`/`Bytes` out (`poll_transmit`) and ticks `poll_timeout(now)`;
@@ -633,12 +633,12 @@ fn next_ltime(clock: &mut u64) -> u64 {
 /// Holds all serf state — the three Lamport clocks, membership store, options,
 /// event ring, query bookkeeping, deadlines, and (feature-gated) the coordinate
 /// client — and **no** transport reference.  It reaches a memberlist reliable
-/// coordinator only through the narrow [`Reliable`](reliable::Reliable) seam:
+/// coordinator only through the narrow `Reliable` seam:
 /// every serf-logic method that must touch the membership transport takes a
 /// `&mut impl Reliable<I, A>` (named `t`), borrowed disjointly from the core's
-/// own state.  The composing super-machine
-/// ([`crate::StreamEndpoint`]) owns both the core and the coordinator as
-/// separate fields and threads the latter into the former.
+/// own state.  The composing super-machine (`StreamEndpoint` or `QuicEndpoint`)
+/// owns both the core and the coordinator as separate fields and threads the
+/// latter into the former.
 ///
 /// `I` is the node-id type; `A` is the (resolved) address type; `R` is the
 /// random number generator injected at construction time (default: `SmallRng`).

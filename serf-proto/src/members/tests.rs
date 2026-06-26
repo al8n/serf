@@ -13,6 +13,7 @@ use super::*;
 /// A subsequent `recent_intent` lookup for a specific node then returns the
 /// same answer on both stores, and a downstream `handle_node_join` for that
 /// node would produce the same `MemberStatus` on both machines.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[test]
 fn upsert_intent_cap_eviction_is_deterministic() {
   use memberlist_proto::Instant;
@@ -122,6 +123,7 @@ fn serf_state_display_matches_as_str() {
   }
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[test]
 fn upsert_intent_newest_ltime_wins() {
   use memberlist_proto::Instant;
@@ -155,6 +157,7 @@ fn upsert_intent_newest_ltime_wins() {
   );
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[test]
 fn recent_intent_kind_mismatch_returns_none() {
   use memberlist_proto::Instant;

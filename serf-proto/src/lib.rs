@@ -5,9 +5,13 @@
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use any::{AnyMessage, EncodeError};
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use bridge::BridgeError;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use framing::{FrameError, MessageType};
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use typed::{
   ConflictResponseMessage, JoinMessage, LeaveMessage, PushPullMessage, RelayMessage,
 };
@@ -15,7 +19,10 @@ pub use typed::{
   Coordinate, Filter, QueryFlag, QueryMessage, QueryResponseMessage, TagFilter, Tags, UserEvent,
   UserEventMessage, UserEvents,
 };
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 pub(crate) use typed::{KeyRequestMessage, KeyResponseMessage};
 
 /// A lamport logical clock value — a monotonically increasing counter used to
@@ -52,9 +59,13 @@ impl LamportTime {
   }
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod any;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod bridge;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod framing;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod messages;
 pub mod typed;
 
@@ -65,7 +76,11 @@ pub use coordinate_client::{
   CoordinateClient, CoordinateClientStats, CoordinateError, CoordinateOptions,
 };
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub mod endpoint;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub mod event;
 pub mod members;
 pub mod options;
@@ -94,10 +109,16 @@ pub use quic_endpoint::QuicEndpoint;
 pub use snapshot::CoordinateRecord;
 pub use snapshot::{ReplayResult, SnapshotError, SnapshotRecord};
 
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg(all(
+  any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+  any(feature = "tcp", feature = "quic")
+))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  doc(cfg(all(
+    any(feature = "aes-gcm", feature = "chacha20-poly1305"),
+    any(feature = "tcp", feature = "quic")
+  )))
 )]
 pub use event::{KeyRequest, KeyRequestOperation, KeyResponseArgs};
 
