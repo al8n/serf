@@ -80,6 +80,15 @@ pub mod stream_endpoint;
 #[doc(inline)]
 pub use stream_endpoint::StreamEndpoint;
 
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub mod quic_endpoint;
+
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+#[doc(inline)]
+pub use quic_endpoint::QuicEndpoint;
+
 #[cfg(feature = "coordinates")]
 #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
 pub use snapshot::CoordinateRecord;
