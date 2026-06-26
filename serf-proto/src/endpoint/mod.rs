@@ -60,7 +60,8 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use memberlist_proto::{
-  CheapClone, Data, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng, typed::NodeState,
+  CheapClone, Data, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng,
+  typed::{Meta, NodeState},
 };
 
 use self::reliable::Reliable;
@@ -73,7 +74,7 @@ use crate::KeyRequestMessage;
 use crate::event::{KeyRequest as KeyRequestEvent, KeyRequestOperation, KeyResponseArgs};
 use crate::{
   AnyMessage, ConflictResponseMessage, EncodeError, LamportTime, MessageType,
-  bridge::{tags_from_pb, user_event_to_pb},
+  bridge::{tags_from_pb, tags_to_pb, user_event_to_pb},
   event::{
     DialPassthrough, Event, MemberEvent, MemberEventKind, QueryAck, QueryEvent,
     QueryResponse as QueryResponseEvent,
@@ -556,6 +557,10 @@ pub enum Error {
   #[cfg_attr(docsrs, doc(cfg(feature = "tag-regex")))]
   #[error("query filter contains an invalid tag regex")]
   InvalidQueryFilter,
+  /// The coordinator's `update_meta()` call from `set_tags()` failed (e.g. the
+  /// encoded tag map exceeds the metadata cap).
+  #[error("set_tags update_meta error: {0}")]
+  SetTagsMeta(memberlist_proto::Error),
 }
 
 // ── clock witness ─────────────────────────────────────────────────────────────
@@ -1297,6 +1302,72 @@ where
     self.event_join_ignore = v;
   }
 
+  /// Update the local node's tags, re-advertise them via the coordinator, and
+  /// synchronously refresh the local member in the membership store.
+  ///
+  /// The coordinator queues an Alive/NodeUpdated broadcast so peers learn the
+  /// new metadata; the corresponding `NodeUpdated` event arrives later via
+  /// `poll_event` and is idempotent (it re-applies the same tags via the normal
+  /// `handle_node_update` path).  The synchronous refresh here means
+  /// tag-filtered local queries (`Filter::Tag` in `should_process_query`) see
+  /// the new tags immediately, without waiting for that event.
+  ///
+  /// If the local node is not yet in `members.states` (the local `NodeJoined`
+  /// has not been drained yet), the in-place refresh is skipped.  Materializing
+  /// a phantom entry here would cause the queued `NodeUpdated` to emit a
+  /// `Member(Update)` event before the imminent `Member(Join)`, violating the
+  /// Join-before-Update ordering consumers rely on.  When `NodeJoined` does
+  /// arrive it creates the member with tags decoded from the `Meta` set by
+  /// `update_meta`, and with the correct status/ltime from any buffered intent.
+  /// `handle_node_update` already suppresses `NodeUpdated` for absent members,
+  /// so no spurious event reaches the driver in this path.
+  ///
+  /// Tags are not part of the push-pull snapshot (only Lamport clocks,
+  /// per-member status times, `left_members`, and the event ring are), so
+  /// `set_tags` never marks the snapshot dirty.  Mirrors Go serf
+  /// `base.go` `SetTags`.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::SetTagsMeta`] if the encoded tag map exceeds
+  /// `Meta::MAX_SIZE` or the coordinator's configured `meta_max_size`.
+  pub(crate) fn set_tags<T>(&mut self, t: &mut T, tags: Tags) -> Result<(), Error>
+  where
+    T: Reliable<I, A>,
+    I: Clone,
+    A: Clone,
+  {
+    use buffa::Message as _;
+
+    let pb_tags = tags_to_pb(&tags);
+    let encoded = pb_tags.encode_to_vec();
+    // `Meta::try_from` only fails when the encoded size exceeds `Meta::MAX_SIZE`
+    // (u16::MAX bytes). Surface this as `SetTagsMeta` rather than panicking so
+    // the driver can log and retry with fewer or shorter tags.
+    let n = encoded.len();
+    let meta = Meta::try_from(encoded).map_err(|_| {
+      Error::SetTagsMeta(memberlist_proto::Error::MetaExceedsCap(
+        memberlist_proto::SizeExceeded::new(n, Meta::MAX_SIZE),
+      ))
+    })?;
+    t.update_meta(meta).map_err(Error::SetTagsMeta)?;
+
+    // Refresh the local member's tags in place if it is already present, so
+    // tag-filtered local queries see the new tags before the coordinator's
+    // NodeUpdated event is drained. If the local member is not yet present
+    // (set_tags before the local NodeJoined), do nothing: materializing it here
+    // would surface a Member(Update) before the Member(Join), and the join will
+    // create the member with these tags (decoded from the meta set above) and the
+    // correct status/ltime from any buffered intent.
+    if let Some(ms) = self.members.states.get_mut(t.endpoint_ref().local_id_ref()) {
+      let node = ms.member().node().clone();
+      let status = ms.status();
+      *ms.member_mut() = Member::new(node, tags, status);
+    }
+
+    Ok(())
+  }
+
   // ── push-pull ingress replay (H8/G2, G3, G4) ────────────────────────────
 
   /// Replay a remote push-pull body received via `RemoteStateReceived`.
@@ -1614,10 +1685,13 @@ where
     let status = ms.status();
     *ms.member_mut() = Member::new(n, tags, status);
     let member = ms.member().clone();
-    // Drop the mutable borrow on ms before calling mark_local_state_dirty.
 
-    // Membership changed — snapshot is stale.
-    self.mark_local_state_dirty();
+    // No `mark_local_state_dirty` here: a NodeUpdated changes only the member's
+    // tags and address, and the push-pull snapshot carries neither (only the
+    // Lamport clocks, per-member status times, `left_members`, and the event
+    // ring). Status and status time are unchanged, so the snapshot is
+    // unaffected and a resync would be wasted work — and `set_tags` queues
+    // exactly this event via `update_meta` on every local tag change.
 
     self
       .pending_events
@@ -3918,6 +3992,20 @@ where
       AnyMessage::PushPull(pp) => pp,
       other => panic!("expected PushPull, got {:?}", other.message_type()),
     }
+  }
+
+  /// Return the local node's serf-side tags from `members.states` (test
+  /// adapter for `set_tags` synchronous-observability assertions).
+  ///
+  /// Returns `None` when the local node is not yet tracked in the serf
+  /// membership store.
+  #[cfg(test)]
+  pub(crate) fn test_local_tags_in(&self, local_id: &I) -> Option<Tags> {
+    self
+      .members
+      .states
+      .get(local_id)
+      .map(|ms| ms.member().tags().clone())
   }
 
   /// Clear the dirty flag (test adapter for dirty-flag unit assertions).

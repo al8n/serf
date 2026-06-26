@@ -108,7 +108,6 @@ pub(crate) fn coordinate_from_pb(b: &pb::Coordinate) -> Coordinate {
 // ─── Tags ─────────────────────────────────────────────────────────────────────
 
 /// Convert typed [`Tags`] → `pb::Tags`.
-#[cfg(test)]
 pub(crate) fn tags_to_pb(t: &Tags) -> pb::Tags {
   pb::Tags {
     entries: t

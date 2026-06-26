@@ -98,6 +98,21 @@ where
   /// snapshot would not fit inside a reliable-stream frame.
   fn set_local_state_snapshot(&mut self, bytes: Bytes) -> Result<(), memberlist_proto::Error>;
 
+  /// Update the local node's advertised metadata.
+  ///
+  /// serf encodes its tag map into `meta` and calls this so the coordinator
+  /// re-advertises it (an Alive/NodeUpdated broadcast) and queues a `NodeUpdated`
+  /// event observed via [`poll_inner_event`](Reliable::poll_inner_event).
+  ///
+  /// # Errors
+  ///
+  /// Returns [`memberlist_proto::Error`] if the meta exceeds the wire cap or the
+  /// coordinator is not running.
+  fn update_meta(
+    &mut self,
+    meta: memberlist_proto::typed::Meta,
+  ) -> Result<(), memberlist_proto::Error>;
+
   /// Initiate an outbound push-pull anti-entropy exchange with `peer`.
   ///
   /// The coordinator dials `peer`, performs a label handshake, and exchanges
@@ -188,6 +203,14 @@ where
   }
 
   #[inline]
+  fn update_meta(
+    &mut self,
+    meta: memberlist_proto::typed::Meta,
+  ) -> Result<(), memberlist_proto::Error> {
+    self.update_meta(meta)
+  }
+
+  #[inline]
   fn start_push_pull(&mut self, peer: A, kind: PushPullKind, now: Instant) -> StreamId {
     self.start_push_pull(peer, kind, now)
   }
@@ -249,6 +272,14 @@ where
   #[inline]
   fn set_local_state_snapshot(&mut self, bytes: Bytes) -> Result<(), memberlist_proto::Error> {
     self.set_local_state_snapshot(bytes)
+  }
+
+  #[inline]
+  fn update_meta(
+    &mut self,
+    meta: memberlist_proto::typed::Meta,
+  ) -> Result<(), memberlist_proto::Error> {
+    self.update_meta(meta)
   }
 
   #[inline]

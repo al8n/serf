@@ -38,7 +38,6 @@ use crate::{
   options::Options,
 };
 
-#[cfg(all(test, feature = "tag-regex"))]
 use crate::typed::Tags;
 #[cfg(test)]
 use crate::{
@@ -378,6 +377,20 @@ where
   /// Forwards to [`Endpoint::set_event_join_ignore`].
   pub fn set_event_join_ignore(&mut self, v: bool) {
     self.core.set_event_join_ignore(v)
+  }
+
+  /// Update the local node's tags, re-advertise them via the coordinator, and
+  /// synchronously refresh the local member in the membership store.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::SetTagsMeta`] if the encoded tags exceed the metadata cap.
+  pub fn set_tags(&mut self, tags: Tags) -> Result<(), Error>
+  where
+    I: Clone,
+    A: Clone,
+  {
+    self.core.set_tags(&mut self.transport, tags)
   }
 
   /// Forwards to [`Endpoint::handle_node_join_intent`].
@@ -769,6 +782,32 @@ where
   #[cfg(test)]
   pub(crate) fn test_is_dirty(&self) -> bool {
     self.core.test_is_dirty()
+  }
+
+  /// Return the local node's serf-side tags from `members.states` (test
+  /// adapter for `set_tags` observability assertions).
+  ///
+  /// Returns `None` when the local node is not yet in the serf membership store.
+  #[cfg(test)]
+  pub(crate) fn test_local_tags(&self) -> Option<Tags> {
+    self
+      .core
+      .test_local_tags_in(self.transport.endpoint_ref().local_id_ref())
+  }
+
+  /// Return the local node's advertised meta from the coordinator's inner
+  /// membership store (test adapter for `set_tags` round-trip assertions).
+  ///
+  /// Returns `None` when the local node is not tracked by the coordinator
+  /// (should not happen after construction).
+  #[cfg(test)]
+  pub(crate) fn test_local_meta(&self) -> Option<memberlist_proto::typed::Meta> {
+    let local_id = self.transport.endpoint_ref().local_id_ref();
+    self
+      .transport
+      .endpoint_ref()
+      .member(local_id)
+      .map(|ns| ns.meta_ref().cheap_clone())
   }
 
   /// Forwards to [`Endpoint::test_set_event_join_ignore`].
