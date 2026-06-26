@@ -59,3 +59,12 @@ regex = { version = "1", optional = true }
 buffa-build = "0.7"
 
 [dev-dependencies]
+# The QUIC super-machine loopback test builds a quinn-proto config bundle with a
+# self-signed cert and an accept-any verifier (the same shape memberlist-proto's
+# own QUIC coordinator tests use). Only the `quic`-gated test module references
+# these; they are unconditional dev-deps so the test crate always resolves.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rcgen = "0.14"
+ring = "0.17"
