@@ -84,6 +84,7 @@ where
 }
 
 #[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 impl<I, G, R> QuicEndpoint<I, G, R>
 where
   I: Clone + Eq + core::hash::Hash,
@@ -119,6 +120,7 @@ where
 // through the ones that reach the coordinator (the `Reliable` methods).
 
 #[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 impl<I, G, R> QuicEndpoint<I, G, R>
 where
   I: Id + Clone,
