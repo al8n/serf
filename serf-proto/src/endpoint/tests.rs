@@ -314,6 +314,33 @@ fn inner_node_updated_for_unknown_is_a_noop() {
 }
 
 #[test]
+fn inner_node_updated_does_not_dirty_local_state() {
+  let mut e = ep();
+  e.test_seed_member(2, MemberStatus::Alive, LamportTime::new(3));
+  e.resync_local_state();
+  assert!(
+    !e.test_is_dirty(),
+    "resync_local_state clears the dirty flag"
+  );
+
+  // A NodeUpdated refreshes only the member's tags/address — neither is in the
+  // push-pull snapshot — so it must not dirty local state. set_tags queues
+  // exactly this event via update_meta on every local tag change, so dirtying
+  // here would force a wasted resync per tag update.
+  e.test_inner_node_updated(2, memberlist_proto::Instant::ORIGIN);
+
+  assert!(
+    !e.test_is_dirty(),
+    "a tag-only NodeUpdated must not mark local_state_dirty"
+  );
+  // The Update event is still emitted.
+  assert!(matches!(
+    e.poll_event(),
+    Some(Event::Member(ref me)) if me.kind() == MemberEventKind::Update
+  ));
+}
+
+#[test]
 fn handle_node_join_re_joining_failed_clears_lists() {
   let mut e = ep();
   // Add node 2 as Failed in failed_members.
@@ -6650,4 +6677,162 @@ fn push_pull_near_watermark_event_floor_integrity_and_delivery() {
     matches!(e.poll_event(), Some(Event::User(_))),
     "user_event must emit Event::User — must not be dropped by near-watermark event floor"
   );
+}
+
+// ── set_tags ──────────────────────────────────────────────────────────────────
+
+/// Tags written by `set_tags` must round-trip: encoding them into `Meta` and
+/// decoding that meta must reproduce the original map.
+///
+/// This verifies the `tags_to_pb` → encode → `Meta::try_from` →
+/// `update_meta` → coordinator-meta-store path used by `set_tags`.
+#[test]
+fn set_tags_round_trips_via_local_meta() {
+  use crate::typed::Tags;
+
+  let mut e = ep();
+
+  let tags: Tags = [("role", "web"), ("dc", "us-east-1")].into_iter().collect();
+  e.set_tags(tags.clone())
+    .expect("set_tags must succeed on a live endpoint");
+
+  let meta = e
+    .test_local_meta()
+    .expect("local node must be present in the coordinator's membership store");
+  let decoded = decode_tags_from_meta(meta.as_bytes())
+    .expect("meta written by set_tags must decode as valid Tags");
+
+  assert_eq!(decoded.len(), tags.len(), "decoded tag count must match");
+  for (k, v) in &tags.0 {
+    assert_eq!(
+      decoded.0.get(k),
+      Some(v),
+      "tag {k:?} must round-trip correctly"
+    );
+  }
+}
+
+/// `set_tags` must synchronously update `members.states` so that tag-filtered
+/// local queries evaluate the new tags without a `poll_event` drain first.
+///
+/// The coordinator queues a `NodeUpdated` event for the meta change; this test
+/// verifies the synchronous path is independent of that event being drained.
+#[test]
+fn set_tags_local_member_state_is_observable_without_poll_event() {
+  use crate::typed::Tags;
+
+  let mut e = ep();
+
+  // Seed the local node (id=1) into members.states so the existing-member
+  // refresh arm of set_tags is exercised.
+  e.test_seed_member(1u32, MemberStatus::Alive, LamportTime::new(0));
+
+  let tags: Tags = [("role", "db")].into_iter().collect();
+  e.set_tags(tags.clone())
+    .expect("set_tags must succeed on a live endpoint");
+
+  let local_tags = e.test_local_tags();
+  assert_eq!(
+    local_tags
+      .as_ref()
+      .and_then(|t| t.0.get("role"))
+      .map(|s| s.as_str()),
+    Some("db"),
+    "local member tags in members.states must be updated synchronously by set_tags"
+  );
+}
+
+/// When `set_tags` is called before the local `NodeJoined` has been drained,
+/// no phantom entry must appear in `members.states`. The new tags are written
+/// to the coordinator's meta store via `update_meta` and will be decoded from
+/// there when `handle_node_join` materializes the member.
+#[test]
+fn set_tags_does_not_materialize_absent_local_member() {
+  use crate::typed::Tags;
+
+  let mut e = ep(); // local member absent from members.states
+
+  let tags: Tags = [("env", "staging")].into_iter().collect();
+  e.set_tags(tags)
+    .expect("set_tags must succeed even before the local node is in members.states");
+
+  // No phantom entry must be inserted into members.states.
+  assert!(
+    e.test_local_tags().is_none(),
+    "set_tags must not fabricate a local member when absent from members.states"
+  );
+
+  // The tags must have been advertised via the coordinator's meta store.
+  let meta = e
+    .test_local_meta()
+    .expect("coordinator must track local node meta");
+  let decoded = decode_tags_from_meta(meta.as_bytes())
+    .expect("meta written by set_tags must decode as valid Tags");
+  assert_eq!(
+    decoded.0.get("env").map(|s| s.as_str()),
+    Some("staging"),
+    "new tags must be reflected in the coordinator meta even when local member is absent"
+  );
+}
+
+/// `set_tags` must never mark the push-pull snapshot dirty, regardless of
+/// whether the local member is present or absent. Tags are not part of the
+/// snapshot (only Lamport clocks, per-member status times, `left_members`,
+/// and the event ring are).
+#[test]
+fn set_tags_does_not_mark_local_state_dirty() {
+  use crate::typed::Tags;
+
+  let mut e = ep();
+  // Clear the construction dirty flag so the assertion below is unambiguous.
+  e.resync_local_state();
+  assert!(!e.test_is_dirty(), "resync must clear the dirty flag");
+
+  let tags: Tags = [("dc", "us-west-2")].into_iter().collect();
+  e.set_tags(tags).expect("set_tags must succeed");
+
+  assert!(
+    !e.test_is_dirty(),
+    "set_tags must not mark local_state_dirty"
+  );
+}
+
+/// When `set_tags` is called before the local member exists in `members.states`,
+/// the coordinator's queued `NodeUpdated` event must be suppressed (because the
+/// member is absent) and must not surface as `Member(Update)` before the
+/// `Member(Join)` that a subsequent `NodeJoined` would produce. If no `Join`
+/// event appears in the drain, no `Update` event must appear either.
+#[test]
+fn set_tags_before_join_does_not_emit_update_before_join() {
+  use crate::typed::Tags;
+
+  let mut e = ep(); // local member absent
+
+  let tags: Tags = [("role", "cache")].into_iter().collect();
+  e.set_tags(tags).expect("set_tags must succeed");
+
+  // Drive the serf tick so inner events (NodeUpdated) are drained.
+  e.handle_timeout(t_secs(1));
+
+  // Collect all events produced so far.
+  let mut evs = Vec::new();
+  while let Some(ev) = e.poll_event() {
+    evs.push(ev);
+  }
+
+  // If a Join appears, no Update may precede it.
+  let join_pos = evs
+    .iter()
+    .position(|ev| matches!(ev, Event::Member(me) if me.kind() == MemberEventKind::Join));
+  let update_pos = evs
+    .iter()
+    .position(|ev| matches!(ev, Event::Member(me) if me.kind() == MemberEventKind::Update));
+
+  match (join_pos, update_pos) {
+    (None, Some(_)) => panic!("Member(Update) appeared without a preceding Member(Join): {evs:?}"),
+    (Some(j), Some(u)) if u < j => {
+      panic!("Member(Update) at index {u} appeared before Member(Join) at index {j}: {evs:?}")
+    }
+    _ => {}
+  }
 }
