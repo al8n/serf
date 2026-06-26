@@ -1,0 +1,28 @@
+[package]
+name = "serf-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Runtime-agnostic glue shared by the serf async driver crates"
+
+[features]
+default = ["tag-regex"]
+tcp = ["serf-proto/tcp"]
+tls = ["tcp", "serf-proto/tls"]
+quic = ["serf-proto/quic"]
+quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring"]
+coordinates = ["serf-proto/coordinates"]
+tag-regex = ["serf-proto/tag-regex"]
+
+[dependencies]
+serf-proto = { path = "../serf-proto", default-features = false }
+
+[dev-dependencies]
+bytes = { workspace = true }
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", features = ["std"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
