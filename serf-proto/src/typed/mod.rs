@@ -270,27 +270,27 @@ pub struct UserEvents {
 /// The `status_ltimes` map is transmitted as a `repeated NodeStatusTime` rather
 /// than a proto3 `map<bytes,uint64>` because proto3 forbids `bytes` map keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushPullMessage<I> {
+pub(crate) struct PushPullMessage<I> {
   /// The lamport clock value of the sending node at the time of the exchange.
-  pub ltime: LamportTime,
+  pub(crate) ltime: LamportTime,
   /// Maps each known node-id to its last-seen status lamport time.
-  pub status_ltimes: Vec<(I, LamportTime)>,
+  pub(crate) status_ltimes: Vec<(I, LamportTime)>,
   /// Wire list of node-ids that have left the cluster.
   ///
   /// The codec does NOT dedup this list; the consuming machine is responsible
   /// for treating it as a set (duplicate entries are idempotent leave events).
-  pub left_members: Vec<I>,
+  pub(crate) left_members: Vec<I>,
   /// The lamport clock value for the event subsystem.
-  pub event_ltime: LamportTime,
+  pub(crate) event_ltime: LamportTime,
   /// Buffered user-event batches.
-  pub events: Vec<UserEvents>,
+  pub(crate) events: Vec<UserEvents>,
   /// The lamport clock value for the query subsystem.
-  pub query_ltime: LamportTime,
+  pub(crate) query_ltime: LamportTime,
 }
 
 impl<I> PushPullMessage<I> {
   /// Construct a new `PushPullMessage`.
-  pub fn new(
+  pub(crate) fn new(
     ltime: LamportTime,
     status_ltimes: Vec<(I, LamportTime)>,
     left_members: Vec<I>,
@@ -318,20 +318,16 @@ impl<I> PushPullMessage<I> {
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyRequestMessage {
+pub(crate) struct KeyRequestMessage {
   /// The encryption key, or `None` for a list-keys request.
-  pub key: Option<SecretKey>,
+  pub(crate) key: Option<SecretKey>,
 }
 
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 impl KeyRequestMessage {
   /// Construct a new `KeyRequestMessage`.
-  pub fn new(key: Option<SecretKey>) -> Self {
+  pub(crate) fn new(key: Option<SecretKey>) -> Self {
     Self { key }
   }
 }
@@ -345,28 +341,16 @@ impl KeyRequestMessage {
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
-)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct KeyResponseMessage {
+pub(crate) struct KeyResponseMessage {
   /// `true` if the operation succeeded on this node.
-  pub result: bool,
+  pub(crate) result: bool,
   /// Human-readable result or error description.
-  pub message: SmolStr,
+  pub(crate) message: SmolStr,
   /// Installed keys (used by list-keys responses).
-  pub keys: Vec<SecretKey>,
+  pub(crate) keys: Vec<SecretKey>,
   /// The current primary key, if reporting it.
-  pub primary_key: Option<SecretKey>,
-}
-
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-impl KeyResponseMessage {
-  /// Construct a default (failure, no keys) `KeyResponseMessage`.
-  pub fn new() -> Self {
-    Self::default()
-  }
+  pub(crate) primary_key: Option<SecretKey>,
 }
 
 // ── RelayMessage ──────────────────────────────────────────────────────────────
@@ -381,16 +365,16 @@ impl KeyResponseMessage {
 /// bound is enforced at the bridge layer (`relay_to_pb` / `relay_from_pb`) where
 /// the destination is encoded/decoded as opaque `bytes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayMessage<I, A> {
+pub(crate) struct RelayMessage<I, A> {
   /// The node to forward the message to.
-  pub destination: Node<I, A>,
+  pub(crate) destination: Node<I, A>,
   /// The inner serf framed message, carried unparsed.
-  pub payload: Bytes,
+  pub(crate) payload: Bytes,
 }
 
 impl<I, A> RelayMessage<I, A> {
   /// Construct a new `RelayMessage`.
-  pub fn new(destination: Node<I, A>, payload: Bytes) -> Self {
+  pub(crate) fn new(destination: Node<I, A>, payload: Bytes) -> Self {
     Self {
       destination,
       payload,
@@ -406,16 +390,16 @@ impl<I, A> RelayMessage<I, A> {
 /// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
 /// the bridge layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JoinMessage<I> {
+pub(crate) struct JoinMessage<I> {
   /// The lamport clock value at the time the node joined.
-  pub ltime: crate::LamportTime,
+  pub(crate) ltime: crate::LamportTime,
   /// The joining node's identifier.
-  pub id: I,
+  pub(crate) id: I,
 }
 
 impl<I> JoinMessage<I> {
   /// Construct a new `JoinMessage`.
-  pub fn new(ltime: crate::LamportTime, id: I) -> Self {
+  pub(crate) fn new(ltime: crate::LamportTime, id: I) -> Self {
     Self { ltime, id }
   }
 }
@@ -426,18 +410,18 @@ impl<I> JoinMessage<I> {
 /// `memberlist_proto::Data` so it can be encoded as opaque proto `bytes` in
 /// the bridge layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeaveMessage<I> {
+pub(crate) struct LeaveMessage<I> {
   /// The lamport clock value at the time the leave was emitted.
-  pub ltime: crate::LamportTime,
+  pub(crate) ltime: crate::LamportTime,
   /// The leaving node's identifier.
-  pub id: I,
+  pub(crate) id: I,
   /// Whether the leave is a prune (permanent removal) rather than a graceful leave.
-  pub prune: bool,
+  pub(crate) prune: bool,
 }
 
 impl<I> LeaveMessage<I> {
   /// Construct a new `LeaveMessage`.
-  pub fn new(ltime: crate::LamportTime, id: I, prune: bool) -> Self {
+  pub(crate) fn new(ltime: crate::LamportTime, id: I, prune: bool) -> Self {
     Self { ltime, id, prune }
   }
 }
@@ -448,14 +432,14 @@ impl<I> LeaveMessage<I> {
 /// implement `memberlist_proto::Data` so the embedded `Node<I,A>` can be
 /// encoded as opaque proto `bytes` in the bridge layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConflictResponseMessage<I, A> {
+pub(crate) struct ConflictResponseMessage<I, A> {
   /// The winning node in the conflict resolution.
-  pub member: Node<I, A>,
+  pub(crate) member: Node<I, A>,
 }
 
 impl<I, A> ConflictResponseMessage<I, A> {
   /// Construct a new `ConflictResponseMessage`.
-  pub fn new(member: Node<I, A>) -> Self {
+  pub(crate) fn new(member: Node<I, A>) -> Self {
     Self { member }
   }
 }
