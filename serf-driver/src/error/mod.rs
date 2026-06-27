@@ -91,48 +91,5 @@ impl core::fmt::Display for InvalidOption {
 
 impl std::error::Error for InvalidOption {}
 
-/// Payload for the join-failed error: a join attempt contacted none of the
-/// configured seed nodes successfully. Carries the seed count and a human-readable
-/// reason describing why no seed was reachable.
-#[derive(Debug, Clone)]
-pub struct JoinFailed {
-  seed_count: usize,
-  reason: String,
-}
-
-impl JoinFailed {
-  /// Build a new payload from the seed count and the reason no seed was reached.
-  #[inline]
-  pub fn new(seed_count: usize, reason: String) -> Self {
-    Self { seed_count, reason }
-  }
-
-  /// The number of seeds that were attempted.
-  #[must_use]
-  #[inline]
-  pub const fn seed_count(&self) -> usize {
-    self.seed_count
-  }
-
-  /// The reason no seed was successfully contacted.
-  #[must_use]
-  #[inline]
-  pub fn reason(&self) -> &str {
-    &self.reason
-  }
-}
-
-impl core::fmt::Display for JoinFailed {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(
-      f,
-      "join contacted none of {} seed(s): {}",
-      self.seed_count, self.reason,
-    )
-  }
-}
-
-impl std::error::Error for JoinFailed {}
-
 #[cfg(test)]
 mod tests;
