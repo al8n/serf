@@ -894,6 +894,22 @@ where
   pub fn num_members(&self) -> usize {
     self.members.states.len()
   }
+
+  /// A snapshot of every tracked member (alive, leaving, left, or failed within
+  /// the reap window) as owned [`Member`](crate::members::Member) values, for a
+  /// driver's observable membership view published after each membership change.
+  pub fn members_snapshot(&self) -> Vec<std::sync::Arc<crate::members::Member<I, A>>>
+  where
+    I: Clone,
+    A: Clone,
+  {
+    self
+      .members
+      .states
+      .values()
+      .map(|ms| std::sync::Arc::new(ms.member().clone()))
+      .collect()
+  }
 }
 
 // ── poll API (requires full Id + Data bounds for inner delegation) ─────────────

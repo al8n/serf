@@ -31,16 +31,18 @@
 
 use bytes::Bytes;
 use core::net::SocketAddr;
+use std::sync::Arc;
+
 use memberlist_proto::{
-  Data, Id, Instant, QuicEndpoint as Coordinator, Rng, SeedableRng, SmallRng, Transmit,
-  parse_message,
+  Data, Id, Instant, PushPullKind, QuicEndpoint as Coordinator, Rng, SeedableRng, SmallRng,
+  Transmit, event::StreamId, parse_message, typed::Message,
 };
 use smol_str::SmolStr;
 
 use crate::{
   endpoint::{Endpoint, Error, QueryId, QueryParams},
   event::{Event, QueryEvent},
-  members::SerfState,
+  members::{Member, SerfState},
   options::Options,
 };
 
@@ -225,6 +227,120 @@ where
   /// `broadcast_timeout`.
   pub fn user_broadcast_queue_len(&self) -> usize {
     self.transport.endpoint_ref().user_broadcast_queue_len()
+  }
+
+  // ── driver-owned transport surface (additive forwarders) ────────────────────
+  //
+  // These reach the memberlist QUIC coordinator's already-public driver methods.
+  // The serf `Reliable` seam deliberately excludes them (scheduling / outbound-
+  // dial / wire-sizing / membership read), so the per-runtime QUIC driver
+  // forwards through here rather than naming the coordinator directly.
+
+  /// Arm the coordinator's periodic probe / gossip / push-pull schedulers.
+  ///
+  /// The driver calls this once at loop entry; without it the coordinator's
+  /// `next_probe` / `next_gossip` / `next_pushpull` stay unset and failure
+  /// detection, dissemination, and anti-entropy never run.
+  pub fn start_scheduling(&mut self, now: Instant) {
+    self.transport.start_scheduling(now);
+  }
+
+  /// Initiate an outbound push-pull dial to `peer`, then sieve the resulting
+  /// inner events into serf.
+  ///
+  /// The driver owns the inner-memberlist join: serf's [`Self::join`] only
+  /// announces the local join intent, while contacting each seed is a
+  /// driver-issued push-pull through the coordinator.  Returns the coordinator's
+  /// [`StreamId`] for the dial; the QUIC coordinator services the dial and
+  /// flushes its outbound queue in-band, so the handshake packets surface on the
+  /// next [`Self::poll_transmit`].
+  pub fn start_push_pull(
+    &mut self,
+    peer: SocketAddr,
+    kind: PushPullKind,
+    now: Instant,
+  ) -> StreamId {
+    let id = self.transport.start_push_pull(peer, kind, now);
+    self.core.drain_after_ingress(&mut self.transport, now);
+    id
+  }
+
+  /// Feed one already-decoded gossip [`Message`] into the coordinator, then
+  /// sieve the resulting inner events into serf.
+  ///
+  /// The compound-aware counterpart to [`Self::handle_packet`]: a codec-owning
+  /// driver that has split a compound datagram into individual messages feeds
+  /// each typed message here, skipping the per-call single-message
+  /// `parse_message` that `handle_packet` performs.
+  pub fn handle_message(&mut self, from: SocketAddr, msg: Message<I, SocketAddr>, now: Instant) {
+    self.transport.handle_packet(from, msg, now);
+    self.core.drain_after_ingress(&mut self.transport, now);
+  }
+
+  /// The coordinator's configured gossip MTU — the driver sizes its UDP recv
+  /// buffer and bounds inbound transform stripping by this value.
+  pub fn gossip_mtu(&self) -> usize {
+    self.transport.gossip_mtu()
+  }
+
+  /// Encrypt one outbound gossip datagram for the wire, applying the
+  /// coordinator's configured encryption keyring.
+  ///
+  /// Forwards to [`memberlist_proto::QuicEndpoint::encrypt_gossip`].  The
+  /// codec-owning driver calls this on the label-framed gossip bytes before
+  /// handing them to the UDP socket; when no keyring is configured the bytes are
+  /// returned unchanged.  Returns `Err` when encryption is configured but the
+  /// backend rejects the request — the driver MUST drop the datagram rather than
+  /// emit plaintext on an encrypted-cluster path.
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn encrypt_gossip(
+    &self,
+    datagram: &[u8],
+  ) -> Result<Vec<u8>, memberlist_proto::EncryptionError> {
+    self.transport.encrypt_gossip(datagram)
+  }
+
+  /// Decrypt and unwrap one inbound gossip datagram, reversing the wire
+  /// transform stack the peer applied before decoding.
+  ///
+  /// Forwards to [`memberlist_proto::QuicEndpoint::decrypt_gossip`].  The
+  /// codec-owning driver calls this on the raw bytes from
+  /// [`Self::poll_memberlist_ingress`] before stripping the cluster label; a
+  /// datagram with no encryption wrapper is returned unchanged when no keyring
+  /// is configured, and a frame the keyring cannot decrypt is an `Err` (the
+  /// driver drops it, gossip being lossy and self-healing).
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn decrypt_gossip(&self, datagram: &[u8]) -> Result<Vec<u8>, memberlist_proto::FrameError> {
+    self.transport.decrypt_gossip(datagram)
+  }
+
+  /// The coordinator's maximum reliable-stream frame size — the driver uses it
+  /// to bound the observation byte-backstop budget.
+  pub fn max_stream_frame_size(&self) -> usize {
+    self.transport.max_stream_frame_size()
+  }
+
+  /// The local node's id (the coordinator's membership-endpoint local id).
+  pub fn local_id(&self) -> &I {
+    self.transport.endpoint_ref().local_id_ref()
+  }
+
+  /// A snapshot of every serf member currently tracked (alive, leaving, left,
+  /// or failed within the reap window), for the observable membership view a
+  /// driver publishes after each membership change.
+  pub fn members_snapshot(&self) -> Vec<Arc<Member<I, SocketAddr>>>
+  where
+    I: Clone,
+  {
+    self.core.members_snapshot()
   }
 
   // ── serf-logic + serf-command forwarders ────────────────────────────────────
