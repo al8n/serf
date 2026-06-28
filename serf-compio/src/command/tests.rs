@@ -9,25 +9,42 @@ fn unit_reply() -> Sender<Result<()>> {
   futures_channel::oneshot::channel::<Result<()>>().0
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 #[test]
-fn join_cmd_carries_seeds_and_reply() {
-  let (tx, _rx) = futures_channel::oneshot::channel::<Result<usize>>();
+fn join_cmd_carries_seeds_kind_and_reply() {
+  use memberlist_proto::Instant;
+
+  let (tx, _rx) = futures_channel::oneshot::channel::<JoinReply>();
   let cmd = JoinCmd {
     seeds: vec![addr()],
+    kind: JoinKind::Dispatch,
+    ignore_old: false,
     reply: tx,
   };
   assert_eq!(cmd.seeds.len(), 1);
   assert_eq!(cmd.seeds[0], addr());
+  assert!(matches!(cmd.kind, JoinKind::Dispatch));
+  assert!(!cmd.ignore_old);
 
-  // The enum variant wraps the payload transparently.
-  let (tx2, _rx2) = futures_channel::oneshot::channel::<Result<usize>>();
+  // The enum variant wraps the payload transparently; the await kind carries
+  // its deadline, and the ignore_old flag rides along.
+  let (tx2, _rx2) = futures_channel::oneshot::channel::<JoinReply>();
   let Command::<SmolStr, std::net::SocketAddr>::Join(c) = Command::Join(JoinCmd {
     seeds: vec![addr(), addr()],
+    kind: JoinKind::WaitForCompletion(WaitForCompletionArgs {
+      deadline: Instant::now(),
+    }),
+    ignore_old: true,
     reply: tx2,
   }) else {
     panic!("wrong Command variant");
   };
   assert_eq!(c.seeds.len(), 2);
+  assert!(matches!(c.kind, JoinKind::WaitForCompletion(_)));
+  assert!(
+    c.ignore_old,
+    "ignore_old must round-trip through the command"
+  );
 }
 
 #[test]
@@ -36,20 +53,6 @@ fn leave_cmd_constructs() {
     reply: unit_reply(),
   });
   assert!(matches!(cmd, Command::Leave(_)));
-}
-
-#[test]
-fn set_event_join_ignore_cmd_round_trips_flag() {
-  for &flag in &[true, false] {
-    let cmd = Command::<SmolStr, std::net::SocketAddr>::SetEventJoinIgnore(SetEventJoinIgnoreCmd {
-      ignore: flag,
-      reply: unit_reply(),
-    });
-    assert!(matches!(cmd, Command::SetEventJoinIgnore(_)));
-    if let Command::SetEventJoinIgnore(c) = cmd {
-      assert_eq!(c.ignore, flag);
-    }
-  }
 }
 
 #[test]

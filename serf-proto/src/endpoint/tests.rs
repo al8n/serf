@@ -42,7 +42,11 @@ fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  StreamEndpoint::new(coord(inner), Options::new())
+  let mut e = StreamEndpoint::new(coord(inner), Options::new());
+  // The inner memberlist emits NodeJoined(self) on construction; drain it so
+  // every test starts from the post-self-join-drained state (self is a member).
+  let _ = e.poll_event();
+  e
 }
 
 /// Build a serf `Endpoint` with coordinates enabled (for coordinate-gated tests).
@@ -56,7 +60,9 @@ fn ep_with_coords() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_disable_coordinates(false);
-  StreamEndpoint::new(coord(inner), opts)
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  let _ = e.poll_event();
+  e
 }
 
 #[test]
@@ -66,7 +72,8 @@ fn new_endpoint_starts_alive_with_zero_clocks() {
   assert_eq!(e.member_time(), 0);
   assert_eq!(e.event_time(), 0);
   assert_eq!(e.query_time(), 0);
-  assert_eq!(e.num_members(), 0);
+  // After the construction self-join is drained, the local node is the sole member.
+  assert_eq!(e.num_members(), 1);
 }
 
 #[test]
@@ -376,6 +383,70 @@ fn leave_from_alive_transitions_to_leaving() {
   assert!(e.state().is_leaving(), "leave() must set state to Leaving");
 }
 
+/// Integrity floor: a `leave()` whose post-incremented stamp would reach
+/// `LTIME_MAX` (member clock at `LTIME_MAX - 1`) parks degraded-but-safe — it
+/// returns `LeaveClockExhausted`, advances no clock, queues NO invalid intent,
+/// starts no inner leave, and leaves the lifecycle AND self-membership a
+/// consistent `Alive`.
+#[test]
+fn leave_at_ltime_watermark_parks_degraded_but_safe() {
+  let mut e = ep();
+  // Drive the member clock to the floor so the next leave stamp would be LTIME_MAX.
+  e.test_set_clocks(LTIME_MAX - 1, 0, 0);
+  let q_before = e.user_broadcast_queue_len();
+
+  let err = e
+    .leave(memberlist_proto::Instant::ORIGIN)
+    .expect_err("a leave whose stamp reaches LTIME_MAX must be refused");
+  assert!(
+    matches!(err, Error::LeaveClockExhausted),
+    "expected LeaveClockExhausted, got {err:?}"
+  );
+
+  // No invalid intent was queued, the clock did not advance into the rejected
+  // range, and both the lifecycle state and the local member stay a consistent
+  // Alive — nothing entered an inconsistent Leaving half-state.
+  assert_eq!(
+    e.user_broadcast_queue_len(),
+    q_before,
+    "the degraded leave must not queue a leave intent"
+  );
+  assert_eq!(
+    e.member_time(),
+    LTIME_MAX - 1,
+    "the degraded leave must not advance the member clock"
+  );
+  assert!(e.state().is_alive(), "the endpoint must remain Alive");
+  assert_eq!(
+    e.test_member_status(1),
+    Some(MemberStatus::Alive),
+    "self-membership must stay consistent (Alive, not a half-Leaving)"
+  );
+}
+
+/// Boundary: one tick below the floor (stamp lands at `LTIME_MAX - 1`, still
+/// acceptable), `leave()` proceeds normally — the gate is exactly at the floor,
+/// not off-by-one.
+#[test]
+fn leave_one_below_watermark_succeeds() {
+  let mut e = ep();
+  e.test_set_clocks(LTIME_MAX - 2, 0, 0);
+  e.leave(memberlist_proto::Instant::ORIGIN)
+    .expect("a leave whose stamp is LTIME_MAX - 1 must still apply");
+  // The intent (ltime = LTIME_MAX - 1) is acceptable, so the leave applies
+  // fully: both the lifecycle and self-membership transition to Leaving — the
+  // exact contrast with the degraded watermark path, which stays Alive.
+  assert!(
+    e.state().is_leaving(),
+    "the boundary leave must transition to Leaving"
+  );
+  assert_eq!(
+    e.test_member_status(1),
+    Some(MemberStatus::Leaving),
+    "self-membership must transition to Leaving on the boundary leave"
+  );
+}
+
 #[test]
 fn double_leave_is_rejected() {
   let mut e = ep();
@@ -454,11 +525,14 @@ fn inner_left_cluster_drives_serf_to_left_and_emits_left_cluster_event() {
     e.state().is_left(),
     "state must be Left after propagation delay"
   );
-  // The next poll_event must yield Event::LeftCluster.
-  let ev = e.poll_event().expect("LeftCluster event must be pending");
+  // Member(Leave, self) appears when the inner's NodeLeft(self) is drained
+  // (Leaving → Left transition).  Event::LeftCluster follows once the
+  // leave_propagate_delay deadline fires.  Drain until LeftCluster is found.
+  let found_left_cluster =
+    core::iter::from_fn(|| e.poll_event()).any(|ev| matches!(ev, Event::LeftCluster));
   assert!(
-    matches!(ev, Event::LeftCluster),
-    "expected Event::LeftCluster, got {ev:?}"
+    found_left_cluster,
+    "Event::LeftCluster must be emitted after the leave propagation delay"
   );
 }
 
@@ -470,9 +544,16 @@ fn leave_complete_deadline_not_fired_before_delay() {
   // Tick to just before the propagation deadline (< 1s).
   let before_delay = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_millis(500);
   e.handle_timeout(before_delay);
-  // Still Leaving; no event yet.
+  // SerfState must still be Leaving (the deadline hasn't fired yet).
   assert!(e.state().is_leaving(), "must still be Leaving before delay");
-  assert!(e.poll_event().is_none(), "no LeftCluster before deadline");
+  // Member(Leave, self) from the inner's NodeLeft drain may appear, but
+  // Event::LeftCluster must NOT appear before the propagation deadline.
+  let no_left_cluster =
+    core::iter::from_fn(|| e.poll_event()).all(|ev| !matches!(ev, Event::LeftCluster));
+  assert!(
+    no_left_cluster,
+    "LeftCluster must not appear before the propagation deadline"
+  );
 }
 
 #[test]
@@ -491,8 +572,14 @@ fn shutdown_prevents_leaving_to_left_transition() {
     e.state().is_shutdown(),
     "Shutdown should not transition to Left"
   );
-  // No LeftCluster event.
-  assert!(e.poll_event().is_none());
+  // Event::LeftCluster must not appear (the leave chain was interrupted by
+  // Shutdown). Member(Leave, self) from the inner NodeLeft drain may appear.
+  let no_left_cluster =
+    core::iter::from_fn(|| e.poll_event()).all(|ev| !matches!(ev, Event::LeftCluster));
+  assert!(
+    no_left_cluster,
+    "LeftCluster must not be emitted when Shutdown interrupts the leave chain"
+  );
 }
 
 #[test]
@@ -530,6 +617,64 @@ fn force_leave_transitions_alive_member_to_leaving() {
     e.test_member_status(2),
     Some(MemberStatus::Leaving),
     "force_leave must transition Alive → Leaving"
+  );
+}
+
+/// `force_leave` at `clock == LTIME_MAX - 1` parks degraded-but-safe — it
+/// returns `LeaveClockExhausted`, advances no clock, queues NO invalid intent,
+/// and leaves the target member and clock state consistent.
+#[test]
+fn force_leave_at_ltime_watermark_parks_degraded_but_safe() {
+  let mut e = ep();
+  e.test_seed_member(2, MemberStatus::Alive, LamportTime::new(0));
+  // Drive the member clock to the floor so the next stamp would be LTIME_MAX.
+  e.test_set_clocks(LTIME_MAX - 1, 0, 0);
+  let q_before = e.user_broadcast_queue_len();
+
+  let err = e
+    .force_leave(2u32, false, memberlist_proto::Instant::ORIGIN)
+    .expect_err("a force_leave whose stamp reaches LTIME_MAX must be refused");
+  assert!(
+    matches!(err, Error::LeaveClockExhausted),
+    "expected LeaveClockExhausted, got {err:?}"
+  );
+
+  // No invalid intent was queued, the clock did not advance into the rejected
+  // range, the target member stayed Alive, and the local endpoint state is
+  // unchanged — nothing entered an inconsistent half-state.
+  assert_eq!(
+    e.user_broadcast_queue_len(),
+    q_before,
+    "the degraded force_leave must not queue a leave intent"
+  );
+  assert_eq!(
+    e.member_time(),
+    LTIME_MAX - 1,
+    "the degraded force_leave must not advance the member clock"
+  );
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Alive),
+    "the target member must stay Alive after a degraded force_leave"
+  );
+}
+
+/// Boundary: one tick below the floor (stamp lands at `LTIME_MAX - 1`, still
+/// acceptable), `force_leave()` proceeds normally — the gate is exactly at the
+/// floor, not off-by-one.
+#[test]
+fn force_leave_one_below_watermark_succeeds() {
+  let mut e = ep();
+  e.test_seed_member(2, MemberStatus::Alive, LamportTime::new(0));
+  e.test_set_clocks(LTIME_MAX - 2, 0, 0);
+  e.force_leave(2u32, false, memberlist_proto::Instant::ORIGIN)
+    .expect("a force_leave whose stamp is LTIME_MAX - 1 must still apply");
+  // The intent is acceptable, so the target transitions to Leaving — the exact
+  // contrast with the degraded watermark path, which stays Alive.
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Leaving),
+    "the boundary force_leave must transition the target to Leaving"
   );
 }
 
@@ -1117,15 +1262,30 @@ fn drain_inner_calls_resync_when_dirty() {
 }
 
 #[test]
-fn event_join_ignore_flag_can_be_set() {
-  // Accessor smoke-test: set_event_join_ignore and test_set_event_join_ignore
-  // both write the same field.
+fn ignore_join_stream_recorded_and_consumed_one_shot() {
+  // Accessor smoke-test: an ignore_old join records its exchange StreamId
+  // (idempotently); the matching merge consumes the one-shot entry, and an
+  // unrecorded stream is never present.
   let mut e = ep();
-  assert!(!e.test_is_dirty() || true); // just ensure no panic
-  e.set_event_join_ignore(true);
-  // test_set_event_join_ignore is also wired, confirm symmetry.
-  e.test_set_event_join_ignore(false);
-  // Confirm the flag can be toggled (no panic, no side-effects without a merge).
+  let p = std::net::SocketAddr::from(([127, 0, 0, 1], 6100));
+  let s = e.start_join_push_pull(
+    p,
+    /*ignore_old*/ true,
+    memberlist_proto::Instant::ORIGIN,
+  );
+  // Idempotent: re-noting the same StreamId must not double-store.
+  e.test_note_ignore_join_stream(s);
+  assert!(
+    e.test_has_ignore_join_stream(s),
+    "recorded exchange must be present"
+  );
+  // A join merge on this stream consumes the single entry (a second entry, had
+  // the record not been idempotent, would survive this one consume).
+  e.test_merge_remote_state_with_stream(bytes::Bytes::new(), true, s);
+  assert!(
+    !e.test_has_ignore_join_stream(s),
+    "a join merge consumes the one-shot ignore-join entry"
+  );
 }
 
 #[test]
@@ -1832,8 +1992,8 @@ fn relay_node(port: u16) -> memberlist_proto::Node<u32, std::net::SocketAddr> {
 
 #[test]
 fn relay_response_is_silent_noop_when_too_few_members() {
-  // With 0 non-self members, relay_factor=2 requires at least 3 total members
-  // (relay_factor + 1 = 3) but we have 0 → silent no-op: no RelayDropped event,
+  // With only self in membership, relay_factor=2 requires at least 3 total members
+  // (relay_factor + 1 = 3) but we have 1 → silent no-op: no RelayDropped event,
   // no directed send.
   let mut e = ep();
   let querier = relay_node(2000);
@@ -3419,7 +3579,7 @@ fn merge_remote_state_max_member_clock_is_ignored() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert_eq!(
     e.member_time(),
@@ -3570,11 +3730,12 @@ fn inbound_user_event_too_large_is_dropped() {
 #[test]
 fn key_query_num_nodes_equals_member_count_at_issue_time() {
   let mut e = ep();
-  // Seed 3 distinct members so num_members() == 3 at issue time.
+  // Seed 3 distinct members; including self (drained at construction) the total
+  // membership at issue time is 4.
   for id in [10u32, 11, 12] {
     e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(1));
   }
-  assert_eq!(e.num_members(), 3);
+  assert_eq!(e.num_members(), 4);
 
   let far_future = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(9999);
   let _query_id = e.test_register_key_query(far_future);
@@ -3584,7 +3745,7 @@ fn key_query_num_nodes_equals_member_count_at_issue_time() {
     .test_last_pending_query_num_nodes()
     .expect("pending query must exist");
   assert_eq!(
-    num_nodes, 3,
+    num_nodes, 4,
     "num_nodes must equal the member count at issue time"
   );
 
@@ -3598,7 +3759,7 @@ fn key_query_num_nodes_equals_member_count_at_issue_time() {
   match ev {
     Event::KeyResponse(kr) => {
       assert_eq!(
-        kr.num_nodes, 3,
+        kr.num_nodes, 4,
         "KeyResponse.num_nodes must equal the queried member count"
       );
       assert_eq!(kr.num_resp, 0, "no responses were folded before timeout");
@@ -3613,8 +3774,9 @@ fn key_query_num_nodes_equals_member_count_at_issue_time() {
 #[test]
 fn key_query_num_nodes_is_captured_at_issue_not_at_close() {
   let mut e = ep();
+  // Self is already a member after construction drain; seed one more.
   e.test_seed_member(10u32, MemberStatus::Alive, LamportTime::new(1));
-  assert_eq!(e.num_members(), 1);
+  assert_eq!(e.num_members(), 2);
 
   let far_future = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(9999);
   let _query_id = e.test_register_key_query(far_future);
@@ -3622,9 +3784,9 @@ fn key_query_num_nodes_is_captured_at_issue_not_at_close() {
   // Now add 2 more members after the query was issued.
   e.test_seed_member(11u32, MemberStatus::Alive, LamportTime::new(1));
   e.test_seed_member(12u32, MemberStatus::Alive, LamportTime::new(1));
-  assert_eq!(e.num_members(), 3);
+  assert_eq!(e.num_members(), 4);
 
-  // Close the query: num_nodes must reflect membership AT ISSUE TIME (1), not now (3).
+  // Close the query: num_nodes must reflect membership AT ISSUE TIME (2), not now (4).
   let after_deadline = far_future + std::time::Duration::from_nanos(1);
   e.test_fire_due_query_closes(after_deadline);
 
@@ -3632,8 +3794,8 @@ fn key_query_num_nodes_is_captured_at_issue_not_at_close() {
   match ev {
     Event::KeyResponse(kr) => {
       assert_eq!(
-        kr.num_nodes, 1,
-        "num_nodes must be the count at issue time (1), not the current count (3)"
+        kr.num_nodes, 2,
+        "num_nodes must be the count at issue time (2), not the current count (4)"
       );
     }
     other => panic!("expected Event::KeyResponse, got {other:?}"),
@@ -3810,7 +3972,7 @@ fn merge_remote_state_max_minus_one_member_clock_drops_entire_message() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   // No state mutation: clock unchanged, dirty flag not set by this call.
   assert_eq!(
@@ -3852,7 +4014,7 @@ fn merge_remote_state_max_minus_one_event_clock_drops_entire_message() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert_eq!(
     e.event_time(),
@@ -4073,7 +4235,7 @@ fn zero_event_buffer_size_does_not_panic_on_merge_remote_state() {
     .expect("encode must succeed");
 
   // Must NOT panic.
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 }
 
 // ── Clock integrity + overflow regression tests ───────────────────────────────
@@ -4277,6 +4439,8 @@ fn inbound_query_oversized_is_dropped_before_state_mutation() {
   let opts = crate::options::Options::new().with_query_size_limit(64);
   let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
+  // Drain the construction self-join so it does not appear as a spurious event.
+  let _ = e.poll_event();
 
   // Encode a QueryMessage whose payload pushes the wire encoding over 64 bytes.
   let oversized_payload = bytes::Bytes::from(vec![0u8; 100]);
@@ -4586,7 +4750,7 @@ fn merge_remote_state_with_trailing_junk_is_dropped() {
 
   let clock_before = e.member_time();
   let dirty_before = e.test_is_dirty();
-  e.test_merge_remote_state(padded, false);
+  e.test_merge_remote_state(padded);
 
   assert_eq!(
     e.member_time(),
@@ -4803,6 +4967,8 @@ fn user_event_total_packet_with_junk_exceeding_size_limit_is_dropped() {
   let opts = crate::options::Options::new().with_max_user_event_size(32);
   let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
+  // Drain the construction self-join so it does not appear as a spurious event.
+  let _ = e.poll_event();
 
   // A small valid UserEvent that fits within 32 bytes on its own.
   let valid = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
@@ -4850,6 +5016,8 @@ fn pre_decode_fence_drops_oversized_valid_query_frame() {
   let opts = crate::options::Options::new().with_query_size_limit(64);
   let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
+  // Drain the construction self-join so it does not appear as a spurious event.
+  let _ = e.poll_event();
 
   // Construct a syntactically valid Query whose encoded frame exceeds 64 bytes.
   let q = QueryMessage::<u32, std::net::SocketAddr> {
@@ -4916,6 +5084,8 @@ fn pre_decode_fence_drops_oversized_valid_user_event_frame() {
   let opts = crate::options::Options::new().with_max_user_event_size(32);
   let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
+  // Drain the construction self-join so it does not appear as a spurious event.
+  let _ = e.poll_event();
 
   // Construct a syntactically valid UserEvent whose encoded frame exceeds 32 bytes.
   let frame = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
@@ -5378,7 +5548,7 @@ fn stale_push_pull_does_not_set_dirty() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode PushPull");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert!(
     !e.test_is_dirty(),
@@ -5407,7 +5577,7 @@ fn clock_advancing_push_pull_sets_dirty() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode PushPull");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert!(
     e.test_is_dirty(),
@@ -5932,7 +6102,7 @@ fn next_ltime_integrity_floor_near_watermark() {
     e.event_time()
   );
 
-  // The leave path uses next_ltime(&mut self.clock).
+  // The leave path uses post-increment (saturating_add then stamp the new value).
   let mut e2 = ep();
   e2.test_set_clocks(LTIME_MAX - 1, LTIME_MAX - 1, LTIME_MAX - 1);
   let now = memberlist_proto::Instant::ORIGIN;
@@ -6272,7 +6442,7 @@ fn left_member_replay_at_watermark_boundary_skips_leave() {
     .encode()
     .expect("encode must succeed");
   // Must not panic.
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   // The leave is skipped (derived LTIME_MAX rejected); member stays Alive.
   let status = e.test_member_status(99u32);
@@ -6301,6 +6471,12 @@ fn left_member_replay_at_watermark_boundary_skips_leave() {
 /// user_event, query, force_leave, and resync_local_state: every stored clock
 /// and every push-pull emission must satisfy the integrity floor (not 0, not
 /// u64::MAX, no wrap).
+///
+/// witness(LTIME_MAX - 1) advances the stored member clock to LTIME_MAX (post-
+/// increment semantics), so force_leave's prospective stamp = LTIME_MAX + 1,
+/// which is unacceptable — the watermark guard returns LeaveClockExhausted
+/// without mutating the clock.  member_clock stays at LTIME_MAX — not 0, not
+/// u64::MAX.
 ///
 /// After load_snapshot with last_event_clock = LTIME_MAX - 1, the stored
 /// event_clock is LTIME_MAX - 1 (from witness) and event_buffer.min_time is
@@ -6379,11 +6555,25 @@ fn all_clock_derived_values_satisfy_integrity_floor_after_near_watermark_snapsho
     "query_buffer.min_time must not be u64::MAX"
   );
 
-  // force_leave stamps clock.saturating_add(1): no UB.
+  // After load_snapshot, witness(LTIME_MAX - 1) advances the stored clock to
+  // LTIME_MAX (witness semantics: stored = t + 1).  The next force_leave stamp
+  // would be LTIME_MAX + 1, which is not acceptable — the watermark guard
+  // returns LeaveClockExhausted without mutating anything further.  No invalid
+  // intent is emitted and the clock stays at LTIME_MAX.
+  let clock_after_snapshot = e.member_time();
+  assert_eq!(
+    clock_after_snapshot, LTIME_MAX,
+    "after witnessing LTIME_MAX-1, stored clock must be LTIME_MAX"
+  );
   let fl = e.force_leave(99u32, false, now);
   assert!(
-    fl.is_ok(),
-    "force_leave must succeed after near-watermark snapshot: {fl:?}"
+    matches!(fl, Err(Error::LeaveClockExhausted)),
+    "force_leave at LTIME_MAX clock must return LeaveClockExhausted: {fl:?}"
+  );
+  assert_eq!(
+    e.member_time(),
+    LTIME_MAX,
+    "member_clock must remain LTIME_MAX after refused force_leave"
   );
 
   // resync_local_state must emit push-pull with non-0 / non-u64::MAX clocks.
@@ -6473,7 +6663,7 @@ fn push_pull_near_watermark_status_time_integrity_floor() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   // The inner NodeJoined event materialises node 99.
   e.test_inner_node_joined(99u32, now);
@@ -6629,8 +6819,6 @@ fn push_pull_near_watermark_event_floor_integrity_and_delivery() {
   use crate::typed::PushPullMessage;
 
   let mut e = ep();
-  // Set event_join_ignore = true so the G4 path fires on is_join = true.
-  e.set_event_join_ignore(true);
 
   // LTIME_MAX - 1 passes ltime_is_acceptable.
   let near_max = LTIME_MAX - 1;
@@ -6650,8 +6838,9 @@ fn push_pull_near_watermark_event_floor_integrity_and_delivery() {
   let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
-  // is_join = true triggers the G4 event_buffer.min_time update path.
-  e.test_merge_remote_state(encoded, true);
+  // A suppressed (ignore-join) merge triggers the G4 event_buffer.min_time
+  // update path.
+  e.test_merge_remote_state_suppressed(encoded);
 
   // Integrity floor: min_time is the ingress value, not 0, not u64::MAX.
   assert_ne!(
@@ -6742,27 +6931,34 @@ fn set_tags_local_member_state_is_observable_without_poll_event() {
   );
 }
 
-/// When `set_tags` is called before the local `NodeJoined` has been drained,
-/// no phantom entry must appear in `members.states`. The new tags are written
-/// to the coordinator's meta store via `update_meta` and will be decoded from
-/// there when `handle_node_join` materializes the member.
+/// After the construction self-join is drained (the local `NodeJoined` has been
+/// processed), `set_tags` must update the existing local member in-place and
+/// must not create a duplicate or phantom entry. The tags must also be reflected
+/// in the coordinator's meta store.
 #[test]
 fn set_tags_does_not_materialize_absent_local_member() {
   use crate::typed::Tags;
 
-  let mut e = ep(); // local member absent from members.states
+  // ep() drains the construction NodeJoined, so the local member IS already in
+  // members.states as Alive when this test begins.
+  let mut e = ep();
 
   let tags: Tags = [("env", "staging")].into_iter().collect();
-  e.set_tags(tags)
-    .expect("set_tags must succeed even before the local node is in members.states");
+  e.set_tags(tags.clone())
+    .expect("set_tags must succeed when the local node is in members.states");
 
-  // No phantom entry must be inserted into members.states.
-  assert!(
-    e.test_local_tags().is_none(),
-    "set_tags must not fabricate a local member when absent from members.states"
+  // set_tags must have updated the existing local member's tags in-place.
+  let local_tags = e.test_local_tags();
+  assert_eq!(
+    local_tags
+      .as_ref()
+      .and_then(|t| t.0.get("env"))
+      .map(|s| s.as_str()),
+    Some("staging"),
+    "set_tags must update the local member's tags in members.states"
   );
 
-  // The tags must have been advertised via the coordinator's meta store.
+  // The tags must also have been advertised via the coordinator's meta store.
   let meta = e
     .test_local_meta()
     .expect("coordinator must track local node meta");
@@ -6771,7 +6967,7 @@ fn set_tags_does_not_materialize_absent_local_member() {
   assert_eq!(
     decoded.0.get("env").map(|s| s.as_str()),
     Some("staging"),
-    "new tags must be reflected in the coordinator meta even when local member is absent"
+    "new tags must be reflected in the coordinator meta"
   );
 }
 
@@ -6797,16 +6993,19 @@ fn set_tags_does_not_mark_local_state_dirty() {
   );
 }
 
-/// When `set_tags` is called before the local member exists in `members.states`,
-/// the coordinator's queued `NodeUpdated` event must be suppressed (because the
-/// member is absent) and must not surface as `Member(Update)` before the
-/// `Member(Join)` that a subsequent `NodeJoined` would produce. If no `Join`
-/// event appears in the drain, no `Update` event must appear either.
+/// After the construction self-join is drained (the local member is already in
+/// `members.states`), `set_tags` triggers a `NodeUpdated` in the inner
+/// coordinator. The invariant is that no `Member(Update)` ever appears BEFORE a
+/// `Member(Join)` in the same event-stream segment. When the Join already
+/// occurred at construction (before this collection), an Update appearing alone
+/// (with no Join in the current segment) is valid — the prior Join satisfies the
+/// ordering constraint.
 #[test]
 fn set_tags_before_join_does_not_emit_update_before_join() {
   use crate::typed::Tags;
 
-  let mut e = ep(); // local member absent
+  // ep() drains the construction NodeJoined, so the local member IS present.
+  let mut e = ep();
 
   let tags: Tags = [("role", "cache")].into_iter().collect();
   e.set_tags(tags).expect("set_tags must succeed");
@@ -6820,7 +7019,9 @@ fn set_tags_before_join_does_not_emit_update_before_join() {
     evs.push(ev);
   }
 
-  // If a Join appears, no Update may precede it.
+  // Within this collection: if both a Join and an Update appear, the Join must
+  // come first.  An Update without a Join in this segment is also valid because
+  // the Join already happened at construction (before this collection).
   let join_pos = evs
     .iter()
     .position(|ev| matches!(ev, Event::Member(me) if me.kind() == MemberEventKind::Join));
@@ -6828,11 +7029,10 @@ fn set_tags_before_join_does_not_emit_update_before_join() {
     .iter()
     .position(|ev| matches!(ev, Event::Member(me) if me.kind() == MemberEventKind::Update));
 
-  match (join_pos, update_pos) {
-    (None, Some(_)) => panic!("Member(Update) appeared without a preceding Member(Join): {evs:?}"),
-    (Some(j), Some(u)) if u < j => {
-      panic!("Member(Update) at index {u} appeared before Member(Join) at index {j}: {evs:?}")
-    }
-    _ => {}
+  if let (Some(j), Some(u)) = (join_pos, update_pos) {
+    assert!(
+      u >= j,
+      "Member(Update) at index {u} must not precede Member(Join) at index {j}: {evs:?}"
+    );
   }
 }

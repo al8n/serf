@@ -265,3 +265,148 @@ async fn fire_quic_timeout_drains_socket_before_handle_timeout() {
   let _ = driver.close().await;
   let _ = peer.close().await;
 }
+
+/// Park one `ignore_old` await-result `PendingJoin` whose single exchange is
+/// still live, with its `StreamId` recorded in the machine's ignore set and a
+/// `deadline` already in the past. Returns the join's `(StreamId, ExchangeId)`
+/// and the oneshot receiver the caller awaits.
+fn park_ignore_old_join(
+  endpoint: &mut QuicEndpoint<SmolStr, StdRng, StdRng>,
+  pending_joins: &mut Vec<PendingJoin>,
+  deadline: Instant,
+) -> (StreamId, ExchangeId, oneshot::Receiver<JoinReply>) {
+  let seed: SocketAddr = "127.0.0.1:7946".parse().expect("seed addr");
+  // `ignore_old = true` records the returned `StreamId` in the machine's
+  // per-exchange ignore set — the entry whose premature clear is the bug.
+  let sid = endpoint.start_join_push_pull(seed, true, Instant::now());
+  let eid = ExchangeId::from(sid);
+  let (tx, rx) = oneshot::channel::<JoinReply>();
+  pending_joins.push(PendingJoin {
+    pending: core::iter::once(eid).collect(),
+    contacted: SmallVec::new(),
+    ignore_streams: core::iter::once(sid).collect(),
+    requested: 1,
+    deadline,
+    reply: Some(tx),
+  });
+  (sid, eid, rx)
+}
+
+/// The deadline reaper must NOT clear an `ignore_old` join's ignore `StreamId`
+/// while its push/pull exchange is still live: it replies to the caller (deadline
+/// path) but the waiter LINGERS with its `StreamId` recorded, so a late merge for
+/// that still-live exchange still suppresses the peer's pre-join user events. Only
+/// when the exchange finally completes is the waiter reaped and its ignore stream
+/// cleared. This is the premature-clear / cancellation-safety regression.
+#[compio::test]
+async fn deadline_reap_keeps_ignore_stream_until_exchange_completes() {
+  let mut endpoint = build_endpoint();
+  let mut joins: Vec<PendingJoin> = Vec::new();
+  // Deadline already elapsed; the exchange is still pending.
+  let past = Instant::now() - Duration::from_secs(1);
+  let (sid, eid, rx) = park_ignore_old_join(&mut endpoint, &mut joins, past);
+
+  // Reap on the elapsed deadline. Reply resolution is decoupled from ignore-stream
+  // cleanup: the caller is answered, but the waiter must linger.
+  reap_pending_joins::<SmolStr, StdRng, StdRng>(&mut endpoint, &mut joins, Instant::now()).await;
+
+  // The caller got the deadline reply (zero contacts -> JoinAllFailed) ...
+  match rx.await {
+    Ok(Err((_set, SerfError::JoinAllFailed(_)))) => {}
+    other => panic!("deadline reap must reply JoinAllFailed, got {other:?}"),
+  }
+  // ... but the waiter LINGERED rather than being removed, and its ignore
+  // `StreamId` was NOT cleared — it stays recorded for the still-live exchange so
+  // a late merge for that exchange still suppresses the peer's pre-join user
+  // events. Removing the waiter and clearing the stream here would let that late
+  // merge replay them.
+  assert_eq!(
+    joins.len(),
+    1,
+    "the waiter must linger past its reply while the exchange is still live"
+  );
+  assert!(
+    joins[0].reply.is_none(),
+    "the deadline reply must have resolved (reply taken)"
+  );
+  assert_eq!(
+    joins[0].ignore_streams.as_slice(),
+    &[sid],
+    "the ignore StreamId must stay recorded for the still-live exchange"
+  );
+  assert!(
+    joins[0].pending.contains(&eid),
+    "the live exchange is still pending"
+  );
+
+  // The delayed terminal `ExchangeCompleted` (a failure / timeout / decode error
+  // all surface as `Failed`) finally arrives: NOW the waiter is reaped and its
+  // ignore stream cleared. No second reply is sent (the deadline already replied).
+  let peer: SocketAddr = "127.0.0.1:7946".parse().expect("peer addr");
+  complete_join_exchange::<SmolStr, StdRng, StdRng>(&mut endpoint, &mut joins, eid, peer, false);
+  assert!(
+    joins.is_empty(),
+    "the waiter must be reaped once its last exchange completes"
+  );
+}
+
+/// A deadline-reaped join lingers with `reply == None` while its exchange is
+/// still live. `min_pending_join_deadline` must exclude it: the lingering waiter
+/// has already replied to its caller and is cleaned up by `complete_join_exchange`
+/// when its `ExchangeCompleted` arrives (I/O-driven), NOT by a timer. Contributing
+/// a past deadline here causes a CPU busy-spin for the remaining stream-timeout
+/// window.
+#[compio::test]
+async fn resolved_lingering_join_excluded_from_min_deadline() {
+  let mut endpoint = build_endpoint();
+  let mut joins: Vec<PendingJoin> = Vec::new();
+  // Past deadline — the join will be reaped by the timer, leaving a lingering
+  // waiter (reply == None, exchange still pending).
+  let past = Instant::now() - Duration::from_secs(1);
+  let (_sid, _eid, _rx) = park_ignore_old_join(&mut endpoint, &mut joins, past);
+
+  // Reap: the reply resolves (reply taken -> None), waiter lingers.
+  reap_pending_joins::<SmolStr, StdRng, StdRng>(&mut endpoint, &mut joins, Instant::now()).await;
+
+  assert_eq!(joins.len(), 1, "the lingering waiter must still be present");
+  assert!(
+    joins[0].reply.is_none(),
+    "the deadline reply must have resolved (reply taken)"
+  );
+
+  // The lingering waiter (reply == None) must NOT contribute a timer deadline —
+  // returning None here is what prevents the busy-spin.
+  assert_eq!(
+    min_pending_join_deadline(&joins),
+    None,
+    "a resolved-lingering waiter must not contribute a timer deadline"
+  );
+}
+
+/// A success-path merge consumes the ignore `StreamId` BEFORE the exchange's
+/// `ExchangeCompleted`, so the count->0 clear in `complete_join_exchange` is a
+/// no-op for it: the all-exchanges-done path resolves the reply with the contact
+/// and reaps the waiter. This guards the non-deadline terminal that shares the
+/// reap path with the deadline-linger case.
+#[compio::test]
+async fn all_exchanges_done_resolves_and_reaps() {
+  let mut endpoint = build_endpoint();
+  let mut joins: Vec<PendingJoin> = Vec::new();
+  // A far-future deadline: this resolution is driven by exchange completion, not
+  // the timer.
+  let future = Instant::now() + Duration::from_secs(60);
+  let (_sid, eid, rx) = park_ignore_old_join(&mut endpoint, &mut joins, future);
+
+  // The exchange completes Succeeded; its peer enters `contacted` and, with no
+  // exchanges left pending, the reply resolves and the waiter is reaped.
+  let peer: SocketAddr = "127.0.0.1:7946".parse().expect("peer addr");
+  complete_join_exchange::<SmolStr, StdRng, StdRng>(&mut endpoint, &mut joins, eid, peer, true);
+  assert!(
+    joins.is_empty(),
+    "an all-exchanges-done waiter is reaped on completion, not left for the timer"
+  );
+  match rx.await {
+    Ok(Ok(contacted)) => assert_eq!(contacted.as_slice(), &[peer]),
+    other => panic!("a successful exchange must reply Ok(contacted), got {other:?}"),
+  }
+}

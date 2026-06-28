@@ -44,6 +44,7 @@ memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main"
 
 rand = { workspace = true }
 smol_str.workspace = true
+smallvec.workspace = true
 bytes = { workspace = true }
 thiserror.workspace = true
 futures-channel.workspace = true

@@ -42,7 +42,9 @@ fn ep(id: u32, port: u16) -> StreamEndpoint<u32, SocketAddr, RawRecords> {
     Box::new(|_addr: &SocketAddr| None),
     Box::new(|addr: &SocketAddr| *addr),
   );
-  StreamEndpoint::new(coord, Options::new())
+  let mut e = StreamEndpoint::new(coord, Options::new());
+  let _ = e.poll_event();
+  e
 }
 
 #[test]
@@ -125,7 +127,7 @@ fn merge_remote_state_folds_remote_clocks() {
     .encode()
     .expect("encode push-pull body");
 
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert_eq!(
     e.member_time(),
@@ -257,5 +259,111 @@ fn loopback_push_pull_converges_member_clock() {
   assert!(
     acceptor.test_member_status(1).is_some(),
     "the acceptor learned the dialer (node 1) as a member over the exchange"
+  );
+}
+
+/// A completed Join push/pull surfaces `Event::ExchangeCompleted` with
+/// `kind() == ExchangeKind::PushPull` on the dialer side.
+///
+/// The inner coordinator emits `memberlist_proto::Event::ExchangeCompleted`
+/// when the outbound bridge is reaped; serf's `on_inner_event` must forward
+/// it rather than swallowing it so that a driver awaiting a join can resolve
+/// directly from the event stream.
+#[test]
+fn completed_join_push_pull_surfaces_exchange_completed_event() {
+  use crate::{ExchangeKind, ExchangeStatus, event::Event};
+
+  let now = Instant::ORIGIN;
+  let mut dialer = ep(1, 7946);
+  let mut acceptor = ep(2, 7000);
+
+  // Dialer: start a Join push/pull and grab the Connect action's exchange id.
+  let dial_exchange = {
+    dialer
+      .transport_mut()
+      .start_push_pull(sa(7000), PushPullKind::Join, now);
+    match dialer.poll_action() {
+      Some(StreamAction::Connect(c)) => c.id(),
+      other => panic!("dialer must surface a Connect, got {other:?}"),
+    }
+  };
+  while dialer.poll_action().is_some() {}
+
+  // Acceptor: admit the inbound connection.
+  let accept_exchange = acceptor
+    .accept_connection(sa(7946), now)
+    .expect("acceptor admits the inbound connection");
+
+  // Shuttle bytes and half-close signals until the exchange completes.
+  for _ in 0..256 {
+    let mut moved = false;
+
+    let mut to_acceptor = Vec::new();
+    while let Some((id, _peer, bytes)) = dialer.poll_transport_transmit() {
+      if id == dial_exchange {
+        to_acceptor.extend_from_slice(&bytes);
+      }
+    }
+    if !to_acceptor.is_empty() {
+      acceptor.handle_transport_data(accept_exchange, &to_acceptor, false, now);
+      moved = true;
+    }
+    while let Some(action) = dialer.poll_action() {
+      if let StreamAction::Shutdown(r) | StreamAction::Close(r) | StreamAction::Abort(r) = action {
+        if r.id() == dial_exchange {
+          acceptor.handle_transport_data(accept_exchange, &[], true, now);
+          moved = true;
+        }
+      }
+    }
+
+    let mut to_dialer = Vec::new();
+    while let Some((id, _peer, bytes)) = acceptor.poll_transport_transmit() {
+      if id == accept_exchange {
+        to_dialer.extend_from_slice(&bytes);
+      }
+    }
+    if !to_dialer.is_empty() {
+      dialer.handle_transport_data(dial_exchange, &to_dialer, false, now);
+      moved = true;
+    }
+    while let Some(action) = acceptor.poll_action() {
+      if let StreamAction::Shutdown(r) | StreamAction::Close(r) | StreamAction::Abort(r) = action {
+        if r.id() == accept_exchange {
+          dialer.handle_transport_data(dial_exchange, &[], true, now);
+          moved = true;
+        }
+      }
+    }
+
+    dialer.handle_timeout(now);
+    acceptor.handle_timeout(now);
+
+    // Look for Event::ExchangeCompleted on the dialer side.
+    while let Some(ev) = dialer.poll_event() {
+      if let Event::ExchangeCompleted(ref c) = ev {
+        assert_eq!(
+          c.kind(),
+          ExchangeKind::PushPull,
+          "ExchangeCompleted kind must be PushPull for a Join push/pull"
+        );
+        assert_eq!(
+          c.outcome(),
+          ExchangeStatus::Succeeded,
+          "Join push/pull outcome must be Succeeded"
+        );
+        return;
+      }
+    }
+    while acceptor.poll_event().is_some() {}
+
+    if !moved {
+      break;
+    }
+  }
+
+  panic!(
+    "no Event::ExchangeCompleted(kind=PushPull) surfaced from the dialer after a \
+     completed loopback Join push/pull"
   );
 }

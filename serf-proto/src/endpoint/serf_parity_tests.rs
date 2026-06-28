@@ -30,7 +30,14 @@ fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
     Box::new(|_addr: &std::net::SocketAddr| None),
     Box::new(|addr: &std::net::SocketAddr| *addr),
   );
-  StreamEndpoint::new(coord, Options::new())
+  let mut e = StreamEndpoint::new(coord, Options::new());
+  let _ = e.poll_event();
+  e
+}
+
+/// A distinct loopback peer address for the per-peer ignore-join tests.
+fn peer(port: u16) -> std::net::SocketAddr {
+  std::net::SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 // ── base.rs handle_node_join invariants ───────────────────────────────────────
@@ -249,7 +256,7 @@ fn push_pull_body(
 fn merge_witnesses_clocks_at_ltime_minus_one() {
   let mut e = ep();
   let body = push_pull_body(10, vec![], vec![], 8, vec![], 6);
-  e.test_merge_remote_state(body, false);
+  e.test_merge_remote_state(body);
   // witness(9) → clock = 10; witness(7) → event_clock = 8; witness(5) → query_clock = 6
   assert_eq!(e.member_time(), 10, "member clock: witness(9) → 10");
   assert_eq!(e.event_time(), 8, "event clock: witness(7) → 8");
@@ -263,7 +270,7 @@ fn merge_witnesses_clocks_at_ltime_minus_one() {
 fn merge_zero_clocks_are_not_witnessed() {
   let mut e = ep();
   let body = push_pull_body(0, vec![], vec![], 0, vec![], 0);
-  e.test_merge_remote_state(body, false);
+  e.test_merge_remote_state(body);
   assert_eq!(e.member_time(), 0, "zero ltime must not witness");
   assert_eq!(e.event_time(), 0, "zero event_ltime must not witness");
   assert_eq!(e.query_time(), 0, "zero query_ltime must not witness");
@@ -281,7 +288,7 @@ fn merge_processes_left_members_before_joins() {
   let mut e = ep();
   // Node 2 in status_ltimes (ltime=4) AND in left_members.
   let body = push_pull_body(5, vec![(2u32, 4)], vec![2u32], 0, vec![], 0);
-  e.test_merge_remote_state(body, false);
+  e.test_merge_remote_state(body);
   // The join pass must have skipped node 2 (left_set guard).
   // The leave intent at synthetic ltime=5 must be buffered (node 2 not in states yet).
   assert_eq!(
@@ -304,7 +311,7 @@ fn merge_join_intent_buffered_for_non_left_node() {
   let mut e = ep();
   // Node 3 appears only in status_ltimes, NOT in left_members.
   let body = push_pull_body(5, vec![(3u32, 7)], vec![], 0, vec![], 0);
-  e.test_merge_remote_state(body, false);
+  e.test_merge_remote_state(body);
   // A join intent must be buffered for node 3 (it is not in states yet).
   assert_eq!(
     e.test_intent_ltime(3, IntentKind::Join),
@@ -313,46 +320,94 @@ fn merge_join_intent_buffered_for_non_left_node() {
   );
 }
 
-/// delegate.rs:528-534 — G4: `eventJoinIgnore` + `is_join` bumps `event_buffer.min_time`
-/// to max(min_time, event_ltime).
+/// delegate.rs:528-534 — G4: a join merge whose `originating_stream_id` matches a
+/// recorded ignore-join exchange bumps `event_buffer.min_time` to
+/// max(min_time, event_ltime), and CONSUMES the one-shot per-exchange entry.
 #[test]
 fn join_with_event_join_ignore_bumps_event_min_time() {
   let mut e = ep();
-  e.test_set_event_join_ignore(true);
+  // Start a real `ignore_old` join to mint and record this exchange's StreamId.
+  let s = e.start_join_push_pull(peer(5001), /*ignore_old*/ true, Instant::ORIGIN);
+  assert!(
+    e.test_has_ignore_join_stream(s),
+    "an ignore_old join must record its exchange StreamId"
+  );
   let body = push_pull_body(0, vec![], vec![], 42, vec![], 0);
-  e.test_merge_remote_state(body, /*is_join*/ true);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ true, s);
   assert_eq!(
     e.test_event_min_time(),
     42,
-    "event_join_ignore + is_join must set min_time to remote event_ltime"
+    "an ignore-join exchange's merge must set min_time to remote event_ltime"
+  );
+  assert!(
+    !e.test_has_ignore_join_stream(s),
+    "the ignore-join entry must be consumed (one-shot) at the join merge"
   );
 }
 
-/// G4 inverse: `is_join = false` must NOT bump event_buffer.min_time.
+/// G4 inverse: a REFRESH (non-join) exchange on a recorded ignore-join stream must
+/// NOT bump min_time and must NOT consume the entry — only a join merge does.
 #[test]
 fn refresh_exchange_does_not_bump_event_min_time() {
   let mut e = ep();
-  e.test_set_event_join_ignore(true);
+  let s = e.start_join_push_pull(peer(5002), /*ignore_old*/ true, Instant::ORIGIN);
   let body = push_pull_body(0, vec![], vec![], 99, vec![], 0);
-  e.test_merge_remote_state(body, /*is_join*/ false);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ false, s);
   assert_eq!(
     e.test_event_min_time(),
     0,
     "non-join exchange must not bump event_buffer.min_time"
   );
+  assert!(
+    e.test_has_ignore_join_stream(s),
+    "a refresh must not consume the exchange's pending ignore-join entry"
+  );
 }
 
-/// G4 inverse: flag not set even with is_join must NOT bump min_time.
+/// G4 same-peer concurrency-correctness (the per-exchange precision the StreamId
+/// key buys): an `ignore_old` join and a non-ignore join to the SAME seed get
+/// DISTINCT `StreamId`s, so the non-ignore join's merge must NOT be suppressed and
+/// must NOT consume the ignore-join's still-pending entry. A per-PEER key could
+/// not tell these apart — whichever merge landed first would consume the wrong
+/// token.
 #[test]
-fn join_without_event_join_ignore_does_not_bump_min_time() {
+fn non_ignore_join_to_same_seed_is_not_suppressed() {
   let mut e = ep();
-  // event_join_ignore is false (default)
+  let seed = peer(5003);
+  // Two concurrent joins to the SAME seed: one ignore_old, one plain.
+  let ignored = e.start_join_push_pull(seed, /*ignore_old*/ true, Instant::ORIGIN);
+  let plain = e.start_join_push_pull(seed, /*ignore_old*/ false, Instant::ORIGIN);
+  assert_ne!(ignored, plain, "same-seed joins get distinct StreamIds");
+  assert!(
+    e.test_has_ignore_join_stream(ignored),
+    "the ignore_old join recorded its exchange"
+  );
+  assert!(
+    !e.test_has_ignore_join_stream(plain),
+    "the plain join to the same seed is NOT recorded"
+  );
+
+  // The plain join's merge lands first: it must not be suppressed and must leave
+  // the ignore_old join's entry intact.
   let body = push_pull_body(0, vec![], vec![], 99, vec![], 0);
-  e.test_merge_remote_state(body, /*is_join*/ true);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ true, plain);
   assert_eq!(
     e.test_event_min_time(),
     0,
-    "event_join_ignore=false: min_time must not be bumped"
+    "a non-ignore join to the same seed must not bump event_buffer.min_time"
+  );
+  assert!(
+    e.test_has_ignore_join_stream(ignored),
+    "the plain join's merge must not consume the ignore_old join's entry"
+  );
+
+  // The ignore_old join's own merge still suppresses, keyed by ITS StreamId.
+  let body = push_pull_body(0, vec![], vec![], 99, vec![], 0);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ true, ignored);
+  assert_eq!(
+    e.test_event_min_time(),
+    99,
+    "the ignore_old join's own merge (its StreamId) bumps min_time"
   );
 }
 
@@ -369,7 +424,7 @@ fn merge_replays_buffered_user_events() {
     }],
   }];
   let body = push_pull_body(4, vec![], vec![], 4, events, 0);
-  e.test_merge_remote_state(body, false);
+  e.test_merge_remote_state(body);
   // The replayed user event must surface.
   let ev = e.poll_event().expect("replayed user event must surface");
   assert!(
@@ -378,15 +433,19 @@ fn merge_replays_buffered_user_events() {
   );
 }
 
-/// G4 + replay: when event_join_ignore bumps min_time to the remote event_ltime,
-/// events strictly below the new min_time must be suppressed on replay.
+/// G4 + replay: when an ignore-join peer's merge bumps min_time to the remote
+/// event_ltime, events strictly below the new min_time must be suppressed on
+/// replay.
 ///
 /// G4 sets `min_time = event_ltime`.  An event at `ltime=4` with `min_time=5`
 /// satisfies `ltime < min_time`, so it is suppressed.
 #[test]
 fn join_with_event_join_ignore_suppresses_event_replay() {
   let mut e = ep();
-  e.test_set_event_join_ignore(true);
+  let s = e.start_join_push_pull(peer(5005), /*ignore_old*/ true, Instant::ORIGIN);
+  // Starting the dial surfaces no serf event, but drain defensively so the
+  // assertion below only observes replay (or its suppression).
+  while e.poll_event().is_some() {}
   // event_ltime = 5 → G4 bumps min_time to 5.  Event at ltime=4 < 5 must be dropped.
   let events = vec![UserEvents {
     ltime: LamportTime::new(4),
@@ -396,11 +455,55 @@ fn join_with_event_join_ignore_suppresses_event_replay() {
     }],
   }];
   let body = push_pull_body(0, vec![], vec![], 5, events, 0);
-  e.test_merge_remote_state(body, /*is_join*/ true);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ true, s);
   // min_time = 5; event at ltime=4 must be suppressed.
   assert!(
     e.poll_event().is_none(),
     "event at ltime < min_time must be suppressed after G4 bump"
+  );
+}
+
+/// Cancellation safety: an ignore-join whose exchange terminates WITHOUT a merge
+/// (a dropped/failed join future) is cleaned up by the driver at the join's
+/// terminal via `clear_ignore_join_stream`, so a later merge on that stream is NOT
+/// suppressed — the entry cannot leak.
+#[test]
+fn ignore_join_cleared_on_exchange_termination_does_not_leak() {
+  let mut e = ep();
+  let s = e.start_join_push_pull(peer(5006), /*ignore_old*/ true, Instant::ORIGIN);
+  assert!(
+    e.test_has_ignore_join_stream(s),
+    "the ignore_old join recorded its exchange"
+  );
+  // The ignore-old join terminates without ever merging (the join future was
+  // dropped / the dial failed): the driver clears its StreamId.
+  e.test_clear_ignore_join_stream(s);
+  assert!(
+    !e.test_has_ignore_join_stream(s),
+    "a terminated ignore-join exchange must drop its pending entry"
+  );
+  while e.poll_event().is_some() {}
+
+  // A later merge carrying a buffered event must replay: because the entry was
+  // cleared, the merge is not suppressed (no min_time bump, event surfaces).
+  let events = vec![UserEvents {
+    ltime: LamportTime::new(3),
+    events: vec![UserEvent {
+      name: "should-replay".into(),
+      payload: Bytes::from_static(b"z"),
+    }],
+  }];
+  let body = push_pull_body(4, vec![], vec![], 4, events, 0);
+  e.test_merge_remote_state_with_stream(body, /*is_join*/ true, s);
+  assert_eq!(
+    e.test_event_min_time(),
+    0,
+    "a cleared ignore must NOT bump min_time on a later merge"
+  );
+  let ev = e.poll_event().expect("the later merge's event must replay");
+  assert!(
+    matches!(ev, Event::User(ref u) if u.name == "should-replay"),
+    "expected the un-suppressed event to surface, got: {ev:?}"
   );
 }
 
@@ -411,7 +514,7 @@ fn merge_empty_user_data_is_silently_dropped() {
   // Simulate the RemoteStateReceived path: empty bytes are dropped before
   // merge_remote_state is called (the sieve arm guards `!user_data.is_empty()`).
   // Here we test that a zero-byte body passed directly does not panic.
-  e.test_merge_remote_state(Bytes::new(), false);
+  e.test_merge_remote_state(Bytes::new());
   assert!(e.poll_event().is_none());
 }
 
@@ -419,7 +522,7 @@ fn merge_empty_user_data_is_silently_dropped() {
 #[test]
 fn merge_malformed_body_is_silently_dropped() {
   let mut e = ep();
-  e.test_merge_remote_state(Bytes::from_static(b"\xff\xfe\xfd"), false);
+  e.test_merge_remote_state(Bytes::from_static(b"\xff\xfe\xfd"));
   assert_eq!(
     e.member_time(),
     0,

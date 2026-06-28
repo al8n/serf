@@ -7,18 +7,40 @@ use core::time::Duration;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future};
 use memberlist_proto::MaybeResolved;
 use serf_proto::{
   event::{Event, MemberEventKind},
+  members::SerfState,
   options::Options as SerfOptions,
 };
 use smol_str::SmolStr;
 
 use crate::{
-  Channel, FirstAddrResolver, RuntimeOptions, Serf, SerfError, SocketAddrResolver, TcpTransport,
-  TcpTransportOptions, VoidDelegate, gossip_rng,
+  Channel, FirstAddrResolver, Resolver, RuntimeOptions, Serf, SerfError, SocketAddrResolver,
+  TcpTransport, TcpTransportOptions, VoidDelegate, gossip_rng,
 };
+
+/// A loopback address with a port nothing listens on — `connect()` returns
+/// `ECONNREFUSED` immediately, so its push/pull exchange fails fast. The port is
+/// below the OS ephemeral range, so a `:0` test bind never collides with it.
+fn blackhole_addr() -> SocketAddr {
+  "127.0.0.1:7213".parse().expect("loopback addr")
+}
+
+/// Resolver that always resolves to an empty address list — models a
+/// service-discovery resolver that finds no live endpoints under a configured
+/// service key.
+struct EmptyResolver;
+
+impl Resolver for EmptyResolver {
+  type Address = String;
+  type Error = std::io::Error;
+
+  async fn resolve(&self, _addr: &String) -> Result<Vec<SocketAddr>, std::io::Error> {
+    Ok(Vec::new())
+  }
+}
 
 #[cfg(encryption)]
 use crate::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
@@ -232,9 +254,13 @@ async fn two_node_tcp_join_observes_membership() {
   // subscription (the channel buffers either way, but this is the clean order).
   let mut a_events = a.events();
 
-  // Node A dials node B as its seed.
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  // Node A joins node B (await-result): the call returns the reached address
+  // once the push-pull to B's seed completes.
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   // Node A should observe node B joining via a `Member(Join)` event.
   let observed = compio::time::timeout(Duration::from_secs(20), async {
@@ -312,8 +338,11 @@ async fn two_node_tcp_join_observes_membership_encrypted() {
 
   let mut a_events = a.events();
 
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   let observed = compio::time::timeout(Duration::from_secs(20), async {
     loop {
@@ -362,7 +391,14 @@ async fn mismatched_keyring_nodes_do_not_exchange_membership() {
 
   let mut a_events = a.events();
 
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
+  // Fire-and-forget dispatch: the dial is queued regardless of whether the
+  // reliable exchange can authenticate. An await-result `join` would instead
+  // fail here (the mismatched-key push-pull never completes); the absence probe
+  // below is what proves membership never merges.
+  let dispatched = a
+    .dispatch_join(&SocketAddrResolver, &[MaybeResolved::Resolved(b_addr)])
+    .await
+    .expect("join dispatched");
   assert_eq!(dispatched, 1, "exactly one seed was dispatched");
 
   // Absence probe: A must never surface a Join carrying node-b. A short window
@@ -436,7 +472,9 @@ async fn tcp_events_dropped_counter_observable_under_backpressure() {
   // Subscribe before the join so we can drain until completion is confirmed.
   let mut events = a.events();
 
-  a.join(vec![b_addr]).await.expect("join dispatched");
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
 
   // Drain A's event stream only until Member(Join, [B]) confirms the
   // push-pull completed. After breaking, `events` is alive but never polled
@@ -478,4 +516,384 @@ async fn tcp_events_dropped_counter_observable_under_backpressure() {
     dropped > 0,
     "events_dropped must be > 0 when event_queue_cap=1 and events are not drained (got {dropped})"
   );
+}
+
+/// `join_many` over two seeds — one reachable (node B), one a blackhole port —
+/// returns only the reached seed's address. The reachable exchange succeeds and
+/// the blackhole exchange fails fast; once both terminate the call resolves
+/// `Ok([b_addr])`.
+#[compio::test]
+async fn tcp_join_many_returns_only_reached_seeds() {
+  let b = spawn_node("jm-b").await;
+  let a = spawn_node("jm-a").await;
+  let b_addr = b.advertise_address();
+  let blackhole = blackhole_addr();
+
+  let reached = a
+    .join_many(
+      &SocketAddrResolver,
+      [
+        MaybeResolved::Resolved(b_addr),
+        MaybeResolved::Resolved(blackhole),
+      ]
+      .into_iter(),
+      false,
+    )
+    .await
+    .expect("join_many reaches the reachable seed");
+
+  assert_eq!(reached.len(), 1, "only the reachable seed is contacted");
+  assert_eq!(
+    reached[0], b_addr,
+    "the reached set carries node B's address"
+  );
+
+  a.shutdown().await.expect("jm-a shuts down");
+  b.shutdown().await.expect("jm-b shuts down");
+}
+
+/// An await-result `join` against an unreachable blackhole seed surfaces
+/// `SerfError::JoinAllFailed { requested: 1, contacted: 0 }` once the dial fails
+/// fast — well before the join deadline.
+#[compio::test]
+async fn tcp_join_unreachable_seed_surfaces_join_all_failed() {
+  let a = spawn_node("blackhole-joiner").await;
+
+  let err = a
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(blackhole_addr()),
+      false,
+    )
+    .await
+    .expect_err("join against a blackhole must fail");
+
+  match err {
+    SerfError::JoinAllFailed(payload) => {
+      assert_eq!(payload.requested(), 1, "one seed requested");
+      assert_eq!(payload.contacted(), 0, "no seed contacted");
+    }
+    other => panic!("expected JoinAllFailed, got {other:?}"),
+  }
+
+  a.shutdown().await.expect("joiner shuts down");
+}
+
+/// A non-empty `join` whose resolver returns zero addresses surfaces
+/// `JoinAllFailed`, NOT a silent success — a service-discovery resolver that
+/// finds no endpoints must never be reported as a healthy zero-contact join.
+#[compio::test]
+async fn tcp_join_zero_resolution_surfaces_join_all_failed() {
+  let a = spawn_node("empty-resolve-joiner").await;
+
+  let err = a
+    .join(
+      &EmptyResolver,
+      MaybeResolved::Unresolved("svc-a".into()),
+      false,
+    )
+    .await
+    .expect_err("a seed resolving to zero addresses must fail");
+
+  match err {
+    SerfError::JoinAllFailed(payload) => {
+      assert_eq!(payload.requested(), 1, "one input seed requested");
+      assert_eq!(payload.contacted(), 0);
+    }
+    other => panic!("expected JoinAllFailed, got {other:?}"),
+  }
+
+  // An empty `join_many` input is a trivial `Ok(empty)` — no command is sent.
+  let empty: Vec<MaybeResolved<String, SocketAddr>> = Vec::new();
+  let reached = a
+    .join_many(&EmptyResolver, empty.into_iter(), false)
+    .await
+    .expect("empty input is a trivial success");
+  assert!(reached.is_empty(), "empty input contacts nothing");
+
+  a.shutdown().await.expect("joiner shuts down");
+}
+
+/// After a two-node join, the snapshot forwarders on the joined node must reflect
+/// the two-member cluster: `members()` returns both nodes, `local_member()` returns
+/// this node's own `Member`, and `state()` returns `SerfState::Alive`.
+///
+/// `broadcast_join` materialises the local node in members.states immediately, so
+/// the snapshot update races the join return: we drain until `Member(Join, [B])`
+/// confirms the push-pull completed, at which point the snapshot is already
+/// current (refresh_snapshot is called before the join reply is delivered).
+#[compio::test]
+async fn tcp_snapshot_forwarders_reflect_joined_cluster() {
+  let b = spawn_node("snap-b").await;
+  let a = spawn_node("snap-a").await;
+  let b_addr = b.advertise_address();
+  let b_id = SmolStr::new("snap-b");
+  let a_id = SmolStr::new("snap-a");
+
+  // Subscribe before the join so a Member event does not race the subscription.
+  let mut a_events = a.events();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+
+  // Drain until B's join event confirms the push-pull completed. The event
+  // stream may carry Member(Join, [A]) first (local node materialised in
+  // members.states during broadcast_join), so we skip non-B join events.
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::Member(me)) if me.kind() == MemberEventKind::Join => {
+          if me.members().iter().any(|m| m.node().id_ref() == &b_id) {
+            break;
+          }
+        }
+        Some(_) => {}
+        None => panic!("event stream closed before join was observed"),
+      }
+    }
+  })
+  .await
+  .expect("A must observe B joining within timeout");
+
+  // The snapshot is refreshed before the join reply is sent, so num_members()
+  // reflects the 2-member cluster immediately. A brief poll guards against any
+  // marginal scheduling jitter on slow CI hosts.
+  compio::time::timeout(Duration::from_secs(5), async {
+    loop {
+      if a.num_members() == 2 {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("snapshot must show 2 members immediately after B's join event");
+
+  // members() must reflect both nodes.
+  let members = a.members();
+  assert_eq!(
+    members.len(),
+    2,
+    "two-node cluster: members() must return 2"
+  );
+  let ids: Vec<&SmolStr> = members.iter().map(|m| m.node().id_ref()).collect();
+  assert!(ids.contains(&&a_id), "members() must include local node A");
+  assert!(ids.contains(&&b_id), "members() must include peer node B");
+
+  // local_member() must return A's own membership record.
+  let local = a.local_member();
+  assert_eq!(
+    local.node().id_ref(),
+    &a_id,
+    "local_member() must return local node A"
+  );
+
+  // state() must be Alive after a successful join.
+  assert_eq!(
+    a.state(),
+    SerfState::Alive,
+    "state() must be Alive after join"
+  );
+
+  // advertise_node() must compose the local id and advertise address.
+  let anode = a.advertise_node();
+  assert_eq!(
+    anode.id_ref(),
+    &a_id,
+    "advertise_node() id matches local_id()"
+  );
+  assert_eq!(
+    anode.addr_ref(),
+    &a.advertise_address(),
+    "advertise_node() addr matches advertise_address()"
+  );
+
+  // default_query_timeout() must be a positive duration for a 2-member cluster.
+  let qt = a.default_query_timeout();
+  assert!(
+    qt > Duration::ZERO,
+    "default_query_timeout() must be positive"
+  );
+
+  // default_query_param() must carry that timeout with no filters/relay/ack.
+  let qp = a.default_query_param();
+  assert_eq!(
+    qp.timeout, qt,
+    "default_query_param().timeout matches default_query_timeout()"
+  );
+  assert!(
+    qp.filters.is_empty(),
+    "default_query_param() has no filters"
+  );
+  assert!(!qp.request_ack, "default_query_param() has no ack");
+  assert_eq!(qp.relay_factor, 0, "default_query_param() has no relay");
+
+  a.shutdown().await.expect("snap-a shuts down");
+  b.shutdown().await.expect("snap-b shuts down");
+}
+
+/// `remove_failed_node` is a thin alias for `force_leave(id, false)`. Calling it
+/// on a valid node-id in the cluster must complete without error — the driver
+/// processes the forced leave broadcast unconditionally.
+#[compio::test]
+async fn tcp_remove_failed_node_alias_succeeds() {
+  let b = spawn_node("rfn-b").await;
+  let a = spawn_node("rfn-a").await;
+  let b_addr = b.advertise_address();
+  let b_id = SmolStr::new("rfn-b");
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+
+  // remove_failed_node is force_leave(id, false); must not error.
+  a.remove_failed_node(b_id.clone())
+    .await
+    .expect("remove_failed_node must not error");
+
+  // remove_failed_node_prune is force_leave(id, true); must not error either.
+  a.remove_failed_node_prune(b_id)
+    .await
+    .expect("remove_failed_node_prune must not error");
+
+  a.shutdown().await.expect("rfn-a shuts down");
+  b.shutdown().await.expect("rfn-b shuts down");
+}
+
+/// Two concurrently-polled `join` calls with `ignore_old=true` on cloned handles
+/// must both complete without panicking or deadlocking.
+///
+/// The per-exchange ignore mechanism records each join exchange's `StreamId`
+/// independently and consumes it one-shot at that exchange's own merge, so
+/// concurrent ignore_old joins are safe WITHOUT the former `join_lock` — there is
+/// no shared flag to serialize. This is the concurrency-correctness property that
+/// replaces the old lock-serialization contract.
+#[compio::test]
+async fn tcp_concurrent_ignore_old_joins_coexist() {
+  let b = spawn_node("cji-b").await;
+  let b_addr = b.advertise_address();
+  let a1 = spawn_node("cji-a").await;
+  let a2 = a1.clone();
+
+  // Run both join futures concurrently on the same compio task; with no lock,
+  // they interleave freely and must both still resolve.
+  let (r1, r2) = future::join(
+    a1.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), true),
+    a2.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), true),
+  )
+  .await;
+
+  let contacted = r1.is_ok() as usize + r2.is_ok() as usize;
+  assert!(
+    contacted >= 1,
+    "at least one concurrent ignore_old join must reach node B (got r1={r1:?}, r2={r2:?})"
+  );
+
+  a1.shutdown().await.expect("cji-a shuts down");
+  b.shutdown().await.expect("cji-b shuts down");
+}
+
+/// The same-seed hole the per-exchange key closes: an `ignore_old` join AND a
+/// plain (non-ignore) join to the SAME seed, polled concurrently, must coexist.
+/// Each is a distinct exchange with a distinct `StreamId`, so the ignore_old
+/// suppression targets ONLY its own merge — the plain join's same-seed merge is
+/// never wrongly suppressed, and neither call consumes the other's token. A
+/// per-PEER key could mis-route whichever merge landed first. (The deterministic
+/// per-exchange suppression precision is proven by the serf-proto
+/// `non_ignore_join_to_same_seed_is_not_suppressed` test; here we assert the
+/// driver-level coexistence and convergence.)
+#[compio::test]
+async fn tcp_concurrent_ignore_old_and_plain_join_same_seed_coexist() {
+  let b = spawn_node("cssj-b").await;
+  let b_addr = b.advertise_address();
+  let a = spawn_node("cssj-a").await;
+
+  // Same seed B, two concurrent joins: one ignore_old, one plain.
+  let (r_ignore, r_plain) = future::join(
+    a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), true),
+    a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false),
+  )
+  .await;
+
+  assert!(
+    r_ignore.is_ok() || r_plain.is_ok(),
+    "at least one same-seed join must reach B (ignore={r_ignore:?}, plain={r_plain:?})"
+  );
+
+  // A converges to a 2-member cluster (self + B): neither same-seed join blocked
+  // or dropped the other.
+  compio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if a.num_members() == 2 {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("A must converge to a 2-member cluster (self + B)");
+
+  a.shutdown().await.expect("cssj-a shuts down");
+  b.shutdown().await.expect("cssj-b shuts down");
+}
+
+/// A `dispatch_join` to one peer running concurrently with a
+/// `join_many(ignore_old=true)` to a DIFFERENT peer must not interfere: both
+/// resolve and the node converges to a 3-member cluster. The ignore_old join's
+/// per-exchange suppression targets only its own `StreamId`, so the concurrent
+/// dispatch_join's exchange is never wrongly suppressed (the machine-level
+/// `non_ignore_join_to_same_seed_is_not_suppressed` test proves the
+/// merge-suppression precision deterministically).
+#[compio::test]
+async fn tcp_concurrent_dispatch_join_and_ignore_old_join_coexist() {
+  let b = spawn_node("cdj-b").await;
+  let c = spawn_node("cdj-c").await;
+  let b_addr = b.advertise_address();
+  let c_addr = c.advertise_address();
+  let a = spawn_node("cdj-a").await;
+
+  // Concurrently: an ignore_old await-join to B, and a fire-and-forget
+  // dispatch_join to C. Neither shares state with the other.
+  let (join_b, dispatch_c) = future::join(
+    a.join_many(
+      &SocketAddrResolver,
+      core::iter::once(MaybeResolved::Resolved(b_addr)),
+      true,
+    ),
+    a.dispatch_join(&SocketAddrResolver, &[MaybeResolved::Resolved(c_addr)]),
+  )
+  .await;
+
+  join_b.expect("the ignore_old join_many to B must reach B");
+  assert_eq!(
+    dispatch_c.expect("dispatch_join to C must dispatch"),
+    1,
+    "dispatch_join reports the single dispatched seed"
+  );
+
+  // Both peers must converge into A's membership — the concurrent ignore_old
+  // join to B did not block or drop the dispatch_join to C.
+  compio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if a.num_members() == 3 {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("A must converge to a 3-member cluster (self + B + C)");
+
+  let ids: Vec<SmolStr> = a
+    .members()
+    .iter()
+    .map(|m| m.node().id_ref().clone())
+    .collect();
+  assert!(ids.iter().any(|id| id == "cdj-b"), "members must include B");
+  assert!(ids.iter().any(|id| id == "cdj-c"), "members must include C");
+
+  a.shutdown().await.expect("cdj-a shuts down");
+  b.shutdown().await.expect("cdj-b shuts down");
+  c.shutdown().await.expect("cdj-c shuts down");
 }

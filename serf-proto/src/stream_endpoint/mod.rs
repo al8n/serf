@@ -300,6 +300,40 @@ where
     id
   }
 
+  /// Initiate an outbound **join** push-pull dial to `peer`, returning the
+  /// exchange's [`StreamId`].
+  ///
+  /// Like [`Self::start_push_pull`] with [`PushPullKind::Join`], but when
+  /// `ignore_old` is set it records the returned `StreamId` as a per-EXCHANGE
+  /// ignore-join target on the serf core, so the resulting join merge (whose
+  /// `originating_stream_id` equals this `StreamId`) suppresses replay of the
+  /// peer's pre-join user events (H8/G4). The driver uses this for the seed joins
+  /// of an `ignore_old` join, and must hand the returned `StreamId` to
+  /// [`Self::clear_ignore_join_stream`] if the join terminates without merging.
+  /// Reconnect-driven joins go through the coordinator directly and never ignore
+  /// old events.
+  pub fn start_join_push_pull(&mut self, peer: A, ignore_old: bool, now: Instant) -> StreamId {
+    let id = self.start_push_pull(peer, PushPullKind::Join, now);
+    if ignore_old {
+      self.core.note_ignore_join_stream(id);
+    }
+    id
+  }
+
+  /// Remove a terminated `ignore_old` join's exchange `id` from the serf core's
+  /// ignore set.
+  ///
+  /// The driver calls this when an `ignore_old` join reaches its terminal without
+  /// a merge having consumed the entry (dial failure, timeout, empty push/pull
+  /// body, or a dropped join future). Idempotent: a `StreamId` the success-path
+  /// merge already consumed is simply absent. Required because
+  /// [`memberlist_proto::event::ExchangeCompleted`]'s `eid` is a different domain
+  /// from the `StreamId` on the stream backend, so the machine cannot self-clean
+  /// the no-merge case — the driver owns the per-join terminal bookkeeping.
+  pub fn clear_ignore_join_stream(&mut self, id: StreamId) {
+    self.core.clear_ignore_join_stream(id);
+  }
+
   /// Feed one already-decoded gossip [`Message`] into the coordinator, then
   /// sieve the resulting inner events into serf.
   ///
@@ -486,11 +520,6 @@ where
     A: Data,
   {
     self.core.resync_local_state(&mut self.transport)
-  }
-
-  /// Forwards to [`Endpoint::set_event_join_ignore`].
-  pub fn set_event_join_ignore(&mut self, v: bool) {
-    self.core.set_event_join_ignore(v)
   }
 
   /// Update the local node's tags, re-advertise them via the coordinator, and
@@ -924,10 +953,22 @@ where
       .map(|ns| ns.meta_ref().cheap_clone())
   }
 
-  /// Forwards to [`Endpoint::test_set_event_join_ignore`].
+  /// Forwards to [`Endpoint::test_note_ignore_join_stream`].
   #[cfg(test)]
-  pub(crate) fn test_set_event_join_ignore(&mut self, v: bool) {
-    self.core.test_set_event_join_ignore(v)
+  pub(crate) fn test_note_ignore_join_stream(&mut self, id: StreamId) {
+    self.core.test_note_ignore_join_stream(id)
+  }
+
+  /// Forwards to [`Endpoint::test_has_ignore_join_stream`].
+  #[cfg(test)]
+  pub(crate) fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
+    self.core.test_has_ignore_join_stream(id)
+  }
+
+  /// Forwards to [`Endpoint::test_clear_ignore_join_stream`].
+  #[cfg(test)]
+  pub(crate) fn test_clear_ignore_join_stream(&mut self, id: StreamId) {
+    self.core.test_clear_ignore_join_stream(id)
   }
 
   /// Forwards to [`Endpoint::test_event_min_time`].
@@ -938,14 +979,42 @@ where
 
   /// Forwards to [`Endpoint::test_merge_remote_state`].
   #[cfg(test)]
-  pub(crate) fn test_merge_remote_state(&mut self, user_data: Bytes, is_join: bool)
+  pub(crate) fn test_merge_remote_state(&mut self, user_data: Bytes)
   where
     I: Clone + Data,
     A: Data,
   {
     self
       .core
-      .test_merge_remote_state(&mut self.transport, user_data, is_join)
+      .test_merge_remote_state(&mut self.transport, user_data)
+  }
+
+  /// Forwards to [`Endpoint::test_merge_remote_state_suppressed`].
+  #[cfg(test)]
+  pub(crate) fn test_merge_remote_state_suppressed(&mut self, user_data: Bytes)
+  where
+    I: Clone + Data,
+    A: Data,
+  {
+    self
+      .core
+      .test_merge_remote_state_suppressed(&mut self.transport, user_data)
+  }
+
+  /// Forwards to [`Endpoint::test_merge_remote_state_with_stream`].
+  #[cfg(test)]
+  pub(crate) fn test_merge_remote_state_with_stream(
+    &mut self,
+    user_data: Bytes,
+    is_join: bool,
+    sid: StreamId,
+  ) where
+    I: Clone + Data,
+    A: Data,
+  {
+    self
+      .core
+      .test_merge_remote_state_with_stream(&mut self.transport, user_data, is_join, sid)
   }
 
   /// Forwards to [`Endpoint::test_intent_ltime`].

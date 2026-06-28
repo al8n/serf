@@ -11,21 +11,77 @@ use memberlist_proto::Instant;
 #[cfg(encryption)]
 use memberlist_proto::SecretKey;
 #[cfg(any(feature = "tcp", feature = "quic"))]
+use smallvec::SmallVec;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+use std::net::SocketAddr;
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+use crate::error::SerfError;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 use serf_proto::{
   endpoint::{QueryId, QueryParams},
   event::QueryEvent,
   typed::Tags,
 };
 
+/// Address-set reply for [`Command::Join`].
+///
+/// Both join kinds reply through this single type (mirroring how the memberlist
+/// driver unifies its join reply into one channel type): `Ok(set)` carries the
+/// dispatched set ([`JoinKind::Dispatch`]) or the contacted set
+/// ([`JoinKind::WaitForCompletion`] success); `Err((set, err))` is the legacy
+/// partial-success tuple, surfacing the reached-so-far set alongside the error.
+/// Every error this driver produces — `NotRunning`, `Shutdown`, and
+/// `JoinAllFailed` — resolves before any contact is accumulated, so the tuple's
+/// set is empty in practice; it is carried for the legacy `join_many` shape.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) type JoinReply =
+  core::result::Result<SmallVec<[SocketAddr; 1]>, (SmallVec<[SocketAddr; 1]>, SerfError)>;
+
+/// Payload for [`JoinKind::WaitForCompletion`].
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) struct WaitForCompletionArgs {
+  /// Wall-clock instant past which the driver replies with whatever contacted
+  /// set it has accumulated (an empty set surfaces as `JoinAllFailed`).
+  pub(crate) deadline: Instant,
+}
+
+/// Semantic of a [`Command::Join`] dispatch.
+///
+/// Both kinds share the same `start_push_pull` fan-out (one outbound exchange
+/// per resolved seed); the kind only affects WHEN the reply fires and WHAT it
+/// carries:
+/// - `Dispatch`: reply immediately with the dispatched seed set
+///   (fire-and-forget; the caller does not wait for any exchange to terminate).
+/// - `WaitForCompletion`: reply once every dispatched exchange has terminated
+///   (an [`Event::ExchangeCompleted`](serf_proto::event::Event) with
+///   `kind == ExchangeKind::PushPull` for each) OR the deadline elapses,
+///   whichever comes first; the reply carries the contacted set (an empty set
+///   surfaces as `JoinAllFailed`).
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) enum JoinKind {
+  /// Reply immediately with the dispatched seed set.
+  Dispatch,
+  /// Reply once every dispatched exchange has terminated OR the deadline expires.
+  WaitForCompletion(WaitForCompletionArgs),
+}
+
 /// Payload for [`Command::Join`].
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) struct JoinCmd {
-  /// Pre-resolved socket addresses of the seed peers to contact.
-  pub(crate) seeds: Vec<std::net::SocketAddr>,
-  /// One-shot reply channel delivering the count of seeds the driver dispatched
-  /// a push-pull to. Join is dispatch-only: the reply reports how many exchanges
-  /// were initiated, not how many seeds were reached — actual joins surface as
-  /// membership [`Event`](serf_proto::event::Event)s.
-  pub(crate) reply: Sender<Result<usize>>,
+  /// Pre-resolved socket addresses of the seed peers to contact. The handle
+  /// resolves every `MaybeResolved` seed through the caller's resolver before
+  /// sending the command, so the driver only ever sees concrete addresses.
+  pub(crate) seeds: Vec<SocketAddr>,
+  /// Dispatch semantic — see [`JoinKind`].
+  pub(crate) kind: JoinKind,
+  /// When `true`, each seed's join push/pull is started as an `ignore_old` join
+  /// so the machine records that exchange's `StreamId` and suppresses replay of
+  /// the seed's pre-join user events. Keyed per-EXCHANGE and one-shot — see
+  /// `serf_proto::StreamEndpoint::start_join_push_pull`.
+  pub(crate) ignore_old: bool,
+  /// One-shot reply channel delivering the address-set result. See [`JoinReply`].
+  pub(crate) reply: Sender<JoinReply>,
 }
 
 /// Payload for [`Command::Leave`].
@@ -185,14 +241,6 @@ pub(crate) struct SetTagsCmd {
   pub(crate) reply: Sender<Result<()>>,
 }
 
-/// Payload for [`Command::SetEventJoinIgnore`].
-pub(crate) struct SetEventJoinIgnoreCmd {
-  /// When `true`, the machine suppresses `Event::Member(Join)` events.
-  pub(crate) ignore: bool,
-  /// One-shot reply channel (always `Ok(())`; the setter never fails).
-  pub(crate) reply: Sender<Result<()>>,
-}
-
 /// Payload for [`Command::InstallKey`], [`Command::UseKey`], and
 /// [`Command::RemoveKey`].
 ///
@@ -236,9 +284,11 @@ pub(crate) struct ShutdownCmd {
 /// `I` is the node-id type; `A` is the resolved peer-address type (typically
 /// `std::net::SocketAddr`). All variants are newtype-over-payload-struct.
 pub(crate) enum Command<I, A> {
-  /// Initiate joins to the given seed peers (addresses already resolved). The
-  /// reply carries the count of seeds the driver dispatched a push-pull to, not
-  /// the count reached; actual joins surface as membership events.
+  /// Initiate joins to the given resolved seeds. The reply carries the
+  /// address-set result: a dispatched or contacted set on success, or the
+  /// legacy partial-success tuple on failure (see [`JoinReply`]).
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
   Join(JoinCmd),
 
   /// Begin a graceful leave from the cluster.
@@ -269,10 +319,6 @@ pub(crate) enum Command<I, A> {
   #[cfg(any(feature = "tcp", feature = "quic"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
   SetTags(SetTagsCmd),
-
-  /// Enable or disable suppression of member-join events in the driver's
-  /// observation stream.
-  SetEventJoinIgnore(SetEventJoinIgnoreCmd),
 
   /// Issue a cluster-wide install-key query.
   ///
