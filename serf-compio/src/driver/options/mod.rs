@@ -14,6 +14,15 @@ use crate::error::{InvalidOption, SerfError};
 #[cfg(feature = "clap")]
 use humantime::parse_duration;
 
+/// Default per-call deadline for the await-result
+/// [`Serf::join`](crate::Serf::join) / [`Serf::join_many`](crate::Serf::join_many).
+///
+/// Past this deadline the driver replies with whatever seeds it has contacted so
+/// far (an empty contact set surfaces as
+/// [`SerfError::JoinAllFailed`](crate::SerfError::JoinAllFailed)). Mirrors the
+/// memberlist driver's `DEFAULT_JOIN_DEADLINE`.
+pub const DEFAULT_JOIN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Default per-call deadline for [`Serf::leave`](crate::Serf::leave).
 pub const DEFAULT_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -119,6 +128,8 @@ pub const DEFAULT_OBSERVATION_CHANNEL: Channel = Channel::Bounded(1024);
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct RuntimeOptions {
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  join_deadline: Duration,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   leave_timeout: Duration,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   idle_wake_interval: Duration,
@@ -142,6 +153,15 @@ const _: () = {
 
   #[derive(Args)]
   struct RuntimeOptionsCli {
+    #[arg(
+      id = "runtime-join-deadline",
+      long = "runtime-join-deadline",
+      env = "SERF_RUNTIME_JOIN_DEADLINE",
+      value_parser = parse_duration,
+      // The humantime spelling of DEFAULT_JOIN_DEADLINE.
+      default_value = "10s",
+    )]
+    join_deadline: Duration,
     #[arg(
       id = "runtime-leave-timeout",
       long = "runtime-leave-timeout",
@@ -193,6 +213,7 @@ const _: () = {
   impl From<RuntimeOptionsCli> for RuntimeOptions {
     fn from(c: RuntimeOptionsCli) -> Self {
       Self {
+        join_deadline: c.join_deadline,
         leave_timeout: c.leave_timeout,
         idle_wake_interval: c.idle_wake_interval,
         iter_drain_cap: c.iter_drain_cap,
@@ -234,6 +255,7 @@ const _: () = {
           }
         };
       }
+      take!("runtime-join-deadline", join_deadline, Duration);
       take!("runtime-leave-timeout", leave_timeout, Duration);
       take!("runtime-idle-wake-interval", idle_wake_interval, Duration);
       take!("runtime-iter-drain-cap", iter_drain_cap, usize);
@@ -250,6 +272,7 @@ impl RuntimeOptions {
   #[inline]
   pub const fn new() -> Self {
     Self {
+      join_deadline: DEFAULT_JOIN_DEADLINE,
       leave_timeout: DEFAULT_LEAVE_TIMEOUT,
       idle_wake_interval: DEFAULT_IDLE_WAKE_INTERVAL,
       iter_drain_cap: DEFAULT_ITER_DRAIN_CAP,
@@ -257,6 +280,15 @@ impl RuntimeOptions {
       event_queue_cap: DEFAULT_EVENT_QUEUE_CAP,
       observation_channel: DEFAULT_OBSERVATION_CHANNEL,
     }
+  }
+
+  /// Builder: per-call deadline for the await-result
+  /// [`Serf::join`](crate::Serf::join) / [`join_many`](crate::Serf::join_many).
+  #[must_use]
+  #[inline]
+  pub const fn with_join_deadline(mut self, d: Duration) -> Self {
+    self.join_deadline = d;
+    self
   }
 
   /// Builder: per-call deadline for [`Serf::leave`](crate::Serf::leave).
@@ -308,6 +340,13 @@ impl RuntimeOptions {
     self
   }
 
+  /// Per-call deadline for the await-result [`Serf::join`](crate::Serf::join) /
+  /// [`join_many`](crate::Serf::join_many).
+  #[inline]
+  pub const fn join_deadline(&self) -> Duration {
+    self.join_deadline
+  }
+
   /// Per-call deadline for [`Serf::leave`](crate::Serf::leave).
   #[inline]
   pub const fn leave_timeout(&self) -> Duration {
@@ -353,6 +392,12 @@ impl RuntimeOptions {
   /// (TCP/TLS/QUIC) routes through the one `Serf::new` path, so this single call
   /// covers all three.
   ///
+  /// - `join_deadline == 0`: the await-result join parks a waiter until either
+  ///   every dispatched push/pull terminates or this deadline elapses. A zero
+  ///   deadline is past-due the instant the waiter is parked, so the next reap
+  ///   sweep replies before any `ExchangeCompleted` can be observed — every
+  ///   await-result join would spuriously surface `JoinAllFailed` even against a
+  ///   reachable seed.
   /// - `idle_wake_interval == 0`: the driver loop's fallback sleep when the
   ///   coordinator's `poll_timeout` has no nearer deadline
   ///   (`poll_timeout().unwrap_or(now + idle_wake_interval)`). Zero makes a
@@ -380,6 +425,16 @@ impl RuntimeOptions {
   /// loud immediate [`SerfError::LeaveTimeout`] rather than a silent break.
   #[cfg(any(feature = "tcp", feature = "quic"))]
   pub(crate) fn validate(&self) -> Result<(), SerfError> {
+    if self.join_deadline.is_zero() {
+      return Err(SerfError::InvalidOption(InvalidOption::new(
+        "join_deadline",
+        "the await-result join deadline must be nonzero: a parked join waiter is past-due the \
+           instant it is parked, so the next reap sweep replies before any push/pull \
+           ExchangeCompleted can be observed — every await-result join would spuriously surface \
+           JoinAllFailed even against a reachable seed"
+          .to_string(),
+      )));
+    }
     if self.idle_wake_interval.is_zero() {
       return Err(SerfError::InvalidOption(InvalidOption::new(
         "idle_wake_interval",

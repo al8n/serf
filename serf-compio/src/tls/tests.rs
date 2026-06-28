@@ -202,8 +202,11 @@ async fn two_node_tls_join_observes_membership() {
   let mut a_events = a.events();
 
   // Node A dials node B as its seed.
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   // Node A should observe node B joining via a `Member(Join)` event.
   let observed = compio::time::timeout(Duration::from_secs(20), async {
@@ -429,8 +432,11 @@ async fn two_node_tls_join_observes_membership_encrypted() {
 
   let mut a_events = a.events();
 
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   let observed = compio::time::timeout(Duration::from_secs(20), async {
     loop {

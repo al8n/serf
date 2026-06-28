@@ -5,6 +5,7 @@ use core::time::Duration;
 #[test]
 fn runtime_options_defaults_are_accessible() {
   let opts = RuntimeOptions::new();
+  assert_eq!(opts.join_deadline(), DEFAULT_JOIN_DEADLINE);
   assert_eq!(opts.leave_timeout(), DEFAULT_LEAVE_TIMEOUT);
   assert_eq!(opts.idle_wake_interval(), DEFAULT_IDLE_WAKE_INTERVAL);
   assert_eq!(opts.iter_drain_cap(), DEFAULT_ITER_DRAIN_CAP);
@@ -123,6 +124,19 @@ fn runtime_validate_rejects_zero_idle_wake_interval() {
   ));
 }
 
+// A zero `join_deadline` makes every parked await-join waiter past-due on insert,
+// so the reaper replies `JoinAllFailed` before any push/pull can complete;
+// `validate` rejects it at construction.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[test]
+fn runtime_validate_rejects_zero_join_deadline() {
+  let opts = RuntimeOptions::new().with_join_deadline(Duration::ZERO);
+  assert!(matches!(
+    opts.validate(),
+    Err(crate::SerfError::InvalidOption(_))
+  ));
+}
+
 // `iter_drain_cap == 0` (the per-iteration batch cap; the select arms and the
 // uncapped timeout drain still make one-per-pass forward progress) and
 // `leave_timeout == 0` (a loud immediate `LeaveTimeout`) degrade-but-function,
@@ -212,6 +226,18 @@ fn runtime_validate_rejects_zero_idle_wake_interval_from_serde() {
   ));
 }
 
+#[cfg(all(feature = "serde", any(feature = "tcp", feature = "quic")))]
+#[test]
+fn runtime_validate_rejects_zero_join_deadline_from_serde() {
+  let opts: RuntimeOptions =
+    serde_json::from_str(r#"{"join_deadline":"0s"}"#).expect("deserialize");
+  assert_eq!(opts.join_deadline(), Duration::ZERO);
+  assert!(matches!(
+    opts.validate(),
+    Err(crate::SerfError::InvalidOption(_))
+  ));
+}
+
 // A zero capacity sourced via a clap-parsed flag is rejected the same way.
 #[cfg(all(feature = "clap", any(feature = "tcp", feature = "quic")))]
 #[test]
@@ -269,6 +295,26 @@ fn runtime_validate_rejects_zero_idle_wake_interval_from_clap() {
   let cli = Cli::try_parse_from(["app", "--runtime-idle-wake-interval", "0s"])
     .expect("clap parses idle-wake-interval 0s");
   assert_eq!(cli.runtime.idle_wake_interval(), Duration::ZERO);
+  assert!(matches!(
+    cli.runtime.validate(),
+    Err(crate::SerfError::InvalidOption(_))
+  ));
+}
+
+#[cfg(all(feature = "clap", any(feature = "tcp", feature = "quic")))]
+#[test]
+fn runtime_validate_rejects_zero_join_deadline_from_clap() {
+  use clap::Parser;
+
+  #[derive(Parser)]
+  struct Cli {
+    #[command(flatten)]
+    runtime: RuntimeOptions,
+  }
+
+  let cli = Cli::try_parse_from(["app", "--runtime-join-deadline", "0s"])
+    .expect("clap parses join-deadline 0s");
+  assert_eq!(cli.runtime.join_deadline(), Duration::ZERO);
   assert!(matches!(
     cli.runtime.validate(),
     Err(crate::SerfError::InvalidOption(_))

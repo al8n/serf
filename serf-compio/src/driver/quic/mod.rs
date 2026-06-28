@@ -18,7 +18,7 @@
 
 #![cfg(feature = "quic")]
 
-use std::{cell::Cell, net::SocketAddr, rc::Rc};
+use std::{cell::Cell, collections::HashSet, net::SocketAddr, rc::Rc};
 
 use core::time::Duration;
 
@@ -29,13 +29,16 @@ use futures_channel::oneshot;
 use futures_util::{FutureExt, pin_mut, select_biased};
 use lochan::mpsc;
 use memberlist_proto::{
-  Instant, PushPullKind, Rng, SeedableRng, Transmit,
+  Instant, Rng, SeedableRng, StreamId, Transmit,
   codec::{
     DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
     parse_messages,
   },
 };
-use serf_proto::{LamportTime, QuicEndpoint, event::Event, members::SerfState};
+use serf_proto::{
+  ExchangeKind, ExchangeStatus, LamportTime, QuicEndpoint, event::Event, members::SerfState,
+};
+use smallvec::SmallVec;
 
 #[cfg(encryption)]
 use crate::command::{KeyCmd, ListKeysCmd};
@@ -44,22 +47,146 @@ use crate::delegate::KeyringDelegate;
 use crate::{
   Channel,
   command::{
-    Command, ForceLeaveCmd, JoinCmd, LeaveCmd, QueryCmd, RespondCmd, SetEventJoinIgnoreCmd,
-    SetTagsCmd, ShutdownCmd,
+    Command, ForceLeaveCmd, JoinCmd, JoinKind, JoinReply, LeaveCmd, QueryCmd, RespondCmd,
+    SetTagsCmd, ShutdownCmd, WaitForCompletionArgs,
   },
   delegate::Delegate,
   driver::{
     options::RuntimeOptions,
     shared::{
-      add_obs_payload, dispatch_event_delegate, drain_past_due_udp, observation_payload_bytes,
-      yield_once,
+      ExchangeId, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
+      observation_payload_bytes, yield_once,
     },
   },
-  error::{Result, SerfError},
+  error::{JoinFailed, Result, SerfError},
   snapshot::{SerfSnapshot, SnapshotCell},
 };
 #[cfg(encryption)]
 use serf_proto::{KeyRequestOperation, KeyResponseArgs, event::KeyRequest};
+
+/// Driver-side state for one outstanding await-result join call.
+///
+/// Mirrors the stream driver's `PendingJoin`. A [`Command::Join`] carrying
+/// [`JoinKind::WaitForCompletion`] dispatches one push/pull per resolved seed
+/// and parks the per-call state here. The QUIC coordinator services the dial
+/// in-band, so each `start_push_pull`'s returned machine `StreamId` coerces
+/// directly into the [`ExchangeId`] domain (via `From<StreamId>`) — the same
+/// value the bridge-reap path stamps onto its [`Event::ExchangeCompleted`].
+/// Contact accounting is per-OUTBOUND-EXCHANGE, filtered to
+/// [`ExchangeKind::PushPull`]: each successful exchange pushes its peer into
+/// `contacted`; duplicate seeds count independently.
+///
+/// Reply resolution and ignore-stream cleanup are SEPARATE terminal states. The
+/// caller's reply resolves on all-exchanges-done OR `deadline` (whichever first),
+/// consuming `reply`. The ignore-stream cleanup must wait until every dispatched
+/// exchange has completed — i.e. `pending` is empty — because a `StreamId`
+/// recorded for a still-live exchange must stay in the machine's ignore set so a
+/// late merge still suppresses the peer's pre-join user events. The waiter is
+/// removed from `joins` only once BOTH terminals are reached (reply sent and
+/// `pending` empty); on a deadline that fires with exchanges still live it
+/// replies and LINGERS, holding its `ignore_streams` until they complete.
+struct PendingJoin {
+  /// Outbound exchange ids this waiter dispatched and is still awaiting a
+  /// terminal `ExchangeCompleted` for. Removed on completion; when empty the
+  /// ignore-stream cleanup runs and the waiter is reaped.
+  pending: HashSet<ExchangeId>,
+  /// Peer addresses of the dispatched exchanges that terminated `Succeeded`.
+  contacted: SmallVec<[SocketAddr; 1]>,
+  /// The `StreamId`s this join recorded in the machine's per-exchange ignore set
+  /// (non-empty only for an `ignore_old` join). Each is consumed by its own merge
+  /// on the success path; any that did NOT merge are cleared via
+  /// `clear_ignore_join_stream` only once every dispatched exchange has completed
+  /// (`pending` empty), so a failed `ignore_old` exchange never leaks its
+  /// `StreamId` and a still-live one is never prematurely cleared.
+  ignore_streams: SmallVec<[StreamId; 1]>,
+  /// Total outbound-exchange count this call dispatched — the `JoinAllFailed`
+  /// denominator on a zero-contact resolution.
+  requested: usize,
+  /// Wall-clock instant past which the driver replies with whatever `contacted`
+  /// set it has accumulated even if `pending` is non-empty.
+  deadline: Instant,
+  /// One-shot reply channel back to the caller, taken when the reply resolves
+  /// (all-exchanges-done or `deadline`). `None` once resolved; the waiter then
+  /// lingers — only to drive ignore-stream cleanup — until `pending` empties.
+  /// See [`JoinReply`].
+  reply: Option<oneshot::Sender<JoinReply>>,
+}
+
+impl PendingJoin {
+  /// Resolve the caller's reply once, from the current `contacted` set. Idempotent:
+  /// after the first call `reply` is `None` and this is a no-op, so the deadline
+  /// path and the all-exchanges-done path never double-send. A zero-contact
+  /// resolution is the `JoinAllFailed` the reaper would otherwise have produced.
+  fn resolve_reply(&mut self) {
+    if let Some(reply) = self.reply.take() {
+      let result = if self.contacted.is_empty() {
+        Err((
+          SmallVec::new(),
+          SerfError::JoinAllFailed(JoinFailed::new(self.requested, 0)),
+        ))
+      } else {
+        Ok(self.contacted.clone())
+      };
+      // Ignoring Err: caller dropped the reply receiver (the join future was
+      // cancelled).
+      let _ = reply.send(result);
+    }
+  }
+
+  /// This waiter has reached both terminal states — its reply resolved AND every
+  /// dispatched exchange completed — so it can be removed and its ignore-stream
+  /// cleanup run.
+  fn is_done(&self) -> bool {
+    self.reply.is_none() && self.pending.is_empty()
+  }
+}
+
+/// Apply one terminal `ExchangeCompleted` to its await-result join waiter (if
+/// any), driving both decoupled terminals: remove `eid` from the waiter's
+/// `pending` and, on success, push the peer into `contacted`; resolve the
+/// caller's reply the instant `pending` empties (ahead of the observation
+/// hand-off, so a slow delegate cannot delay it); and once the waiter is fully
+/// done (reply sent AND `pending` empty) clear its still-recorded ignore-join
+/// streams and reap it. A `StreamId` the success-path merge already consumed is
+/// absent, so the clear removes only the streams whose exchange did not merge.
+///
+/// Shared by the live drain and unit tests; takes the decoded
+/// `(eid, peer, succeeded)` rather than the `Event` so it is callable without
+/// constructing a coordinator-internal `ExchangeCompleted`.
+fn complete_join_exchange<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R>,
+  pending_joins: &mut Vec<PendingJoin>,
+  eid: ExchangeId,
+  peer: SocketAddr,
+  succeeded: bool,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let Some(idx) = pending_joins
+    .iter()
+    .position(|pj| pj.pending.contains(&eid))
+  else {
+    return;
+  };
+  let pj = &mut pending_joins[idx];
+  pj.pending.remove(&eid);
+  if succeeded {
+    pj.contacted.push(peer);
+  }
+  // Resolve the reply the moment every dispatched exchange has terminated. If the
+  // deadline already replied, `reply` is `None` and this is a no-op.
+  if pj.pending.is_empty() {
+    pj.resolve_reply();
+  }
+  if pending_joins[idx].is_done() {
+    let pj = pending_joins.swap_remove(idx);
+    for s in &pj.ignore_streams {
+      endpoint.clear_ignore_join_stream(*s);
+    }
+  }
+}
 
 /// Driver-side state for the single in-flight graceful-leave operation.
 ///
@@ -103,6 +230,8 @@ impl PendingLeave {
 
 /// Pump-loop-local state tracking outstanding commands awaiting completion.
 struct PendingCommands {
+  /// Outstanding await-result join waiters. See [`PendingJoin`].
+  joins: Vec<PendingJoin>,
   /// Outstanding graceful-leave waiter (at most one at a time). See [`PendingLeave`].
   leave: Option<PendingLeave>,
 }
@@ -208,7 +337,10 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   // closes the gossip socket so the bound port is free when the caller resumes
   // from `shutdown.await`.
   let mut shutdown_reply: Option<oneshot::Sender<Result<()>>> = None;
-  let mut pending = PendingCommands { leave: None };
+  let mut pending = PendingCommands {
+    joins: Vec::new(),
+    leave: None,
+  };
 
   // Per-pump UDP recv buffer size, derived once at entry as the larger of the
   // gossip plane (`gossip_mtu` + AEAD wrapper) and the raw-QUIC plane (quinn's
@@ -293,6 +425,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &*keyring,
       )
       .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
       reap_pending_leave(&mut pending.leave, Instant::now()).await;
       refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
       break;
@@ -308,6 +441,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       .unwrap_or(setup_now + driver_opts.idle_wake_interval());
     let timeout_deadline = [
       Some(endpoint_deadline),
+      min_pending_join_deadline(&pending.joins),
       min_pending_leave_deadline(&pending.leave),
     ]
     .into_iter()
@@ -351,6 +485,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &*keyring,
       )
       .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
       reap_pending_leave(&mut pending.leave, Instant::now()).await;
       if dirty {
         refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
@@ -380,6 +515,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &*keyring,
       )
       .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
       reap_pending_leave(&mut pending.leave, Instant::now()).await;
       refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
       dirty = false;
@@ -487,6 +623,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
     {
       exit = true;
     }
+    reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
     reap_pending_leave(&mut pending.leave, Instant::now()).await;
 
     if dirty {
@@ -507,6 +644,21 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
     reply_shutdown(c);
   }
   drop(commands);
+  // Reply Err(Shutdown) to every parked await-result join waiter whose reply has
+  // not yet resolved — their reply receivers would otherwise hang forever (the
+  // loop's reap path is gone and the task is exiting). Clear EVERY remaining
+  // waiter's ignore-join streams (including a lingering waiter that already
+  // replied on its deadline but was awaiting exchange completion): after shutdown
+  // no late merge can arrive, so nothing is left to suppress.
+  for pj in pending.joins.drain(..) {
+    for s in &pj.ignore_streams {
+      endpoint.clear_ignore_join_stream(*s);
+    }
+    if let Some(reply) = pj.reply {
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(Err((SmallVec::new(), SerfError::Shutdown)));
+    }
+  }
   if let Some(pl) = pending.leave.take() {
     pl.resolve_all(|| Err(SerfError::Shutdown)).await;
   }
@@ -527,12 +679,9 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
   // Ignoring Err on each send: caller dropped the reply receiver.
   match c {
     Command::Join(JoinCmd { reply, .. }) => {
-      let _ = reply.send(Err(SerfError::Shutdown));
+      let _ = reply.send(Err((SmallVec::new(), SerfError::Shutdown)));
     }
     Command::Leave(LeaveCmd { reply }) | Command::Shutdown(ShutdownCmd { reply }) => {
-      let _ = reply.send(Err(SerfError::Shutdown));
-    }
-    Command::SetEventJoinIgnore(SetEventJoinIgnoreCmd { reply, .. }) => {
       let _ = reply.send(Err(SerfError::Shutdown));
     }
     Command::ForceLeave(ForceLeaveCmd { reply, .. }) => {
@@ -584,34 +733,81 @@ async fn dispatch_command<I, G, R>(
 {
   let running = endpoint.state() == SerfState::Alive;
   match cmd {
-    Command::Join(JoinCmd { seeds, reply }) => {
+    Command::Join(JoinCmd {
+      seeds,
+      kind,
+      ignore_old,
+      reply,
+    }) => {
       // Gate on a running node: `leave()` is terminal (it stops the periodic
       // schedulers), so a join after leave would leave the node non-participating.
       if !running {
         // Ignoring Err: caller dropped the reply receiver.
-        let _ = reply.send(Err(SerfError::NotRunning));
+        let _ = reply.send(Err((SmallVec::new(), SerfError::NotRunning)));
         return;
       }
       // Announce the serf-level join intent so peers learn the local join ltime
       // without waiting for the next anti-entropy round.
       if let Err(e) = endpoint.join() {
         // Ignoring Err: caller dropped the reply receiver.
-        let _ = reply.send(Err(SerfError::from(e)));
+        let _ = reply.send(Err((SmallVec::new(), SerfError::from(e))));
         return;
       }
-      // Dial every seed via a coordinator push-pull (the driver owns the inner-
-      // memberlist join). The QUIC coordinator services the dial + flushes the
-      // outbound queue in-band; the handshake packets surface on the next
-      // `poll_transmit` drain.
-      let count = seeds.len();
-      for seed in seeds {
-        let _sid = endpoint.start_push_pull(seed, PushPullKind::Join, now);
+      // The QUIC coordinator services the dial + flushes the outbound queue
+      // in-band, so each `start_push_pull`'s returned machine `StreamId` coerces
+      // directly into the `ExchangeId` the bridge-reap path will stamp onto its
+      // `ExchangeCompleted` — no inline action drain / capture is needed.
+      match kind {
+        JoinKind::Dispatch => {
+          let mut dispatched: SmallVec<[SocketAddr; 1]> = SmallVec::new();
+          for seed in seeds {
+            // Ignoring StreamId return: the Dispatch arm tracks no per-exchange
+            // waiter state — completion / failure surfaces through `poll_event`.
+            let _sid = endpoint.start_join_push_pull(seed, ignore_old, now);
+            dispatched.push(seed);
+          }
+          // Ignoring Err: caller dropped the reply receiver (the fire-and-forget
+          // `dispatch_join` future was cancelled).
+          let _ = reply.send(Ok(dispatched));
+        }
+        JoinKind::WaitForCompletion(WaitForCompletionArgs { deadline }) => {
+          let requested = seeds.len();
+          let mut exchange_ids: HashSet<ExchangeId> = HashSet::with_capacity(requested);
+          // An `ignore_old` join records every seed's `StreamId` in the machine;
+          // the driver owns clearing any that fail to merge. A plain join records
+          // nothing, so this stays empty.
+          let mut ignore_streams: SmallVec<[StreamId; 1]> = SmallVec::new();
+          for seed in seeds {
+            let sid = endpoint.start_join_push_pull(seed, ignore_old, now);
+            if ignore_old {
+              ignore_streams.push(sid);
+            }
+            exchange_ids.insert(ExchangeId::from(sid));
+          }
+          if exchange_ids.is_empty() {
+            // No seed produced an exchange (only reachable with a zero-length
+            // `seeds`, which the handle never sends for an await join). Resolve
+            // now — parking would hang with no terminal event incoming.
+            for s in &ignore_streams {
+              endpoint.clear_ignore_join_stream(*s);
+            }
+            // Ignoring Err: caller dropped the reply receiver.
+            let _ = reply.send(Err((
+              SmallVec::new(),
+              SerfError::JoinAllFailed(JoinFailed::new(requested, 0)),
+            )));
+          } else {
+            pending.joins.push(PendingJoin {
+              pending: exchange_ids,
+              contacted: SmallVec::new(),
+              ignore_streams,
+              requested,
+              deadline,
+              reply: Some(reply),
+            });
+          }
+        }
       }
-      // serf surfaces a push-pull's outcome as the internal `RemoteStateReceived`
-      // sieve, not an `ExchangeCompleted` event, so the pump reports the count of
-      // seeds dispatched rather than parking for per-exchange contact accounting.
-      // Ignoring Err: caller dropped the reply receiver.
-      let _ = reply.send(Ok(count));
     }
     Command::Leave(LeaveCmd { reply }) => {
       // Leave is a SHARED in-flight operation. If one is in flight, JOIN it (do
@@ -703,11 +899,6 @@ async fn dispatch_command<I, G, R>(
       };
       // Ignoring Err: caller dropped the reply receiver.
       let _ = reply.send(res);
-    }
-    Command::SetEventJoinIgnore(SetEventJoinIgnoreCmd { ignore, reply }) => {
-      endpoint.set_event_join_ignore(ignore);
-      // Ignoring Err: caller dropped the reply receiver.
-      let _ = reply.send(Ok(()));
     }
     #[cfg(encryption)]
     Command::InstallKey(KeyCmd {
@@ -1004,6 +1195,23 @@ where
   let mut drained = false;
   while let Some(ev) = endpoint.poll_event() {
     drained = true;
+    // Await-result join resolution. `ExchangeCompleted` fires for every outbound
+    // bridge kind; an await-join waiter consumes only `PushPull` completions.
+    // `complete_join_exchange` drives both decoupled terminals: it resolves the
+    // caller's reply the moment `pending` empties (here on the pump task, ahead of
+    // the observation hand-off, so a slow delegate cannot delay it) and clears the
+    // ignore-join streams only once the waiter is fully done.
+    if let Event::ExchangeCompleted(ref c) = ev
+      && c.kind() == ExchangeKind::PushPull
+    {
+      complete_join_exchange(
+        endpoint,
+        &mut pending.joins,
+        c.eid(),
+        *c.peer(),
+        matches!(c.outcome(), ExchangeStatus::Succeeded),
+      );
+    }
     // Leave-completion resolution. `LeftCluster` fires once the leave notices
     // have drained to the wire; resolving the parked waiter here — on this pump
     // task, ahead of the observation task's `notify_leave` — is what makes
@@ -1180,6 +1388,61 @@ async fn observation_task<I, D>(
       events_dropped.set(events_dropped.get() + 1);
     }
   }
+}
+
+/// Reap await-result join waiters on the deadline timer. This drives ONLY the
+/// reply terminal: a waiter whose `deadline` has elapsed replies its partial
+/// `contacted` (the same timeout semantics the caller always had). Reply
+/// resolution is decoupled from ignore-stream cleanup — on a deadline that fires
+/// with exchanges still live (`pending` non-empty) the waiter replies and
+/// LINGERS, keeping its `ignore_streams` recorded so a late merge for a still-live
+/// exchange still suppresses; the lingering waiter is then reaped by
+/// [`complete_join_exchange`] when its last exchange completes. The all-exchanges-
+/// done case (including a zero-exchange degenerate waiter) is reaped there too.
+///
+/// A waiter is removed (and its still-recorded ignore-join streams cleared) here
+/// only once BOTH terminals are reached — reply resolved AND `pending` empty —
+/// covering any timer/event ordering. A stream the success-path merge already
+/// consumed is absent, so the clear removes only the streams whose exchange did
+/// not merge. Mirrors the stream driver's `reap_pending_joins`; `swap_remove` is
+/// sound because `joins` has no ordering.
+async fn reap_pending_joins<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R>,
+  pending_joins: &mut Vec<PendingJoin>,
+  now: Instant,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut i = 0;
+  while i < pending_joins.len() {
+    if now >= pending_joins[i].deadline {
+      // Deadline reached: resolve the reply with the partial `contacted`. This is
+      // a no-op if the all-exchanges-done path already replied.
+      pending_joins[i].resolve_reply();
+    }
+    if pending_joins[i].is_done() {
+      // Reply resolved AND every dispatched exchange completed — clear the
+      // ignore-join streams that did not merge and reap the waiter.
+      let pj = pending_joins.swap_remove(i);
+      for s in &pj.ignore_streams {
+        endpoint.clear_ignore_join_stream(*s);
+      }
+    } else {
+      i += 1;
+    }
+  }
+}
+
+/// Earliest pending-join deadline, if any — folded into the per-iteration
+/// `timeout_deadline` so the timer fires by the first expiring join's deadline.
+fn min_pending_join_deadline(pending_joins: &[PendingJoin]) -> Option<Instant> {
+  pending_joins
+    .iter()
+    .filter(|pj| pj.reply.is_some())
+    .map(|pj| pj.deadline)
+    .min()
 }
 
 /// Reap a deadline-expired graceful-leave waiter. If `pending_leave`'s deadline

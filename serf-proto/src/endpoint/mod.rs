@@ -60,7 +60,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use memberlist_proto::{
-  CheapClone, Data, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng,
+  CheapClone, Data, Id, Instant, Node, PushPullKind, Rng, SeedableRng, SmallRng, StreamId,
   typed::{Meta, NodeState},
 };
 
@@ -497,6 +497,17 @@ pub enum Error {
   /// when already `Leaving` or `Shutdown`.
   #[error("leave called from invalid state: {0}")]
   BadLeaveState(SerfState),
+  /// `leave()` could not stamp a leave intent because the member Lamport clock
+  /// has reached the `LTIME_MAX` integrity floor.
+  ///
+  /// The post-incremented leave ltime would land at or above `LTIME_MAX`, which
+  /// every node (including this one) rejects, so broadcasting it or starting the
+  /// inner leave would desync local membership.  The endpoint parks
+  /// degraded-but-safe: it stays `Alive` and consistent, emits no invalid
+  /// intent, and starts no inner leave.  Unreachable in any finite cluster
+  /// lifetime (2^63 membership events).
+  #[error("leave clock exhausted: member clock reached the LTIME_MAX integrity floor")]
+  LeaveClockExhausted,
   /// `join()` was called while the local endpoint is not `Alive`.
   ///
   /// serf only announces its own join intent from the `Alive` state; a
@@ -761,13 +772,28 @@ where
   /// `Endpoint` always ships a current serf snapshot on the next push-pull
   /// egress — not the snapshot from the last explicit sync.
   local_state_dirty: bool,
-  /// When `true`, a push-pull join bumps `event_buffer.min_time` to the
-  /// remote `event_ltime` (H8/G4 / Go serf `eventJoinIgnore`).
+  /// Outbound exchange [`StreamId`]s serf started as an `ignore_old` join
+  /// push/pull.
   ///
-  /// Set by the driver via `set_event_join_ignore(true)` before issuing a
-  /// join that should suppress replay of the peer's buffered events.  The
-  /// ingress `merge_remote_state` checks this on `is_join == true`.
-  event_join_ignore: bool,
+  /// When the driver issues an `ignore_old` join, the composing super-machine
+  /// records the exchange's `StreamId` here (via
+  /// [`Endpoint::note_ignore_join_stream`]) — the same `StreamId` that
+  /// `start_push_pull` returned. The matching merge arrives as
+  /// `RemoteStateReceived` carrying that exchange's `originating_stream_id`; when
+  /// it equals a recorded entry the entry is consumed (one-shot) and
+  /// `event_buffer.min_time` is bumped to the remote `event_ltime`, dropping the
+  /// peer's pre-join user events (H8/G4 / Go serf `eventJoinIgnore`). A failed,
+  /// timed-out, or dropped `ignore_old` join never merges, so the driver removes
+  /// its `StreamId` (via [`Endpoint::clear_ignore_join_stream`]) when the join
+  /// reaches its terminal — a stale entry can never leak.
+  ///
+  /// Keyed per-EXCHANGE, not per-peer: two joins to the SAME seed (e.g. an
+  /// `ignore_old` join racing a `dispatch_join`) get distinct `StreamId`s, so
+  /// only the `ignore_old` join's own merge is suppressed — whichever merge lands
+  /// first can no longer consume the wrong token. The set is tiny (the in-flight
+  /// `ignore_old` exchanges), so a `Vec` with linear lookup is the right
+  /// structure.
+  ignore_join_streams: Vec<StreamId>,
   /// The address of the most recently reconnect-dialled peer.
   ///
   /// Set by `fire_reconnect` each time a dial is initiated.  Test helpers
@@ -843,7 +869,7 @@ where
       // The snapshot starts dirty so the first push-pull always ships a fresh
       // body even if no explicit API call has been made yet.
       local_state_dirty: true,
-      event_join_ignore: false,
+      ignore_join_streams: Vec::new(),
       #[cfg(feature = "coordinates")]
       coord_client,
       #[cfg(feature = "coordinates")]
@@ -1138,9 +1164,19 @@ where
         self.handle_user_packet(t, from, data, now);
       }
       IE::RemoteStateReceived(r) => {
+        // Correlate the merge to the exchange that produced it by its
+        // `originating_stream_id` — for an outbound join this is exactly the
+        // `StreamId` `start_push_pull` returned and that the driver recorded.
+        let sid = r.originating_stream_id();
         let (_peer, user_data, is_join) = r.into_parts();
         if !user_data.is_empty() {
-          self.merge_remote_state(t, user_data, is_join);
+          // Consume the one-shot ignore-join entry for THIS exchange iff this is
+          // a join: the `ignore_old` join's own merge suppresses its pre-join
+          // user events. A refresh, or any other exchange to the same peer (a
+          // concurrent `dispatch_join`, or an inbound join we did not ignore),
+          // carries a different `StreamId` and leaves the set untouched.
+          let suppress = is_join && self.consume_ignore_join_stream(sid);
+          self.merge_remote_state(t, user_data, suppress);
         }
       }
 
@@ -1187,8 +1223,17 @@ where
       // ── drop with no serf-level action ───────────────────────────────────
       // PingFailed: no serf action; the inner already records the failure.
       IE::PingFailed(_) => {}
-      // ExchangeCompleted: driver bookkeeping only; serf takes no action.
-      IE::ExchangeCompleted(_) => {}
+      // Surface the terminal exchange outcome so drivers awaiting a Join
+      // push/pull (or any other reliable exchange) can resolve without
+      // inferring completion from membership-state side effects.
+      IE::ExchangeCompleted(p) => {
+        // An ignore-join's `StreamId` is NOT cleaned here: `ExchangeCompleted`
+        // carries the coordinator-allocated `eid`, which on the stream backend
+        // is a separate domain from the `StreamId` the ignore set is keyed by.
+        // The driver clears a terminated `ignore_old` join's `StreamId` from its
+        // own per-join bookkeeping instead (see `clear_ignore_join_stream`).
+        self.pending_events.push_back(Event::ExchangeCompleted(p));
+      }
       // DecodeError: the inner has already logged / tracked the error;
       // serf takes no action on undecodable inner messages.
       IE::DecodeError(_) => {}
@@ -1306,16 +1351,49 @@ where
     }
   }
 
-  /// Set the `event_join_ignore` flag.
+  /// Record outbound exchange `id` as an `ignore_old` join.
   ///
-  /// When `true`, an incoming push-pull marked as a join bumps
-  /// `event_buffer.min_time` to the remote `event_ltime` so that
-  /// pre-join events from that peer are not replayed locally (H8/G4).
+  /// The composing super-machine calls this when the driver starts an
+  /// `ignore_old` join push/pull, passing the `StreamId` `start_push_pull`
+  /// returned, so the matching merge (whose `originating_stream_id` equals `id`)
+  /// bumps `event_buffer.min_time` and suppresses replay of the peer's pre-join
+  /// user events (H8/G4). The entry is one-shot: it is consumed at the join merge
+  /// (see [`Self::consume_ignore_join_stream`]) or removed by the driver via
+  /// [`Self::clear_ignore_join_stream`] when the join terminates without a merge.
+  /// Idempotent — a duplicate `StreamId` is not stored twice.
+  pub(crate) fn note_ignore_join_stream(&mut self, id: StreamId) {
+    if !self.ignore_join_streams.contains(&id) {
+      self.ignore_join_streams.push(id);
+    }
+  }
+
+  /// Consume the one-shot ignore-join entry for exchange `id`, returning whether
+  /// one was present.
   ///
-  /// The driver sets this before calling `inner.join` to suppress historic
-  /// user events from the seed peers.
-  pub fn set_event_join_ignore(&mut self, v: bool) {
-    self.event_join_ignore = v;
+  /// Called on a join push/pull merge whose `originating_stream_id` is `id`
+  /// (suppression is applied iff this returns `true`). Removing the entry here is
+  /// what makes the ignore per-exchange one-shot: a second merge on the same
+  /// stream, or any other exchange to the same peer, is unaffected.
+  fn consume_ignore_join_stream(&mut self, id: StreamId) -> bool {
+    if let Some(idx) = self.ignore_join_streams.iter().position(|s| *s == id) {
+      self.ignore_join_streams.swap_remove(idx);
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Remove exchange `id` from the ignore-join set without applying suppression.
+  ///
+  /// The driver calls this when an `ignore_old` join reaches its terminal without
+  /// a merge having consumed the entry (dial failure, timeout, empty push/pull
+  /// body, or a dropped join future), so a stale `StreamId` can never linger.
+  /// Idempotent: a `StreamId` the merge already consumed on the success path is
+  /// simply absent, making this a no-op there. `ExchangeCompleted` cannot drive
+  /// this on the stream backend because its `eid` is a different domain from the
+  /// `StreamId`, so the cleanup is driver-side per-join bookkeeping.
+  pub(crate) fn clear_ignore_join_stream(&mut self, id: StreamId) {
+    self.consume_ignore_join_stream(id);
   }
 
   /// Update the local node's tags, re-advertise them via the coordinator, and
@@ -1406,11 +1484,12 @@ where
   /// the causal ordering intact).
   ///
   /// **G4 — `eventJoinIgnore` bumps `event_buffer.min_time`:**
-  /// If `is_join` is `true` AND `self.event_join_ignore` is set, the
-  /// `event_buffer.min_time` is raised to `max(min_time, event_ltime)`.
-  /// This suppresses all buffered user events from the remote peer that
-  /// pre-date the current event-clock (prevents re-emitting stale events
-  /// on a fresh join exchange).
+  /// If `suppress_pre_join_events` is set (the caller saw a join push/pull from
+  /// a peer it started an `ignore_old` join against and consumed the one-shot
+  /// per-peer entry), the `event_buffer.min_time` is raised to
+  /// `max(min_time, event_ltime)`. This suppresses all buffered user events
+  /// from the remote peer that pre-date the current event-clock (prevents
+  /// re-emitting stale events on a fresh join exchange).
   ///
   /// After the intent passes, every buffered user event in the push-pull
   /// body is replayed via `handle_user_event`.  Events older than
@@ -1419,7 +1498,7 @@ where
   ///
   /// Decoding errors in the `user_data` bytes are silently dropped —
   /// the machine must not panic on bad network input.
-  fn merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes, is_join: bool)
+  fn merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes, suppress_pre_join_events: bool)
   where
     T: Reliable<I, A>,
     I: Clone + Data,
@@ -1518,10 +1597,12 @@ where
       self.handle_node_join_intent(*ltime, node_id, now);
     }
 
-    // G4: if is_join && event_join_ignore, bump event_buffer.min_time to
-    // max(min_time, remote event_ltime).  This prevents pre-join events
-    // from being replayed on a fresh join exchange.
-    if is_join && self.event_join_ignore && event_ltime > self.event_buffer.min_time {
+    // G4: when this join push/pull came from a peer we started an `ignore_old`
+    // join against (the caller consumed the one-shot per-peer entry and passed
+    // `suppress_pre_join_events`), bump event_buffer.min_time to
+    // max(min_time, remote event_ltime).  This prevents the peer's pre-join
+    // events from being replayed on a fresh join exchange.
+    if suppress_pre_join_events && event_ltime > self.event_buffer.min_time {
       self.event_buffer.min_time = event_ltime;
       self.mark_local_state_dirty();
     }
@@ -2171,18 +2252,23 @@ where
   /// - `Alive` → proceeds with the leave chain below.
   ///
   /// Leave chain (decision 5 / oracle `api.go` leave()):
-  /// 1. Set `state = Leaving`.
-  /// 2. Handle the local leave intent (`handle_node_leave_intent` for the
-  ///    local id), which marks the local node as `Leaving` in the membership
-  ///    store and queues a join-refute suppression.
-  /// 3. Increment the member clock.
-  /// 4. Enqueue a leave-intent broadcast on the intent tier (rank 0) so
+  /// 1. Post-increment the member clock to stamp the leave ltime — but only
+  ///    after the [`LTIME_MAX`] integrity-floor gate: if the stamp would land at
+  ///    or above `LTIME_MAX` (a clock driven near the floor), return
+  ///    [`Error::LeaveClockExhausted`] without mutating any state. No invalid
+  ///    intent is emitted and no inner leave starts; the endpoint stays a
+  ///    consistent `Alive` member (degraded-but-safe).
+  /// 2. Set `state = Leaving`, then handle the local leave intent
+  ///    (`handle_node_leave_intent` for the local id), which marks the local
+  ///    node as `Leaving` in the membership store and queues a join-refute
+  ///    suppression.
+  /// 3. Enqueue a leave-intent broadcast on the intent tier (rank 0) so
   ///    peers learn about the leave.  (`FIX`: no `on_finished` callback —
   ///    flushing is bounded by `broadcast_timeout` deadline instead.)
-  /// 5. Call inner `leave(now)` to begin the memberlist dead-self fan-out.
+  /// 4. Call inner `leave(now)` to begin the memberlist dead-self fan-out.
   ///    The inner will eventually emit `Event::LeftCluster` once all dead-self
   ///    packets are drained via `poll_transmit`.
-  /// 6. Arm `leave_broadcast_deadline = now + broadcast_timeout`.  The
+  /// 5. Arm `leave_broadcast_deadline = now + broadcast_timeout`.  The
   ///    driver can short-circuit by watching `user_broadcast_queue_len()`.
   ///
   /// The `Leaving → Left` transition happens later in `handle_timeout` when
@@ -2202,26 +2288,53 @@ where
       SerfState::Alive => {}
     }
 
-    // 1. Transition to Leaving.
+    let local_id = t.endpoint_ref().local_id_ref().clone();
+
+    // Post-increment: advance first, then stamp the new value. This matches
+    // Go serf's clock.Increment() (returns the new value), and is required so
+    // the leave ltime (1 on a fresh node) is strictly greater than the
+    // self-join status_time (0), preventing a stale-intent rejection.
+    //
+    // Compute the prospective stamp WITHOUT committing the clock yet: near the
+    // LTIME_MAX integrity floor (a member clock driven there by a corrupt
+    // snapshot or crafted peer value), the post-incremented stamp lands at or
+    // above LTIME_MAX, which handle_node_leave_intent and every peer reject.
+    // Committing such a clock would also poison our push-pull snapshot — peers
+    // drop a whole body whose top-level ltime is out of range — so we park
+    // degraded-but-safe BEFORE any mutation: stay Alive and consistent, emit no
+    // invalid intent, and start no inner leave. Unreachable in any finite
+    // cluster lifetime (2^63 membership events).
+    let stamp = self.clock.saturating_add(1);
+    if !ltime_is_acceptable(stamp) {
+      return Err(Error::LeaveClockExhausted);
+    }
+
+    // The stamp is acceptable: commit it and transition to Leaving.
+    self.clock = stamp;
+    let ltime = LamportTime(self.clock);
+    self.mark_local_state_dirty();
+
+    // 1. Transition to Leaving BEFORE applying the local intent so the
+    //    self-refute guard in handle_node_leave_intent does NOT fire (it only
+    //    fires when state == Alive).
     self.state = SerfState::Leaving;
 
-    // 2. Local leave intent — marks the local node as Leaving in the store
-    //    and witnesses the member clock.
-    let local_id = t.endpoint_ref().local_id_ref().clone();
-    // next_ltime stamps the current clock value (clamped to < LTIME_MAX) and
-    // advances the clock in one atomic step, closing the local-emission hole.
-    let ltime = LamportTime(next_ltime(&mut self.clock));
-    self.mark_local_state_dirty();
-    // We are setting state = Leaving above so the self-refute guard in
-    // handle_node_leave_intent will NOT fire (it only fires when state == Alive).
-    self.handle_node_leave_intent(t, ltime, &local_id, false, now);
+    // 2. Local leave intent — marks the local node as Leaving in the store. The
+    //    acceptability gate above guarantees this applies; defensively revert to
+    //    a consistent Alive state and bail if it somehow did not, so we never
+    //    broadcast an intent no node can apply nor start an inconsistent inner
+    //    leave.
+    if !self.handle_node_leave_intent(t, ltime, &local_id, false, now) {
+      self.state = SerfState::Alive;
+      return Err(Error::LeaveClockExhausted);
+    }
 
-    // 4. Broadcast the leave intent on the intent tier (rank 0) so peers learn
+    // 3. Broadcast the leave intent on the intent tier (rank 0) so peers learn
     //    the local node is leaving without waiting for anti-entropy.  The
     //    driver bounds the flush via the broadcast deadline below.
     self.broadcast_leave(t, ltime, local_id, false);
 
-    // 5. Arm the broadcast-timeout deadline so the driver always has a finite
+    // 4. Arm the broadcast-timeout deadline so the driver always has a finite
     //    wait; it can short-circuit by watching `user_broadcast_queue_len()`.
     self.leave_broadcast_deadline = Some(now + self.opts.broadcast_timeout());
 
@@ -2256,13 +2369,28 @@ where
       return Err(Error::BadLeaveState(self.state));
     }
 
-    // Advance first, then stamp the new value so the forced leave outranks any
-    // prior status the target node has (post-increment semantics, unlike leave()
-    // which stamps pre-increment).  saturating_add is the no-UB backstop.
-    self.clock = self.clock.saturating_add(1);
+    // Compute the prospective stamp WITHOUT committing the clock yet: near the
+    // LTIME_MAX integrity floor, the post-incremented stamp lands at or above
+    // LTIME_MAX, which handle_node_leave_intent and every peer reject.
+    // Committing such a clock would also poison push-pull snapshots, so we park
+    // degraded-but-safe BEFORE any mutation: advance no clock, apply no local
+    // intent, and broadcast nothing. Mirrors the identical guard in leave().
+    let stamp = self.clock.saturating_add(1);
+    if !ltime_is_acceptable(stamp) {
+      return Err(Error::LeaveClockExhausted);
+    }
+
+    // The stamp is acceptable: commit it.
+    self.clock = stamp;
     let ltime = LamportTime(self.clock);
     self.mark_local_state_dirty();
-    self.handle_node_leave_intent(t, ltime, &id, prune, now);
+
+    // Apply the local leave intent; if for any reason it does not apply (e.g.
+    // the target is unknown), skip the broadcast so we do not emit an intent
+    // no node can apply.
+    if !self.handle_node_leave_intent(t, ltime, &id, prune, now) {
+      return Ok(());
+    }
 
     // Broadcast the leave intent (carrying the prune flag) so peers apply the
     // same forced removal.
@@ -4036,10 +4164,27 @@ where
     self.local_state_dirty
   }
 
-  /// Set the `event_join_ignore` flag (test adapter).
+  /// Record outbound exchange `id` as an `ignore_old` join (test adapter).
   #[cfg(test)]
-  pub(crate) fn test_set_event_join_ignore(&mut self, v: bool) {
-    self.event_join_ignore = v;
+  pub(crate) fn test_note_ignore_join_stream(&mut self, id: StreamId) {
+    self.note_ignore_join_stream(id);
+  }
+
+  /// Whether exchange `id` is currently a recorded `ignore_old` join (test
+  /// adapter for cancellation / one-shot-consume / per-exchange assertions).
+  #[cfg(test)]
+  pub(crate) fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
+    self.ignore_join_streams.contains(&id)
+  }
+
+  /// Mirror the driver's terminal cleanup (test adapter): drop the pending
+  /// ignore-join entry for exchange `id`, exactly as
+  /// [`Self::clear_ignore_join_stream`] does when a join terminates without a
+  /// merge — a dial failure, timeout, or a dropped join future — so the
+  /// cancellation-safety property can be asserted directly.
+  #[cfg(test)]
+  pub(crate) fn test_clear_ignore_join_stream(&mut self, id: StreamId) {
+    self.clear_ignore_join_stream(id);
   }
 
   /// Read the current `event_buffer.min_time` (test adapter for G4 assertions).
@@ -4050,19 +4195,56 @@ where
 
   // ── Push-pull / merge test helpers ───────────────────────────────────────
 
-  /// Directly invoke `merge_remote_state` with raw `user_data` bytes (test adapter).
+  /// Directly invoke `merge_remote_state` with raw `user_data` bytes and no
+  /// ignore-old suppression (test adapter).
   ///
   /// Sets `drain_now = Instant::ORIGIN` before the call so intent handlers
   /// receive a stable `now`.  Use `test_set_drain_now` to override the
-  /// timestamp when wall-clock values matter.
+  /// timestamp when wall-clock values matter.  For the ignore-old / G4 path use
+  /// [`Self::test_merge_remote_state_with_stream`] (per-exchange consume) or
+  /// [`Self::test_merge_remote_state_suppressed`] (suppression applied directly).
   #[cfg(test)]
-  pub(crate) fn test_merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes, is_join: bool)
+  pub(crate) fn test_merge_remote_state<T>(&mut self, t: &mut T, user_data: Bytes)
   where
     T: Reliable<I, A>,
     I: Clone + Data,
     A: Data,
   {
-    self.merge_remote_state(t, user_data, is_join);
+    self.merge_remote_state(t, user_data, false);
+  }
+
+  /// Invoke `merge_remote_state` with suppression forced on (test adapter for the
+  /// G4 `eventJoinIgnore` watermark): bumps `event_buffer.min_time` to the remote
+  /// `event_ltime` and drops the body's pre-join user events, exactly as a
+  /// consumed ignore-join merge does — without minting an exchange `StreamId`.
+  #[cfg(test)]
+  pub(crate) fn test_merge_remote_state_suppressed<T>(&mut self, t: &mut T, user_data: Bytes)
+  where
+    T: Reliable<I, A>,
+    I: Clone + Data,
+    A: Data,
+  {
+    self.merge_remote_state(t, user_data, true);
+  }
+
+  /// Drive the full `RemoteStateReceived` ignore-old path for a merge whose
+  /// `originating_stream_id` is `sid` (test adapter): consume the one-shot
+  /// ignore-join entry for `sid` iff `is_join`, then merge.  Mirrors
+  /// `on_inner_event`'s per-exchange suppression logic.
+  #[cfg(test)]
+  pub(crate) fn test_merge_remote_state_with_stream<T>(
+    &mut self,
+    t: &mut T,
+    user_data: Bytes,
+    is_join: bool,
+    sid: StreamId,
+  ) where
+    T: Reliable<I, A>,
+    I: Clone + Data,
+    A: Data,
+  {
+    let suppress = is_join && self.consume_ignore_join_stream(sid);
+    self.merge_remote_state(t, user_data, suppress);
   }
 
   /// Return the `ltime` of the most recently buffered intent for `id` of `kind`,

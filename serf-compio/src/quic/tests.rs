@@ -20,9 +20,28 @@ use serf_proto::{
 use smol_str::SmolStr;
 
 use crate::{
-  Channel, FirstAddrResolver, QuicOptions, QuicTransport, QuicTransportOptions, RuntimeOptions,
-  Serf, SerfError, SocketAddrResolver, Transport, VoidDelegate, gossip_rng,
+  Channel, FirstAddrResolver, QuicOptions, QuicTransport, QuicTransportOptions, Resolver,
+  RuntimeOptions, Serf, SerfError, SocketAddrResolver, Transport, VoidDelegate, gossip_rng,
 };
+
+/// A loopback address with a port nothing listens on — its QUIC push/pull dial
+/// never completes a handshake, so its exchange fails. The port is below the OS
+/// ephemeral range, so a `:0` test bind never collides with it.
+fn blackhole_addr() -> SocketAddr {
+  "127.0.0.1:7214".parse().expect("loopback addr")
+}
+
+/// Resolver that always resolves to an empty address list.
+struct EmptyResolver;
+
+impl Resolver for EmptyResolver {
+  type Address = String;
+  type Error = std::io::Error;
+
+  async fn resolve(&self, _addr: &String) -> Result<Vec<SocketAddr>, std::io::Error> {
+    Ok(Vec::new())
+  }
+}
 
 #[cfg(encryption)]
 use crate::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
@@ -277,9 +296,13 @@ async fn two_node_quic_join_observes_membership() {
   // subscription (the channel buffers either way, but this is the clean order).
   let mut a_events = a.events();
 
-  // Node A dials node B as its seed.
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  // Node A joins node B (await-result): the call returns the reached address
+  // once the QUIC push-pull to B's seed completes.
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   // Node A should observe node B joining via a `Member(Join)` event.
   let observed = compio::time::timeout(Duration::from_secs(20), async {
@@ -406,8 +429,11 @@ async fn two_node_quic_join_with_large_max_udp_payload() {
 
   let mut a_events = a.events();
 
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   let observed = compio::time::timeout(Duration::from_secs(20), async {
     loop {
@@ -541,8 +567,11 @@ async fn two_node_quic_join_observes_membership_encrypted() {
 
   let mut a_events = a.events();
 
-  let dispatched = a.join(vec![b_addr]).await.expect("join dispatched");
-  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
 
   let observed = compio::time::timeout(Duration::from_secs(20), async {
     loop {
@@ -566,4 +595,122 @@ async fn two_node_quic_join_observes_membership_encrypted() {
 
   a.shutdown().await.expect("node A shuts down");
   b.shutdown().await.expect("node B shuts down");
+}
+
+/// Build and spawn a QUIC serf node with a custom `RuntimeOptions` (used by the
+/// blackhole join tests to shorten the await-join deadline — a QUIC dial to a
+/// closed UDP port has no fast reset, so its exchange resolves only at the
+/// deadline reaper).
+async fn spawn_node_with_runtime(id: &str, runtime: RuntimeOptions) -> Serf<SmolStr> {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_quic_config(test_quic_options());
+  Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    runtime,
+    SerfOptions::new(),
+    gossip_rng().expect("seed gossip rng"),
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf node")
+}
+
+/// `join_many` over two QUIC seeds — one reachable (node B), one a blackhole —
+/// returns only the reached seed. B's handshake succeeds quickly; the blackhole
+/// exchange stays pending until the (shortened) deadline, at which the waiter is
+/// reaped with the reachable seed already in its contacted set.
+#[compio::test]
+async fn quic_join_many_returns_only_reached_seeds() {
+  let b = spawn_node("jm-b").await;
+  let a = spawn_node_with_runtime(
+    "jm-a",
+    RuntimeOptions::new().with_join_deadline(Duration::from_secs(6)),
+  )
+  .await;
+  let b_addr = b.advertise_address();
+
+  let reached = a
+    .join_many(
+      &SocketAddrResolver,
+      [
+        MaybeResolved::Resolved(b_addr),
+        MaybeResolved::Resolved(blackhole_addr()),
+      ]
+      .into_iter(),
+      false,
+    )
+    .await
+    .expect("join_many reaches the reachable seed");
+
+  assert_eq!(reached.len(), 1, "only the reachable seed is contacted");
+  assert_eq!(
+    reached[0], b_addr,
+    "the reached set carries node B's address"
+  );
+
+  a.shutdown().await.expect("jm-a shuts down");
+  b.shutdown().await.expect("jm-b shuts down");
+}
+
+/// An await-result `join` against an unreachable blackhole QUIC seed surfaces
+/// `SerfError::JoinAllFailed { requested: 1, contacted: 0 }` at the deadline.
+#[compio::test]
+async fn quic_join_unreachable_seed_surfaces_join_all_failed() {
+  let a = spawn_node_with_runtime(
+    "blackhole-joiner",
+    RuntimeOptions::new().with_join_deadline(Duration::from_secs(3)),
+  )
+  .await;
+
+  let err = a
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(blackhole_addr()),
+      false,
+    )
+    .await
+    .expect_err("join against a blackhole must fail");
+
+  match err {
+    SerfError::JoinAllFailed(payload) => {
+      assert_eq!(payload.requested(), 1, "one seed requested");
+      assert_eq!(payload.contacted(), 0, "no seed contacted");
+    }
+    other => panic!("expected JoinAllFailed, got {other:?}"),
+  }
+
+  a.shutdown().await.expect("joiner shuts down");
+}
+
+/// A non-empty `join` whose resolver returns zero addresses surfaces
+/// `JoinAllFailed` rather than a silent success (no command is even dispatched).
+#[compio::test]
+async fn quic_join_zero_resolution_surfaces_join_all_failed() {
+  let a = spawn_node("empty-resolve-joiner").await;
+
+  let err = a
+    .join(
+      &EmptyResolver,
+      MaybeResolved::Unresolved("svc-a".into()),
+      false,
+    )
+    .await
+    .expect_err("a seed resolving to zero addresses must fail");
+
+  match err {
+    SerfError::JoinAllFailed(payload) => {
+      assert_eq!(payload.requested(), 1, "one input seed requested");
+      assert_eq!(payload.contacted(), 0);
+    }
+    other => panic!("expected JoinAllFailed, got {other:?}"),
+  }
+
+  a.shutdown().await.expect("joiner shuts down");
 }

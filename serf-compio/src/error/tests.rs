@@ -54,6 +54,7 @@ fn every_variant_displays_and_debugs() {
     SerfError::LeaveTimeout,
     SerfError::Shutdown,
     SerfError::NotRunning,
+    SerfError::JoinAllFailed(JoinFailed::new(3, 0)),
     SerfError::InvalidGossipMtu(InvalidGossipMtu::new(70_000, 65_467)),
     SerfError::GossipMtuTooSmall(GossipMtuTooSmall::new(64, 512)),
     SerfError::InvalidAdvertiseAddr(InvalidAdvertiseAddr::new(

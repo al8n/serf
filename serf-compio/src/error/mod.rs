@@ -3,7 +3,7 @@
 use core::fmt;
 use std::{io, net::SocketAddr};
 
-pub use serf_driver::error::{GossipMtuTooSmall, InvalidOption};
+pub use serf_driver::error::{GossipMtuTooSmall, InvalidOption, JoinFailed};
 
 /// Payload for [`SerfError::InvalidGossipMtu`]: the configured `gossip_mtu`
 /// exceeds the largest plaintext gossip payload that can fit a single UDP
@@ -147,6 +147,14 @@ pub enum SerfError {
   /// The local node has left the cluster; the operation requires an active node.
   #[error("the local node has left the cluster; the operation requires a running node")]
   NotRunning,
+
+  /// An await-result [`join`](crate::Serf::join) dispatched a push/pull to one
+  /// or more resolved seeds but none was contacted before the call resolved —
+  /// the typical "all seeds unreachable" cluster-bootstrap failure. A non-empty
+  /// seed input that resolved to zero addresses surfaces here too, rather than
+  /// collapsing to a silent success.
+  #[error(transparent)]
+  JoinAllFailed(JoinFailed),
 
   /// The configured `gossip_mtu` exceeds the ceiling after the encryption
   /// wrapper is applied. Returned at construction (fail-fast, before any socket

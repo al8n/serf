@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 use memberlist_proto::SecretKey;
-use memberlist_proto::{Instant, Node, StreamId};
+use memberlist_proto::{Instant, Node, StreamId, event::ExchangeCompleted};
 use smol_str::SmolStr;
 
 use crate::{LamportTime, UserEventMessage, members::Member};
@@ -493,6 +493,18 @@ pub enum Event<I, A> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   KeyRequest(KeyRequest<I, A>),
+  /// The terminal outcome of a reliable exchange initiated by this node.
+  ///
+  /// Emitted when the coordinator's bridge-reap path fires for an outbound
+  /// exchange.  The payload carries the opaque `eid` (correlates with the
+  /// `ExchangeId` returned by the coordinator's `start_push_pull` /
+  /// `accept_connection`), the `peer` address, the `outcome`
+  /// ([`memberlist_proto::event::ExchangeStatus`]), and the `kind`
+  /// ([`memberlist_proto::event::ExchangeKind`]) that identifies the
+  /// initiator.  A driver awaiting a Join push/pull resolves when
+  /// `kind() == ExchangeKind::PushPull`.  Inbound (peer-initiated)
+  /// exchanges do NOT emit this event — only outbound ones do.
+  ExchangeCompleted(ExchangeCompleted<A>),
 }
 
 #[cfg(test)]

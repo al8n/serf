@@ -145,7 +145,9 @@ fn ep(id: u32, port: u16) -> QuicEndpoint<u32> {
     test_quic_options(),
     Some(seed),
   );
-  QuicEndpoint::new(coord, Options::new())
+  let mut e = QuicEndpoint::new(coord, Options::new());
+  let _ = e.poll_event();
+  e
 }
 
 #[test]
@@ -224,7 +226,7 @@ fn merge_remote_state_folds_remote_clocks() {
     .encode()
     .expect("encode push-pull body");
 
-  e.test_merge_remote_state(encoded, false);
+  e.test_merge_remote_state(encoded);
 
   assert_eq!(
     e.member_time(),

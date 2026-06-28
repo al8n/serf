@@ -1,4 +1,4 @@
-use super::{GossipMtuTooSmall, InvalidOption};
+use super::{GossipMtuTooSmall, InvalidOption, JoinFailed};
 
 #[test]
 fn gossip_mtu_too_small_fields_and_display() {
@@ -20,4 +20,17 @@ fn invalid_option_fields_and_display() {
   assert!(s.contains("gossip_interval"), "missing option name: {s}");
   assert!(s.contains("must be nonzero"), "missing reason: {s}");
   let _: &dyn std::error::Error = &opt;
+}
+
+#[test]
+fn join_failed_fields_and_display() {
+  let jf = JoinFailed::new(3, 0);
+  assert_eq!(jf.requested(), 3);
+  assert_eq!(jf.contacted(), 0);
+  let s = format!("{jf}");
+  assert!(s.contains('3'), "missing requested count: {s}");
+  assert!(s.contains('0'), "missing contacted count: {s}");
+  let _: &dyn std::error::Error = &jf;
+  // Copy + Eq are derived.
+  assert_eq!(jf, JoinFailed::new(3, 0));
 }

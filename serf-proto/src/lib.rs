@@ -130,3 +130,7 @@ pub use event::{KeyRequest, KeyRequestOperation, KeyResponseArgs};
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
 pub use memberlist_proto::SecretKey;
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub use memberlist_proto::event::{ExchangeCompleted, ExchangeId, ExchangeKind, ExchangeStatus};
