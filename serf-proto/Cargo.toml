@@ -50,13 +50,13 @@ derive_more = { workspace = true }
 rand = { workspace = true }
 thiserror.workspace = true
 bitflags = "2"
-buffa = { version = "0.7", default-features = false }
+buffa = { version = "0.8", default-features = false }
 smol_str = { workspace = true }
 zeroize = { version = "1", optional = true }
 regex = { version = "1", optional = true }
 
 [build-dependencies]
-buffa-build = "0.7"
+buffa-build = "0.8"
 
 [dev-dependencies]
 # The QUIC super-machine loopback test builds a quinn-proto config bundle with a
