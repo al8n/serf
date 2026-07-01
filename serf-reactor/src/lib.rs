@@ -59,6 +59,7 @@ mod resolver;
 mod serf;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod shared;
+mod snapshot;
 #[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(any(feature = "tcp", feature = "quic"))]
@@ -112,6 +113,11 @@ pub use resolver::{
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use serf::Serf;
+
+/// The published, lock-free membership snapshot a [`Serf`] handle reads.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub use snapshot::SerfSnapshot;
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
