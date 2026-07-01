@@ -5,10 +5,11 @@
 //! channel, and spawns the driver pump on the agnostic runtime `R`. Every command
 //! method pushes one [`Command`] onto the shared queue and (for the awaited kinds)
 //! parks on a one-shot reply the driver resolves. `Clone` / `Drop` reference-count
-//! the shared driver; membership reads go through the lock-free
-//! [`SerfSnapshot`]. The ergonomic per-backend constructors (`tcp` / `tls` /
-//! `quic`), the richer snapshot accessors, and the full test suite are layered on
-//! in a later chunk.
+//! the shared driver; membership reads go through the lock-free [`SerfSnapshot`]
+//! and the snapshot read-forwarders (`members` / `local_member` / `state` /
+//! `advertise_node` / `default_query_*`). The ergonomic per-backend constructor
+//! [`Serf::tcp`] instantiates the transport for the caller; `tls` / `quic` slot in
+//! the same way once those backends land.
 
 use core::{marker::PhantomData, time::Duration};
 use std::{net::SocketAddr, sync::Arc};
@@ -17,7 +18,6 @@ use agnostic::Runtime;
 use bytes::Bytes;
 use futures_channel::oneshot;
 use memberlist_proto::{Instant, Node};
-use serf_driver::SerfSnapshot;
 use serf_proto::{
   LamportTime,
   endpoint::{QueryId, QueryParams},
@@ -33,6 +33,8 @@ use smol_str::SmolStr;
 use crate::command::{KeyCmd, ListKeysCmd};
 #[cfg(encryption)]
 use crate::delegate::KeyringDelegate;
+#[cfg(feature = "tcp")]
+use crate::tcp::{TcpTransport, TcpTransportOptions};
 use crate::{
   MaybeResolved,
   command::{
@@ -45,10 +47,13 @@ use crate::{
   events::EventStream,
   resolver::{AdvertiseAddrResolver, Resolver},
   shared::Shared,
+  snapshot::SerfSnapshot,
   transport::{Transport, TransportRuntime},
 };
 #[cfg(encryption)]
 use memberlist_proto::SecretKey;
+#[cfg(feature = "tcp")]
+use memberlist_proto::{CheapClone, Data};
 
 /// The initial published snapshot: the local node, `Alive`, with empty tags and
 /// zeroed Lamport clocks. Superseded by the driver's first real republish.
@@ -90,6 +95,10 @@ pub struct Serf<I, A, R> {
   /// Per-call await-result join deadline offset, cached from the runtime options
   /// so each `join` can stamp its absolute `WaitForCompletion` deadline.
   join_deadline: Duration,
+  /// Cached `query_timeout_mult` from the serf options, so
+  /// [`default_query_timeout`](Serf::default_query_timeout) derives the query
+  /// timeout from the live snapshot member count without a driver round-trip.
+  query_timeout_mult: usize,
   /// Ties the handle to the resolver's unresolved address type. Not held in any
   /// field — `join` enforces seeds resolve in this address domain.
   _a: PhantomData<fn(A)>,
@@ -105,6 +114,7 @@ impl<I, A, R> Clone for Serf<I, A, R> {
       shared: self.shared.clone(),
       events_rx: self.events_rx.clone(),
       join_deadline: self.join_deadline,
+      query_timeout_mult: self.query_timeout_mult,
       _a: PhantomData,
       _r: PhantomData,
     }
@@ -158,6 +168,9 @@ where
     runtime_options.validate().map_err(T::Error::from)?;
     // Cache the join deadline before `runtime_options` moves into the bundle.
     let join_deadline = runtime_options.join_deadline();
+    // Cache `query_timeout_mult` before `serf_options` moves into the bundle, so
+    // the handle can compute `default_query_timeout` without a driver round-trip.
+    let query_timeout_mult = serf_options.query_timeout_mult();
 
     let transport = T::new(options, resolver, advertise_resolver).await?;
     let local_id = transport.local_id().clone();
@@ -185,9 +198,104 @@ where
       shared,
       events_rx,
       join_deadline,
+      query_timeout_mult,
       _a: PhantomData,
       _r: PhantomData,
     })
+  }
+}
+
+// Ergonomic per-backend constructors: instantiate the transport for the caller so
+// a node can be built without naming the generic `Serf::new::<T, …>` machinery.
+// `tls` / `quic` slot in the same way once those backends land.
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+impl<I, A, R> Serf<I, A, R>
+where
+  I: memberlist_proto::Id
+    + CheapClone
+    + Clone
+    + core::fmt::Debug
+    + core::fmt::Display
+    + Send
+    + Sync
+    + Unpin
+    + 'static,
+  A: Data + Clone + Send + Sync + 'static,
+  R: Runtime,
+{
+  /// Build a TCP-backed serf node and spawn its driver on the runtime `R`.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`TcpTransport`](crate::TcpTransport) for the caller: it binds a UDP gossip
+  /// socket and a TCP reliable listener on the advertise address (resolved once
+  /// via `resolver` / `advertise_resolver`), then spawns the stream driver. The
+  /// gossip RNG is drawn from OS entropy via [`gossip_rng`](crate::gossip_rng);
+  /// use [`tcp_with_rng`](Self::tcp_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Arc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Arc::new(VoidKeyringDelegate)` for a node that manages no keys).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tcp<RES, AR, D>(
+    options: TcpTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+  {
+    Self::tcp_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`tcp`](Self::tcp) but with a caller-supplied gossip RNG `G` — draw it
+  /// via [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tcp_with_rng<RES, AR, D, G>(
+    options: TcpTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<TcpTransport<I, A, R>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
   }
 }
 
@@ -205,6 +313,86 @@ impl<I, A, R> Serf<I, A, R> {
   #[must_use]
   pub fn num_members(&self) -> usize {
     self.shared.load_snapshot().num_members()
+  }
+
+  /// All known cluster members at the latest published snapshot instant — alive,
+  /// leaving, left, and failed within the reap window. Mirrors serf-compio's
+  /// `Serf::members`.
+  #[must_use]
+  pub fn members(&self) -> Vec<Arc<Member<I, SocketAddr>>> {
+    self.snapshot().members().to_vec()
+  }
+
+  /// The local node's full membership view at the latest published snapshot
+  /// instant. Returns the same `Arc` that lives at the local index in
+  /// [`members`](Self::members), so it is always consistent with that view.
+  /// Mirrors serf-compio's `Serf::local_member`.
+  #[must_use]
+  pub fn local_member(&self) -> Arc<Member<I, SocketAddr>> {
+    self.snapshot().local()
+  }
+
+  /// The lifecycle state of the local serf endpoint, derived from the latest
+  /// published snapshot. Mirrors serf-compio's `Serf::state`.
+  #[must_use]
+  pub fn state(&self) -> SerfState {
+    self.snapshot().state()
+  }
+
+  /// The bound advertise address this node gossips to peers, read from the local
+  /// member of the latest published snapshot. Mirrors serf-compio's
+  /// `Serf::advertise_address`.
+  #[must_use]
+  pub fn advertise_address(&self) -> SocketAddr {
+    *self.snapshot().local_ref().node().addr_ref()
+  }
+
+  /// The local node's id, read from the local member of the latest published
+  /// snapshot. Mirrors serf-compio's `Serf::local_id` (returned owned here, as the
+  /// snapshot is loaded by value).
+  #[must_use]
+  pub fn local_id(&self) -> I
+  where
+    I: Clone,
+  {
+    self.snapshot().local_ref().node().id_ref().clone()
+  }
+
+  /// The local node as an `(id, advertise-address)` [`Node`], composed from the
+  /// local member of the latest published snapshot. Mirrors serf-compio's
+  /// `Serf::advertise_node`.
+  #[must_use]
+  pub fn advertise_node(&self) -> Node<I, SocketAddr>
+  where
+    I: Clone,
+  {
+    self.snapshot().local().node().clone()
+  }
+
+  /// Default query timeout derived from the current snapshot member count.
+  ///
+  /// Computed as `200ms × query_timeout_mult × ⌈log₁₀(N+1)⌉` where N is the
+  /// snapshot member count, matching the machine's own zero-timeout resolution.
+  /// Mirrors serf-compio's `Serf::default_query_timeout`.
+  #[must_use]
+  pub fn default_query_timeout(&self) -> Duration {
+    let n = self.num_members();
+    let log_factor = ((n as f64 + 1.0).log10().ceil() as u32).max(1);
+    Duration::from_millis(200) * self.query_timeout_mult as u32 * log_factor
+  }
+
+  /// Default query parameters derived from the current snapshot: no filters, no
+  /// relay, no ACK, and a timeout from
+  /// [`default_query_timeout`](Self::default_query_timeout). Mirrors serf-compio's
+  /// `Serf::default_query_param`.
+  #[must_use]
+  pub fn default_query_param(&self) -> QueryParams<I> {
+    QueryParams {
+      filters: Vec::new(),
+      relay_factor: 0,
+      request_ack: false,
+      timeout: self.default_query_timeout(),
+    }
   }
 
   /// Subscribe to the serf event stream (membership transitions, user events,
@@ -372,6 +560,20 @@ impl<I, A, R> Serf<I, A, R> {
       reply: tx,
     }))?;
     await_reply(rx).await
+  }
+
+  /// Force-remove a failed node immediately without pruning the tombstone. Thin
+  /// alias for `force_leave(id, false)`; serf stops attempting to reconnect.
+  /// Mirrors serf-compio's `Serf::remove_failed_node`.
+  pub async fn remove_failed_node(&self, id: I) -> Result<()> {
+    self.force_leave(id, false).await
+  }
+
+  /// Force-remove a failed node immediately and prune the tombstone. Thin alias
+  /// for `force_leave(id, true)`; the node is removed at once rather than after
+  /// the tombstone timeout. Mirrors serf-compio's `Serf::remove_failed_node_prune`.
+  pub async fn remove_failed_node_prune(&self, id: I) -> Result<()> {
+    self.force_leave(id, true).await
   }
 
   /// Broadcast a user-defined event cluster-wide.
@@ -553,3 +755,6 @@ where
   }
   Ok(addrs)
 }
+
+#[cfg(all(test, feature = "tcp", feature = "tokio"))]
+mod tests;
