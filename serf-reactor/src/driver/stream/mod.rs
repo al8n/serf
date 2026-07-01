@@ -1376,7 +1376,8 @@ where
     // is always `Some` here — the shutdown branch above (which takes it) returned
     // before reaching this point. `Poll::Pending` from the socket IS the
     // kernel-empty signal (the readiness analogue of serf-compio's completion
-    // reap), so the recv-loop stops and `handle_timeout` fires inline below.
+    // reap), so the recv-loop stops. A full batch sets `more`, which defers the
+    // single `handle_timeout` site below to a later, quiescent poll.
     let mut recv_n = 0;
     while recv_n < this.iter_drain_cap {
       let Some(socket) = this.socket.as_ref() else {
@@ -1443,45 +1444,58 @@ where
       more = true;
     }
 
-    // Timer: fire an overdue deadline inline (the single `handle_timeout` site),
-    // else arm + poll the sleep. Fold in the earliest pending-join / -leave
-    // deadline so a parked waiter's timeout fires even when the coordinator has no
-    // nearer deadline.
-    let endpoint_deadline = this
-      .endpoint
-      .poll_timeout()
-      .map(|d| d.min(now + this.idle_wake))
-      .unwrap_or(now + this.idle_wake);
-    let target = [
-      Some(endpoint_deadline),
-      this.min_pending_join_deadline(),
-      this.min_pending_leave_deadline(),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
-    .unwrap_or(endpoint_deadline);
-    if target <= now {
-      this.endpoint.handle_timeout(now);
-      progress = true;
-      more = true;
-    } else {
-      this.arm_timer(target, now);
-      if let Some(timer) = this.timer.as_mut()
-        && timer.as_mut().poll(cx).is_ready()
-      {
-        this.endpoint.handle_timeout(Instant::now());
-        this.timer = None;
-        this.timer_deadline = None;
+    // Timer + deadline reaps, gated on quiescence (`!more`). While `more` — the UDP
+    // recv loop or the bridge-inbound loop hit its per-poll `iter_drain_cap`, or a
+    // machine surface still had queued work — a ready pre-deadline datagram or
+    // completion may sit BEHIND that cap, undrained. Firing `handle_timeout` (or a
+    // deadline reap) now could time out a probe / await-result join / graceful
+    // leave whose resolving Ack / ExchangeCompleted / LeftCluster is already
+    // waiting one poll behind, yielding false suspicion, a spurious `JoinAllFailed`,
+    // or a `LeaveTimeout`. The `more` self-wake below re-polls and drains that work
+    // first; the single `handle_timeout` site and the join / leave deadline reaps
+    // run only once the socket is drained to `Poll::Pending` and `drain_surfaces`
+    // is quiescent. The kernel buffer is finite and each poll makes `iter_drain_cap`
+    // progress before re-polling, so this defers the timer without starving it.
+    if !more {
+      // Fire an overdue deadline inline (the single `handle_timeout` site), else arm
+      // + poll the sleep. Fold in the earliest pending-join / -leave deadline so a
+      // parked waiter's timeout fires even when the coordinator has no nearer one.
+      let endpoint_deadline = this
+        .endpoint
+        .poll_timeout()
+        .map(|d| d.min(now + this.idle_wake))
+        .unwrap_or(now + this.idle_wake);
+      let target = [
+        Some(endpoint_deadline),
+        this.min_pending_join_deadline(),
+        this.min_pending_leave_deadline(),
+      ]
+      .into_iter()
+      .flatten()
+      .min()
+      .unwrap_or(endpoint_deadline);
+      if target <= now {
+        this.endpoint.handle_timeout(now);
         progress = true;
         more = true;
+      } else {
+        this.arm_timer(target, now);
+        if let Some(timer) = this.timer.as_mut()
+          && timer.as_mut().poll(cx).is_ready()
+        {
+          this.endpoint.handle_timeout(Instant::now());
+          this.timer = None;
+          this.timer_deadline = None;
+          progress = true;
+          more = true;
+        }
       }
-    }
 
-    // Reap deadline-expired join / leave waiters (a fired `handle_timeout` may have
-    // completed exchanges; the deadline path resolves the rest).
-    this.reap_pending_joins(now);
-    this.reap_pending_leave(now);
+      // Reap deadline-expired join / leave waiters (a fired `handle_timeout` may
+      // have completed exchanges; the deadline path resolves the rest).
+      this.reap_pending_joins(now);
+      this.reap_pending_leave(now);
+    }
 
     // Republish the snapshot whenever the pump made progress (the serf endpoint
     // exposes no cheap version stamp, so — as in serf-compio — a productive poll
@@ -1746,3 +1760,6 @@ where
     keyring,
   )
 }
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests;
