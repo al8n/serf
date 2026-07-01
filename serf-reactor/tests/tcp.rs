@@ -17,7 +17,11 @@ use std::net::SocketAddr;
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use futures_util::{StreamExt, future};
+#[cfg(encryption)]
+use serf_proto::event::MemberEventKind;
 use serf_proto::{event::Event, members::SerfState, options::Options as SerfOptions};
+#[cfg(encryption)]
+use serf_reactor::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
 use serf_reactor::{
   FirstAddrResolver, MaybeResolved, RuntimeOptions, Serf, SocketAddrResolver, TcpTransportOptions,
   VoidDelegate,
@@ -353,4 +357,144 @@ async fn remove_failed_node_alias_succeeds() {
 
   a.shutdown().await.expect("rfn-a shuts down");
   b.shutdown().await.expect("rfn-b shuts down");
+}
+
+/// A deterministic test secret key, selecting whichever AEAD cipher this build
+/// compiled so the encrypted tests work under either backend.
+#[cfg(encryption)]
+fn test_secret_key(fill: u8) -> SecretKey {
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes256([fill; 32]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([fill; 32]);
+  key
+}
+
+/// Build and spawn a reactor TCP node on an ephemeral loopback port with
+/// `encryption` installed as its gossip-and-reliable keyring policy.
+#[cfg(encryption)]
+async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_encryption(encryption);
+  Serf::<SmolStr, SocketAddr, TokioRuntime>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    std::sync::Arc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn encrypted serf tcp node")
+}
+
+/// Two nodes sharing one keyring join and converge over an AEAD-sealed gossip
+/// plane: A joins B (await-result over the encrypted reliable push/pull), both
+/// reach the two-member cluster, and A surfaces B's membership through its event
+/// stream. Proves the keyring reaches the coordinator and that
+/// `encrypt_gossip`/`decrypt_gossip` round-trip end-to-end rather than running as
+/// identity transforms.
+#[cfg(encryption)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_node_join_converges_encrypted() {
+  let key = EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42)));
+  let b = spawn_encrypted_node("enc-b", key.clone()).await;
+  let a = spawn_encrypted_node("enc-a", key).await;
+  let b_addr = b.advertise_address();
+  let b_id = SmolStr::new("enc-b");
+
+  // Subscribe before joining so the membership event cannot race the subscription.
+  let mut a_events = a.events();
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
+
+  converge(&a, &b).await;
+
+  let observed = tokio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::Member(me)) if me.kind() == MemberEventKind::Join => {
+          if me.members().iter().any(|m| m.node().id_ref() == &b_id) {
+            break true;
+          }
+        }
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await;
+  assert!(
+    matches!(observed, Ok(true)),
+    "node A should observe node B joining the encrypted cluster within the timeout"
+  );
+
+  a.shutdown().await.expect("enc-a shuts down");
+  b.shutdown().await.expect("enc-b shuts down");
+}
+
+/// A node holding one keyring and a node holding a DIFFERENT keyring must NOT
+/// exchange membership: the reliable push/pull units and the gossip datagrams are
+/// both AEAD-sealed under disjoint keys, so neither side can authenticate the
+/// other and the join never merges. Proves the encryption is real enforcement,
+/// not an identity pass-through — without this negative case a passing encrypted
+/// convergence test could not distinguish real AEAD from an identity transform.
+#[cfg(encryption)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_keyring_nodes_do_not_exchange_membership() {
+  let b = spawn_encrypted_node(
+    "mis-b",
+    EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42))),
+  )
+  .await;
+  let a = spawn_encrypted_node(
+    "mis-a",
+    EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x43))),
+  )
+  .await;
+  let b_addr = b.advertise_address();
+  let b_id = SmolStr::new("mis-b");
+
+  let mut a_events = a.events();
+
+  // Fire-and-forget dispatch: an await-result `join` would instead fail here (the
+  // mismatched-key push/pull never authenticates); the absence probe below is what
+  // proves membership never merges.
+  let dispatched = a
+    .dispatch_join(&SocketAddrResolver, &[MaybeResolved::Resolved(b_addr)])
+    .await
+    .expect("join dispatched");
+  assert_eq!(dispatched, 1, "exactly one seed was dispatched");
+
+  // Absence probe: A must never surface a Join carrying node-b. A short window
+  // covers several gossip / probe / push-pull rounds on loopback — the positive
+  // test forms its cluster within ~1-2s, so a clean 3s window is decisive.
+  let observed = tokio::time::timeout(Duration::from_secs(3), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::Member(me)) if me.kind() == MemberEventKind::Join => {
+          if me.members().iter().any(|m| m.node().id_ref() == &b_id) {
+            break true;
+          }
+        }
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await;
+  assert!(
+    !matches!(observed, Ok(true)),
+    "node A must NOT observe node B across a mismatched keyring"
+  );
+
+  a.shutdown().await.expect("mis-a shuts down");
+  b.shutdown().await.expect("mis-b shuts down");
 }
