@@ -293,3 +293,197 @@ async fn due_deadline_waits_for_join_completion_behind_iter_drain_cap() {
     "the resolved join reached the seed whose completion was queued behind the cap: {reached:?}"
   );
 }
+
+/// Regression (liveness / non-starving): under a SUSTAINED ingress flood that hits
+/// `iter_drain_cap` every poll (so `more` never clears), a past-due await-result
+/// join deadline must STILL be reaped within a bounded number of polls. A blunt
+/// `if !more` gate never fires the reap while `more`, so a flood would suppress the
+/// deadline forever (a liveness-denial DoS); the bounded-deferral policy fires it
+/// once `TIMER_DEFERRAL_LIVENESS_BOUND` deferrals elapse.
+///
+/// Pre-fix, the reap is gated out every poll and the join never resolves within the
+/// poll budget. Post-fix, it resolves to `JoinAllFailed` (no seed was contacted)
+/// within the deferral bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_flood_does_not_starve_due_join_deadline_reap() {
+  let now = Instant::now();
+  // A small cap makes the per-poll flood cheap. The flood keeps `more` set via the
+  // inbound-gossip surface: each fed datagram is undecodable garbage the drain
+  // drops, but it still counts toward the surface's `iter_drain_cap`.
+  let cap = 4usize;
+  let (mut driver, _obs_rx, _shared) = build_driver(cap).await;
+
+  // A real, live outbound exchange id whose exchange never completes (no peer ever
+  // feeds it): the parked join stays pending, so ONLY the past-due deadline reap can
+  // resolve it — to `JoinAllFailed`.
+  driver
+    .endpoint
+    .start_push_pull(sa("127.0.0.1:7300"), PushPullKind::Join, now);
+  let mut eid = None;
+  while let Some(action) = driver.endpoint.poll_action() {
+    if let StreamAction::Connect(info) = action {
+      eid = Some(info.id());
+    }
+  }
+  let eid = eid.expect("start_push_pull emitted a Connect exchange id");
+
+  let (tx, mut rx) = oneshot::channel::<JoinReply>();
+  let mut pending = HashSet::new();
+  pending.insert(eid);
+  driver.pending_joins.push(PendingJoin {
+    pending,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: now - Duration::from_secs(1),
+    reply: Some(tx),
+  });
+
+  let flood_src = sa("127.0.0.1:7301");
+  let mut resolved = None;
+  let mut polls = 0usize;
+  for _ in 0..(TIMER_DEFERRAL_LIVENESS_BOUND as usize + 4) {
+    // Refill the ingress flood BEFORE each poll so the inbound-gossip surface hits
+    // its cap and `more` is set for this poll.
+    for _ in 0..cap {
+      driver
+        .endpoint
+        .handle_gossip(flood_src, &[0xff, 0x00, 0xff], now);
+    }
+    let _ = poll_once(&mut driver);
+    polls += 1;
+    match rx.try_recv() {
+      Ok(Some(reply)) => {
+        resolved = Some(reply);
+        break;
+      }
+      Ok(None) => {}
+      Err(_) => panic!("join reply sender dropped without resolving"),
+    }
+  }
+
+  let reply = resolved.expect(
+    "the past-due join deadline reap fired despite the sustained ingress flood; \
+     a blunt !more gate would starve it indefinitely",
+  );
+  assert!(
+    polls <= TIMER_DEFERRAL_LIVENESS_BOUND as usize + 1,
+    "the reap fired within the deferral bound, not later: {polls} polls",
+  );
+  match reply {
+    Err((ref reached, SerfError::JoinAllFailed(_))) => {
+      assert!(
+        reached.is_empty(),
+        "no seed was contacted, so the all-failed set is empty: {reached:?}"
+      );
+    }
+    other => panic!("expected JoinAllFailed from the deadline reap, got {other:?}"),
+  }
+}
+
+/// Drive an INBOUND (server-side) Join push/pull on `driver.endpoint` until its pull
+/// response is queued in the coordinator's transmit surface and the terminal
+/// `StreamAction::Close` is WITHHELD behind those bytes (the coordinator self-orders
+/// a teardown after the exchange's last transmit). A separate dialer endpoint
+/// supplies the push frames. The response transmit is deliberately NOT drained here,
+/// so the `Close` stays withheld until the pump's own drain runs. Returns the server
+/// exchange id.
+fn drive_server_to_withheld_close(
+  driver: &mut TestDriver,
+  dialer_addr: SocketAddr,
+  now: Instant,
+) -> ExchangeId {
+  let mut dialer = build_endpoint("dialer", dialer_addr);
+  dialer.start_push_pull(sa(DRIVER_ADDR), PushPullKind::Join, now);
+  let mut dialer_eid = None;
+  let mut push: Vec<Vec<u8>> = Vec::new();
+  for _ in 0..256 {
+    let mut progressed = false;
+    while let Some(action) = dialer.poll_action() {
+      progressed = true;
+      if let StreamAction::Connect(info) = action {
+        dialer_eid = Some(info.id());
+      }
+    }
+    while let Some((id, _peer, bytes)) = dialer.poll_transport_transmit() {
+      progressed = true;
+      if Some(id) == dialer_eid {
+        push.push(bytes.to_vec());
+      }
+    }
+    if !progressed {
+      break;
+    }
+  }
+  assert!(
+    !push.is_empty(),
+    "the dialer emitted its push frames up front"
+  );
+
+  let server_eid = driver
+    .endpoint
+    .accept_connection(dialer_addr, now)
+    .expect("the driver admits the inbound exchange");
+  for chunk in &push {
+    driver
+      .endpoint
+      .handle_transport_data(server_eid, chunk, false, now);
+  }
+  driver
+    .endpoint
+    .handle_transport_data(server_eid, &[], true, now); // the dialer's FIN
+
+  // Tick the server so it generates the pull response and reaps the exchange
+  // cleanly. Do NOT drain actions or transport transmits: the response stays queued
+  // and the terminal `Close` stays withheld behind it.
+  for _ in 0..32 {
+    driver.endpoint.handle_timeout(now);
+  }
+  server_eid
+}
+
+/// Regression (fixed-point drain): a terminal `StreamAction::Close` the coordinator
+/// withholds behind an exchange's final transport transmit must be released AND
+/// processed within the SAME poll — the transport surface pops the response
+/// (releasing the `Close`), and the fixed-point re-pass drains the `Close`, closing
+/// the bridge. A single ordered pass would leave the `Close` buffered, so the pump
+/// would report false quiescence and return `Pending` with the TCP bridge still open
+/// until an unrelated wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_point_drain_releases_withheld_close_same_poll() {
+  let now = Instant::now();
+  // The default (large) cap: no surface hits its cap, so a false quiescence could
+  // come ONLY from the single-pass ordering — isolating the fixed-point fix.
+  let cap = RuntimeOptions::new().iter_drain_cap();
+  let (mut driver, _obs_rx, _shared) = build_driver(cap).await;
+
+  let dialer_addr = sa("127.0.0.1:7400");
+  let server_eid = drive_server_to_withheld_close(&mut driver, dialer_addr, now);
+
+  // Register the pump's bridge handle for the server exchange as the real accept
+  // path would: the withheld `Close` targets this handle, and the response transmit
+  // routes to `out_rx`.
+  let (out_tx, out_rx) = flume::unbounded::<BridgeOut>();
+  let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+  driver
+    .bridges
+    .insert(server_eid, BridgeHandle { out_tx, cancel_tx });
+  assert!(
+    driver.bridges.contains_key(&server_eid),
+    "precondition: the server bridge is registered"
+  );
+
+  // ONE poll. The fixed-point drain must pop the response transmit (releasing the
+  // withheld `Close`) and then drain that `Close`, removing the bridge — all here.
+  let _ = poll_once(&mut driver);
+
+  assert!(
+    !driver.bridges.contains_key(&server_eid),
+    "the fixed-point surface drain released and processed the withheld Close in the \
+     same poll; a single-pass drain would leave the TCP bridge open past this poll"
+  );
+  assert!(
+    matches!(out_rx.try_recv(), Ok(BridgeOut::Data(_))),
+    "the pull response transmit routed to the bridge before its Close"
+  );
+}

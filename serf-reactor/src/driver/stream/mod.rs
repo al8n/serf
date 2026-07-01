@@ -94,6 +94,18 @@ pub(crate) const ACCEPT_CAP: usize = 256;
 /// channel (the payload byte budget bounds their bytes; this bounds their count).
 const OBS_OVERFLOW_MAX: usize = 1024;
 
+/// Upper bound on how many consecutive capped (`more`) polls may DEFER a due
+/// timer / deadline reap before it fires regardless. While `more`, ready
+/// pre-deadline ingress can sit behind a per-poll cap, so firing immediately could
+/// time out a probe / join / leave whose resolving Ack / `ExchangeCompleted` /
+/// `LeftCluster` is buffered one poll behind (premature). Deferring re-polls to
+/// drain that first — and the pre-deadline backlog is FIFO, so it drains within a
+/// few `iter_drain_cap`-sized polls — but an UNBOUNDED defer would let a sustained
+/// ingress flood suppress failure detection and join / leave / query deadlines
+/// forever (a liveness-denial DoS). This bound caps the deferral, trading a few
+/// polls of deadline staleness under flood for guaranteed liveness.
+const TIMER_DEFERRAL_LIVENESS_BOUND: u32 = 8;
+
 /// A message from the pump to a bridge's TCP write side. Teardown is signalled out
 /// of band by dropping the [`BridgeHandle`], not by a variant here, so it can
 /// preempt even a write stalled on an unresponsive peer.
@@ -329,6 +341,11 @@ where
   iter_drain_cap: usize,
   timer: Option<Pin<Box<R::Sleep>>>,
   timer_deadline: Option<Instant>,
+  /// Consecutive capped-poll deferrals of a due timer / deadline reap, bounded by
+  /// [`TIMER_DEFERRAL_LIVENESS_BOUND`]. Accumulates only while a deadline is
+  /// overdue AND a per-poll cap is being hit; reset the moment the poll reaches
+  /// quiescence, the deadline fires, or nothing is due.
+  timer_deferrals: u32,
   idle_wake: Duration,
   leave_timeout: Duration,
   close_timeout: Duration,
@@ -396,6 +413,7 @@ where
       iter_drain_cap: driver_opts.iter_drain_cap().max(1),
       timer: None,
       timer_deadline: None,
+      timer_deferrals: 0,
       idle_wake: driver_opts.idle_wake_interval(),
       leave_timeout: driver_opts.leave_timeout(),
       close_timeout: stream_opts.close_timeout(),
@@ -845,14 +863,55 @@ where
     }
   }
 
-  /// Drains each machine surface up to `iter_drain_cap` items in one pass.
-  /// Returns `(worked, more)`: whether any surface produced work, and whether any
-  /// surface hit its cap with work left (self-wake).
+  /// Repeatedly runs the ordered surface pass to a FIXED POINT. A later surface can
+  /// create work for an earlier one within the same poll: draining an exchange's
+  /// final transport transmit releases its withheld [`StreamAction::Close`] for the
+  /// action surface, and answering an `Event::KeyRequest` (`respond_key`) queues a
+  /// directed gossip transmit after the transmit surface was already drained. A
+  /// single ordered pass would leave that late-generated work buffered and report
+  /// false quiescence (`more == false` with ready machine work undrained), so the
+  /// timer could fire and the pump return `Pending` with a TCP bridge still open or
+  /// a key response delayed past its query deadline.
+  ///
+  /// Repeating the ordered pass while any surface made progress converges: the
+  /// machine emits finite output per (finite, already-buffered) input and each
+  /// surface is cap-bounded, so successive passes strictly drain the buffered work
+  /// down. On return `more == false` therefore genuinely means no ready machine work
+  /// remains from this poll's input. A pass that hits a per-surface cap ends the
+  /// fixed point immediately with `more == true`: the caller self-wakes and re-polls
+  /// rather than uncapped-draining a surface a fast peer can refill, keeping each
+  /// poll bounded.
   fn drain_surfaces(&mut self, cx: &mut Context<'_>) -> (bool, bool)
   where
     I: Send + Sync + 'static,
   {
     let now = Instant::now();
+    let mut worked = false;
+    loop {
+      let (pass_worked, pass_more) = self.drain_surfaces_pass(cx, now);
+      worked |= pass_worked;
+      if pass_more {
+        // A per-surface cap was hit: end the fixed point and self-wake (`more`)
+        // rather than repeat the pass, so the poll stays bounded.
+        return (worked, true);
+      }
+      if !pass_worked {
+        // No surface made progress: the fixed point is reached and no ready machine
+        // work remains from this poll's input.
+        return (worked, false);
+      }
+    }
+  }
+
+  /// One ordered surface pass — inbound-ingress → action → transport → gossip →
+  /// event — each surface draining up to `iter_drain_cap` items. Returns
+  /// `(worked, more)`: whether any surface produced work in this pass, and whether
+  /// any surface hit its cap. [`Self::drain_surfaces`] iterates this to a fixed
+  /// point so a later surface feeding an earlier one is drained the same poll.
+  fn drain_surfaces_pass(&mut self, cx: &mut Context<'_>, now: Instant) -> (bool, bool)
+  where
+    I: Send + Sync + 'static,
+  {
     let budget = self.iter_drain_cap;
     let mut worked = false;
     let mut more = false;
@@ -1444,38 +1503,41 @@ where
       more = true;
     }
 
-    // Timer + deadline reaps, gated on quiescence (`!more`). While `more` — the UDP
-    // recv loop or the bridge-inbound loop hit its per-poll `iter_drain_cap`, or a
-    // machine surface still had queued work — a ready pre-deadline datagram or
-    // completion may sit BEHIND that cap, undrained. Firing `handle_timeout` (or a
-    // deadline reap) now could time out a probe / await-result join / graceful
-    // leave whose resolving Ack / ExchangeCompleted / LeftCluster is already
-    // waiting one poll behind, yielding false suspicion, a spurious `JoinAllFailed`,
-    // or a `LeaveTimeout`. The `more` self-wake below re-polls and drains that work
-    // first; the single `handle_timeout` site and the join / leave deadline reaps
-    // run only once the socket is drained to `Poll::Pending` and `drain_surfaces`
-    // is quiescent. The kernel buffer is finite and each poll makes `iter_drain_cap`
-    // progress before re-polling, so this defers the timer without starving it.
+    // Timer + deadline reaps under a BOUNDED-DEFERRAL liveness policy. Fold the
+    // coordinator's next deadline together with the earliest parked join / leave
+    // deadline into one `target`; `due` means at least one is overdue. Firing while
+    // ready pre-deadline ingress is still buffered would be premature (false
+    // suspicion / a spurious `JoinAllFailed` / a `LeaveTimeout`), but never firing
+    // while `more` would let a flood starve the deadline — so the two cases split.
+    let endpoint_deadline = this
+      .endpoint
+      .poll_timeout()
+      .map(|d| d.min(now + this.idle_wake))
+      .unwrap_or(now + this.idle_wake);
+    let target = [
+      Some(endpoint_deadline),
+      this.min_pending_join_deadline(),
+      this.min_pending_leave_deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(endpoint_deadline);
+    let due = target <= now;
+    // The deferral counter accumulates only while a deadline is actually overdue.
+    if !due {
+      this.timer_deferrals = 0;
+    }
+
     if !more {
-      // Fire an overdue deadline inline (the single `handle_timeout` site), else arm
-      // + poll the sleep. Fold in the earliest pending-join / -leave deadline so a
-      // parked waiter's timeout fires even when the coordinator has no nearer one.
-      let endpoint_deadline = this
-        .endpoint
-        .poll_timeout()
-        .map(|d| d.min(now + this.idle_wake))
-        .unwrap_or(now + this.idle_wake);
-      let target = [
-        Some(endpoint_deadline),
-        this.min_pending_join_deadline(),
-        this.min_pending_leave_deadline(),
-      ]
-      .into_iter()
-      .flatten()
-      .min()
-      .unwrap_or(endpoint_deadline);
-      if target <= now {
+      // Quiescent: the recv / bridge-inbound loops drained to `Poll::Pending` and
+      // `drain_surfaces` reached its fixed point, so the whole poll-entry backlog is
+      // processed. Fire an overdue deadline inline (the single `handle_timeout`
+      // site) — non-prematurely, since nothing that could resolve it is still
+      // buffered — else arm + poll the sleep so the next deadline wakes the pump.
+      if due {
         this.endpoint.handle_timeout(now);
+        this.timer_deferrals = 0;
         progress = true;
         more = true;
       } else {
@@ -1495,6 +1557,26 @@ where
       // have completed exchanges; the deadline path resolves the rest).
       this.reap_pending_joins(now);
       this.reap_pending_leave(now);
+    } else if due {
+      // `more`: a per-poll cap was hit, so ready pre-deadline ingress may sit BEHIND
+      // it — a resolving Ack / `ExchangeCompleted` / `LeftCluster` could be one poll
+      // behind. DEFER the timer + reaps and re-poll (the `more` self-wake below) so
+      // that FIFO backlog drains first. Deferral is BOUNDED: after
+      // `TIMER_DEFERRAL_LIVENESS_BOUND` consecutive deferrals the pre-deadline
+      // backlog is drained (FIFO, `iter_drain_cap` per poll), so fire regardless —
+      // an unbounded defer would let a sustained flood starve failure detection and
+      // join / leave / query deadlines. No timer is armed while deferring; the
+      // self-wake alone re-polls, so there is no lost wakeup and the counter
+      // guarantees the deferral terminates.
+      if this.timer_deferrals >= TIMER_DEFERRAL_LIVENESS_BOUND {
+        this.endpoint.handle_timeout(now);
+        this.reap_pending_joins(now);
+        this.reap_pending_leave(now);
+        this.timer_deferrals = 0;
+        progress = true;
+      } else {
+        this.timer_deferrals += 1;
+      }
     }
 
     // Republish the snapshot whenever the pump made progress (the serf endpoint
