@@ -45,6 +45,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "tcp")]
+mod bridge;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod command;
 #[cfg(any(feature = "tcp", feature = "quic"))]
@@ -52,6 +54,15 @@ mod delegate;
 mod driver;
 mod error;
 mod events;
+mod resolver;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod serf;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod shared;
+#[cfg(feature = "tcp")]
+mod tcp;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod transport;
 
 use rand::{
   SeedableRng,
@@ -87,6 +98,28 @@ pub(crate) fn os_seeded_std_rng() -> crate::Result<StdRng> {
 pub use error::{
   GossipMtuTooSmall, InvalidAdvertiseAddr, InvalidGossipMtu, InvalidOption, Result, SerfError,
 };
+
+/// The seed/advertise address form re-exported from `memberlist-proto`: either an
+/// already-`Resolved` wire [`std::net::SocketAddr`] or an `Unresolved` user
+/// address the caller's [`Resolver`] resolves at the boundary.
+pub use memberlist_proto::MaybeResolved;
+
+pub use resolver::{
+  AdvertiseAddrResolver, AdvertiseResolutionError, FirstAddrResolver, Ipv4PreferringResolver,
+  Ipv6PreferringResolver, OsResolver, Resolver, SocketAddrResolver,
+};
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub use serf::Serf;
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub use transport::{Transport, TransportRuntime};
+
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+pub use tcp::{TcpTransport, TcpTransportOptions};
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
