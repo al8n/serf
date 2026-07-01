@@ -3,6 +3,7 @@ members = [
   "serf-proto",
   "serf-driver",
   "serf-compio",
+  "serf-reactor",
 ]
 exclude = ["legacy"]
 resolver = "3"
@@ -41,6 +42,9 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 
 # Networking / transport
 compio = { version = "0.19", default-features = false }
+agnostic = "0.10"
+agnostic-lite = { version = "0.6", features = ["time"] }
+arc-swap = "1"
 flume = { version = "0.12", default-features = false }
 hostaddr = { version = "0.2", default-features = false }
 lochan = "0.1"

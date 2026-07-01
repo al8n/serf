@@ -1,0 +1,117 @@
+[package]
+name = "serf-reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "agnostic-runtime (tokio / smol) async driver for the Sans-I/O serf machine"
+
+[features]
+default = ["tcp", "tag-regex"]
+# Plain-TCP reliable coordinator.
+tcp = ["serf-proto/tcp", "serf-driver/tcp"]
+# TLS-over-TCP reliable coordinator (implies tcp). The record layer comes from
+# serf-proto; a crypto-backend feature (tls-rustls-*) supplies the rustls
+# provider via memberlist-proto (serf-proto exposes no rustls provider itself).
+tls = ["tcp", "serf-proto/tls", "serf-driver/tls"]
+tls-rustls-ring = ["tls", "memberlist-proto/tls-rustls-ring"]
+tls-rustls-aws-lc-rs = ["tls", "memberlist-proto/tls-rustls-aws-lc-rs"]
+# QUIC coordinator.
+quic = ["serf-proto/quic", "serf-driver/quic"]
+quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring", "serf-driver/quic-rustls-ring"]
+# Vivaldi network coordinate estimation.
+coordinates = ["serf-proto/coordinates", "serf-driver/coordinates"]
+# Encryption backends — forward to serf-proto (key-management messages) and to
+# memberlist-proto (the coordinator's gossip-encryption keyring + encrypt/decrypt).
+aes-gcm = ["serf-proto/aes-gcm", "memberlist-proto/aes-gcm"]
+chacha20-poly1305 = ["serf-proto/chacha20-poly1305", "memberlist-proto/chacha20-poly1305"]
+# Regex-backed tag-filter matching.
+tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
+# Emit `tracing` spans around the public driver operations.
+tracing = ["dep:tracing"]
+# Runtime conveniences: pull in the concrete agnostic runtime impls.
+tokio = ["agnostic/tokio"]
+smol = ["agnostic/smol"]
+# Optional config layering: `serde` adds Serialize/Deserialize; `clap` adds CLI flags.
+serde = ["dep:serde", "dep:humantime-serde"]
+clap = ["dep:clap", "dep:humantime"]
+# DNS resolver support.
+dns = ["dep:hickory-proto", "dep:resolv-conf"]
+# Auto-detect the advertise address from the host's own interfaces.
+getifs = ["dep:getifs", "dep:iprfc"]
+
+[dependencies]
+serf-proto = { path = "../serf-proto", default-features = false }
+serf-driver = { path = "../serf-driver", default-features = false }
+# Pinned to the same git+branch as serf-proto to guarantee a single copy in the
+# resolver; serf-reactor uses EncryptionError and the SecretKey type under the
+# encryption cfg gate.
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
+
+rand = { workspace = true, features = ["std", "std_rng", "sys_rng"] }
+smol_str.workspace = true
+smallvec.workspace = true
+bytes = { workspace = true }
+thiserror.workspace = true
+futures-channel.workspace = true
+futures-util = { workspace = true, default-features = false, features = [
+  "std",
+  "async-await-macro",
+] }
+flume = { workspace = true, default-features = false, features = ["async"] }
+
+# Agnostic async runtime substrate (tokio / smol) — declared ahead of the driver
+# and transport modules that use it, so those can be added without a Cargo.toml
+# edit.
+agnostic = { workspace = true, features = ["net"] }
+agnostic-lite.workspace = true
+# Shared-state substrate for the Send/Arc reactor model, used by the driver's
+# shared state.
+arc-swap.workspace = true
+# Address handling used by the transport modules.
+hostaddr = { workspace = true, features = ["std", "smol_str"] }
+
+tracing = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+humantime-serde = { workspace = true, optional = true }
+humantime = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+hickory-proto = { workspace = true, optional = true, default-features = false, features = [
+  "std",
+] }
+resolv-conf = { workspace = true, optional = true }
+getifs = { workspace = true, optional = true }
+iprfc = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The QUIC / TLS loopback smoke tests build a quinn-proto config bundle with a
+# self-signed cert and an accept-any verifier. Only the transport-gated test
+# modules reference these; they are unconditional dev-deps so the test crate
+# always resolves.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rcgen = "0.14"
+ring = "0.17"
+# Used in the serde option-layer tests.
+serde_json = "1"
+
+[package.metadata.docs.rs]
+# A single coherent crypto-provider set (ring, not aws-lc-rs; tokio, not smol) so
+# the doc build documents every gated item without pulling conflicting providers.
+features = [
+  "tokio",
+  "tls-rustls-ring",
+  "quic-rustls-ring",
+  "coordinates",
+  "aes-gcm",
+  "chacha20-poly1305",
+  "tag-regex",
+  "tracing",
+  "serde",
+  "clap",
+  "dns",
+  "getifs",
+]
+rustdoc-args = ["--cfg", "docsrs"]
