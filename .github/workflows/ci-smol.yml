@@ -1,0 +1,81 @@
+name: ci-smol
+
+# The reactor async driver under smol. serf-reactor's real-node integration
+# suites (tcp / tls / quic) are written as `#[tokio::test]` and gated on the
+# `tokio` feature, so they run in ci-tokio; there are no smol-runtime integration
+# cells yet. This workflow is the smol gate: it builds + clippy-lints the crate
+# with the `smol` runtime feature (proving the `agnostic/smol` code path compiles
+# clean) and runs the crate's runtime-independent unit tests. Nodes bind ephemeral
+# loopback ports, so no subnet setup is required.
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+  schedule: [cron: "0 1 */30 * *"]
+
+env:
+  FEATURES: "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs"
+
+jobs:
+  test:
+    name: ${{ matrix.os }} - reactor - smol
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      # Cache BEFORE the build steps so the restore actually warms this run; a
+      # cache placed after the test step only saves, never restores.
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-reactor-smol
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clippy (smol runtime path)
+        # --no-deps: lint only our own crate, not its external dependencies.
+        run: cargo clippy -p serf-reactor --all-targets --features "$FEATURES" --no-deps -- -D warnings
+
+      - name: Test (runtime-independent unit tests)
+        run: cargo test -p serf-reactor --lib --features "$FEATURES"
