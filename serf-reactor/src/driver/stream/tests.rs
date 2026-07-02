@@ -770,3 +770,287 @@ async fn parked_saturated_handoff_completion_is_accounted_not_reaped() {
     "the resolved join reached the seed whose completion was parked on the saturated hand-off: {reached:?}"
   );
 }
+
+/// Regression (overlapping deadlines, Gate 1): a SECOND await-result join whose
+/// resolving completion is buffered on `inbound_rx` AFTER the FIRST join's
+/// (earlier) deadline crossing snapshotted the reap watermark, but BEFORE the
+/// second join's own (later) deadline elapses. A single sticky watermark taken at
+/// the first crossing (`W0`) covers only the first join's backlog, so once the
+/// later deadline also elapses the shared fire path reaps BOTH joins against `W0`
+/// — spuriously failing the later join whose `Ok` completion is still queued
+/// behind `W0`. Re-snapshotting the watermark when the latest due deadline
+/// advances widens the target to cover the later join's backlog, so both resolve
+/// `Ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_deadlines_later_join_waits_for_its_own_backlog() {
+  let now = Instant::now();
+  // iter_drain_cap = 1: one inbound item per poll, so W0 drains slowly enough that
+  // the later deadline elapses mid-drain (the fire poll then sees both due).
+  let (mut driver, _obs_rx, _shared) = build_driver(1, 4096).await;
+
+  // Two reached seeds; each drives an outbound push/pull to a Succeeded whose pull
+  // response + peer-FIN we queue on inbound_rx.
+  let seed_a = sa("127.0.0.1:7010");
+  let seed_b = sa("127.0.0.1:7011");
+  let (eid_a, resp_a) = drive_push_to_queued_response(&mut driver, seed_a, now);
+  let (eid_b, resp_b) = drive_push_to_queued_response(&mut driver, seed_b, now);
+  let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+
+  // A dummy 'connecting' exchange for benign filler (its transport data is dropped
+  // by the machine — no conn), deepening the first join's backlog.
+  driver
+    .endpoint
+    .start_push_pull(sa("127.0.0.1:7012"), PushPullKind::Join, now);
+  let mut dummy = None;
+  while let Some(action) = driver.endpoint.poll_action() {
+    if let StreamAction::Connect(info) = action {
+      dummy.get_or_insert(info.id());
+    }
+  }
+  let dummy = dummy.expect("the dummy start_push_pull emitted a Connect exchange id");
+
+  // Backlog + join A's completion queued FIRST: this is the depth W0 will cover.
+  // Join B's completion is deliberately NOT queued yet.
+  const DEPTH: usize = 24;
+  for _ in 0..DEPTH {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: dummy,
+        bytes: vec![0u8; 1],
+        received_at: now,
+      }),
+    );
+  }
+  for bytes in resp_a {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: eid_a,
+        bytes,
+        received_at: now,
+      }),
+    );
+  }
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
+      eid: eid_a,
+      received_at: now,
+    }),
+  );
+
+  // Join A: deadline ALREADY past → due on the first poll, snapshotting W0 to the
+  // depth queued above. Join B: deadline in the near FUTURE (captured fresh so a
+  // slow setup cannot backdate it), so on that first poll B does NOT yet widen the
+  // watermark.
+  let t_ref = Instant::now();
+  let future = Duration::from_millis(100);
+  let (tx_a, mut rx_a) = oneshot::channel::<JoinReply>();
+  let mut pending_a = HashSet::new();
+  pending_a.insert(eid_a);
+  driver.pending_joins.push(PendingJoin {
+    pending: pending_a,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: t_ref - Duration::from_secs(1),
+    reply: Some(tx_a),
+  });
+  let (tx_b, mut rx_b) = oneshot::channel::<JoinReply>();
+  let mut pending_b = HashSet::new();
+  pending_b.insert(eid_b);
+  driver.pending_joins.push(PendingJoin {
+    pending: pending_b,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: t_ref + future,
+    reply: Some(tx_b),
+  });
+
+  // One poll snapshots W0 at join A's crossing (join B still future), covering only
+  // the depth queued so far — NOT join B's completion.
+  let _ = poll_once(&mut driver);
+
+  // NOW queue join B's completion, strictly BEHIND W0 and BEFORE its own deadline
+  // `t_ref + future` (which has not yet elapsed).
+  for bytes in resp_b {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: eid_b,
+        bytes,
+        received_at: now,
+      }),
+    );
+  }
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
+      eid: eid_b,
+      received_at: now,
+    }),
+  );
+
+  // Let join B's deadline elapse while W0 is still draining: the next fire poll now
+  // sees BOTH deadlines due. A single sticky W0 reaps join B before its buffered
+  // completion drains; the re-snapshotted watermark defers until it does.
+  tokio::time::sleep(future + Duration::from_millis(50)).await;
+
+  let mut reached_a = None;
+  let mut reached_b = None;
+  for _ in 0..(DEPTH + 128) {
+    let _ = poll_once(&mut driver);
+    if reached_a.is_none()
+      && let Ok(Some(reply)) = rx_a.try_recv()
+    {
+      reached_a = Some(reply);
+    }
+    if reached_b.is_none()
+      && let Ok(Some(reply)) = rx_b.try_recv()
+    {
+      reached_b = Some(reply);
+    }
+    if reached_a.is_some() && reached_b.is_some() {
+      break;
+    }
+  }
+
+  let reached_a = reached_a
+    .expect("join A resolved within the poll budget")
+    .expect("join A (earlier, past deadline) resolved Ok from its buffered completion");
+  assert!(
+    reached_a.contains(&seed_a),
+    "join A reached seed A: {reached_a:?}"
+  );
+  let reached_b = reached_b
+    .expect("join B resolved within the poll budget")
+    .expect(
+      "join B (later deadline) resolved Ok — its completion, queued behind W0 but before its own \
+       deadline, was covered by the re-snapshotted watermark; a single sticky W0 reaps a spurious \
+       JoinAllFailed here",
+    );
+  assert!(
+    reached_b.contains(&seed_b),
+    "join B reached seed B: {reached_b:?}"
+  );
+}
+
+/// Regression (overlapping deadlines, leave analog): the EARLIER due deadline is a
+/// graceful-leave deadline and the LATER one an await-result join whose completion
+/// is buffered behind the watermark the leave's crossing snapshotted. The max due
+/// deadline the re-snapshot tracks must span both planes (join AND leave), so the
+/// leave's earlier crossing does not pin the watermark and starve the later join
+/// into a spurious `JoinAllFailed`. The leave itself times out on its own past
+/// deadline (not under test); the join must resolve `Ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_deadlines_leave_then_join_waits_for_join_backlog() {
+  let now = Instant::now();
+  let (mut driver, _obs_rx, _shared) = build_driver(1, 4096).await;
+
+  let seed = sa("127.0.0.1:7020");
+  let (eid, resp) = drive_push_to_queued_response(&mut driver, seed, now);
+  let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+
+  driver
+    .endpoint
+    .start_push_pull(sa("127.0.0.1:7021"), PushPullKind::Join, now);
+  let mut dummy = None;
+  while let Some(action) = driver.endpoint.poll_action() {
+    if let StreamAction::Connect(info) = action {
+      dummy.get_or_insert(info.id());
+    }
+  }
+  let dummy = dummy.expect("the dummy start_push_pull emitted a Connect exchange id");
+
+  // Backlog queued FIRST (the depth the leave's crossing snapshots). The join's
+  // completion is NOT queued yet.
+  const DEPTH: usize = 24;
+  for _ in 0..DEPTH {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: dummy,
+        bytes: vec![0u8; 1],
+        received_at: now,
+      }),
+    );
+  }
+
+  // A leave with a PAST deadline (the earlier due deadline that snapshots the
+  // watermark) and a join with a FUTURE deadline (so its completion, queued after
+  // the snapshot, must be covered when its own deadline later elapses).
+  let t_ref = Instant::now();
+  let future = Duration::from_millis(100);
+  let (ltx, _lrx) = oneshot::channel::<Result<()>>();
+  driver.pending_leave = Some(PendingLeave {
+    repliers: vec![ltx],
+    deadline: t_ref - Duration::from_secs(1),
+  });
+  let (jtx, mut jrx) = oneshot::channel::<JoinReply>();
+  let mut pending = HashSet::new();
+  pending.insert(eid);
+  driver.pending_joins.push(PendingJoin {
+    pending,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: t_ref + future,
+    reply: Some(jtx),
+  });
+
+  // One poll snapshots the watermark at the leave's past-deadline crossing (the
+  // join is still future), covering only the filler backlog — not the join.
+  let _ = poll_once(&mut driver);
+
+  // Queue the join's completion BEHIND the watermark and BEFORE its own deadline.
+  for bytes in resp {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid,
+        bytes,
+        received_at: now,
+      }),
+    );
+  }
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
+      eid,
+      received_at: now,
+    }),
+  );
+
+  // Let the join deadline elapse while the watermark is still draining.
+  tokio::time::sleep(future + Duration::from_millis(50)).await;
+
+  let mut resolved = None;
+  for _ in 0..(DEPTH + 128) {
+    let _ = poll_once(&mut driver);
+    if let Ok(Some(reply)) = jrx.try_recv() {
+      resolved = Some(reply);
+      break;
+    }
+  }
+
+  let reached = resolved
+    .expect("the join resolved within the poll budget")
+    .expect(
+      "the join (later deadline) resolved Ok — the leave's earlier crossing did not pin the \
+       watermark; the max-due re-snapshot covered the join's backlog before the reap",
+    );
+  assert!(
+    reached.contains(&seed),
+    "the join reached its seed despite the overlapping earlier leave deadline: {reached:?}"
+  );
+}
