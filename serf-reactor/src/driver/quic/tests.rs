@@ -57,7 +57,10 @@ mod gate {
   use super::*;
 
   use core::num::NonZeroU8;
-  use std::{sync::Arc, task::Waker};
+  use std::{
+    sync::{Arc, atomic::AtomicBool},
+    task::{Wake, Waker},
+  };
 
   use agnostic::tokio::TokioRuntime;
   use memberlist_proto::{
@@ -88,6 +91,25 @@ mod gate {
   fn poll_once(driver: &mut TestDriver) -> Poll<()> {
     let mut cx = Context::from_waker(Waker::noop());
     Pin::new(driver).poll(&mut cx)
+  }
+
+  /// A `Waker` that records whether it was woken. A SYNCHRONOUS wake during a poll is
+  /// the busy-spin signal: it means the pump requested an immediate re-poll
+  /// (`wake_by_ref`) rather than parking on a timer. Timer / channel registrations do
+  /// NOT wake synchronously, so the flag stays clear when the pump correctly parks.
+  #[derive(Default)]
+  struct SpinFlag {
+    woken: AtomicBool,
+  }
+
+  impl Wake for SpinFlag {
+    fn wake(self: Arc<Self>) {
+      self.woken.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.woken.store(true, Ordering::SeqCst);
+    }
   }
 
   /// A self-signed `localhost` cert + key for the test quinn `ServerConfig`.
@@ -300,6 +322,60 @@ mod gate {
       other => {
         panic!("a quiescent (Poll::Pending) recv stop must fire the past-due reap: {other:?}")
       }
+    }
+  }
+
+  /// A recv-ERROR stop is (correctly) non-quiescent for the timer/reap GATE, but that
+  /// must NOT drive an immediate self-wake: with nothing bounded to make progress on —
+  /// no saturated batch, and only a FUTURE deadline pending — a `wake_by_ref` every
+  /// poll would busy-spin a core between deadlines. The pump must instead PARK on the
+  /// bounded `RECV_ERROR_BACKOFF` timer: it returns `Poll::Pending` WITHOUT waking its
+  /// waker synchronously, and the timer alone re-polls (retrying the errored recv)
+  /// after the backoff.
+  ///
+  /// Fail-on-revert: with the recv-error stop feeding an unconditional `more`, the
+  /// pump self-wakes on the very first poll and this asserts false.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn persistent_recv_error_does_not_spin() {
+    let now = Instant::now();
+    let (mut driver, _obs_rx, _shared) = build_driver(8).await;
+
+    // A FUTURE (not-yet-due) deadline pending: the join sits parked, so nothing is due
+    // this poll and the only thing that could wake the pump is the (buggy) recv-error
+    // self-wake. `pending` empty + `reply` live keeps the waiter in the timer horizon
+    // without a real exchange whose egress could set `more` and mask the spin.
+    let (tx, _rx) = oneshot::channel::<JoinReply>();
+    driver.pending_joins.push(PendingJoin {
+      pending: HashSet::new(),
+      contacted: SmallVec::new(),
+      ignore_streams: SmallVec::new(),
+      requested: 1,
+      deadline: now + Duration::from_secs(30),
+      reply: Some(tx),
+    });
+
+    // Script every recv-loop poll to report an ERROR stop for the whole test.
+    driver.recv_errors_remaining = usize::MAX;
+
+    let flag = Arc::new(SpinFlag::default());
+    let waker = Waker::from(flag.clone());
+
+    // Repeatedly poll: each must park (Pending) WITHOUT a synchronous self-wake. The
+    // 5ms backoff timer cannot fire in the microseconds before the flag is read, and
+    // each poll re-arms it (cancelling the prior), so only a busy-spin bug trips this.
+    for _ in 0..5 {
+      flag.woken.store(false, Ordering::SeqCst);
+      let mut cx = Context::from_waker(&waker);
+      let poll = Pin::new(&mut driver).poll(&mut cx);
+      assert!(
+        poll.is_pending(),
+        "the pump must stay pending under a persistent recv error",
+      );
+      assert!(
+        !flag.woken.load(Ordering::SeqCst),
+        "a persistent recv error self-woke the pump (busy-spin) instead of parking on \
+         the bounded RECV_ERROR_BACKOFF timer",
+      );
     }
   }
 }

@@ -128,6 +128,23 @@ const OBS_OVERFLOW_MAX: usize = 1024;
 /// liveness wins once the grace elapses.
 const SHARED_PATH_STALENESS_GRACE: Duration = Duration::from_millis(5);
 
+/// How long the pump parks after a UDP recv ERROR stop before retrying the recv,
+/// when there is nothing else bounded to make progress on (no saturated batch, no
+/// due deadline).
+///
+/// A recv error is not the kernel-empty `Poll::Pending` signal, so it must not be
+/// read as quiescence — it gates the timer/reap like a saturated batch (see the
+/// module docs). But it is ALSO not a reason to self-wake: an immediate
+/// `wake_by_ref` on every errored poll would busy-spin a core between deadlines, and
+/// — because a `Poll::Ready(Err(_))` from the socket registers NO readiness waker —
+/// no socket wake will re-poll the pump either. So a recv error with nothing else
+/// pending arms a real sleep for this bounded backoff and parks; the timer alone
+/// re-polls and retries the errored recv. Small, because a UDP recv error is
+/// typically transient (a stale ICMP port-unreachable surfacing as `ECONNREFUSED`,
+/// or a momentary `ENOBUFS`) and clears on the next poll, and the shared socket's
+/// gossip/QUIC recv is stalled only for this window.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(5);
+
 /// Size the per-recv UDP buffer to the larger of the two planes that share this
 /// one socket.
 ///
@@ -1018,6 +1035,23 @@ where
     }
   }
 
+  /// Arms the wakeup timer for `target` and polls it once so its waker is registered
+  /// and the pump re-polls when it fires. Returns whether it fired already (an
+  /// already-elapsed target), in which case the caller self-wakes via `more`. Parking
+  /// on the returned `false` re-polls ONLY on the armed timer — no self-wake — which
+  /// is how a recv-error backoff avoids a busy-spin.
+  fn arm_and_poll_timer(&mut self, target: Instant, now: Instant, cx: &mut Context<'_>) -> bool {
+    self.arm_timer(target, now);
+    if let Some(timer) = self.timer.as_mut()
+      && timer.as_mut().poll(cx).is_ready()
+    {
+      self.timer = None;
+      self.timer_deadline = None;
+      return true;
+    }
+    false
+  }
+
   /// Reply `Err(Shutdown)` to a command drained during teardown.
   fn reply_shutdown(cmd: Command<I, SocketAddr>) {
     match cmd {
@@ -1176,7 +1210,14 @@ where
     // `handle_timeout` site below.
     let recv_capped = recv_n == this.iter_drain_cap;
     let recv_quiescent = !recv_capped && !recv_errored;
-    more |= recv_capped || recv_errored;
+    // WAKE and GATE are separate concerns. Both a saturated batch and a recv error
+    // are non-quiescent for the reap gate above (`recv_quiescent`), but their WAKE
+    // policy differs: a saturated batch is bounded backlog to drain next poll, so it
+    // self-wakes; a recv ERROR is not bounded progress — a persistent one would
+    // self-wake every poll and burn a core, and the socket registered no readiness
+    // waker on its `Ready(Err)` — so it does NOT self-wake here. The deadline gate
+    // below instead arms a bounded `RECV_ERROR_BACKOFF` timer for it and parks.
+    more |= recv_capped;
 
     // Drain machine surfaces (gossip/QUIC egress capped, ingress + events uncapped).
     let (drained, drain_more) = this.drain_surfaces(cx);
@@ -1244,26 +1285,41 @@ where
         this.timeout_stall_since = None;
         progress = true;
         more = true;
-      } else {
-        // A deadline is due but the recv stop was non-quiescent (a saturated batch or
-        // a recv error, either backlog-uncertain) and the grace has not elapsed:
-        // DEFER (self-wake) so the next poll drains the recv toward a `Poll::Pending`
-        // quiescent stop. No timer is armed — the deadline already elapsed, so the
-        // `more` self-wake alone re-polls (no lost wakeup), and the wall-clock grace
-        // bounds the deferral so a persistent error cannot starve the timer forever.
+      } else if recv_capped {
+        // A deadline is due but the recv stop was a SATURATED BATCH (real backlog) and
+        // the grace has not elapsed: DEFER by self-waking so the next poll drains the
+        // recv toward a `Poll::Pending` quiescent stop. No timer is armed — the
+        // deadline already elapsed, so the `more` self-wake alone re-polls (no lost
+        // wakeup), and the wall-clock grace bounds the deferral.
         more = true;
+      } else {
+        // A deadline is due but the recv stop was a recv ERROR (the only remaining
+        // non-quiescent case) and the grace has not elapsed: DEFER. There is nothing
+        // bounded to drain, so an immediate self-wake would busy-spin the whole grace;
+        // instead park on a timer at the grace expiry, when the force-fire (grace
+        // elapsed) re-polls the recv. The grace still bounds the hold-back, so a
+        // persistent error cannot starve the timer. `timeout_stall_since` is `Some`
+        // here (anchored just above for this non-quiescent stop).
+        let grace_deadline = this
+          .timeout_stall_since
+          .map_or(now, |t| t + SHARED_PATH_STALENESS_GRACE);
+        if this.arm_and_poll_timer(grace_deadline, now, cx) {
+          more = true;
+        }
       }
     } else {
       // Idle: nothing due. Clear the stall anchor, then arm + poll the sleep for the
-      // next deadline; NO self-wake (an armed sleep or socket readiness re-polls).
+      // next deadline; NO self-wake (an armed sleep or socket readiness re-polls). A
+      // recv ERROR folds a bounded `RECV_ERROR_BACKOFF` into the target so the errored
+      // recv is retried within the backoff even when the next deadline is far off (the
+      // idle wake is 60s) — a `Ready(Err)` socket registered no readiness waker, so
+      // only this timer re-polls.
       this.timeout_stall_since = None;
-      let target = reap_deadline.map_or(endpoint_deadline, |d| d.min(endpoint_deadline));
-      this.arm_timer(target, now);
-      if let Some(timer) = this.timer.as_mut()
-        && timer.as_mut().poll(cx).is_ready()
-      {
-        this.timer = None;
-        this.timer_deadline = None;
+      let mut target = reap_deadline.map_or(endpoint_deadline, |d| d.min(endpoint_deadline));
+      if recv_errored {
+        target = target.min(now + RECV_ERROR_BACKOFF);
+      }
+      if this.arm_and_poll_timer(target, now, cx) {
         more = true;
       }
     }
