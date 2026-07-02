@@ -70,10 +70,15 @@ pub type SniProvider = Box<dyn Fn(&SocketAddr) -> Option<String> + Send + Sync>;
 /// Embedded into the transport constructor. Bundles the local node identifier,
 /// the (possibly-unresolved) advertise address, the stream-transport tuning
 /// knobs, the per-peer SNI provider closure, the machine-layer [`TlsOptions`]
-/// bundle (cert/key/verifier), and the optional gossip-encryption policy. The
-/// cluster label and inbound-label-check policy are supplied via the serf
-/// `Options` block (not here), feeding both planes from a single validated
-/// source.
+/// bundle (cert/key/verifier), and the optional gossip-encryption policy.
+///
+/// Serf exposes no memberlist cluster label: neither this block nor the serf
+/// `Options` carries one, so both planes run unlabeled (the coordinator built in
+/// `Transport::run` passes `None`). The reliable-plane cluster boundary is the TLS
+/// trust anchor — peer-certificate verification plus the per-peer SNI — while the
+/// gossip plane is segregated by the encryption keyring. memberlist-reactor's
+/// lower-level options DO surface a label; serf, layered on top, relies on the TLS
+/// trust + keyring instead.
 pub struct TlsTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,
@@ -411,9 +416,11 @@ where
     let inner = Endpoint::new(inner_opts, gossip_rng);
     // The TLS coordinator carries the per-peer SNI provider and the cert/key bundle
     // (ridden as the inner options on `LabelOptions`); the membership address IS the
-    // transport socket (`|addr| *addr`). Like the plain-TCP plane this stage carries
-    // no cluster label (`None`) — TLS isolation comes from the record-layer cert
-    // verification and SNI.
+    // transport socket (`|addr| *addr`). Serf threads no memberlist cluster label —
+    // there is none in its options — so, like the plain-TCP plane, the reliable
+    // record layer runs unlabeled (`None`); the cluster boundary here is the TLS
+    // trust anchor (peer-cert verification + SNI), with gossip segregated by the
+    // keyring.
     #[allow(unused_mut)]
     let mut coord = Coordinator::<_, _, Labeled<TlsRecords>, G>::new(
       inner,

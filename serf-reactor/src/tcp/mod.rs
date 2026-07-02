@@ -38,9 +38,15 @@ use crate::{
 /// Per-backend TCP-specific transport options.
 ///
 /// Bundles the local node identifier, the (possibly-unresolved) advertise
-/// address, and the stream-transport tuning knobs. The cluster label and
-/// inbound-label-check policy are supplied via the serf `Options` block (not
-/// here), feeding both planes from a single validated source.
+/// address, and the stream-transport tuning knobs.
+///
+/// Serf exposes no memberlist cluster label: neither this block nor the serf
+/// `Options` carries one, so both the reliable and gossip planes run unlabeled (the
+/// coordinator built in `Transport::run` passes `None`). On the plain-TCP transport
+/// the cluster boundary is the encryption keyring alone — there is no TLS trust
+/// anchor, so an unencrypted plain-TCP cluster is segregated only by network
+/// reachability. memberlist-reactor's lower-level options DO surface a label; serf,
+/// layered on top, does not.
 pub struct TcpTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,
@@ -315,7 +321,9 @@ where
     let stream_timeout = inner_opts.stream_timeout();
     let inner = Endpoint::new(inner_opts, gossip_rng);
     // Plain TCP has no SNI (`|_| None`) and a membership address that IS the
-    // transport socket (`|addr| *addr`). No cluster label at this stage.
+    // transport socket (`|addr| *addr`). Serf threads no memberlist cluster label —
+    // there is none in its options — so the reliable record layer runs unlabeled
+    // (`None`); on plain TCP the cluster boundary is the encryption keyring alone.
     #[allow(unused_mut)]
     let mut coord = Coordinator::<_, _, RawRecords, G>::new(
       inner,
