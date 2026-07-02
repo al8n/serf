@@ -94,17 +94,16 @@ pub(crate) const ACCEPT_CAP: usize = 256;
 /// channel (the payload byte budget bounds their bytes; this bounds their count).
 const OBS_OVERFLOW_MAX: usize = 1024;
 
-/// Upper bound on how many consecutive capped (`more`) polls may DEFER a due
-/// timer / deadline reap before it fires regardless. While `more`, ready
-/// pre-deadline ingress can sit behind a per-poll cap, so firing immediately could
-/// time out a probe / join / leave whose resolving Ack / `ExchangeCompleted` /
-/// `LeftCluster` is buffered one poll behind (premature). Deferring re-polls to
-/// drain that first — and the pre-deadline backlog is FIFO, so it drains within a
-/// few `iter_drain_cap`-sized polls — but an UNBOUNDED defer would let a sustained
-/// ingress flood suppress failure detection and join / leave / query deadlines
-/// forever (a liveness-denial DoS). This bound caps the deferral, trading a few
-/// polls of deadline staleness under flood for guaranteed liveness.
-const TIMER_DEFERRAL_LIVENESS_BOUND: u32 = 8;
+/// How long the SWIM suspicion tick may be held back under a sustained UDP flood
+/// before it fires bounded-early. The refuting Ack that would clear a false
+/// `Suspect` rides ONLY the UDP recv path, which a flood pins every poll, so —
+/// unlike the reliable plane — the SWIM tick cannot gate on a drain watermark. It
+/// need not: SWIM refutes within its multi-second suspicion window, so a few ms of
+/// staleness is the correct freshness-under-load trade. This is a `Duration`, not
+/// a poll count: the failure mode of a fixed count is that at a low `iter_drain_cap`
+/// (or a large exchange) a count elapses while real pre-deadline work is still
+/// buffered, whereas a wall-clock grace bounds the staleness directly.
+const SWIM_STALENESS_GRACE: Duration = Duration::from_millis(5);
 
 /// A message from the pump to a bridge's TCP write side. Teardown is signalled out
 /// of band by dropping the [`BridgeHandle`], not by a variant here, so it can
@@ -213,6 +212,16 @@ struct PendingJoin {
   requested: usize,
   /// Wall-clock instant past which the driver replies with whatever `contacted`
   /// set it has accumulated even if `pending` is non-empty.
+  ///
+  /// This is a driver-local FALLBACK, subordinate to the machine's arrival-time
+  /// `ExchangeCompleted`: [`Self::resolve_reply`] runs only from the `fire` path,
+  /// which requires the reliable backlog to have drained (`reap_watermark`), so
+  /// this deadline can never reap a join whose completing frame — stamped
+  /// `received_at < deadline` — is still in flight. serf-proto's `StreamEndpoint`
+  /// exposes no per-exchange CALLER deadline (`start_join_push_pull` takes only
+  /// `peer, ignore_old, now`; the exchange deadline is the frozen inner FSM's own),
+  /// so this second clock cannot yet be removed outright; plumbing the caller
+  /// deadline INTO the exchange is a serf-proto follow-up.
   deadline: Instant,
   /// One-shot reply channel back to the caller, taken when the reply resolves.
   /// `None` once resolved; the waiter then lingers — only to drive ignore-stream
@@ -341,11 +350,37 @@ where
   iter_drain_cap: usize,
   timer: Option<Pin<Box<R::Sleep>>>,
   timer_deadline: Option<Instant>,
-  /// Consecutive capped-poll deferrals of a due timer / deadline reap, bounded by
-  /// [`TIMER_DEFERRAL_LIVENESS_BOUND`]. Accumulates only while a deadline is
-  /// overdue AND a per-poll cap is being hit; reset the moment the poll reaches
-  /// quiescence, the deadline fires, or nothing is due.
-  timer_deferrals: u32,
+  /// Monotone count of bridge-inbound items the pump has removed from
+  /// `inbound_rx` (the step-6 drain AND the shutdown drain). The reliable-plane
+  /// watermark is expressed against this counter.
+  inbound_drained_total: u64,
+  /// The reliable plane's pre-deadline backlog target: `inbound_drained_total`
+  /// once every item that was in flight toward `inbound_rx` when a reliable
+  /// deadline first went due has been drained. Snapshotted ONCE at that crossing;
+  /// `None` when no reliable deadline is due. The join/leave reaps and the
+  /// reliable-exchange deadlines inside `handle_timeout` fire only once
+  /// `inbound_drained_total` reaches it — non-premature by FIFO, and (because a
+  /// join completion never rides the UDP gossip flood) immune to that flood with
+  /// no force-fire.
+  ///
+  /// Covers only frames a bridge has already READ (`received_at < deadline`,
+  /// queued or parked). A frame still kernel-resident-but-unread at the deadline
+  /// is stamped `received_at >= deadline` at its later read, so the FSM's
+  /// arrival-time gate rejects it as a `Timeout` — a correct, Go-faithful
+  /// read-deadline outcome (a read completing after the deadline is late), NOT a
+  /// dropped success, so the watermark does not (and must not) wait for it.
+  reap_watermark: Option<u64>,
+  /// Wall-clock anchor for the SWIM suspicion plane: the instant the SWIM tick
+  /// first deferred on a pinned UDP path (reliable backlog already clear). `None`
+  /// when the SWIM tick is not deferring. The tick fires once
+  /// [`SWIM_STALENESS_GRACE`] has elapsed since this anchor.
+  swim_stall_since: Option<Instant>,
+  /// Frames a bridge has read but the pump has not yet received — queued in
+  /// `inbound_rx` OR parked on a bridge's saturated `send_async`. Bridges bump it
+  /// before each send; the pump clears it on receive. Lets the watermark account
+  /// for a completion parked OUTSIDE `inbound_rx.len()`, and is exact (drains to
+  /// `0`) so the watermark is always reachable.
+  bridge_inbound_inflight: Arc<AtomicU64>,
   idle_wake: Duration,
   leave_timeout: Duration,
   close_timeout: Duration,
@@ -413,7 +448,10 @@ where
       iter_drain_cap: driver_opts.iter_drain_cap().max(1),
       timer: None,
       timer_deadline: None,
-      timer_deferrals: 0,
+      inbound_drained_total: 0,
+      reap_watermark: None,
+      swim_stall_since: None,
+      bridge_inbound_inflight: Arc::new(AtomicU64::new(0)),
       idle_wake: driver_opts.idle_wake_interval(),
       leave_timeout: driver_opts.leave_timeout(),
       close_timeout: stream_opts.close_timeout(),
@@ -465,6 +503,7 @@ where
         .as_ref()
         .expect("a bridge is only spawned while running, before the shutdown freeze drops the template inbound sender")
         .clone(),
+      self.bridge_inbound_inflight.clone(),
       self.shared.clone(),
       self.bridge_recv_buf_len,
       self.close_timeout,
@@ -881,34 +920,43 @@ where
   /// fixed point immediately with `more == true`: the caller self-wakes and re-polls
   /// rather than uncapped-draining a surface a fast peer can refill, keeping each
   /// poll bounded.
-  fn drain_surfaces(&mut self, cx: &mut Context<'_>) -> (bool, bool)
+  fn drain_surfaces(&mut self, cx: &mut Context<'_>) -> (bool, bool, bool)
   where
     I: Send + Sync + 'static,
   {
     let now = Instant::now();
     let mut worked = false;
+    let mut ingress_capped = false;
     loop {
-      let (pass_worked, pass_more) = self.drain_surfaces_pass(cx, now);
+      let (pass_worked, pass_more, pass_ingress_capped) = self.drain_surfaces_pass(cx, now);
       worked |= pass_worked;
+      // `ingress_capped` gates the SWIM staleness plane (a pinned UDP path), so
+      // surface it across passes even though the machine's inbound ingress is fed
+      // only by the pre-drain recv loop and so caps at most in the first pass.
+      ingress_capped |= pass_ingress_capped;
       if pass_more {
         // A per-surface cap was hit: end the fixed point and self-wake (`more`)
         // rather than repeat the pass, so the poll stays bounded.
-        return (worked, true);
+        return (worked, true, ingress_capped);
       }
       if !pass_worked {
         // No surface made progress: the fixed point is reached and no ready machine
         // work remains from this poll's input.
-        return (worked, false);
+        return (worked, false, ingress_capped);
       }
     }
   }
 
   /// One ordered surface pass — inbound-ingress → action → transport → gossip →
-  /// event — each surface draining up to `iter_drain_cap` items. Returns
-  /// `(worked, more)`: whether any surface produced work in this pass, and whether
-  /// any surface hit its cap. [`Self::drain_surfaces`] iterates this to a fixed
-  /// point so a later surface feeding an earlier one is drained the same poll.
-  fn drain_surfaces_pass(&mut self, cx: &mut Context<'_>, now: Instant) -> (bool, bool)
+  /// event — each capped surface draining up to `iter_drain_cap` items. Returns
+  /// `(worked, more, ingress_capped)`: whether any surface produced work in this
+  /// pass, whether any capped surface hit its cap, and whether the inbound-ingress
+  /// surface specifically hit its cap (the UDP recv path's second stage, which
+  /// gates the SWIM staleness plane). The event surface is UNCAPPED (drained to
+  /// empty) so a surfaced terminal is never stranded behind a cap.
+  /// [`Self::drain_surfaces`] iterates this to a fixed point so a later surface
+  /// feeding an earlier one is drained the same poll.
+  fn drain_surfaces_pass(&mut self, cx: &mut Context<'_>, now: Instant) -> (bool, bool, bool)
   where
     I: Send + Sync + 'static,
   {
@@ -950,7 +998,8 @@ where
       }
     }
     worked |= ingress > 0;
-    more |= ingress == budget;
+    let ingress_capped = ingress == budget;
+    more |= ingress_capped;
 
     // Stream actions: open dials, half-close, or tear down reliable exchanges.
     let mut actions = 0;
@@ -1024,20 +1073,23 @@ where
     worked |= sent > 0;
     more |= sent == budget;
 
-    // Observation events: retry the overflow first, then drain up to the budget.
+    // Observation events: retry the overflow first, then drain to EMPTY. UNLIKE
+    // the other surfaces this one is NOT capped: a surfaced terminal
+    // (`ExchangeCompleted` / `LeftCluster`) folded by `send_observation` must never
+    // be stranded behind a per-poll cap under a UDP flood — that residence is
+    // exactly what let a flood defeat the reap gate. Sound: `pending_events` is
+    // pump-fed (bounded per poll by the already-capped feeds + an O(members)
+    // `handle_timeout` burst), `send_observation` is non-blocking (overflow+drop),
+    // and there is no event→event feedback, so the drain terminates.
     self.flush_obs_overflow();
-    let mut events = 0;
-    while events < budget {
-      let Some(ev) = self.endpoint.poll_event() else {
-        break;
-      };
-      events += 1;
+    let mut events = false;
+    while let Some(ev) = self.endpoint.poll_event() {
+      events = true;
       self.send_observation(ev);
     }
-    worked |= events > 0;
-    more |= events == budget;
+    worked |= events;
 
-    (worked, more)
+    (worked, more, ingress_capped)
   }
 
   /// Retries retained overflow events into the obs channel, stopping at the first
@@ -1202,6 +1254,21 @@ where
     self.pending_leave.as_ref().map(|pl| pl.deadline)
   }
 
+  /// Frames that a bridge has read but the pump has not yet drained, expressed as
+  /// the pair `(queued, parked)`: `queued` is the observable `inbound_rx` depth,
+  /// `parked` is the residue a bridge has read (`received_at < deadline`) but is
+  /// still parked delivering on a SATURATED `send_async` — a completion OUTSIDE
+  /// `inbound_rx.len()` that a raw depth watermark would miss. `bridge_inbound_inflight`
+  /// counts queued+parked (bridges bump before each send, the pump clears on
+  /// receive), so `parked = inflight - queued`. Both terms are added to the reap
+  /// watermark; every counted frame is received exactly once, so the watermark is
+  /// always reachable (no over-count can strand it above the drain).
+  fn inbound_backlog_watermark_terms(&self) -> (u64, u64) {
+    let queued = self.inbound_rx.as_ref().map_or(0, |rx| rx.len() as u64);
+    let inflight = self.bridge_inbound_inflight.load(Ordering::Acquire);
+    (queued, inflight.saturating_sub(queued))
+  }
+
   /// Publish a fresh [`SerfSnapshot`] of the endpoint's observable membership.
   /// Skips the publish when the local node is not yet present in the membership
   /// store (the local `NodeJoined` sieve has not fired), so `SerfSnapshot::new`
@@ -1348,18 +1415,24 @@ where
                   bytes,
                   received_at,
                 })) => {
+                  this.inbound_drained_total += 1;
+                  this.bridge_inbound_inflight.fetch_sub(1, Ordering::Release);
                   this
                     .endpoint
                     .handle_transport_data(eid, &bytes, false, received_at);
                   channel_work = true;
                 }
                 Ok(BridgeInbound::Eof(BridgeEof { eid, received_at })) => {
+                  this.inbound_drained_total += 1;
+                  this.bridge_inbound_inflight.fetch_sub(1, Ordering::Release);
                   this
                     .endpoint
                     .handle_transport_data(eid, &[], true, received_at);
                   channel_work = true;
                 }
                 Ok(BridgeInbound::Error(BridgeEof { eid, received_at })) => {
+                  this.inbound_drained_total += 1;
+                  this.bridge_inbound_inflight.fetch_sub(1, Ordering::Release);
                   this.endpoint.handle_transport_error(eid, received_at);
                   channel_work = true;
                 }
@@ -1373,7 +1446,7 @@ where
           }
           // Pull the resulting machine surfaces to QUIESCENCE; account_event folds
           // every terminal completion into the matching pending join.
-          let (_, surf_more) = this.drain_surfaces(cx);
+          let (_, surf_more, _) = this.drain_surfaces(cx);
           if channel_work || surf_more {
             continue;
           }
@@ -1455,9 +1528,11 @@ where
     if recv_n > 0 {
       progress = true;
     }
-    if recv_n == this.iter_drain_cap {
-      more = true;
-    }
+    // Stage 1 of the UDP path: a full recv batch means the kernel may hold more.
+    // Folded (with the ingress-decode stage) into `udp_backlog`, which gates ONLY
+    // the SWIM staleness plane — never the reliable reap.
+    let recv_capped = recv_n == this.iter_drain_cap;
+    more |= recv_capped;
 
     // Accept inbound connections. Aux tasks wake the driver after enqueueing, so
     // `try_recv` (no waker registration) is sufficient.
@@ -1484,6 +1559,10 @@ where
         break;
       };
       inbound_n += 1;
+      // Advance the reliable-plane drain counter and clear the frame's in-flight
+      // reservation BEFORE folding it, so the watermark reflects post-drain state.
+      this.inbound_drained_total += 1;
+      this.bridge_inbound_inflight.fetch_sub(1, Ordering::Release);
       this.dispatch_bridge_inbound(msg);
     }
     if inbound_n > 0 {
@@ -1493,8 +1572,8 @@ where
       more = true;
     }
 
-    // Drain machine surfaces (bounded per surface).
-    let (drained, drain_more) = this.drain_surfaces(cx);
+    // Drain machine surfaces (bounded per surface; the event surface uncapped).
+    let (drained, drain_more, ingress_capped) = this.drain_surfaces(cx);
     progress |= drained;
     more |= drain_more;
     // A conflict `Event::Shutdown` observed during the drain flips the shutdown
@@ -1503,79 +1582,108 @@ where
       more = true;
     }
 
-    // Timer + deadline reaps under a BOUNDED-DEFERRAL liveness policy. Fold the
-    // coordinator's next deadline together with the earliest parked join / leave
-    // deadline into one `target`; `due` means at least one is overdue. Firing while
-    // ready pre-deadline ingress is still buffered would be premature (false
-    // suspicion / a spurious `JoinAllFailed` / a `LeaveTimeout`), but never firing
-    // while `more` would let a flood starve the deadline — so the two cases split.
+    // Timer + deadline reaps under two RESIDENCE-SCOPED gates (replacing the old
+    // fixed-count deferral, which fired prematurely at a low `iter_drain_cap` or a
+    // large exchange, and could starve under a flood). Every join/leave-resolving
+    // input rides the reliable `inbound_rx` FIFO; a UDP gossip flood deposits ZERO
+    // there. So the reliable reaps + the reliable-exchange deadlines in
+    // `handle_timeout` gate on the exact `inbound_rx` backlog DEPTH — snapshotted
+    // once at deadline-crossing (`reap_watermark`) — while the refutable SWIM
+    // suspicion tick, whose Ack rides only the pinned UDP path, fires bounded-early
+    // after a wall-clock staleness grace.
     let endpoint_deadline = this
       .endpoint
       .poll_timeout()
       .map(|d| d.min(now + this.idle_wake))
       .unwrap_or(now + this.idle_wake);
-    let target = [
-      Some(endpoint_deadline),
+    let reap_deadline = [
       this.min_pending_join_deadline(),
       this.min_pending_leave_deadline(),
     ]
     .into_iter()
     .flatten()
-    .min()
-    .unwrap_or(endpoint_deadline);
-    let due = target <= now;
-    // The deferral counter accumulates only while a deadline is actually overdue.
-    if !due {
-      this.timer_deferrals = 0;
+    .min();
+    // `endpoint_deadline` folds `idle_wake`, so `ep_due` is exactly "the coordinator
+    // has an elapsed SWIM / reliable-exchange deadline"; a bare idle wake is not due
+    // and takes the idle arm below.
+    let ep_due = endpoint_deadline <= now;
+    let reap_due = reap_deadline.is_some_and(|d| d <= now);
+
+    // Snapshot the reliable backlog ONCE, when a reliable deadline first goes due:
+    // the drain target past which every completion in flight at the deadline (queued
+    // in `inbound_rx` OR parked on a saturated bridge hand-off) is guaranteed folded.
+    if (ep_due || reap_due) && this.reap_watermark.is_none() {
+      let (queued, parked) = this.inbound_backlog_watermark_terms();
+      this.reap_watermark = Some(this.inbound_drained_total + queued + parked);
     }
+    if !ep_due && !reap_due {
+      this.reap_watermark = None;
+      this.swim_stall_since = None;
+    }
+    // GATE 1 (reliable plane): the pre-deadline backlog has drained. FIFO ⇒ a
+    // completion buffered at the deadline is folded (resolving its join/leave)
+    // before the counter reaches the watermark; fixed at snapshot ⇒ a concurrent
+    // flood (UDP, or bridge appends behind the mark) never pushes it away, so the
+    // pump drains to it in bounded polls with no force-fire.
+    let tcp_clear = this
+      .reap_watermark
+      .is_none_or(|w| this.inbound_drained_total >= w);
+    // Both UDP stages: a full recv batch (kernel may hold more) or a capped ingress
+    // decode. Gates ONLY the SWIM plane.
+    let udp_backlog = recv_capped || ingress_capped;
+    // Anchor the SWIM staleness grace the first poll the tick is held back purely by
+    // a pinned UDP path (reliable backlog already clear, nothing else due).
+    if ep_due && !reap_due && tcp_clear && udp_backlog {
+      this.swim_stall_since.get_or_insert(now);
+    }
+    // GATE 2 (SWIM plane): fire once the UDP path drained this poll, OR the staleness
+    // grace elapsed. A reap forcing the shared `handle_timeout` also satisfies it
+    // (`reap_due` short-circuits below).
+    let swim_ok = !udp_backlog
+      || this
+        .swim_stall_since
+        .is_some_and(|t| now.saturating_duration_since(t) >= SWIM_STALENESS_GRACE);
+    let fire = tcp_clear && (ep_due || reap_due) && (reap_due || swim_ok);
 
-    if !more {
-      // Quiescent: the recv / bridge-inbound loops drained to `Poll::Pending` and
-      // `drain_surfaces` reached its fixed point, so the whole poll-entry backlog is
-      // processed. Fire an overdue deadline inline (the single `handle_timeout`
-      // site) — non-prematurely, since nothing that could resolve it is still
-      // buffered — else arm + poll the sleep so the next deadline wakes the pump.
-      if due {
+    if fire {
+      // Reliable backlog folded: fire the coordinator's elapsed deadlines, then fold
+      // the UNCAPPED terminal events they emit (`LeftCluster` / `ExchangeCompleted`)
+      // BEFORE the reaps — a same-poll leave whose `LeftCluster` is unfolded would
+      // otherwise reap a false `LeaveTimeout` — then reap the deadline residue (a
+      // no-op for a resolve already folded here).
+      if ep_due {
         this.endpoint.handle_timeout(now);
-        this.timer_deferrals = 0;
-        progress = true;
-        more = true;
-      } else {
-        this.arm_timer(target, now);
-        if let Some(timer) = this.timer.as_mut()
-          && timer.as_mut().poll(cx).is_ready()
-        {
-          this.endpoint.handle_timeout(Instant::now());
-          this.timer = None;
-          this.timer_deadline = None;
-          progress = true;
-          more = true;
-        }
       }
-
-      // Reap deadline-expired join / leave waiters (a fired `handle_timeout` may
-      // have completed exchanges; the deadline path resolves the rest).
+      while let Some(ev) = this.endpoint.poll_event() {
+        this.send_observation(ev);
+      }
       this.reap_pending_joins(now);
       this.reap_pending_leave(now);
-    } else if due {
-      // `more`: a per-poll cap was hit, so ready pre-deadline ingress may sit BEHIND
-      // it — a resolving Ack / `ExchangeCompleted` / `LeftCluster` could be one poll
-      // behind. DEFER the timer + reaps and re-poll (the `more` self-wake below) so
-      // that FIFO backlog drains first. Deferral is BOUNDED: after
-      // `TIMER_DEFERRAL_LIVENESS_BOUND` consecutive deferrals the pre-deadline
-      // backlog is drained (FIFO, `iter_drain_cap` per poll), so fire regardless —
-      // an unbounded defer would let a sustained flood starve failure detection and
-      // join / leave / query deadlines. No timer is armed while deferring; the
-      // self-wake alone re-polls, so there is no lost wakeup and the counter
-      // guarantees the deferral terminates.
-      if this.timer_deferrals >= TIMER_DEFERRAL_LIVENESS_BOUND {
-        this.endpoint.handle_timeout(now);
-        this.reap_pending_joins(now);
-        this.reap_pending_leave(now);
-        this.timer_deferrals = 0;
-        progress = true;
-      } else {
-        this.timer_deferrals += 1;
+      this.reap_watermark = None;
+      this.swim_stall_since = None;
+      progress = true;
+      more = true;
+    } else if ep_due || reap_due {
+      // A deadline is due but its gate is not yet satisfied (reliable backlog still
+      // draining, or the SWIM plane inside its grace). DEFER: self-wake and re-poll
+      // so step-6 drains `inbound_rx` toward the watermark / the grace elapses. No
+      // timer is armed — the deadline already elapsed, so the `more` self-wake alone
+      // re-polls (no lost wakeup), and the exact watermark guarantees termination.
+      more = true;
+    } else {
+      // Idle: nothing due. Arm + poll the sleep for the next deadline; NO self-wake
+      // (return `Pending` — the armed sleep, a bridge `wake_driver`, or a socket
+      // readiness re-polls us).
+      let target = reap_deadline.map_or(endpoint_deadline, |d| d.min(endpoint_deadline));
+      this.arm_timer(target, now);
+      if let Some(timer) = this.timer.as_mut()
+        && timer.as_mut().poll(cx).is_ready()
+      {
+        // The sleep elapsed at/just after arming: clear it and self-wake so the next
+        // poll re-evaluates with `now` advanced and fires through the gates above.
+        this.timer = None;
+        this.timer_deadline = None;
+        more = true;
       }
     }
 
