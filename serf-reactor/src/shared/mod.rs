@@ -48,6 +48,11 @@ pub(crate) struct Shared<I> {
   events_dropped: AtomicU64,
   /// Observation-channel drops (a slow delegate; may lose application data).
   observation_dropped: AtomicU64,
+  /// Cumulative gossip payloads that rode the QUIC datagram plane (a
+  /// `DatagramSendStatus::Queued`), as opposed to the plain-UDP fallback. Zero on
+  /// the stream transports and on a QUIC endpoint in `UnreliableTransport::Udp`
+  /// mode.
+  datagrams_sent: AtomicU64,
   /// Set once the driver is shutting down; handle command methods observe it.
   shutdown: AtomicBool,
   /// Count of live `Serf` handles. The last to drop flips `shutdown` and wakes
@@ -78,6 +83,7 @@ impl<I> Shared<I> {
       snapshot: ArcSwap::from_pointee(initial),
       events_dropped: AtomicU64::new(0),
       observation_dropped: AtomicU64::new(0),
+      datagrams_sent: AtomicU64::new(0),
       shutdown: AtomicBool::new(false),
       handles: AtomicUsize::new(1),
       shutdown_complete_tx: Mutex::new(Some(shutdown_complete_tx)),
@@ -139,6 +145,11 @@ impl<I> Shared<I> {
     self.observation_dropped.fetch_add(n, Ordering::Relaxed);
   }
 
+  /// Records `n` gossip payloads sent over the QUIC datagram plane.
+  pub(crate) fn add_datagrams_sent(&self, n: u64) {
+    self.datagrams_sent.fetch_add(n, Ordering::Relaxed);
+  }
+
   /// The cumulative recoverable EventStream-forward drop count.
   pub(crate) fn events_dropped(&self) -> u64 {
     self.events_dropped.load(Ordering::Relaxed)
@@ -147,6 +158,11 @@ impl<I> Shared<I> {
   /// The cumulative observation-channel drop count.
   pub(crate) fn observation_dropped(&self) -> u64 {
     self.observation_dropped.load(Ordering::Relaxed)
+  }
+
+  /// The cumulative count of gossip payloads sent over the QUIC datagram plane.
+  pub(crate) fn datagrams_sent(&self) -> u64 {
+    self.datagrams_sent.load(Ordering::Relaxed)
   }
 
   /// Whether the driver is shutting down.

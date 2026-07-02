@@ -518,6 +518,15 @@ impl<I, A, R> Serf<I, A, R> {
     self.shared.observation_dropped()
   }
 
+  /// The cumulative count of gossip payloads sent over the QUIC datagram plane
+  /// (a datagram queued onto the peer's pooled, TLS-protected connection) rather
+  /// than the plain-UDP fallback. Always `0` on the stream transports and on a
+  /// QUIC endpoint configured for `UnreliableTransport::Udp`.
+  #[must_use]
+  pub fn datagrams_sent(&self) -> u64 {
+    self.shared.datagrams_sent()
+  }
+
   /// Send `cmd` to the driver, failing fast if the node has shut down.
   fn send(&self, cmd: Command<I, SocketAddr>) -> Result<()> {
     if self.shared.is_shutdown() {

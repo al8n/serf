@@ -23,16 +23,17 @@
 //! watermark can gate exactly — a join's resolving push/pull completion and a
 //! gossip flood arrive on the SAME path. There is thus no per-completion watermark
 //! to observe; the non-premature gate is instead UDP-recv QUIESCENCE. When the
-//! recv loop stops on `Poll::Pending` (`!recv_capped`), every kernel-ready packet
+//! recv loop stops on `Poll::Pending` (`recv_quiescent`), every kernel-ready packet
 //! — including any completing QUIC stream packet — was fed through `handle_udp`
 //! this poll and its `ExchangeCompleted` folded by `drain_surfaces` BEFORE the
 //! reaps run, so a due reap / reliable-exchange `handle_timeout` fires only over a
-//! genuinely-absent completion. Under a sustained flood that keeps the batch
-//! saturated (`recv_capped`) every poll, the fire is held back only until a
-//! bounded wall-clock staleness grace elapses, then fires for liveness (quinn's
-//! connection timers must advance and a parked join/leave must resolve). The
-//! grace is bounded-early exactly as the stream driver's SWIM tick is; on QUIC it
-//! covers the reliable plane too, because that plane shares the flooded path.
+//! genuinely-absent completion. A stop that is NOT `Poll::Pending` — a saturated
+//! batch (`recv_capped`) OR a recv error (which is not a kernel-empty signal: a
+//! completing packet may sit behind it) — is backlog-uncertain and holds the fire
+//! back until a bounded wall-clock staleness grace elapses, then fires for liveness
+//! (quinn's connection timers must advance and a parked join/leave must resolve).
+//! The grace is bounded-early exactly as the stream driver's SWIM tick is; on QUIC
+//! it covers the reliable plane too, because that plane shares the same path.
 
 #![cfg(feature = "quic")]
 
@@ -57,7 +58,7 @@ use bytes::Bytes;
 use flume::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use memberlist_proto::{
-  Instant, SeedableRng, StreamId, Transmit,
+  DatagramSendStatus, Instant, SeedableRng, StreamId, Transmit, UnreliableTransport,
   codec::{
     DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
     parse_messages,
@@ -303,6 +304,13 @@ where
   timeout_stall_since: Option<Instant>,
   idle_wake: Duration,
   leave_timeout: Duration,
+  /// Test-only: the number of upcoming recv-loop socket polls that must report a
+  /// recv ERROR stop instead of reading the real socket. A bound UDP socket cannot
+  /// be made to error on demand, so a pump test decrements this to drive the
+  /// recv-error gate deterministically (an `Err` stop, then a real `Poll::Pending`
+  /// quiescent stop).
+  #[cfg(test)]
+  recv_errors_remaining: usize,
   /// The driver's keyring delegate: applies inbound key-management ops and produces
   /// the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)]
@@ -351,9 +359,29 @@ where
       timeout_stall_since: None,
       idle_wake: driver_opts.idle_wake_interval(),
       leave_timeout: driver_opts.leave_timeout(),
+      #[cfg(test)]
+      recv_errors_remaining: 0,
       #[cfg(encryption)]
       keyring,
     }
+  }
+
+  /// Poll the shared UDP socket once for the recv loop, returning one datagram, a
+  /// recv error, or `Poll::Pending` (the kernel-empty signal). A `#[cfg(test)]`
+  /// hook can script an `Err` stop here so a pump test can drive the recv-error
+  /// gate deterministically — a bound socket cannot be made to error on demand.
+  fn poll_recv_once(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<(usize, SocketAddr)>> {
+    #[cfg(test)]
+    if self.recv_errors_remaining > 0 {
+      self.recv_errors_remaining -= 1;
+      return Poll::Ready(Err(std::io::Error::from(
+        std::io::ErrorKind::ConnectionRefused,
+      )));
+    }
+    let Some(socket) = self.socket.as_ref() else {
+      return Poll::Pending;
+    };
+    socket.poll_recv_from(cx, &mut self.recv_buf)
   }
 
   /// Applies one handle command to the machine.
@@ -671,11 +699,15 @@ where
     }
     worked |= ingress;
 
-    // Outbound gossip: encode (plain or compound) + encrypt, then send on the UDP
-    // socket. Popping the last transmit is the endpoint's leave-completion fence
-    // (it emits `LeftCluster`), so the leave/shutdown datagrams reach the socket
-    // before that fence fires.
+    // Outbound gossip: encode (plain or compound) + encrypt, then route onto the
+    // unreliable wire the endpoint is configured for — a QUIC datagram over the
+    // peer's pooled (quinn-TLS-protected) connection in `Datagram` mode, or the
+    // shared UDP socket in `Udp` mode. Popping the last transmit is the endpoint's
+    // leave-completion fence (it emits `LeftCluster`), so the leave/shutdown
+    // datagrams reach the wire before that fence fires.
     let encode_opts = EncodeOptions::new(self.label.clone());
+    let unreliable = self.endpoint.unreliable_transport();
+    let mut needs_flush = false;
     let mut sent = 0;
     while sent < budget {
       let Some(transmit) = self.endpoint.poll_memberlist_transmit() else {
@@ -707,14 +739,63 @@ where
           Err(_) => continue,
         };
       }
-      if let Some(socket) = self.socket.as_ref() {
-        // Ignoring Poll: gossip is best-effort — a full or errored UDP send drops
-        // the datagram and SWIM recovers on the next round.
-        let _ = socket.poll_send_to(cx, &on_wire, peer);
+      // `Bytes` so the datagram-queue path and the UDP fallback can share the
+      // encoded (and, under an encryption backend, already-sealed) payload without
+      // a second copy — `clone` is an O(1) refcount bump.
+      let on_wire = Bytes::from(on_wire);
+      match unreliable {
+        UnreliableTransport::Udp => {
+          if let Some(socket) = self.socket.as_ref() {
+            // Ignoring Poll: gossip is best-effort — a full or errored UDP send
+            // drops the datagram and SWIM recovers on the next round.
+            let _ = socket.poll_send_to(cx, &on_wire, peer);
+          }
+        }
+        UnreliableTransport::Datagram => {
+          match self
+            .endpoint
+            .queue_unreliable_datagram(peer, on_wire.clone(), now)
+          {
+            // Accepted onto an established QUIC connection: flush it into
+            // `poll_transmit` this pass (below) so a datagram-borne probe leaves on
+            // the tick its timeout is armed.
+            DatagramSendStatus::Queued => {
+              needs_flush = true;
+              self.shared.add_datagrams_sent(1);
+            }
+            // NotReady may mean the queue just initiated a cold dial: flush this
+            // pass so the connection's Initial is emitted now (else it does not warm
+            // until the next driver wake). The gossip itself still goes out
+            // immediately over the plain-UDP fallback.
+            DatagramSendStatus::NotReady => {
+              needs_flush = true;
+              if let Some(socket) = self.socket.as_ref() {
+                // Ignoring Poll: gossip is best-effort — SWIM recovers next round.
+                let _ = socket.poll_send_to(cx, &on_wire, peer);
+              }
+            }
+            // TooLarge: the connection is already Established (max_size was Some), so
+            // there is no pending Initial to flush; fall back to plain UDP.
+            DatagramSendStatus::TooLarge => {
+              if let Some(socket) = self.socket.as_ref() {
+                // Ignoring Poll: gossip is best-effort — SWIM recovers next round.
+                let _ = socket.poll_send_to(cx, &on_wire, peer);
+              }
+            }
+          }
+        }
       }
     }
     worked |= sent > 0;
     more |= sent == budget;
+
+    // Flush any datagrams queued above into `poll_transmit` THIS pass so the
+    // raw-QUIC loop below sends them now — a datagram-borne probe whose timeout is
+    // armed this same tick must not wait for the next driver wake (that wake can be
+    // the timeout).
+    if needs_flush {
+      self.endpoint.flush_outbound_transmits(now);
+    }
 
     // Raw QUIC datagrams: already wire-framed by quinn-proto (handshake, acks,
     // reliable stream data, datagram-mode gossip), no codec wrap.
@@ -1060,34 +1141,42 @@ where
 
     // Receive QUIC/gossip (bounded; a full batch means the kernel may hold more).
     // The socket is always `Some` here — the shutdown branch above (which takes it)
-    // returned before reaching this point. `Poll::Pending` from the socket IS the
-    // kernel-empty signal, and — because `handle_udp` processes a QUIC stream
-    // packet in-band — a `!recv_capped` stop proves every completing reliable
-    // packet ready this poll was fed to the machine.
+    // returned before reaching this point. Only `Poll::Pending` from the socket IS
+    // the kernel-empty signal, and — because `handle_udp` processes a QUIC stream
+    // packet in-band — a `Poll::Pending` stop proves every completing reliable
+    // packet ready this poll was fed to the machine. A recv-ERROR stop is NOT
+    // kernel-empty (the kernel may still hold a completing packet behind the
+    // error), so it is tracked separately and gates the reaps like a saturated
+    // batch.
     let mut recv_n = 0;
+    let mut recv_errored = false;
     while recv_n < this.iter_drain_cap {
-      let Some(socket) = this.socket.as_ref() else {
-        break;
-      };
-      match socket.poll_recv_from(cx, &mut this.recv_buf) {
+      match this.poll_recv_once(cx) {
         Poll::Ready(Ok((n, src))) => {
           this.endpoint.handle_udp(src, &this.recv_buf[..n], now);
           recv_n += 1;
         }
-        // Ignoring Err: a transient recv error is non-fatal; re-armed next poll.
-        Poll::Ready(Err(_)) => break,
+        // Ignoring Err: a transient recv error is non-fatal (the datagram is
+        // dropped, re-armed next poll) — but it is NOT quiescence, so record it for
+        // the timer/reap gate below.
+        Poll::Ready(Err(_)) => {
+          recv_errored = true;
+          break;
+        }
         Poll::Pending => break,
       }
     }
     if recv_n > 0 {
       progress = true;
     }
-    // A saturated batch means the kernel may still hold datagrams — possibly a
-    // reliable-exchange completion or a probe Ack. This is the ONLY backlog signal
-    // (the ingress decode drains to empty), and it gates the shared `handle_timeout`
-    // site below.
+    // Either non-quiescent stop means the kernel may still hold datagrams — possibly
+    // a reliable-exchange completion or a probe Ack: a saturated batch, or a recv
+    // error behind which a completing packet may sit. This is the ONLY backlog
+    // signal (the ingress decode drains to empty), and it gates the shared
+    // `handle_timeout` site below.
     let recv_capped = recv_n == this.iter_drain_cap;
-    more |= recv_capped;
+    let recv_quiescent = !recv_capped && !recv_errored;
+    more |= recv_capped || recv_errored;
 
     // Drain machine surfaces (gossip/QUIC egress capped, ingress + events uncapped).
     let (drained, drain_more) = this.drain_surfaces(cx);
@@ -1103,10 +1192,12 @@ where
     // every resolving input (a reliable push/pull completion, a probe Ack) rides
     // the one UDP recv, so — with no disjoint FIFO to watermark — the non-premature
     // gate is recv QUIESCENCE: a due `handle_timeout` / join / leave reap fires only
-    // when the recv batch drained (`!recv_capped`, so every kernel-ready completing
-    // packet was fed through `handle_udp` and its terminal folded by
-    // `drain_surfaces` above), OR — under a flood that saturates the batch every
-    // poll — after a bounded staleness grace, for liveness.
+    // when the recv loop stopped on `Poll::Pending` (`recv_quiescent`, so every
+    // kernel-ready completing packet was fed through `handle_udp` and its terminal
+    // folded by `drain_surfaces` above), OR — under a flood that saturates the batch
+    // (or a persistent recv error) every poll — after a bounded staleness grace, for
+    // liveness. A saturated batch AND a recv-error stop are both backlog-uncertain:
+    // neither proves the kernel is empty, so both defer the reaps.
     let endpoint_deadline = this
       .endpoint
       .poll_timeout()
@@ -1126,21 +1217,21 @@ where
 
     if ep_due || reap_due {
       // Anchor the staleness grace the first poll the fire is held back purely by a
-      // saturated recv batch (the kernel may still hold a pre-deadline completion).
-      if recv_capped {
+      // non-quiescent recv stop — a saturated batch OR a recv error, either of which
+      // may hide a pre-deadline completion still in the kernel.
+      if !recv_quiescent {
         this.timeout_stall_since.get_or_insert(now);
       }
-      let quiescent = !recv_capped;
-      let grace_ok = quiescent
+      let grace_ok = recv_quiescent
         || this
           .timeout_stall_since
           .is_some_and(|t| now.saturating_duration_since(t) >= SHARED_PATH_STALENESS_GRACE);
       if grace_ok {
-        // The recv is quiescent (every kernel-ready completing packet was folded by
-        // `drain_surfaces` above) or the grace elapsed. Fire the coordinator's
-        // elapsed deadlines, fold the UNCAPPED terminal events they emit
-        // (`LeftCluster` / `ExchangeCompleted`) BEFORE the reaps — a same-poll leave
-        // whose `LeftCluster` went unfolded would otherwise reap a false
+        // The recv stopped on `Poll::Pending` (every kernel-ready completing packet
+        // was folded by `drain_surfaces` above) or the grace elapsed. Fire the
+        // coordinator's elapsed deadlines, fold the UNCAPPED terminal events they
+        // emit (`LeftCluster` / `ExchangeCompleted`) BEFORE the reaps — a same-poll
+        // leave whose `LeftCluster` went unfolded would otherwise reap a false
         // `LeaveTimeout` — then reap the deadline residue.
         if ep_due {
           this.endpoint.handle_timeout(now);
@@ -1154,11 +1245,12 @@ where
         progress = true;
         more = true;
       } else {
-        // A deadline is due but the recv batch was saturated and the grace has not
-        // elapsed: DEFER (self-wake) so the next poll drains the recv toward
-        // quiescence. No timer is armed — the deadline already elapsed, so the
+        // A deadline is due but the recv stop was non-quiescent (a saturated batch or
+        // a recv error, either backlog-uncertain) and the grace has not elapsed:
+        // DEFER (self-wake) so the next poll drains the recv toward a `Poll::Pending`
+        // quiescent stop. No timer is armed — the deadline already elapsed, so the
         // `more` self-wake alone re-polls (no lost wakeup), and the wall-clock grace
-        // bounds the deferral.
+        // bounds the deferral so a persistent error cannot starve the timer forever.
         more = true;
       }
     } else {
