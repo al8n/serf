@@ -311,9 +311,12 @@ mod gate {
        the join, but a completing packet may sit behind the error",
     );
 
-    // Poll B: the recv loop now stops on a genuine `Poll::Pending` (nothing was ever
-    // sent to the bound socket). The gate is quiescent, so the past-due reap fires and
-    // resolves the stuck join `JoinAllFailed`.
+    // Poll B: the recv loop now stops on a `Poll::Pending` quiescent stop, scripted so
+    // it is deterministic across platforms. (On Windows the join's QUIC packet to a
+    // closed port draws an ICMP port-unreachable, so a real `recv_from` would return
+    // `ConnectionReset` — another non-quiescent error stop — rather than `Pending`.)
+    // The gate is quiescent, so the past-due reap fires and resolves the stuck join.
+    driver.recv_force_pending = true;
     let _ = poll_once(&mut driver);
     match rx.try_recv().expect("reply channel live") {
       Some(Err((reached, SerfError::JoinAllFailed(_)))) => {

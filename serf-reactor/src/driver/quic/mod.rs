@@ -328,6 +328,13 @@ where
   /// quiescent stop).
   #[cfg(test)]
   recv_errors_remaining: usize,
+  /// Test seam: when set, `poll_recv_once` reports a `Poll::Pending` (kernel-empty)
+  /// quiescent stop WITHOUT reading the real socket. On Windows a UDP `recv_from`
+  /// after sending to a closed port returns `ConnectionReset` (the ICMP
+  /// port-unreachable), so a pump test needing a deterministic quiescent stop scripts
+  /// it here rather than relying on the real socket returning `Pending`.
+  #[cfg(test)]
+  recv_force_pending: bool,
   /// The driver's keyring delegate: applies inbound key-management ops and produces
   /// the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)]
@@ -378,6 +385,8 @@ where
       leave_timeout: driver_opts.leave_timeout(),
       #[cfg(test)]
       recv_errors_remaining: 0,
+      #[cfg(test)]
+      recv_force_pending: false,
       #[cfg(encryption)]
       keyring,
     }
@@ -394,6 +403,10 @@ where
       return Poll::Ready(Err(std::io::Error::from(
         std::io::ErrorKind::ConnectionRefused,
       )));
+    }
+    #[cfg(test)]
+    if self.recv_force_pending {
+      return Poll::Pending;
     }
     let Some(socket) = self.socket.as_ref() else {
       return Poll::Pending;
