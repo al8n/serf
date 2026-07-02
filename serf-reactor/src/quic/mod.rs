@@ -54,10 +54,24 @@ use crate::{
 /// `TransportConfig` bundle plus SNI provider).
 ///
 /// Serf exposes no memberlist cluster label: neither this block nor the serf
-/// `Options` carries one, so both planes run unlabeled. The reliable-plane cluster
-/// boundary is the QUIC TLS trust anchor (peer-certificate verification + SNI);
-/// gossip is segregated by the encryption keyring. memberlist-reactor's lower-level
-/// options DO surface a label; serf, layered on top, does not.
+/// `Options` carries one, so both planes run unlabeled.
+///
+/// QUIC always runs TLS 1.3, but its reliable-plane inbound cluster boundary still
+/// depends on the client-auth mode of the supplied [`QuicOptions`]:
+///
+/// - **mTLS** (the quinn `ServerConfig` carries a client-certificate verifier): the
+///   boundary IS the QUIC TLS trust anchor — mutual peer-certificate verification
+///   plus SNI — so only a peer holding a cluster-trusted client cert can drive a
+///   reliable membership merge.
+/// - **Server-auth-only** (no client-cert verifier): the acceptor does NOT
+///   authenticate the inbound peer, so the reliable plane has no cryptographic
+///   inbound cluster-membership check; inbound membership then relies on network
+///   policy (firewall / segmentation). The gossip keyring protects only the gossip
+///   datagrams, never the QUIC reliable streams.
+///
+/// memberlist-reactor's lower-level options DO surface a label; a label-equivalent
+/// separation would be a serf-wide product feature (both runtimes), out of scope for
+/// this port.
 pub struct QuicTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,

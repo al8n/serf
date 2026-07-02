@@ -12,10 +12,13 @@
 //! plane stays plain UDP. This is the `Send`/`agnostic` sibling of serf-compio's
 //! `!Send`, compio-bound `TlsTransport`.
 //!
-//! TLS secures the *reliable* push-pull plane. The unreliable gossip plane is
-//! still AEAD-protected by the optional encryption keyring (carried through to the
-//! coordinator the same way the TCP plane carries it), so an encrypted cluster
-//! protects both planes.
+//! TLS gives the *reliable* push-pull plane channel confidentiality and integrity.
+//! Whether it also authenticates the inbound peer — the reliable-plane cluster
+//! boundary — depends on the client-auth mode of the supplied `rustls` config (mTLS
+//! vs. `with_no_client_auth`); see [`TlsTransportOptions`]. The unreliable gossip
+//! plane is separately AEAD-protected by the optional encryption keyring (carried
+//! through to the coordinator the same way the TCP plane carries it); that keyring
+//! never protects the TLS reliable plane.
 //!
 //! ## Server name
 //!
@@ -47,6 +50,12 @@ use smol_str::SmolStr;
 /// TLS machine-options bundle (server + client `rustls` config) handed to
 /// [`TlsTransport`]. Re-exported from `memberlist-proto` so callers don't need a
 /// direct dep on it.
+///
+/// The client-auth mode of the `rustls` `ServerConfig` in this bundle sets the
+/// reliable-plane cluster boundary: a config carrying a client-certificate verifier
+/// (mTLS) authenticates every inbound peer, whereas a `with_no_client_auth`
+/// (server-auth-only) config does not — see [`TlsTransportOptions`] for the full
+/// per-mode contract.
 pub use memberlist_proto::TlsOptions;
 
 #[cfg(encryption)]
@@ -74,11 +83,25 @@ pub type SniProvider = Box<dyn Fn(&SocketAddr) -> Option<String> + Send + Sync>;
 ///
 /// Serf exposes no memberlist cluster label: neither this block nor the serf
 /// `Options` carries one, so both planes run unlabeled (the coordinator built in
-/// `Transport::run` passes `None`). The reliable-plane cluster boundary is the TLS
-/// trust anchor — peer-certificate verification plus the per-peer SNI — while the
-/// gossip plane is segregated by the encryption keyring. memberlist-reactor's
-/// lower-level options DO surface a label; serf, layered on top, relies on the TLS
-/// trust + keyring instead.
+/// `Transport::run` passes `None`).
+///
+/// The reliable-plane inbound cluster boundary then depends on the client-auth mode
+/// of the supplied [`TlsOptions`]:
+///
+/// - **mTLS** (the `ServerConfig` carries a client-certificate verifier): the
+///   boundary IS the TLS trust anchor — mutual peer-certificate verification plus
+///   the per-peer SNI — so only a peer holding a cluster-trusted client cert can
+///   drive a reliable membership merge.
+/// - **Server-auth-only** (`with_no_client_auth`): the acceptor does NOT
+///   authenticate the inbound peer, so the reliable plane has no cryptographic
+///   inbound cluster-membership check; inbound membership then relies on network
+///   policy (firewall / segmentation), not on the TLS layer. The gossip keyring
+///   protects only the gossip (unreliable) plane, never the TLS reliable push/pull.
+///
+/// The gossip plane is separately segregated by the encryption keyring under both
+/// modes. memberlist-reactor's lower-level options DO surface a label; a
+/// label-equivalent separation across shared / server-auth-only TLS deployments
+/// would be a serf-wide product feature (both runtimes), out of scope for this port.
 pub struct TlsTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,
@@ -166,8 +189,8 @@ impl<I, A> TlsTransportOptions<I, A> {
   /// unencrypted node still builds and interoperates. Attach a keyring
   /// (`EncryptionOptions::new().with_keyring(Keyring::new(primary_key))`) to
   /// AEAD-protect the gossip datagrams — every node sharing the cluster MUST carry
-  /// the same keyring to interop. The reliable plane is secured by the TLS session
-  /// independently of this keyring.
+  /// the same keyring to interop. The reliable plane rides the TLS session
+  /// independently of this keyring, which never covers it.
   #[cfg(encryption)]
   #[cfg_attr(
     docsrs,
@@ -418,9 +441,11 @@ where
     // (ridden as the inner options on `LabelOptions`); the membership address IS the
     // transport socket (`|addr| *addr`). Serf threads no memberlist cluster label —
     // there is none in its options — so, like the plain-TCP plane, the reliable
-    // record layer runs unlabeled (`None`); the cluster boundary here is the TLS
-    // trust anchor (peer-cert verification + SNI), with gossip segregated by the
-    // keyring.
+    // record layer runs unlabeled (`None`). The reliable-plane inbound cluster
+    // boundary is the TLS trust anchor (mutual peer-cert verification + SNI) ONLY
+    // under mTLS; a server-auth-only config (`with_no_client_auth`) does not
+    // authenticate the inbound peer, leaving that check to network policy. Gossip is
+    // segregated separately by the keyring, which never covers the TLS reliable plane.
     #[allow(unused_mut)]
     let mut coord = Coordinator::<_, _, Labeled<TlsRecords>, G>::new(
       inner,
@@ -431,8 +456,8 @@ where
     // Install the gossip-encryption keyring so the coordinator's
     // `encrypt_gossip`/`decrypt_gossip` (forwarded from the serf endpoint pump)
     // become real on the unreliable plane. A no-keyring policy is the identity
-    // transform, so an unencrypted node is unaffected. The reliable plane is secured
-    // by the TLS session regardless.
+    // transform, so an unencrypted node is unaffected. The reliable plane rides the
+    // TLS session regardless of the keyring.
     #[cfg(encryption)]
     coord.set_encryption_options(self.encryption);
     // Serf's core RNG is seeded from its own OS-drawn entropy (`self.serf_rng`),
