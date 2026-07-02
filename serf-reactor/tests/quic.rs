@@ -235,6 +235,72 @@ async fn user_event_delivered() {
   b.shutdown().await.expect("ue-b shuts down");
 }
 
+/// Datagram-mode non-vacuity: with `UnreliableTransport::Datagram` the outbound
+/// gossip is routed through the QUIC datagram plane (`queue_unreliable_datagram` +
+/// `flush_outbound_transmits`), NOT the plain-UDP fallback. Two nodes join and
+/// converge, B broadcasts a user event that A receives over gossip, and the sender's
+/// `datagrams_sent` counter proves the gossip actually rode QUIC datagrams over the
+/// pooled, TLS-protected connection.
+///
+/// This is the discriminator the plain-UDP fallback would otherwise mask: a driver
+/// that bypassed the configured mode (the pre-fix always-`poll_send_to` path) still
+/// delivers the event over UDP and converges, but leaves `datagrams_sent` at `0`.
+/// `datagrams_sent` advances only on a `DatagramSendStatus::Queued`, so asserting it
+/// is non-zero fails on that revert while the convergence assertions alone would not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn datagram_mode_gossip_rides_quic_datagrams() {
+  let b = spawn_node("dg-b").await;
+  let a = spawn_node("dg-a").await;
+  let b_addr = b.advertise_address();
+
+  let mut a_events = a.events();
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over QUIC");
+  converge(&a, &b).await;
+
+  b.user_event("greet", Bytes::from_static(b"hello"), false)
+    .await
+    .expect("user event dispatched");
+
+  let got = tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("A observes B's user event within the timeout");
+  assert_eq!(
+    got,
+    Some(Bytes::from_static(b"hello")),
+    "A receives B's user-event payload over datagram-mode gossip"
+  );
+
+  // The discriminator: the gossip that crossed rode QUIC datagrams, not the plain-UDP
+  // fallback. Both nodes hold a warm pooled connection after the join, so their
+  // periodic gossip is queued as datagrams; `datagrams_sent` advances only on a
+  // `DatagramSendStatus::Queued`.
+  tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      if b.datagrams_sent() > 0 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect(
+    "B's gossip must ride the QUIC datagram plane (datagrams_sent > 0), not the plain-UDP fallback",
+  );
+
+  a.shutdown().await.expect("dg-a shuts down");
+  b.shutdown().await.expect("dg-b shuts down");
+}
+
 /// After a two-node QUIC join, a query issued by A round-trips: B receives the
 /// `Event::Query`, responds, and A surfaces the matching `Event::QueryResponse`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

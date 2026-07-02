@@ -34,8 +34,9 @@ use core::net::SocketAddr;
 use std::sync::Arc;
 
 use memberlist_proto::{
-  Data, Id, Instant, PushPullKind, QuicEndpoint as Coordinator, Rng, SeedableRng, SmallRng,
-  Transmit, event::StreamId, parse_message, typed::Message,
+  Data, DatagramSendStatus, Id, Instant, PushPullKind, QuicEndpoint as Coordinator, Rng,
+  SeedableRng, SmallRng, Transmit, UnreliableTransport, event::StreamId, parse_message,
+  typed::Message,
 };
 use smol_str::SmolStr;
 
@@ -317,6 +318,48 @@ where
   /// buffer and bounds inbound transform stripping by this value.
   pub fn gossip_mtu(&self) -> usize {
     self.transport.gossip_mtu()
+  }
+
+  /// Which wire the coordinator's unreliable (gossip + probe) path rides —
+  /// [`Datagram`](UnreliableTransport::Datagram) (a QUIC datagram over the peer's
+  /// pooled, TLS-protected connection) or [`Udp`](UnreliableTransport::Udp) (the
+  /// shared UDP socket). The driver reads this to route each outbound gossip
+  /// transmit: queue a QUIC datagram in `Datagram` mode, or send on the plain-UDP
+  /// path. Forwards to
+  /// [`memberlist_proto::QuicEndpoint::unreliable_transport`].
+  pub fn unreliable_transport(&self) -> UnreliableTransport {
+    self.transport.unreliable_transport()
+  }
+
+  /// Offer one already-encoded (label-framed and, under an encryption backend,
+  /// AEAD-sealed) gossip datagram to `peer` over its pooled QUIC connection.
+  ///
+  /// Forwards to [`memberlist_proto::QuicEndpoint::queue_unreliable_datagram`].
+  /// The returned [`DatagramSendStatus`] tells the driver whether the payload was
+  /// accepted onto an established connection
+  /// ([`Queued`](DatagramSendStatus::Queued)) or it must fall back to the
+  /// plain-UDP path ([`NotReady`](DatagramSendStatus::NotReady) /
+  /// [`TooLarge`](DatagramSendStatus::TooLarge)). Connection liveness is never a
+  /// membership signal — a dropped or refused datagram becomes a probe timeout,
+  /// not a `Suspect`.
+  pub fn queue_unreliable_datagram(
+    &mut self,
+    peer: SocketAddr,
+    bytes: Bytes,
+    now: Instant,
+  ) -> DatagramSendStatus {
+    self.transport.queue_unreliable_datagram(peer, bytes, now)
+  }
+
+  /// Flush quinn's queued outbound — including datagrams just handed to
+  /// [`queue_unreliable_datagram`](Self::queue_unreliable_datagram) — into the
+  /// [`poll_transmit`](Self::poll_transmit) queue at `now` WITHOUT advancing any
+  /// membership timer, so a datagram leaves on the same tick it was queued (a
+  /// datagram-borne probe whose timeout is armed this tick must not wait for the
+  /// next driver wake). Forwards to
+  /// [`memberlist_proto::QuicEndpoint::flush_outbound_transmits`].
+  pub fn flush_outbound_transmits(&mut self, now: Instant) {
+    self.transport.flush_outbound_transmits(now);
   }
 
   /// Encrypt one outbound gossip datagram for the wire, applying the
