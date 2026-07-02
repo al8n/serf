@@ -10,5 +10,8 @@ pub(crate) mod options;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod shared;
 
+#[cfg(feature = "quic")]
+pub(crate) mod quic;
+
 #[cfg(feature = "tcp")]
 pub(crate) mod stream;

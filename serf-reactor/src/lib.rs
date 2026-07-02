@@ -54,6 +54,8 @@ mod delegate;
 mod driver;
 mod error;
 mod events;
+#[cfg(feature = "quic")]
+mod quic;
 mod resolver;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod serf;
@@ -126,6 +128,10 @@ pub use transport::{Transport, TransportRuntime};
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 pub use tcp::{TcpTransport, TcpTransportOptions};
+
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub use quic::{QuicOptions, QuicTransport, QuicTransportOptions};
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]

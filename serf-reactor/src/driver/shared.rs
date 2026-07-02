@@ -11,8 +11,9 @@
 /// Coordinator-allocated handle for one in-flight reliable exchange.
 ///
 /// Shared by the stream driver and the per-bridge task so they agree on the same
-/// opaque id without the rest of the crate naming the machine's streams module.
-#[cfg(feature = "tcp")]
+/// opaque id without the rest of the crate naming the machine's streams module; the
+/// QUIC driver correlates its await-result joins on the same id domain.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) type ExchangeId = memberlist_proto::event::ExchangeId;
 
 /// Byte-backstop weight of a serf event. Delegates to
