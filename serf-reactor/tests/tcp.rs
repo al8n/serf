@@ -1,20 +1,26 @@
-//! Real-node TCP serf tests on tokio: two loopback nodes exercising the reactor
-//! stream driver end-to-end. Each test spins up ephemeral `127.0.0.1:0` nodes via
-//! the ergonomic [`Serf::tcp`] constructor and drives the full pump — join
-//! push/pull, coordinator merge, gossip, user events, queries, and graceful
-//! leave/shutdown — end-to-end proof the reactor stream driver works over a
-//! concrete runtime.
+//! Real-node TCP serf tests: two loopback nodes exercising the reactor stream
+//! driver end-to-end. Each test spins up ephemeral `127.0.0.1:0` nodes via the
+//! ergonomic [`Serf::tcp`] constructor and drives the full pump — join push/pull,
+//! coordinator merge, gossip, user events, queries, and graceful leave/shutdown —
+//! end-to-end proof the reactor stream driver works over a concrete runtime.
+//!
+//! The scenario bodies are runtime-generic `async fn <R: Runtime>` helpers, so the
+//! SAME scenario runs as a `#[tokio::test]` cell over `TokioRuntime` and as a
+//! `_smol` cell driven by `SmolRuntime::block_on` — mirroring memberlist-reactor's
+//! runtime-parameterized suite. The `Serf<I, A, R>` handle is already runtime-
+//! generic; the helpers reach for timers through the runtime (`R::timeout` /
+//! `R::sleep`) rather than a concrete runtime's clock.
 //!
 //! Mirrors serf-compio's serf behavior tests and memberlist-reactor's real-node
 //! harness (bind loopback, join, poll-until-converged with a timeout, assert
 //! membership / events), adapted to the reactor's `Send`/`agnostic` model.
 
-#![cfg(all(feature = "tcp", feature = "tokio"))]
+#![cfg(feature = "tcp")]
 
 use core::time::Duration;
 use std::net::SocketAddr;
 
-use agnostic::tokio::TokioRuntime;
+use agnostic::Runtime;
 use bytes::Bytes;
 use futures_util::{StreamExt, future};
 #[cfg(encryption)]
@@ -28,17 +34,20 @@ use serf_reactor::{
 };
 use smol_str::SmolStr;
 
-/// A tokio-backed reactor TCP node handle.
-type Node = Serf<SmolStr, SocketAddr, TokioRuntime>;
+/// A reactor TCP node handle over the agnostic runtime `R`.
+type Node<R> = Serf<SmolStr, SocketAddr, R>;
 
 /// Build and spawn a reactor TCP node on an ephemeral loopback port through the
 /// ergonomic `Serf::tcp` constructor.
-async fn spawn_node(id: &str) -> Node {
+async fn spawn_node<R>(id: &str) -> Node<R>
+where
+  R: Runtime,
+{
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  Serf::<SmolStr, SocketAddr, TokioRuntime>::tcp(
+  Serf::<SmolStr, SocketAddr, R>::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -54,13 +63,16 @@ async fn spawn_node(id: &str) -> Node {
 
 /// Poll both nodes until each reports the full two-member cluster, or fail on a
 /// generous timeout so a convergence regression surfaces as a timeout, not a hang.
-async fn converge(a: &Node, b: &Node) {
-  tokio::time::timeout(Duration::from_secs(20), async {
+async fn converge<R>(a: &Node<R>, b: &Node<R>)
+where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(20), async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -69,10 +81,12 @@ async fn converge(a: &Node, b: &Node) {
 
 /// Two nodes on loopback: A joins B (await-result), then BOTH converge to a
 /// two-member cluster and shut down cleanly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_join_converges() {
-  let b = spawn_node("conv-b").await;
-  let a = spawn_node("conv-a").await;
+async fn two_node_join_converges<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("conv-b").await;
+  let a = spawn_node::<R>("conv-a").await;
   let b_addr = b.advertise_address();
 
   let reached = a
@@ -91,10 +105,12 @@ async fn two_node_join_converges() {
 
 /// After a two-node join, a user event broadcast by B is delivered to A's event
 /// stream carrying the original name and payload.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn user_event_delivered() {
-  let b = spawn_node("ue-b").await;
-  let a = spawn_node("ue-a").await;
+async fn user_event_delivered<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("ue-b").await;
+  let a = spawn_node::<R>("ue-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe before joining so the user event cannot race the subscription.
@@ -108,7 +124,7 @@ async fn user_event_delivered() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(Duration::from_secs(20), async {
+  let got = R::timeout(Duration::from_secs(20), async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -131,10 +147,12 @@ async fn user_event_delivered() {
 
 /// After a two-node join, a query issued by A round-trips: B receives the
 /// `Event::Query`, responds, and A surfaces the matching `Event::QueryResponse`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn query_round_trip() {
-  let b = spawn_node("q-b").await;
-  let a = spawn_node("q-a").await;
+async fn query_round_trip<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("q-b").await;
+  let a = spawn_node::<R>("q-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe both before the join so neither the query nor its response races
@@ -181,7 +199,7 @@ async fn query_round_trip() {
     }
   };
 
-  let got = tokio::time::timeout(Duration::from_secs(20), async {
+  let got = R::timeout(Duration::from_secs(20), async {
     let (_, got) = future::join(responder, collector).await;
     got
   })
@@ -196,10 +214,12 @@ async fn query_round_trip() {
 /// A graceful leave completes the machine's leave chain: `leave()` resolves only
 /// once `LeftCluster` fires (the reactor gates the reply on it), that event
 /// surfaces on the leaver's own stream, and the local endpoint settles at `Left`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn leave_emits_left_cluster() {
-  let b = spawn_node("lv-b").await;
-  let a = spawn_node("lv-a").await;
+async fn leave_emits_left_cluster<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("lv-b").await;
+  let a = spawn_node::<R>("lv-a").await;
   let b_addr = b.advertise_address();
 
   let mut a_events = a.events();
@@ -213,7 +233,7 @@ async fn leave_emits_left_cluster() {
   a.leave().await.expect("A leaves the cluster");
 
   // `LeftCluster` is also forwarded to A's own subscribers.
-  let saw = tokio::time::timeout(Duration::from_secs(20), async {
+  let saw = R::timeout(Duration::from_secs(20), async {
     loop {
       match a_events.next().await {
         Some(Event::LeftCluster) => break true,
@@ -228,12 +248,12 @@ async fn leave_emits_left_cluster() {
 
   // The local endpoint state settles at `Left` (poll to absorb the snapshot-refresh
   // race after the leave chain completes).
-  tokio::time::timeout(Duration::from_secs(5), async {
+  R::timeout(Duration::from_secs(5), async {
     loop {
       if a.state() == SerfState::Left {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -247,10 +267,12 @@ async fn leave_emits_left_cluster() {
 /// the two-member cluster: `members` returns both nodes, `local_member` / `local_id`
 /// return this node, `state` is `Alive`, `advertise_node` composes id + advertise,
 /// and `default_query_*` produce a positive, filter-free query default.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn snapshot_forwarders_reflect_joined_cluster() {
-  let b = spawn_node("snap-b").await;
-  let a = spawn_node("snap-a").await;
+async fn snapshot_forwarders_reflect_joined_cluster<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("snap-b").await;
+  let a = spawn_node::<R>("snap-a").await;
   let b_addr = b.advertise_address();
   let a_id = SmolStr::new("snap-a");
   let b_id = SmolStr::new("snap-b");
@@ -304,10 +326,12 @@ async fn snapshot_forwarders_reflect_joined_cluster() {
 /// `join_many` over two seeds — one reachable (node B), one an unroutable
 /// blackhole port — returns only the reached seed's address once both exchanges
 /// terminate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_many_returns_only_reached_seeds() {
-  let b = spawn_node("jm-b").await;
-  let a = spawn_node("jm-a").await;
+async fn join_many_returns_only_reached_seeds<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("jm-b").await;
+  let a = spawn_node::<R>("jm-a").await;
   let b_addr = b.advertise_address();
   let blackhole: SocketAddr = "127.0.0.1:7219".parse().expect("loopback addr");
 
@@ -336,10 +360,12 @@ async fn join_many_returns_only_reached_seeds() {
 
 /// `remove_failed_node` / `remove_failed_node_prune` are thin `force_leave`
 /// aliases; calling both on a valid joined node-id completes without error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remove_failed_node_alias_succeeds() {
-  let b = spawn_node("rfn-b").await;
-  let a = spawn_node("rfn-a").await;
+async fn remove_failed_node_alias_succeeds<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("rfn-b").await;
+  let a = spawn_node::<R>("rfn-a").await;
   let b_addr = b.advertise_address();
   let b_id = SmolStr::new("rfn-b");
 
@@ -373,13 +399,16 @@ fn test_secret_key(fill: u8) -> SecretKey {
 /// Build and spawn a reactor TCP node on an ephemeral loopback port with
 /// `encryption` installed as its gossip-and-reliable keyring policy.
 #[cfg(encryption)]
-async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
+async fn spawn_encrypted_node<R>(id: &str, encryption: EncryptionOptions) -> Node<R>
+where
+  R: Runtime,
+{
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_encryption(encryption);
-  Serf::<SmolStr, SocketAddr, TokioRuntime>::tcp(
+  Serf::<SmolStr, SocketAddr, R>::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -399,11 +428,13 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
 /// `encrypt_gossip`/`decrypt_gossip` round-trip end-to-end rather than running as
 /// identity transforms.
 #[cfg(encryption)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_join_converges_encrypted() {
+async fn two_node_join_converges_encrypted<R>()
+where
+  R: Runtime,
+{
   let key = EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42)));
-  let b = spawn_encrypted_node("enc-b", key.clone()).await;
-  let a = spawn_encrypted_node("enc-a", key).await;
+  let b = spawn_encrypted_node::<R>("enc-b", key.clone()).await;
+  let a = spawn_encrypted_node::<R>("enc-a", key).await;
   let b_addr = b.advertise_address();
   let b_id = SmolStr::new("enc-b");
 
@@ -417,7 +448,7 @@ async fn two_node_join_converges_encrypted() {
 
   converge(&a, &b).await;
 
-  let observed = tokio::time::timeout(Duration::from_secs(20), async {
+  let observed = R::timeout(Duration::from_secs(20), async {
     loop {
       match a_events.next().await {
         Some(Event::Member(me)) if me.kind() == MemberEventKind::Join => {
@@ -447,14 +478,16 @@ async fn two_node_join_converges_encrypted() {
 /// not an identity pass-through — without this negative case a passing encrypted
 /// convergence test could not distinguish real AEAD from an identity transform.
 #[cfg(encryption)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mismatched_keyring_nodes_do_not_exchange_membership() {
-  let b = spawn_encrypted_node(
+async fn mismatched_keyring_nodes_do_not_exchange_membership<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_encrypted_node::<R>(
     "mis-b",
     EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42))),
   )
   .await;
-  let a = spawn_encrypted_node(
+  let a = spawn_encrypted_node::<R>(
     "mis-a",
     EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x43))),
   )
@@ -476,7 +509,7 @@ async fn mismatched_keyring_nodes_do_not_exchange_membership() {
   // Absence probe: A must never surface a Join carrying node-b. A short window
   // covers several gossip / probe / push-pull rounds on loopback — the positive
   // test forms its cluster within ~1-2s, so a clean 3s window is decisive.
-  let observed = tokio::time::timeout(Duration::from_secs(3), async {
+  let observed = R::timeout(Duration::from_secs(3), async {
     loop {
       match a_events.next().await {
         Some(Event::Member(me)) if me.kind() == MemberEventKind::Join => {
@@ -497,4 +530,120 @@ async fn mismatched_keyring_nodes_do_not_exchange_membership() {
 
   a.shutdown().await.expect("mis-a shuts down");
   b.shutdown().await.expect("mis-b shuts down");
+}
+
+// The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
+// runtime. Gated on the `tokio` feature so the `--test tcp -- smol` build (which
+// enables only `smol`) can drop the `agnostic/tokio` code path.
+#[cfg(feature = "tokio")]
+mod tokio_cells {
+  use agnostic::tokio::TokioRuntime;
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn two_node_join_converges() {
+    super::two_node_join_converges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn user_event_delivered() {
+    super::user_event_delivered::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn query_round_trip() {
+    super::query_round_trip::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn leave_emits_left_cluster() {
+    super::leave_emits_left_cluster::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_forwarders_reflect_joined_cluster() {
+    super::snapshot_forwarders_reflect_joined_cluster::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn join_many_returns_only_reached_seeds() {
+    super::join_many_returns_only_reached_seeds::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn remove_failed_node_alias_succeeds() {
+    super::remove_failed_node_alias_succeeds::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn two_node_join_converges_encrypted() {
+    super::two_node_join_converges_encrypted::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn mismatched_keyring_nodes_do_not_exchange_membership() {
+    super::mismatched_keyring_nodes_do_not_exchange_membership::<TokioRuntime>().await;
+  }
+}
+
+// The smol cells: the identical scenarios instantiated over `SmolRuntime` and
+// driven by smol's `block_on`. The reactor poll task runs on smol's global
+// executor, so the same scenario bodies verify the driver under a second runtime
+// with no per-runtime scenario code. `cargo test --test tcp -- smol` selects
+// exactly these.
+#[cfg(feature = "smol")]
+mod smol_cells {
+  use agnostic::{RuntimeLite, smol::SmolRuntime};
+
+  #[test]
+  fn two_node_join_converges_smol() {
+    SmolRuntime::block_on(super::two_node_join_converges::<SmolRuntime>());
+  }
+
+  #[test]
+  fn user_event_delivered_smol() {
+    SmolRuntime::block_on(super::user_event_delivered::<SmolRuntime>());
+  }
+
+  #[test]
+  fn query_round_trip_smol() {
+    SmolRuntime::block_on(super::query_round_trip::<SmolRuntime>());
+  }
+
+  #[test]
+  fn leave_emits_left_cluster_smol() {
+    SmolRuntime::block_on(super::leave_emits_left_cluster::<SmolRuntime>());
+  }
+
+  #[test]
+  fn snapshot_forwarders_reflect_joined_cluster_smol() {
+    SmolRuntime::block_on(super::snapshot_forwarders_reflect_joined_cluster::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn join_many_returns_only_reached_seeds_smol() {
+    SmolRuntime::block_on(super::join_many_returns_only_reached_seeds::<SmolRuntime>());
+  }
+
+  #[test]
+  fn remove_failed_node_alias_succeeds_smol() {
+    SmolRuntime::block_on(super::remove_failed_node_alias_succeeds::<SmolRuntime>());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn two_node_join_converges_encrypted_smol() {
+    SmolRuntime::block_on(super::two_node_join_converges_encrypted::<SmolRuntime>());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn mismatched_keyring_nodes_do_not_exchange_membership_smol() {
+    SmolRuntime::block_on(
+      super::mismatched_keyring_nodes_do_not_exchange_membership::<SmolRuntime>(),
+    );
+  }
 }

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - refactor/sansio
     paths-ignore:
       - "README.md"
       - "COPYRIGHT"
@@ -25,36 +26,50 @@ jobs:
   loc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
-        run: |
-          rustup update stable && rustup default stable
-          rustup component add clippy
-          rustup component add rustfmt
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
 
       - name: Install tokeit
         run: |
           cargo install tokeit --force
 
-      - name: Count lines of code
+      - name: Count lines of code (workspace total + each crate)
         run: |
+          set -euo pipefail
           tokeit
+          mv tokeit.json loc-serf.json
+          for c in serf-proto serf-driver serf-compio serf-reactor; do
+            ( cd "$c" && tokeit )
+            mv "$c/tokeit.json" "loc-$c.json"
+          done
 
-      - name: Upload loc to GitHub Gist
+      - name: Upload all loc to the gist in one request
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('tokeit.json', 'utf8');
             const gistId = 'd29ceff54c025fe4e8b144a51efb9324';
-            await github.rest.gists.update({
-              gist_id: gistId,
-              files: {
-                "serf": {
-                  content: output
-                }
-              }
-            });
-            console.log("Gist updated");
+            // Gist file `serf` is the workspace total (the main README's LoC
+            // badge reads …/raw/serf); the rest are per-crate, ready for
+            // per-crate READMEs. The gists API accepts every file in one PATCH,
+            // so one request avoids the per-crate rate-limit storm.
+            const crates = [
+              'serf-proto',
+              'serf-driver',
+              'serf-compio',
+              'serf-reactor',
+            ];
+            const files = {
+              serf: { content: fs.readFileSync('loc-serf.json', 'utf8') },
+            };
+            for (const c of crates) {
+              files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
+            }
+            await github.rest.gists.update({ gist_id: gistId, files });
+            console.log('Gist updated');

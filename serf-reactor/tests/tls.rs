@@ -1,8 +1,13 @@
-//! Real-node TLS serf tests on tokio: two loopback nodes exercising the reactor
-//! stream driver with the rustls record layer end-to-end. Each test spins up
-//! ephemeral `127.0.0.1:0` nodes via the ergonomic [`Serf::tls`] constructor and
-//! drives the full pump — TLS handshake-on-dial, join push/pull, coordinator merge,
-//! gossip, user events, queries, and graceful leave/shutdown.
+//! Real-node TLS serf tests: two loopback nodes exercising the reactor stream
+//! driver with the rustls record layer end-to-end. Each test spins up ephemeral
+//! `127.0.0.1:0` nodes via the ergonomic [`Serf::tls`] constructor and drives the
+//! full pump — TLS handshake-on-dial, join push/pull, coordinator merge, gossip,
+//! user events, queries, and graceful leave/shutdown.
+//!
+//! The scenario bodies are runtime-generic `async fn <R: Runtime>` helpers, so the
+//! SAME scenario runs as a `#[tokio::test]` cell over `TokioRuntime` and as a
+//! `_smol` cell driven by `SmolRuntime::block_on` — mirroring memberlist-reactor's
+//! runtime-parameterized suite.
 //!
 //! Mirrors `tests/tcp.rs` (TLS rides the same stream driver as plain TCP, differing
 //! only in the record layer) and serf-compio's / memberlist-reactor's TLS harness:
@@ -11,12 +16,12 @@
 //! trust anchor. The default SNI provider (`Some("localhost")`) matches the cert
 //! SAN.
 
-#![cfg(all(feature = "tls", feature = "tokio"))]
+#![cfg(feature = "tls")]
 
 use core::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
-use agnostic::tokio::TokioRuntime;
+use agnostic::Runtime;
 use bytes::Bytes;
 use futures_util::{StreamExt, future};
 use rustls::{
@@ -32,8 +37,8 @@ use serf_reactor::{
 };
 use smol_str::SmolStr;
 
-/// A tokio-backed reactor TLS node handle.
-type Node = Serf<SmolStr, SocketAddr, TokioRuntime>;
+/// A reactor TLS node handle over the agnostic runtime `R`.
+type Node<R> = Serf<SmolStr, SocketAddr, R>;
 
 /// Accept-any server-cert verifier for the loopback tests.
 ///
@@ -111,13 +116,16 @@ fn test_tls_options() -> TlsOptions {
 /// Build and spawn a reactor TLS node on an ephemeral loopback port through the
 /// ergonomic `Serf::tls` constructor. The default SNI provider (`Some("localhost")`)
 /// matches the self-signed cert SAN.
-async fn spawn_node(id: &str) -> Node {
+async fn spawn_node<R>(id: &str) -> Node<R>
+where
+  R: Runtime,
+{
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_tls_options(test_tls_options());
-  Serf::<SmolStr, SocketAddr, TokioRuntime>::tls(
+  Serf::<SmolStr, SocketAddr, R>::tls(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -133,13 +141,16 @@ async fn spawn_node(id: &str) -> Node {
 
 /// Poll both nodes until each reports the full two-member cluster, or fail on a
 /// generous timeout so a convergence regression surfaces as a timeout, not a hang.
-async fn converge(a: &Node, b: &Node) {
-  tokio::time::timeout(Duration::from_secs(20), async {
+async fn converge<R>(a: &Node<R>, b: &Node<R>)
+where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(20), async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -148,10 +159,12 @@ async fn converge(a: &Node, b: &Node) {
 
 /// Two nodes on loopback: A joins B over a real TLS push-pull exchange, then BOTH
 /// converge to a two-member cluster and shut down cleanly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_tls_join_converges() {
-  let b = spawn_node("conv-b").await;
-  let a = spawn_node("conv-a").await;
+async fn two_node_tls_join_converges<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("conv-b").await;
+  let a = spawn_node::<R>("conv-a").await;
   let b_addr = b.advertise_address();
 
   let reached = a
@@ -170,10 +183,12 @@ async fn two_node_tls_join_converges() {
 
 /// After a two-node TLS join, a user event broadcast by B is delivered to A's event
 /// stream carrying the original name and payload.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn user_event_delivered() {
-  let b = spawn_node("ue-b").await;
-  let a = spawn_node("ue-a").await;
+async fn user_event_delivered<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("ue-b").await;
+  let a = spawn_node::<R>("ue-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe before joining so the user event cannot race the subscription.
@@ -187,7 +202,7 @@ async fn user_event_delivered() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(Duration::from_secs(20), async {
+  let got = R::timeout(Duration::from_secs(20), async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -210,10 +225,12 @@ async fn user_event_delivered() {
 
 /// After a two-node TLS join, a query issued by A round-trips: B receives the
 /// `Event::Query`, responds, and A surfaces the matching `Event::QueryResponse`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn query_round_trip() {
-  let b = spawn_node("q-b").await;
-  let a = spawn_node("q-a").await;
+async fn query_round_trip<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("q-b").await;
+  let a = spawn_node::<R>("q-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe both before the join so neither the query nor its response races ahead
@@ -260,7 +277,7 @@ async fn query_round_trip() {
     }
   };
 
-  let got = tokio::time::timeout(Duration::from_secs(20), async {
+  let got = R::timeout(Duration::from_secs(20), async {
     let (_, got) = future::join(responder, collector).await;
     got
   })
@@ -275,10 +292,12 @@ async fn query_round_trip() {
 /// A graceful leave completes the machine's leave chain: `leave()` resolves only
 /// once `LeftCluster` fires (the reactor gates the reply on it), that event surfaces
 /// on the leaver's own stream, and the local endpoint settles at `Left`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn leave_emits_left_cluster() {
-  let b = spawn_node("lv-b").await;
-  let a = spawn_node("lv-a").await;
+async fn leave_emits_left_cluster<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("lv-b").await;
+  let a = spawn_node::<R>("lv-a").await;
   let b_addr = b.advertise_address();
 
   let mut a_events = a.events();
@@ -292,7 +311,7 @@ async fn leave_emits_left_cluster() {
   a.leave().await.expect("A leaves the cluster");
 
   // `LeftCluster` is also forwarded to A's own subscribers.
-  let saw = tokio::time::timeout(Duration::from_secs(20), async {
+  let saw = R::timeout(Duration::from_secs(20), async {
     loop {
       match a_events.next().await {
         Some(Event::LeftCluster) => break true,
@@ -307,12 +326,12 @@ async fn leave_emits_left_cluster() {
 
   // The local endpoint state settles at `Left` (poll to absorb the snapshot-refresh
   // race after the leave chain completes).
-  tokio::time::timeout(Duration::from_secs(5), async {
+  R::timeout(Duration::from_secs(5), async {
     loop {
       if a.state() == SerfState::Left {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -320,4 +339,60 @@ async fn leave_emits_left_cluster() {
 
   a.shutdown().await.expect("lv-a shuts down");
   b.shutdown().await.expect("lv-b shuts down");
+}
+
+// The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
+// runtime. Gated on the `tokio` feature so the `--test tls -- smol` build (which
+// enables only `smol`) can drop the `agnostic/tokio` code path.
+#[cfg(feature = "tokio")]
+mod tokio_cells {
+  use agnostic::tokio::TokioRuntime;
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn two_node_tls_join_converges() {
+    super::two_node_tls_join_converges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn user_event_delivered() {
+    super::user_event_delivered::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn query_round_trip() {
+    super::query_round_trip::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn leave_emits_left_cluster() {
+    super::leave_emits_left_cluster::<TokioRuntime>().await;
+  }
+}
+
+// The smol cells: the identical scenarios instantiated over `SmolRuntime` and
+// driven by smol's `block_on`. `cargo test --test tls -- smol` selects exactly
+// these.
+#[cfg(feature = "smol")]
+mod smol_cells {
+  use agnostic::{RuntimeLite, smol::SmolRuntime};
+
+  #[test]
+  fn two_node_tls_join_converges_smol() {
+    SmolRuntime::block_on(super::two_node_tls_join_converges::<SmolRuntime>());
+  }
+
+  #[test]
+  fn user_event_delivered_smol() {
+    SmolRuntime::block_on(super::user_event_delivered::<SmolRuntime>());
+  }
+
+  #[test]
+  fn query_round_trip_smol() {
+    SmolRuntime::block_on(super::query_round_trip::<SmolRuntime>());
+  }
+
+  #[test]
+  fn leave_emits_left_cluster_smol() {
+    SmolRuntime::block_on(super::leave_emits_left_cluster::<SmolRuntime>());
+  }
 }

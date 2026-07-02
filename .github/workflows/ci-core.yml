@@ -1,0 +1,202 @@
+name: ci-core
+
+# The runtime-independent core: the serf-proto wire codec + Sans-I/O machine
+# and its runtime-agnostic glue crate serf-driver. Both are pure-CPU and bind no
+# sockets. This job also builds and tests the preserved `legacy/` serf-core crate
+# (excluded from the workspace) so the old implementation can't silently rot.
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+  schedule: [cron: "0 1 */30 * *"]
+
+jobs:
+  proto:
+    name: ${{ matrix.os }} - proto
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      FEATURES: "tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex"
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-proto
+
+      # serf-proto's build.rs runs protoc (via buffa-build) for the wire codegen,
+      # and its memberlist-proto dependency's build.rs also runs protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Format
+        run: cargo fmt -p serf-proto -p serf-driver --check
+
+      - name: Clippy
+        run: cargo clippy -p serf-proto --all-targets --features "$FEATURES" --no-deps -- -D warnings
+
+      - name: Test
+        run: cargo test -p serf-proto --features "$FEATURES"
+
+  # serf-proto is pure-CPU, so exercise the interesting feature permutations on a
+  # single OS (default, the coordinate + AEAD combos, all-features, no-default,
+  # coordinates+aes+tcp, and quic-rustls-ring alone).
+  proto-features:
+    name: proto - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "default", flags: "" }
+          - { name: "coords-aes-gcm", flags: "--features coordinates,aes-gcm" }
+          - { name: "coords-chacha", flags: "--features coordinates,chacha20-poly1305" }
+          - { name: "all-features", flags: "--all-features" }
+          - { name: "no-default", flags: "--no-default-features" }
+          - { name: "coords-aes-gcm-tcp", flags: "--features coordinates,aes-gcm,tcp" }
+          - { name: "quic-rustls-ring", flags: "--no-default-features --features quic-rustls-ring" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-proto-features
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clippy
+        run: cargo clippy -p serf-proto --all-targets ${{ matrix.flags }} --no-deps -- -D warnings
+
+      - name: Test
+        run: cargo test -p serf-proto ${{ matrix.flags }}
+
+  driver:
+    name: driver
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-driver
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Format
+        run: cargo fmt -p serf-driver --check
+
+      - name: Clippy
+        run: cargo clippy -p serf-driver --all-targets --all-features --no-deps -- -D warnings
+
+      - name: Test
+        run: cargo test -p serf-driver --all-features
+
+  # The preserved pre-Sans-I/O implementation (legacy/serf-core). It is excluded
+  # from the workspace, so build + test it from its own directory on the feature
+  # set the old serf CI used, to keep it from silently rotting.
+  legacy:
+    name: legacy - serf-core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            legacy/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('legacy/**/Cargo.lock') }}-legacy
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test legacy serf-core
+        run: cargo test --no-default-features --features "test,encryption,serde,quickcheck"
+        working-directory: legacy/serf-core

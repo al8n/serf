@@ -1,21 +1,26 @@
-//! Real-node QUIC serf tests on tokio: two loopback nodes exercising the reactor
-//! QUIC driver end-to-end over a quinn-proto config bundle. Each test spins up
+//! Real-node QUIC serf tests: two loopback nodes exercising the reactor QUIC
+//! driver end-to-end over a quinn-proto config bundle. Each test spins up
 //! ephemeral `127.0.0.1:0` nodes via the ergonomic [`Serf::quic`] constructor and
 //! drives the full pump — QUIC push/pull join over a real quinn handshake,
 //! coordinator merge, datagram gossip, user events, queries, and graceful
 //! leave/shutdown — end-to-end proof the reactor QUIC driver works over a concrete
 //! runtime, meeting the same behaviour bar as the TCP suite.
 //!
+//! The scenario bodies are runtime-generic `async fn <R: Runtime>` helpers, so the
+//! SAME scenario runs as a `#[tokio::test]` cell over `TokioRuntime` and as a
+//! `_smol` cell driven by `SmolRuntime::block_on` — mirroring memberlist-reactor's
+//! runtime-parameterized suite.
+//!
 //! Mirrors serf-compio's QUIC smoke tests and the reactor's `tests/tcp.rs`,
 //! adapted to the reactor's `Send`/`agnostic` model and QUIC's single-socket,
 //! stream-multiplexed transport.
 
-#![cfg(all(feature = "quic", feature = "tokio"))]
+#![cfg(feature = "quic")]
 
 use core::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
-use agnostic::tokio::TokioRuntime;
+use agnostic::Runtime;
 use bytes::Bytes;
 use futures_util::{StreamExt, future};
 use memberlist_proto::UnreliableTransport;
@@ -33,8 +38,8 @@ use serf_reactor::{
 };
 use smol_str::SmolStr;
 
-/// A tokio-backed reactor QUIC node handle.
-type Node = Serf<SmolStr, SocketAddr, TokioRuntime>;
+/// A reactor QUIC node handle over the agnostic runtime `R`.
+type Node<R> = Serf<SmolStr, SocketAddr, R>;
 
 /// A self-signed cert + key for `localhost`, for the test TLS bundle.
 fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
@@ -137,13 +142,16 @@ fn test_quic_options() -> QuicOptions {
 
 /// Build and spawn a reactor QUIC node on an ephemeral loopback port through the
 /// ergonomic `Serf::quic` constructor.
-async fn spawn_node(id: &str) -> Node {
+async fn spawn_node<R>(id: &str) -> Node<R>
+where
+  R: Runtime,
+{
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(test_quic_options());
-  Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+  Serf::<SmolStr, SocketAddr, R>::quic(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -159,13 +167,16 @@ async fn spawn_node(id: &str) -> Node {
 
 /// Poll both nodes until each reports the full two-member cluster, or fail on a
 /// generous timeout so a convergence regression surfaces as a timeout, not a hang.
-async fn converge(a: &Node, b: &Node) {
-  tokio::time::timeout(Duration::from_secs(30), async {
+async fn converge<R>(a: &Node<R>, b: &Node<R>)
+where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(30), async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -174,10 +185,12 @@ async fn converge(a: &Node, b: &Node) {
 
 /// Two nodes on loopback: A joins B (await-result over a real QUIC push/pull), then
 /// BOTH converge to a two-member cluster and shut down cleanly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_quic_join_converges() {
-  let b = spawn_node("conv-b").await;
-  let a = spawn_node("conv-a").await;
+async fn two_node_quic_join_converges<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("conv-b").await;
+  let a = spawn_node::<R>("conv-a").await;
   let b_addr = b.advertise_address();
 
   let reached = a
@@ -197,10 +210,12 @@ async fn two_node_quic_join_converges() {
 /// After a two-node QUIC join, a user event broadcast by B is delivered to A's event
 /// stream carrying the original name and payload (datagram gossip over the shared
 /// socket).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn user_event_delivered() {
-  let b = spawn_node("ue-b").await;
-  let a = spawn_node("ue-a").await;
+async fn user_event_delivered<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("ue-b").await;
+  let a = spawn_node::<R>("ue-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe before joining so the user event cannot race the subscription.
@@ -214,7 +229,7 @@ async fn user_event_delivered() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(Duration::from_secs(30), async {
+  let got = R::timeout(Duration::from_secs(30), async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -247,10 +262,12 @@ async fn user_event_delivered() {
 /// delivers the event over UDP and converges, but leaves `datagrams_sent` at `0`.
 /// `datagrams_sent` advances only on a `DatagramSendStatus::Queued`, so asserting it
 /// is non-zero fails on that revert while the convergence assertions alone would not.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn datagram_mode_gossip_rides_quic_datagrams() {
-  let b = spawn_node("dg-b").await;
-  let a = spawn_node("dg-a").await;
+async fn datagram_mode_gossip_rides_quic_datagrams<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("dg-b").await;
+  let a = spawn_node::<R>("dg-a").await;
   let b_addr = b.advertise_address();
 
   let mut a_events = a.events();
@@ -263,7 +280,7 @@ async fn datagram_mode_gossip_rides_quic_datagrams() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(Duration::from_secs(30), async {
+  let got = R::timeout(Duration::from_secs(30), async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -284,12 +301,12 @@ async fn datagram_mode_gossip_rides_quic_datagrams() {
   // fallback. Both nodes hold a warm pooled connection after the join, so their
   // periodic gossip is queued as datagrams; `datagrams_sent` advances only on a
   // `DatagramSendStatus::Queued`.
-  tokio::time::timeout(Duration::from_secs(30), async {
+  R::timeout(Duration::from_secs(30), async {
     loop {
       if b.datagrams_sent() > 0 {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -303,10 +320,12 @@ async fn datagram_mode_gossip_rides_quic_datagrams() {
 
 /// After a two-node QUIC join, a query issued by A round-trips: B receives the
 /// `Event::Query`, responds, and A surfaces the matching `Event::QueryResponse`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn query_round_trip() {
-  let b = spawn_node("q-b").await;
-  let a = spawn_node("q-a").await;
+async fn query_round_trip<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("q-b").await;
+  let a = spawn_node::<R>("q-a").await;
   let b_addr = b.advertise_address();
 
   // Subscribe both before the join so neither the query nor its response races ahead
@@ -353,7 +372,7 @@ async fn query_round_trip() {
     }
   };
 
-  let got = tokio::time::timeout(Duration::from_secs(30), async {
+  let got = R::timeout(Duration::from_secs(30), async {
     let (_, got) = future::join(responder, collector).await;
     got
   })
@@ -368,10 +387,12 @@ async fn query_round_trip() {
 /// A graceful leave completes the machine's leave chain: `leave()` resolves only
 /// once `LeftCluster` fires (the reactor gates the reply on it), that event surfaces
 /// on the leaver's own stream, and the local endpoint settles at `Left`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn leave_emits_left_cluster() {
-  let b = spawn_node("lv-b").await;
-  let a = spawn_node("lv-a").await;
+async fn leave_emits_left_cluster<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("lv-b").await;
+  let a = spawn_node::<R>("lv-a").await;
   let b_addr = b.advertise_address();
 
   let mut a_events = a.events();
@@ -385,7 +406,7 @@ async fn leave_emits_left_cluster() {
   a.leave().await.expect("A leaves the cluster");
 
   // `LeftCluster` is also forwarded to A's own subscribers.
-  let saw = tokio::time::timeout(Duration::from_secs(30), async {
+  let saw = R::timeout(Duration::from_secs(30), async {
     loop {
       match a_events.next().await {
         Some(Event::LeftCluster) => break true,
@@ -400,12 +421,12 @@ async fn leave_emits_left_cluster() {
 
   // The local endpoint state settles at `Left` (poll to absorb the snapshot-refresh
   // race after the leave chain completes).
-  tokio::time::timeout(Duration::from_secs(5), async {
+  R::timeout(Duration::from_secs(5), async {
     loop {
       if a.state() == SerfState::Left {
         break;
       }
-      tokio::time::sleep(Duration::from_millis(20)).await;
+      R::sleep(Duration::from_millis(20)).await;
     }
   })
   .await
@@ -419,9 +440,11 @@ async fn leave_emits_left_cluster() {
 /// acking shutdown, so `shutdown().await` releases the bound port before it
 /// resolves: a second QUIC node binding the SAME advertise address the instant the
 /// first shuts down must construct successfully, not fail with `AddrInUse`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quic_shutdown_releases_bound_address_for_rebind() {
-  let first = spawn_node("rebind-first").await;
+async fn quic_shutdown_releases_bound_address_for_rebind<R>()
+where
+  R: Runtime,
+{
+  let first = spawn_node::<R>("rebind-first").await;
   let addr = first.advertise_address();
   first.shutdown().await.expect("first node shuts down");
 
@@ -429,7 +452,7 @@ async fn quic_shutdown_releases_bound_address_for_rebind() {
     .with_local_id(SmolStr::new("rebind-second"))
     .with_advertise_addr(MaybeResolved::Resolved(addr))
     .with_quic_config(test_quic_options());
-  let second = Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+  let second = Serf::<SmolStr, SocketAddr, R>::quic(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -473,7 +496,10 @@ fn test_secret_key(fill: u8) -> SecretKey {
 /// an incidental push/pull), and the negative test's absence is decisive rather than
 /// a race against the next scheduled sync. Join-time exchanges are unaffected.
 #[cfg(encryption)]
-async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
+async fn spawn_encrypted_node<R>(id: &str, encryption: EncryptionOptions) -> Node<R>
+where
+  R: Runtime,
+{
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
@@ -481,7 +507,7 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
     .with_quic_config(test_quic_options())
     .with_push_pull_interval(Duration::ZERO)
     .with_encryption(encryption);
-  Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+  Serf::<SmolStr, SocketAddr, R>::quic(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -512,11 +538,13 @@ const GOSSIP_DELIVERY_WINDOW: Duration = Duration::from_secs(10);
 /// proves `encrypt_gossip`/`decrypt_gossip` round-trip end-to-end rather than
 /// running as identity transforms.
 #[cfg(encryption)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_quic_gossip_convergence_encrypted() {
+async fn two_node_quic_gossip_convergence_encrypted<R>()
+where
+  R: Runtime,
+{
   let key = EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42)));
-  let b = spawn_encrypted_node("enc-b", key.clone()).await;
-  let a = spawn_encrypted_node("enc-a", key).await;
+  let b = spawn_encrypted_node::<R>("enc-b", key.clone()).await;
+  let a = spawn_encrypted_node::<R>("enc-a", key).await;
   let b_addr = b.advertise_address();
 
   // Subscribe before joining so the user event cannot race the subscription.
@@ -535,7 +563,7 @@ async fn two_node_quic_gossip_convergence_encrypted() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(GOSSIP_DELIVERY_WINDOW, async {
+  let got = R::timeout(GOSSIP_DELIVERY_WINDOW, async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -575,14 +603,16 @@ async fn two_node_quic_gossip_convergence_encrypted() {
 /// ride gossip. A matched key WOULD surface the event within this window (the
 /// positive test proves exactly that), so the absence is not vacuous.
 #[cfg(encryption)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mismatched_keyring_gossip_does_not_cross() {
-  let b = spawn_encrypted_node(
+async fn mismatched_keyring_gossip_does_not_cross<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_encrypted_node::<R>(
     "mis-b",
     EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42))),
   )
   .await;
-  let a = spawn_encrypted_node(
+  let a = spawn_encrypted_node::<R>(
     "mis-a",
     EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x43))),
   )
@@ -611,7 +641,7 @@ async fn mismatched_keyring_gossip_does_not_cross() {
   // negation; a CLOSED stream (`None`) is NOT success — it would mean A's driver died
   // on the bad ciphertext, which cannot prove the event was blocked, so it too is a
   // failure. Only a clean timeout (the event never surfaces) is the blocked outcome.
-  let outcome = tokio::time::timeout(GOSSIP_DELIVERY_WINDOW, async {
+  let outcome = R::timeout(GOSSIP_DELIVERY_WINDOW, async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "secret" => break true,
@@ -647,4 +677,111 @@ async fn mismatched_keyring_gossip_does_not_cross() {
 
   a.shutdown().await.expect("mis-a shuts down");
   b.shutdown().await.expect("mis-b shuts down");
+}
+
+// The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
+// runtime. Gated on the `tokio` feature so the `--test quic -- smol` build (which
+// enables only `smol`) can drop the `agnostic/tokio` code path.
+#[cfg(feature = "tokio")]
+mod tokio_cells {
+  use agnostic::tokio::TokioRuntime;
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn two_node_quic_join_converges() {
+    super::two_node_quic_join_converges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn user_event_delivered() {
+    super::user_event_delivered::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn datagram_mode_gossip_rides_quic_datagrams() {
+    super::datagram_mode_gossip_rides_quic_datagrams::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn query_round_trip() {
+    super::query_round_trip::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn leave_emits_left_cluster() {
+    super::leave_emits_left_cluster::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn quic_shutdown_releases_bound_address_for_rebind() {
+    super::quic_shutdown_releases_bound_address_for_rebind::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn two_node_quic_gossip_convergence_encrypted() {
+    super::two_node_quic_gossip_convergence_encrypted::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn mismatched_keyring_gossip_does_not_cross() {
+    super::mismatched_keyring_gossip_does_not_cross::<TokioRuntime>().await;
+  }
+}
+
+// The smol cells: the identical scenarios instantiated over `SmolRuntime` and
+// driven by smol's `block_on`. The reactor QUIC poll task runs on smol's global
+// executor, so the same scenario bodies verify the driver under a second runtime.
+// `cargo test --test quic -- smol` selects exactly these.
+#[cfg(feature = "smol")]
+mod smol_cells {
+  use agnostic::{RuntimeLite, smol::SmolRuntime};
+
+  #[test]
+  fn two_node_quic_join_converges_smol() {
+    SmolRuntime::block_on(super::two_node_quic_join_converges::<SmolRuntime>());
+  }
+
+  #[test]
+  fn user_event_delivered_smol() {
+    SmolRuntime::block_on(super::user_event_delivered::<SmolRuntime>());
+  }
+
+  #[test]
+  fn datagram_mode_gossip_rides_quic_datagrams_smol() {
+    SmolRuntime::block_on(super::datagram_mode_gossip_rides_quic_datagrams::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn query_round_trip_smol() {
+    SmolRuntime::block_on(super::query_round_trip::<SmolRuntime>());
+  }
+
+  #[test]
+  fn leave_emits_left_cluster_smol() {
+    SmolRuntime::block_on(super::leave_emits_left_cluster::<SmolRuntime>());
+  }
+
+  #[test]
+  fn quic_shutdown_releases_bound_address_for_rebind_smol() {
+    SmolRuntime::block_on(super::quic_shutdown_releases_bound_address_for_rebind::<
+      SmolRuntime,
+    >());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn two_node_quic_gossip_convergence_encrypted_smol() {
+    SmolRuntime::block_on(super::two_node_quic_gossip_convergence_encrypted::<
+      SmolRuntime,
+    >());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn mismatched_keyring_gossip_does_not_cross_smol() {
+    SmolRuntime::block_on(super::mismatched_keyring_gossip_does_not_cross::<SmolRuntime>());
+  }
 }

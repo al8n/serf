@@ -1,0 +1,56 @@
+name: doc
+
+# Build the rustdoc for the crates with the docs.rs cfg, so a doc break (a bad
+# intra-doc link target, an unbuildable feature combination, a rustdoc
+# regression) is caught BEFORE publish instead of on docs.rs. Not
+# warnings-as-errors: serf-proto may carry pre-existing intra-doc-link warnings;
+# this gate catches hard failures and can ratchet to -D warnings later.
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+
+env:
+  RUSTDOCFLAGS: "--cfg docsrs"
+
+jobs:
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Doc serf-proto
+        run: >
+          cargo doc -p serf-proto --no-deps
+          --features tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex
+
+      - name: Doc serf-driver
+        run: cargo doc -p serf-driver --no-deps --all-features
+
+      - name: Doc serf-reactor
+        run: >
+          cargo doc -p serf-reactor --no-deps
+          --features tokio,tcp,tls-rustls-ring,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex,tracing,serde,clap,dns,getifs
+
+      - name: Doc serf-compio
+        run: >
+          cargo doc -p serf-compio --no-deps
+          --features tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex,tracing,serde,clap,dns,getifs

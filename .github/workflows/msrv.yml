@@ -1,0 +1,53 @@
+name: msrv
+
+# Validate the crates build on the stable channel and on the declared MSRV.
+# MSRV is 1.96.0: serf depends on memberlist-proto, whose dependency tree floors
+# at 1.96 (compio-buf adopts the just-stabilized maybe_uninit_slice), so the
+# workspace does not build below this regardless of serf's own rust-version.
+# Every other workflow pins a specific nightly, so without this nothing proves
+# the crates compile on stable or at their stated minimum.
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - stable
+          - "1.96.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Check crates
+        run: >
+          cargo check
+          -p serf-proto
+          -p serf-driver
+          -p serf-reactor
+          -p serf-compio
+          --features serf-reactor/tokio,serf-reactor/tcp,serf-reactor/quic-rustls-ring,serf-compio/tcp,serf-compio/quic-rustls-ring

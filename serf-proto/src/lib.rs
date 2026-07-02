@@ -4,6 +4,8 @@
 //! Depends on `memberlist-proto` for the `Data`/`DataRef` codec primitives; defines serf's
 //! own message set and framing on top of them.
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, allow(unused_attributes))]
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use any::{AnyMessage, EncodeError};

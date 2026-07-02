@@ -103,24 +103,30 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # The real-node TCP test suite (two loopback nodes: join/converge, user event,
-# query round-trip, leave/LeftCluster, snapshot forwarders, shutdown).
+# query round-trip, leave/LeftCluster, snapshot forwarders, shutdown). The scenario
+# bodies are runtime-generic; the file carries a `#[tokio::test]` cell per scenario
+# (gated on `tokio`) and a `_smol` cell driven by `SmolRuntime::block_on` (gated on
+# `smol`), so `--features smol,tcp --test tcp -- smol` builds and runs the smol cells
+# alone. The target requires only the transport feature; a runtime feature (tokio or
+# smol) supplies the cells.
 [[test]]
 name = "tcp"
-required-features = ["tcp", "tokio"]
+required-features = ["tcp"]
 
 # The real-node TLS test suite (two loopback nodes over a self-signed cert +
 # accept-any verifier: join/converge, user event, query round-trip, leave/shutdown).
+# Tokio + smol cells over the runtime-generic scenarios (see the `tcp` target).
 [[test]]
 name = "tls"
-required-features = ["tls-rustls-ring", "tokio"]
+required-features = ["tls-rustls-ring"]
 
 # The real-node QUIC test suite (two loopback nodes over a quinn config bundle:
 # join/converge, user event, query round-trip, leave/LeftCluster, shutdown, and —
 # under an encryption backend — encrypted-gossip convergence + mismatched-key
-# enforcement).
+# enforcement). Tokio + smol cells over the runtime-generic scenarios (see `tcp`).
 [[test]]
 name = "quic"
-required-features = ["quic-rustls-ring", "tokio"]
+required-features = ["quic-rustls-ring"]
 
 [package.metadata.docs.rs]
 # A single coherent crypto-provider set (ring, not aws-lc-rs; tokio, not smol) so
