@@ -1,12 +1,13 @@
 name: ci-smol
 
-# The reactor async driver under smol. serf-reactor's real-node integration
-# suites (tcp / tls / quic) are written as `#[tokio::test]` and gated on the
-# `tokio` feature, so they run in ci-tokio; there are no smol-runtime integration
-# cells yet. This workflow is the smol gate: it builds + clippy-lints the crate
-# with the `smol` runtime feature (proving the `agnostic/smol` code path compiles
-# clean) and runs the crate's runtime-independent unit tests. Nodes bind ephemeral
-# loopback ports, so no subnet setup is required.
+# The reactor async driver under smol. serf-reactor's real-node integration suites
+# (tcp / tls / quic) have runtime-generic scenario bodies with both a `#[tokio::test]`
+# cell (run in ci-tokio) and a `_smol` cell driven by `SmolRuntime::block_on`. This
+# workflow is the smol gate: it clippy-lints the crate with the `smol` runtime feature
+# (proving the `agnostic/smol` code path compiles clean), runs the runtime-independent
+# unit tests, and runs the `_smol` integration cells (`--test {tcp,tls,quic} -- smol`,
+# where `-- smol` selects only the smol cells across the suite binaries). Nodes bind
+# ephemeral loopback ports, so no subnet setup is required.
 
 on:
   push:
@@ -79,3 +80,11 @@ jobs:
 
       - name: Test (runtime-independent unit tests)
         run: cargo test -p serf-reactor --lib --features "$FEATURES"
+
+      - name: Test (smol integration cells)
+        # `-- smol` selects only the `_smol` cells in each suite binary; the tokio
+        # cells over the same runtime-generic scenarios run in ci-tokio.
+        run: |
+          cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test tcp -- smol
+          cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test tls -- smol
+          cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test quic -- smol
