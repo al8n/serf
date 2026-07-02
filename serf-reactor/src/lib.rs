@@ -64,6 +64,8 @@ mod shared;
 mod snapshot;
 #[cfg(feature = "tcp")]
 mod tcp;
+#[cfg(feature = "tls")]
+mod tls;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod transport;
 
@@ -112,6 +114,14 @@ pub use resolver::{
   Ipv6PreferringResolver, OsResolver, Resolver, SocketAddrResolver,
 };
 
+#[cfg(feature = "dns")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
+pub use resolver::{DEFAULT_DNS_TIMEOUT, DnsError, DnsResolver};
+
+#[cfg(feature = "getifs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "getifs")))]
+pub use resolver::{LocalAddrResolver, LocalAddrScope, local_advertise};
+
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use serf::Serf;
@@ -132,6 +142,10 @@ pub use tcp::{TcpTransport, TcpTransportOptions};
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 pub use quic::{QuicOptions, QuicTransport, QuicTransportOptions};
+
+#[cfg(feature = "tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+pub use tls::{SniProvider, TlsOptions, TlsTransport, TlsTransportOptions};
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]

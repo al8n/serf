@@ -37,6 +37,8 @@ use crate::delegate::KeyringDelegate;
 use crate::quic::{QuicTransport, QuicTransportOptions};
 #[cfg(feature = "tcp")]
 use crate::tcp::{TcpTransport, TcpTransportOptions};
+#[cfg(feature = "tls")]
+use crate::tls::{TlsTransport, TlsTransportOptions};
 use crate::{
   MaybeResolved,
   command::{
@@ -287,6 +289,104 @@ where
     G: rand::Rng + Send + Unpin + 'static,
   {
     Self::new::<TcpTransport<I, A, R>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+}
+
+// Ergonomic TLS constructor: instantiate the TLS transport for the caller so a node
+// can be built without naming the generic `Serf::new::<T, …>` machinery. TLS rides
+// the same stream driver as plain TCP, differing only in the record layer.
+#[cfg(feature = "tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+impl<I, A, R> Serf<I, A, R>
+where
+  I: memberlist_proto::Id
+    + CheapClone
+    + Clone
+    + core::fmt::Debug
+    + core::fmt::Display
+    + Send
+    + Sync
+    + Unpin
+    + 'static,
+  A: Data + Clone + Send + Sync + 'static,
+  R: Runtime,
+{
+  /// Build a TLS-backed serf node and spawn its driver on the runtime `R`.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`TlsTransport`](crate::TlsTransport) for the caller: it binds a UDP gossip
+  /// socket and a TCP reliable listener on the advertise address (resolved once via
+  /// `resolver` / `advertise_resolver`), then spawns the stream driver whose
+  /// reliable record layer drives rustls over the plain agnostic TCP stream. The
+  /// caller supplies the rustls server/client bundle and the per-peer SNI provider
+  /// through [`TlsTransportOptions`](crate::TlsTransportOptions). The gossip RNG is
+  /// drawn from OS entropy via [`gossip_rng`](crate::gossip_rng); use
+  /// [`tls_with_rng`](Self::tls_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Arc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Arc::new(VoidKeyringDelegate)` for a node that manages no keys); the keyring
+  /// AEAD-protects the gossip datagrams (the reliable plane rides the TLS session).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tls<RES, AR, D>(
+    options: TlsTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+  {
+    Self::tls_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`tls`](Self::tls) but with a caller-supplied gossip RNG `G` — draw it via
+  /// [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tls_with_rng<RES, AR, D, G>(
+    options: TlsTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<TlsTransport<I, A, R>, RES, AR, D, G>(
       options,
       resolver,
       advertise_resolver,

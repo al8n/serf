@@ -145,7 +145,9 @@ impl<I> Shared<I> {
     self.observation_dropped.fetch_add(n, Ordering::Relaxed);
   }
 
-  /// Records `n` gossip payloads sent over the QUIC datagram plane.
+  /// Records `n` gossip payloads sent over the QUIC datagram plane. Only the QUIC
+  /// driver reports datagram sends; the stream backends leave the counter at zero.
+  #[cfg(feature = "quic")]
   pub(crate) fn add_datagrams_sent(&self, n: u64) {
     self.datagrams_sent.fetch_add(n, Ordering::Relaxed);
   }
