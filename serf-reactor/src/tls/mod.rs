@@ -32,7 +32,7 @@
 
 #![cfg(feature = "tls")]
 
-use core::num::NonZeroU8;
+use core::{num::NonZeroU8, time::Duration};
 use std::{io::ErrorKind, net::SocketAddr};
 
 use agnostic::{
@@ -108,6 +108,10 @@ pub struct TlsTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   stream: StreamTransportOptions,
   sni_provider: SniProvider,
   tls_options: Option<TlsOptions>,
+  /// Override for the memberlist anti-entropy push/pull interval. `None` keeps the
+  /// coordinator default; `Some(Duration::ZERO)` disables periodic push/pull
+  /// entirely. See [`with_push_pull_interval`](Self::with_push_pull_interval).
+  push_pull_interval: Option<Duration>,
   /// Gossip encryption policy. The default (no keyring) leaves the gossip
   /// datagrams plaintext; attaching a keyring via
   /// [`with_encryption`](Self::with_encryption) makes the coordinator's
@@ -133,6 +137,7 @@ impl<I, A> TlsTransportOptions<I, A> {
       stream: StreamTransportOptions::new(),
       sni_provider: Box::new(|_addr: &SocketAddr| Some("localhost".to_string())),
       tls_options: None,
+      push_pull_interval: None,
       #[cfg(encryption)]
       encryption: EncryptionOptions::new(),
     }
@@ -183,6 +188,19 @@ impl<I, A> TlsTransportOptions<I, A> {
     self
   }
 
+  /// Builder: override the memberlist anti-entropy push/pull interval.
+  ///
+  /// `None` (the default) keeps the coordinator's built-in interval. A positive
+  /// duration re-tunes the periodic full-state sync; `Duration::ZERO` disables
+  /// periodic push/pull entirely — join-time and explicit exchanges still run, but
+  /// no background anti-entropy is scheduled.
+  #[must_use]
+  #[inline]
+  pub const fn with_push_pull_interval(mut self, interval: Duration) -> Self {
+    self.push_pull_interval = Some(interval);
+    self
+  }
+
   /// Builder: gossip-encryption policy.
   ///
   /// The default (no keyring) keeps the gossip datagrams plaintext, so an
@@ -219,6 +237,12 @@ impl<I, A> TlsTransportOptions<I, A> {
   #[inline]
   pub const fn stream(&self) -> &StreamTransportOptions {
     &self.stream
+  }
+
+  /// The push/pull interval override, if set.
+  #[inline]
+  pub const fn push_pull_interval(&self) -> Option<Duration> {
+    self.push_pull_interval
   }
 
   /// SNI provider closure.
@@ -272,6 +296,10 @@ where
   stream_options: StreamTransportOptions,
   sni_provider: SniProvider,
   tls_options: TlsOptions,
+  /// Push/pull interval override, applied to the coordinator's `EndpointOptions` in
+  /// [`Transport::run`]. `None` keeps the default; `Some(Duration::ZERO)` disables
+  /// periodic anti-entropy.
+  push_pull_interval: Option<Duration>,
   /// Independent OS-seeded seed for the serf core's RNG, drawn once per node in
   /// [`Transport::new`] and consumed when [`Transport::run`] builds the endpoint
   /// via `new_with_rng`. Distinct from the coordinator's gossip RNG so serf's
@@ -400,6 +428,7 @@ where
       stream_options: options.stream,
       sni_provider: options.sni_provider,
       tls_options,
+      push_pull_interval: options.push_pull_interval,
       serf_rng,
       #[cfg(encryption)]
       encryption: options.encryption,
@@ -430,8 +459,14 @@ where
     // endpoint; build it here from `self`'s stored config. Serf ranks its user
     // broadcasts on three tiers (intent / event / query → ranks 0 / 1 / 2), so the
     // inner memberlist endpoint needs at least three broadcast tiers.
-    let inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
+    let mut inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
       .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+    // A caller-supplied push/pull interval re-tunes (or, at `Duration::ZERO`,
+    // disables) the periodic anti-entropy full-state sync. Left unset, the
+    // coordinator keeps its own default.
+    if let Some(interval) = self.push_pull_interval {
+      inner_opts = inner_opts.with_push_pull_interval(interval);
+    }
     // Snapshot the reliable push/pull exchange timeout from the SAME options the
     // coordinator is built from, so the driver reconciles an await-result join's
     // caller deadline against the exact deadline the coordinator will stamp.

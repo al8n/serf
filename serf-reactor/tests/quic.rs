@@ -462,6 +462,16 @@ fn test_secret_key(fill: u8) -> SecretKey {
 
 /// Build and spawn a reactor QUIC node on an ephemeral loopback port with
 /// `encryption` installed as its gossip keyring policy.
+///
+/// Periodic anti-entropy push/pull is disabled (`with_push_pull_interval(ZERO)`).
+/// On QUIC the reliable push/pull rides quinn's own TLS — NOT the gossip keyring —
+/// and a `PushPullMessage` carries the buffered user events, so a background
+/// full-state sync would smuggle a user event across a mismatched gossip keyring,
+/// bypassing the AEAD. Disabling it leaves the gossip datagram plane as the sole
+/// carrier of ongoing user events, which is exactly the plane these gossip-encryption
+/// tests mean to exercise: the positive test then proves the event rode gossip (not
+/// an incidental push/pull), and the negative test's absence is decisive rather than
+/// a race against the next scheduled sync. Join-time exchanges are unaffected.
 #[cfg(encryption)]
 async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
@@ -469,6 +479,7 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(test_quic_options())
+    .with_push_pull_interval(Duration::ZERO)
     .with_encryption(encryption);
   Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
     opts,
@@ -482,6 +493,14 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
   .await
   .expect("spawn encrypted serf quic node")
 }
+
+/// The window within which a gossip-carried user event is proved to arrive on loopback
+/// under a MATCHED keyring (the positive test) — and therefore the window its ABSENCE
+/// is decisive over under a MISMATCHED keyring (the negative test). Shared by both so
+/// the negative's absence is measured against the exact window the positive proves
+/// delivery within, rather than an arbitrarily shorter one a real cross could outlast.
+#[cfg(encryption)]
+const GOSSIP_DELIVERY_WINDOW: Duration = Duration::from_secs(10);
 
 /// Two QUIC nodes sharing one gossip keyring converge AND exchange gossip: A joins B
 /// (the reliable push/pull rides quinn's own TLS, so it merges membership
@@ -516,7 +535,7 @@ async fn two_node_quic_gossip_convergence_encrypted() {
     .await
     .expect("user event dispatched");
 
-  let got = tokio::time::timeout(Duration::from_secs(30), async {
+  let got = tokio::time::timeout(GOSSIP_DELIVERY_WINDOW, async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
@@ -526,7 +545,7 @@ async fn two_node_quic_gossip_convergence_encrypted() {
     }
   })
   .await
-  .expect("A observes B's user event over the shared-key gossip plane within the timeout");
+  .expect("A observes B's user event over the shared-key gossip plane within the shared window");
   assert_eq!(
     got,
     Some(Bytes::from_static(b"hello")),
@@ -541,11 +560,20 @@ async fn two_node_quic_gossip_convergence_encrypted() {
 /// GOSSIP: on QUIC the reliable push/pull rides quinn's own TLS, so the join still
 /// merges membership (the gossip keyring does not gate that plane) — but a user
 /// event, which is disseminated only over the AEAD-sealed gossip datagrams, cannot
-/// cross a disjoint key. Within a window shorter than the 30s anti-entropy
-/// push/pull interval a user event rides gossip ALONE, so its ABSENCE at A proves
-/// the gossip encryption is real enforcement, not an identity pass-through — the
-/// discriminating negative the positive test above pairs with (both turn on a
-/// gossip-carried event, since the membership merge crosses regardless of the key).
+/// cross a disjoint key. Its ABSENCE at A proves the gossip encryption is real
+/// enforcement, not an identity pass-through — the discriminating negative the
+/// positive test above pairs with (both turn on a gossip-carried event, since the
+/// membership merge crosses regardless of the key).
+///
+/// Determinism rests on the gossip plane being the event's SOLE carrier. Both nodes
+/// run with periodic push/pull disabled (see `spawn_encrypted_node`): a background
+/// full-state sync rides quinn TLS and replays a peer's buffered user events, so
+/// left enabled it would carry the event over the reliable plane at a random point in
+/// its interval — bypassing the gossip AEAD and racing any bounded window. With it
+/// off, the join-time exchange (which precedes the broadcast, when B's event buffer
+/// is still empty) is the only reliable exchange, and every ongoing user event must
+/// ride gossip. A matched key WOULD surface the event within this window (the
+/// positive test proves exactly that), so the absence is not vacuous.
 #[cfg(encryption)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mismatched_keyring_gossip_does_not_cross() {
@@ -562,22 +590,28 @@ async fn mismatched_keyring_gossip_does_not_cross() {
   let b_addr = b.advertise_address();
 
   // The reliable push/pull (quinn TLS) merges membership regardless of the gossip
-  // keyring, so the await-result join still completes — B is now a known member A
-  // gossips to.
+  // keyring, so the await-result join completes and then BOTH nodes hold each other
+  // as members. Converging to that defined stable state first is what makes the
+  // later absence "the event was blocked", not "it had not arrived yet".
   a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
     .await
     .expect("the reliable push/pull merges membership over quinn TLS");
+  converge(&a, &b).await;
 
   // Subscribe, then have B broadcast a user event over the gossip plane. Under the
-  // mismatched keyring A cannot decrypt B's gossip datagrams, so it never surfaces
-  // the event. The window is well under the 30s anti-entropy push/pull interval, so
-  // the event rides gossip ALONE — a later push/pull cannot carry it into A here.
+  // mismatched keyring A cannot decrypt B's gossip datagrams, and periodic push/pull
+  // is disabled, so no plane can carry the event to A.
   let mut a_events = a.events();
   b.user_event("secret", Bytes::from_static(b"hidden"), false)
     .await
     .expect("user event dispatched");
 
-  let observed = tokio::time::timeout(Duration::from_secs(5), async {
+  // Poll over the SAME window the paired positive test proves delivery within, so the
+  // absence is measured against a proven-sufficient window. A crossed event fails the
+  // negation; a CLOSED stream (`None`) is NOT success — it would mean A's driver died
+  // on the bad ciphertext, which cannot prove the event was blocked, so it too is a
+  // failure. Only a clean timeout (the event never surfaces) is the blocked outcome.
+  let outcome = tokio::time::timeout(GOSSIP_DELIVERY_WINDOW, async {
     loop {
       match a_events.next().await {
         Some(Event::User(u)) if u.name.as_str() == "secret" => break true,
@@ -587,9 +621,28 @@ async fn mismatched_keyring_gossip_does_not_cross() {
     }
   })
   .await;
-  assert!(
-    !matches!(observed, Ok(true)),
-    "node A must NOT surface B's gossip-carried user event across a mismatched keyring"
+  match outcome {
+    Ok(true) => {
+      panic!("node A surfaced B's gossip-carried user event across a mismatched keyring")
+    }
+    Ok(false) => panic!(
+      "node A's event stream closed before the window elapsed — cannot conclude the \
+       mismatched-key event was blocked"
+    ),
+    Err(_) => {}
+  }
+  // A clean timeout must mean "blocked", not "A died": both nodes must still hold the
+  // 2-member cluster, so the absence was gossip-AEAD enforcement under a healthy,
+  // converged pair.
+  assert_eq!(
+    a.num_members(),
+    2,
+    "A remains converged after the absence window"
+  );
+  assert_eq!(
+    b.num_members(),
+    2,
+    "B remains converged after the absence window"
   );
 
   a.shutdown().await.expect("mis-a shuts down");

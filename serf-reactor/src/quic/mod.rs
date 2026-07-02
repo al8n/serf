@@ -18,7 +18,7 @@
 
 #![cfg(feature = "quic")]
 
-use core::num::NonZeroU8;
+use core::{num::NonZeroU8, time::Duration};
 use std::{io::ErrorKind, net::SocketAddr};
 
 use agnostic::{
@@ -76,6 +76,10 @@ pub struct QuicTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,
   quic_config: Option<QuicOptions>,
+  /// Override for the memberlist anti-entropy push/pull interval. `None` keeps the
+  /// coordinator default; `Some(Duration::ZERO)` disables periodic push/pull
+  /// entirely. See [`with_push_pull_interval`](Self::with_push_pull_interval).
+  push_pull_interval: Option<Duration>,
   /// Gossip-encryption policy. The default (no keyring) leaves the gossip datagrams
   /// plaintext; attaching a keyring via [`with_encryption`](Self::with_encryption)
   /// makes the coordinator's `encrypt_gossip`/`decrypt_gossip` AEAD-protect them.
@@ -97,6 +101,7 @@ impl<I, A> QuicTransportOptions<I, A> {
       local_id: None,
       advertise_addr: None,
       quic_config: None,
+      push_pull_interval: None,
       #[cfg(encryption)]
       encryption: EncryptionOptions::new(),
     }
@@ -123,6 +128,22 @@ impl<I, A> QuicTransportOptions<I, A> {
   #[inline]
   pub fn with_quic_config(mut self, cfg: QuicOptions) -> Self {
     self.quic_config = Some(cfg);
+    self
+  }
+
+  /// Builder: override the memberlist anti-entropy push/pull interval.
+  ///
+  /// `None` (the default) keeps the coordinator's built-in interval. A positive
+  /// duration re-tunes the periodic full-state sync; `Duration::ZERO` disables
+  /// periodic push/pull entirely — join-time and explicit exchanges still run, but
+  /// no background anti-entropy is scheduled. Disabling it isolates the gossip
+  /// datagram plane as the sole carrier of ongoing user events and membership
+  /// deltas, which is exactly what a gossip-encryption conformance test wants to
+  /// observe.
+  #[must_use]
+  #[inline]
+  pub const fn with_push_pull_interval(mut self, interval: Duration) -> Self {
+    self.push_pull_interval = Some(interval);
     self
   }
 
@@ -164,6 +185,12 @@ impl<I, A> QuicTransportOptions<I, A> {
     self.quic_config.as_ref()
   }
 
+  /// The push/pull interval override, if set.
+  #[inline]
+  pub const fn push_pull_interval(&self) -> Option<Duration> {
+    self.push_pull_interval
+  }
+
   /// Gossip-encryption policy.
   #[cfg(encryption)]
   #[cfg_attr(
@@ -199,6 +226,10 @@ where
   advertise_socket: SocketAddr,
   gossip_socket: <R::Net as Net>::UdpSocket,
   quic_config: QuicOptions,
+  /// Push/pull interval override, applied to the coordinator's `EndpointOptions` in
+  /// [`Transport::run`]. `None` keeps the default; `Some(Duration::ZERO)` disables
+  /// periodic anti-entropy.
+  push_pull_interval: Option<Duration>,
   /// Independent OS-seeded seed for the serf core's RNG, drawn once per node in
   /// [`Transport::new`] and consumed when [`Transport::run`] builds the endpoint via
   /// `new_with_rng`. Distinct from the coordinator's gossip RNG so serf's query IDs
@@ -296,6 +327,7 @@ where
       advertise_socket: bound,
       gossip_socket,
       quic_config,
+      push_pull_interval: options.push_pull_interval,
       serf_rng,
       #[cfg(encryption)]
       encryption: options.encryption,
@@ -327,8 +359,14 @@ where
     // Serf ranks its user broadcasts on three tiers (intent / event / query →
     // ranks 0 / 1 / 2), so the inner memberlist endpoint needs at least three
     // broadcast tiers.
-    let inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
+    let mut inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
       .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+    // A caller-supplied push/pull interval re-tunes (or, at `Duration::ZERO`,
+    // disables) the periodic anti-entropy full-state sync. Left unset, the
+    // coordinator keeps its own default.
+    if let Some(interval) = self.push_pull_interval {
+      inner_opts = inner_opts.with_push_pull_interval(interval);
+    }
     // The shared UDP socket also carries raw QUIC packets, whose size is governed by
     // the quinn `EndpointConfig`'s accepted max UDP payload — which a caller can set
     // above the serf gossip MTU (quinn's default 1472 already exceeds the 1400
