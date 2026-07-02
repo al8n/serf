@@ -220,8 +220,10 @@ struct PendingJoin {
   /// `received_at < deadline` — is still in flight. serf-proto's `StreamEndpoint`
   /// exposes no per-exchange CALLER deadline (`start_join_push_pull` takes only
   /// `peer, ignore_old, now`; the exchange deadline is the frozen inner FSM's own),
-  /// so this second clock cannot yet be removed outright; plumbing the caller
-  /// deadline INTO the exchange is a serf-proto follow-up.
+  /// so this second clock cannot yet be removed outright. It is instead reconciled
+  /// at construction via [`clamp_join_deadline`], which caps it at the exchange
+  /// deadline so the watermark always covers a completion that beat that exchange;
+  /// plumbing the caller deadline INTO the exchange is a serf-proto follow-up.
   deadline: Instant,
   /// One-shot reply channel back to the caller, taken when the reply resolves.
   /// `None` once resolved; the waiter then lingers — only to drive ignore-stream
@@ -255,6 +257,32 @@ impl PendingJoin {
   fn is_done(&self) -> bool {
     self.reply.is_none() && self.pending.is_empty()
   }
+}
+
+/// Reconcile a caller's await-result join deadline with the machine's push/pull
+/// exchange deadline (`now + stream_timeout`), returning the effective
+/// [`PendingJoin::deadline`].
+///
+/// A join we initiate carries two clocks: this driver-local fallback deadline and
+/// the coordinator's own per-exchange deadline (`now + stream_timeout`). The pump's
+/// reap watermark re-snapshots to cover a join's still-buffered completion only when
+/// that join's deadline goes due ([`StreamDriver::max_due_join_leave_deadline`]);
+/// the exchange deadline, hidden behind any earlier endpoint deadline in
+/// `poll_timeout`'s min, never widens the watermark on its own. So a caller deadline
+/// LATER than the exchange deadline lets an elapsed exchange emit a terminal
+/// `ExchangeCompleted(Failed)` while the watermark still covers only an earlier
+/// crossing's backlog — reaping a premature `JoinAllFailed` for a `join_deadline`
+/// that has not elapsed. Clamping the driver deadline so it never exceeds the
+/// exchange deadline keeps the join's deadline in `max_due` whenever the exchange
+/// could fail, so the watermark has already widened to cover a completion that
+/// arrived before it. Plumbing the caller deadline INTO the exchange (collapsing the
+/// two clocks) is a serf-proto follow-up.
+fn clamp_join_deadline(
+  caller_deadline: Instant,
+  now: Instant,
+  stream_timeout: Duration,
+) -> Instant {
+  caller_deadline.min(now + stream_timeout)
 }
 
 /// Driver-side state for the single in-flight graceful-leave operation.
@@ -397,6 +425,11 @@ where
   bridge_inbound_inflight: Arc<AtomicU64>,
   idle_wake: Duration,
   leave_timeout: Duration,
+  /// The reliable push/pull exchange timeout the coordinator stamps on each
+  /// dispatched exchange (`now + stream_timeout`), snapshotted from the same
+  /// `EndpointOptions` the coordinator is built from. An await-result join's
+  /// caller deadline is reconciled against it in [`clamp_join_deadline`].
+  stream_timeout: Duration,
   close_timeout: Duration,
   dial_timeout: Duration,
   bridge_recv_buf_len: usize,
@@ -430,6 +463,7 @@ where
     driver_opts: RuntimeOptions,
     stream_opts: StreamTransportOptions,
     label: Option<Bytes>,
+    stream_timeout: Duration,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     let buf_len = endpoint
@@ -469,6 +503,7 @@ where
       bridge_inbound_inflight: Arc::new(AtomicU64::new(0)),
       idle_wake: driver_opts.idle_wake_interval(),
       leave_timeout: driver_opts.leave_timeout(),
+      stream_timeout,
       close_timeout: stream_opts.close_timeout(),
       dial_timeout: stream_opts.dial_timeout(),
       bridge_recv_buf_len: stream_opts.bridge_recv_buf_len(),
@@ -612,7 +647,7 @@ where
                 contacted: SmallVec::new(),
                 ignore_streams,
                 requested,
-                deadline,
+                deadline: clamp_join_deadline(deadline, now, self.stream_timeout),
                 reply: Some(reply),
               });
             }
@@ -1939,6 +1974,7 @@ pub(crate) fn spawn_stream_driver<I, R, T, D, G, SR>(
   driver_opts: RuntimeOptions,
   stream_opts: StreamTransportOptions,
   label: Option<Bytes>,
+  stream_timeout: Duration,
   #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
 ) -> StreamDriver<I, R, T, G, SR>
 where
@@ -1999,6 +2035,7 @@ where
     driver_opts,
     stream_opts,
     label,
+    stream_timeout,
     #[cfg(encryption)]
     keyring,
   )

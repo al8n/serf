@@ -309,6 +309,10 @@ where
     // inner memberlist endpoint needs at least three broadcast tiers.
     let inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
       .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+    // Snapshot the reliable push/pull exchange timeout from the SAME options the
+    // coordinator is built from, so the driver reconciles an await-result join's
+    // caller deadline against the exact deadline the coordinator will stamp.
+    let stream_timeout = inner_opts.stream_timeout();
     let inner = Endpoint::new(inner_opts, gossip_rng);
     // Plain TCP has no SNI (`|_| None`) and a membership address that IS the
     // transport socket (`|addr| *addr`). No cluster label at this stage.
@@ -342,6 +346,7 @@ where
       runtime.driver_options,
       self.stream_options,
       None,
+      stream_timeout,
       #[cfg(encryption)]
       runtime.keyring,
     );

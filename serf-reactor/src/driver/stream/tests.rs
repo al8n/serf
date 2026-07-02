@@ -42,6 +42,11 @@ fn poll_once(driver: &mut TestDriver) -> Poll<()> {
   Pin::new(driver).poll(&mut cx)
 }
 
+/// The reliable exchange timeout every non-clamp test uses: large enough that no
+/// exchange deadline fires during a fast unit test, so the memberlist default
+/// (`10s`) behavior is preserved for the existing pump regressions.
+const DEFAULT_TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Build a serf `StreamEndpoint<SmolStr, SocketAddr, RawRecords>` rooted at `id` /
 /// `advertise`, mirroring the production construction (memberlist inner endpoint →
 /// reliable coordinator → serf super-machine). Seeded deterministically; the
@@ -50,8 +55,19 @@ fn build_endpoint(
   id: &str,
   advertise: SocketAddr,
 ) -> StreamEndpoint<SmolStr, SocketAddr, RawRecords> {
+  build_endpoint_with_stream_timeout(id, advertise, DEFAULT_TEST_STREAM_TIMEOUT)
+}
+
+/// As [`build_endpoint`], but with an explicit reliable `stream_timeout` so a test
+/// can make the coordinator stamp a short exchange deadline on its push/pulls.
+fn build_endpoint_with_stream_timeout(
+  id: &str,
+  advertise: SocketAddr,
+  stream_timeout: Duration,
+) -> StreamEndpoint<SmolStr, SocketAddr, RawRecords> {
   let inner_opts = EndpointOptions::new(SmolStr::new(id), advertise)
-    .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+    .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"))
+    .with_stream_timeout(stream_timeout);
   let inner = Endpoint::new(inner_opts, SmallRng::seed_from_u64(0));
   let coord = Coordinator::<_, _, RawRecords>::new(
     inner,
@@ -95,10 +111,31 @@ async fn build_driver(
   Receiver<Event<SmolStr, SocketAddr>>,
   Arc<Shared<SmolStr>>,
 ) {
+  build_driver_with_stream_timeout(
+    iter_drain_cap,
+    bridge_inbound_cap,
+    DEFAULT_TEST_STREAM_TIMEOUT,
+  )
+  .await
+}
+
+/// As [`build_driver`], but with an explicit reliable `stream_timeout` applied to
+/// BOTH the driver's endpoint (so its push/pull exchanges carry a short deadline)
+/// AND the driver's clamp field (so [`clamp_join_deadline`] reconciles against the
+/// same value the coordinator will stamp).
+async fn build_driver_with_stream_timeout(
+  iter_drain_cap: usize,
+  bridge_inbound_cap: usize,
+  stream_timeout: Duration,
+) -> (
+  TestDriver,
+  Receiver<Event<SmolStr, SocketAddr>>,
+  Arc<Shared<SmolStr>>,
+) {
   let socket = <<TokioRuntime as Runtime>::Net as Net>::UdpSocket::bind("127.0.0.1:0")
     .await
     .expect("bind gossip socket");
-  let endpoint = build_endpoint("drv", sa(DRIVER_ADDR));
+  let endpoint = build_endpoint_with_stream_timeout("drv", sa(DRIVER_ADDR), stream_timeout);
   let shared = Arc::new(Shared::new(initial_snapshot("drv", sa(DRIVER_ADDR))));
   let obs_payload_bytes = Arc::new(AtomicU64::new(0));
   let (obs_tx, obs_rx) = flume::unbounded();
@@ -126,6 +163,7 @@ async fn build_driver(
     RuntimeOptions::new().with_iter_drain_cap(iter_drain_cap),
     StreamTransportOptions::new().with_bridge_inbound_cap(bridge_inbound_cap),
     None,
+    stream_timeout,
     #[cfg(encryption)]
     Arc::new(crate::VoidKeyringDelegate),
   );
@@ -1052,5 +1090,153 @@ async fn overlapping_deadlines_leave_then_join_waits_for_join_backlog() {
   assert!(
     reached.contains(&seed),
     "the join reached its seed despite the overlapping earlier leave deadline: {reached:?}"
+  );
+}
+
+/// Regression (two-clock reconciliation): an await-result join configured with a
+/// `join_deadline` GREATER than the reliable `stream_timeout` must not resolve a
+/// premature `JoinAllFailed` when the join's own exchange deadline elapses ahead of
+/// the (public) caller deadline.
+///
+/// A join carries two clocks: the driver [`PendingJoin::deadline`] (from the caller)
+/// and the coordinator's per-exchange deadline (`now + stream_timeout`). The exchange
+/// deadline is HIDDEN behind an earlier endpoint deadline in `poll_timeout`'s min
+/// (here a second push/pull started earlier), so it never widens the reap watermark
+/// on its own — only a join whose OWN deadline goes due re-snapshots it. With the raw
+/// (far-future) caller deadline, that earlier endpoint deadline snapshots `W0`, the
+/// shared `handle_timeout` then fires the elapsed exchange deadline as
+/// `ExchangeCompleted(Failed)` once `W0` drains, and the join reaps a spurious
+/// `JoinAllFailed` while its `Succeeded` completion — queued behind `W0`, arrived
+/// before the exchange deadline — is still buffered. [`clamp_join_deadline`] caps the
+/// driver deadline at the exchange deadline, so the join's deadline goes due WITH the
+/// exchange and re-snapshots the watermark to cover that completion; the join then
+/// resolves `Ok`. Reverting the clamp to the raw caller deadline reproduces the
+/// premature failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_deadline_above_stream_timeout_does_not_reap_premature_failure() {
+  let now = Instant::now();
+  // A SHORT stream_timeout so the coordinator stamps a near exchange deadline the
+  // test can let elapse; applied to BOTH the endpoint and the driver's clamp.
+  let stream_timeout = Duration::from_millis(200);
+  // The offset between the earlier (dummy) exchange deadline and the join's, wide
+  // enough that the `W0`-snapshot poll lands between them under CI jitter.
+  let gap = Duration::from_millis(300);
+  // iter_drain_cap = 1: `W0` drains one item per poll, so the join's exchange
+  // deadline elapses mid-drain (the fire poll then sees it due behind `W0`).
+  let (mut driver, _obs_rx, _shared) =
+    build_driver_with_stream_timeout(1, 4096, stream_timeout).await;
+
+  // An EARLIER endpoint deadline: a dummy 'connecting' push/pull started at `now`
+  // (its Connect captured, never dialed, so its transport data is dropped). Its
+  // exchange deadline `T_early = now + stream_timeout` is the min `poll_timeout`
+  // exposes, hiding the later join exchange deadline behind it.
+  driver
+    .endpoint
+    .start_push_pull(sa("127.0.0.1:7031"), PushPullKind::Join, now);
+  let mut dummy = None;
+  while let Some(action) = driver.endpoint.poll_action() {
+    if let StreamAction::Connect(info) = action {
+      dummy.get_or_insert(info.id());
+    }
+  }
+  let dummy = dummy.expect("the dummy start_push_pull emitted a Connect exchange id");
+
+  // The real join push/pull, started `gap` LATER so its exchange deadline
+  // `T_exch = now + gap + stream_timeout` sits strictly AFTER the dummy's — hidden
+  // behind it in `poll_timeout`'s min.
+  let seed = sa("127.0.0.1:7030");
+  let (eid, response) = drive_push_to_queued_response(&mut driver, seed, now + gap);
+  let response_len = response.len();
+  let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+
+  // Backlog for the dummy exchange, queued FIRST: the depth `W0` covers.
+  const DEPTH: usize = 24;
+  for _ in 0..DEPTH {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: dummy,
+        bytes: vec![0u8; 1],
+        received_at: now,
+      }),
+    );
+  }
+
+  // Park the await-result join with a caller deadline FAR in the future
+  // (`join_deadline` = 20s > stream_timeout), reconciled by `clamp_join_deadline` to
+  // the join's exchange deadline (`now + gap + stream_timeout`). The dispatch path
+  // applies this same clamp; reverting its body to the raw caller deadline
+  // reproduces the premature `JoinAllFailed`.
+  let (tx, mut rx) = oneshot::channel::<JoinReply>();
+  let mut pending = HashSet::new();
+  pending.insert(eid);
+  driver.pending_joins.push(PendingJoin {
+    pending,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: clamp_join_deadline(now + Duration::from_secs(20), now + gap, stream_timeout),
+    reply: Some(tx),
+  });
+
+  // Advance past the dummy's exchange deadline (`T_early`) but BEFORE the join's
+  // (`T_exch`): one poll snapshots `W0` to the dummy backlog only. cap = 1 keeps
+  // `handle_timeout` from firing (`W0` not yet drained), so `T_early` stays armed.
+  tokio::time::sleep(stream_timeout + Duration::from_millis(50)).await;
+  let _ = poll_once(&mut driver);
+
+  // Queue the join's `Succeeded` completion NOW — strictly BEHIND `W0`, and by
+  // `received_at` before the join's own exchange deadline.
+  for bytes in response {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid,
+        bytes,
+        received_at: now,
+      }),
+    );
+  }
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
+      eid,
+      received_at: now,
+    }),
+  );
+
+  // Let the join's exchange deadline (`T_exch`) elapse while `W0` is still draining:
+  // `handle_timeout` would now fire it as `ExchangeCompleted(Failed)`. The clamped
+  // driver deadline is due WITH it, re-snapshotting the watermark to cover the
+  // completion queued above; the raw caller deadline would not.
+  tokio::time::sleep(gap + Duration::from_millis(50)).await;
+
+  let mut resolved = None;
+  for _ in 0..(DEPTH + response_len + 128) {
+    let _ = poll_once(&mut driver);
+    match rx.try_recv() {
+      Ok(Some(reply)) => {
+        resolved = Some(reply);
+        break;
+      }
+      Ok(None) => {}
+      Err(_) => panic!("join reply sender dropped without resolving"),
+    }
+  }
+
+  let reached = resolved
+    .expect("the join resolved within the bounded poll budget")
+    .expect(
+      "a join_deadline above the reliable stream_timeout must not reap a premature JoinAllFailed: \
+       the clamped driver deadline goes due WITH the exchange deadline, re-snapshotting the \
+       watermark to cover the Succeeded completion queued behind W0; the raw caller deadline \
+       reaps a spurious failure",
+    );
+  assert!(
+    reached.contains(&seed),
+    "the join reached its seed once the clamped deadline widened the watermark: {reached:?}"
   );
 }
