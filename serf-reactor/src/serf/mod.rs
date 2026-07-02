@@ -33,6 +33,8 @@ use smol_str::SmolStr;
 use crate::command::{KeyCmd, ListKeysCmd};
 #[cfg(encryption)]
 use crate::delegate::KeyringDelegate;
+#[cfg(feature = "quic")]
+use crate::quic::{QuicTransport, QuicTransportOptions};
 #[cfg(feature = "tcp")]
 use crate::tcp::{TcpTransport, TcpTransportOptions};
 use crate::{
@@ -52,7 +54,7 @@ use crate::{
 };
 #[cfg(encryption)]
 use memberlist_proto::SecretKey;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "quic"))]
 use memberlist_proto::{CheapClone, Data};
 
 /// The initial published snapshot: the local node, `Alive`, with empty tags and
@@ -285,6 +287,103 @@ where
     G: rand::Rng + Send + Unpin + 'static,
   {
     Self::new::<TcpTransport<I, A, R>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+}
+
+// Ergonomic QUIC constructor: instantiate the QUIC transport for the caller so a
+// node can be built without naming the generic `Serf::new::<T, …>` machinery.
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+impl<I, A, R> Serf<I, A, R>
+where
+  I: memberlist_proto::Id
+    + CheapClone
+    + Clone
+    + core::fmt::Debug
+    + core::fmt::Display
+    + Send
+    + Sync
+    + Unpin
+    + 'static,
+  A: Data + Clone + Send + Sync + 'static,
+  R: Runtime,
+{
+  /// Build a QUIC-backed serf node and spawn its driver on the runtime `R`.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`QuicTransport`](crate::QuicTransport) for the caller: it binds a single UDP
+  /// socket on the advertise address (resolved once via `resolver` /
+  /// `advertise_resolver`) over which the coordinator multiplexes the reliable
+  /// push/pull streams and serf's datagram gossip, then spawns the QUIC driver. The
+  /// caller supplies the quinn-proto config bundle through
+  /// [`QuicTransportOptions::with_quic_config`](crate::QuicTransportOptions::with_quic_config).
+  /// The gossip RNG is drawn from OS entropy via [`gossip_rng`](crate::gossip_rng);
+  /// use [`quic_with_rng`](Self::quic_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Arc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Arc::new(VoidKeyringDelegate)` for a node that manages no keys); the keyring
+  /// AEAD-protects the gossip datagrams (the reliable plane rides quinn's own TLS).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn quic<RES, AR, D>(
+    options: QuicTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+  {
+    Self::quic_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`quic`](Self::quic) but with a caller-supplied gossip RNG `G` — draw it
+  /// via [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn quic_with_rng<RES, AR, D, G>(
+    options: QuicTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr>,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<QuicTransport<I, A, R>, RES, AR, D, G>(
       options,
       resolver,
       advertise_resolver,

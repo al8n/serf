@@ -1,0 +1,531 @@
+//! Real-node QUIC serf tests on tokio: two loopback nodes exercising the reactor
+//! QUIC driver end-to-end over a quinn-proto config bundle. Each test spins up
+//! ephemeral `127.0.0.1:0` nodes via the ergonomic [`Serf::quic`] constructor and
+//! drives the full pump — QUIC push/pull join over a real quinn handshake,
+//! coordinator merge, datagram gossip, user events, queries, and graceful
+//! leave/shutdown — end-to-end proof the reactor QUIC driver works over a concrete
+//! runtime, meeting the same behaviour bar as the TCP suite.
+//!
+//! Mirrors serf-compio's QUIC smoke tests and the reactor's `tests/tcp.rs`,
+//! adapted to the reactor's `Send`/`agnostic` model and QUIC's single-socket,
+//! stream-multiplexed transport.
+
+#![cfg(all(feature = "quic", feature = "tokio"))]
+
+use core::time::Duration;
+use std::{net::SocketAddr, sync::Arc};
+
+use agnostic::tokio::TokioRuntime;
+use bytes::Bytes;
+use futures_util::{StreamExt, future};
+use memberlist_proto::UnreliableTransport;
+use rustls::{
+  client::danger::{HandshakeSignatureValid, ServerCertVerified},
+  version::TLS13,
+};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use serf_proto::{event::Event, members::SerfState, options::Options as SerfOptions};
+#[cfg(encryption)]
+use serf_reactor::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
+use serf_reactor::{
+  FirstAddrResolver, MaybeResolved, QuicOptions, QuicTransportOptions, RuntimeOptions, Serf,
+  SocketAddrResolver, VoidDelegate,
+};
+use smol_str::SmolStr;
+
+/// A tokio-backed reactor QUIC node handle.
+type Node = Serf<SmolStr, SocketAddr, TokioRuntime>;
+
+/// A self-signed cert + key for `localhost`, for the test TLS bundle.
+fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+  let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+  let cert = CertificateDer::from(ck.cert.der().to_vec());
+  let key = PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+  (vec![cert], key)
+}
+
+fn test_endpoint_config(reset_key: &[u8]) -> quinn_proto::EndpointConfig {
+  let hmac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, reset_key);
+  quinn_proto::EndpointConfig::new(Arc::new(hmac))
+}
+
+fn test_server() -> quinn_proto::ServerConfig {
+  let (chain, key) = self_signed();
+  let provider = Arc::new(rustls::crypto::ring::default_provider());
+  let rustls_server = rustls::ServerConfig::builder_with_provider(provider)
+    .with_protocol_versions(&[&TLS13])
+    .expect("tls13 server")
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .expect("single cert");
+  let qsc = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
+    .expect("quic server config");
+  quinn_proto::ServerConfig::with_crypto(Arc::new(qsc))
+}
+
+/// Accept-any server-cert verifier — test only.
+#[derive(Debug)]
+struct AnyServer;
+
+impl rustls::client::danger::ServerCertVerifier for AnyServer {
+  fn verify_server_cert(
+    &self,
+    _end_entity: &CertificateDer,
+    _intermediates: &[CertificateDer],
+    _server_name: &rustls_pki_types::ServerName,
+    _ocsp_response: &[u8],
+    _now: rustls_pki_types::UnixTime,
+  ) -> Result<ServerCertVerified, rustls::Error> {
+    Ok(ServerCertVerified::assertion())
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    _message: &[u8],
+    _cert: &CertificateDer,
+    _dss: &rustls::DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    Ok(HandshakeSignatureValid::assertion())
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    _message: &[u8],
+    _cert: &CertificateDer,
+    _dss: &rustls::DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    Ok(HandshakeSignatureValid::assertion())
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    rustls::crypto::ring::default_provider()
+      .signature_verification_algorithms
+      .supported_schemes()
+  }
+}
+
+fn test_client() -> quinn_proto::ClientConfig {
+  let provider = Arc::new(rustls::crypto::ring::default_provider());
+  let cfg = rustls::ClientConfig::builder_with_provider(provider)
+    .with_protocol_versions(&[&TLS13])
+    .expect("tls13 client")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AnyServer))
+    .with_no_client_auth();
+  let qcc =
+    quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(cfg)).expect("quic client");
+  quinn_proto::ClientConfig::new(Arc::new(qcc))
+}
+
+/// A fresh QUIC config bundle with a 20s idle timeout (well past a localhost
+/// handshake) and datagram-mode unreliable transport. A fresh bundle is built per
+/// node so each owns its own cert and quinn endpoint config.
+fn test_quic_options() -> QuicOptions {
+  let mut transport = quinn_proto::TransportConfig::default();
+  transport.max_idle_timeout(Some(
+    quinn_proto::IdleTimeout::try_from(Duration::from_secs(20)).expect("idle timeout"),
+  ));
+  QuicOptions::new(
+    test_endpoint_config(&[0x5au8; 32]),
+    test_server(),
+    test_client(),
+    transport,
+    "localhost",
+    UnreliableTransport::Datagram,
+  )
+}
+
+/// Build and spawn a reactor QUIC node on an ephemeral loopback port through the
+/// ergonomic `Serf::quic` constructor.
+async fn spawn_node(id: &str) -> Node {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_quic_config(test_quic_options());
+  Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    #[cfg(encryption)]
+    std::sync::Arc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf quic node")
+}
+
+/// Poll both nodes until each reports the full two-member cluster, or fail on a
+/// generous timeout so a convergence regression surfaces as a timeout, not a hang.
+async fn converge(a: &Node, b: &Node) {
+  tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      if a.num_members() == 2 && b.num_members() == 2 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("both nodes converge to a 2-member cluster");
+}
+
+/// Two nodes on loopback: A joins B (await-result over a real QUIC push/pull), then
+/// BOTH converge to a two-member cluster and shut down cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_node_quic_join_converges() {
+  let b = spawn_node("conv-b").await;
+  let a = spawn_node("conv-a").await;
+  let b_addr = b.advertise_address();
+
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over QUIC");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
+
+  converge(&a, &b).await;
+  assert_eq!(a.num_members(), 2, "A sees the 2-member cluster");
+  assert_eq!(b.num_members(), 2, "B sees the 2-member cluster");
+
+  a.shutdown().await.expect("conv-a shuts down");
+  b.shutdown().await.expect("conv-b shuts down");
+}
+
+/// After a two-node QUIC join, a user event broadcast by B is delivered to A's event
+/// stream carrying the original name and payload (datagram gossip over the shared
+/// socket).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_event_delivered() {
+  let b = spawn_node("ue-b").await;
+  let a = spawn_node("ue-a").await;
+  let b_addr = b.advertise_address();
+
+  // Subscribe before joining so the user event cannot race the subscription.
+  let mut a_events = a.events();
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  b.user_event("greet", Bytes::from_static(b"hello"), false)
+    .await
+    .expect("user event dispatched");
+
+  let got = tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("A observes B's user event within the timeout");
+  assert_eq!(
+    got,
+    Some(Bytes::from_static(b"hello")),
+    "A receives B's user-event payload"
+  );
+
+  a.shutdown().await.expect("ue-a shuts down");
+  b.shutdown().await.expect("ue-b shuts down");
+}
+
+/// After a two-node QUIC join, a query issued by A round-trips: B receives the
+/// `Event::Query`, responds, and A surfaces the matching `Event::QueryResponse`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_round_trip() {
+  let b = spawn_node("q-b").await;
+  let a = spawn_node("q-a").await;
+  let b_addr = b.advertise_address();
+
+  // Subscribe both before the join so neither the query nor its response races ahead
+  // of a subscription.
+  let mut b_events = b.events();
+  let mut a_events = a.events();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  let want = Bytes::from_static(b"pong");
+  a.query(
+    "ping",
+    Bytes::from_static(b"ping-payload"),
+    a.default_query_param(),
+  )
+  .await
+  .expect("query issued");
+
+  // B answers the first "ping" query it sees; A collects the matching response.
+  let responder = async {
+    loop {
+      match b_events.next().await {
+        Some(Event::Query(qe)) if qe.name() == "ping" => {
+          b.respond(qe, want.clone())
+            .await
+            .expect("B responds to the query");
+          break;
+        }
+        Some(_) => {}
+        None => panic!("B's event stream closed before the query arrived"),
+      }
+    }
+  };
+  let collector = async {
+    loop {
+      match a_events.next().await {
+        Some(Event::QueryResponse(qr)) if qr.payload() == &want => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  };
+
+  let got = tokio::time::timeout(Duration::from_secs(30), async {
+    let (_, got) = future::join(responder, collector).await;
+    got
+  })
+  .await
+  .expect("query round-trip completes within the timeout");
+  assert!(got, "A must receive B's query response");
+
+  a.shutdown().await.expect("q-a shuts down");
+  b.shutdown().await.expect("q-b shuts down");
+}
+
+/// A graceful leave completes the machine's leave chain: `leave()` resolves only
+/// once `LeftCluster` fires (the reactor gates the reply on it), that event surfaces
+/// on the leaver's own stream, and the local endpoint settles at `Left`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leave_emits_left_cluster() {
+  let b = spawn_node("lv-b").await;
+  let a = spawn_node("lv-a").await;
+  let b_addr = b.advertise_address();
+
+  let mut a_events = a.events();
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  // The reactor resolves `leave()` only once the machine's `LeftCluster` fires, so a
+  // successful return already proves the graceful-leave chain completed.
+  a.leave().await.expect("A leaves the cluster");
+
+  // `LeftCluster` is also forwarded to A's own subscribers.
+  let saw = tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::LeftCluster) => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .expect("A observes LeftCluster within the timeout");
+  assert!(saw, "A must surface Event::LeftCluster after leave()");
+
+  // The local endpoint state settles at `Left` (poll to absorb the snapshot-refresh
+  // race after the leave chain completes).
+  tokio::time::timeout(Duration::from_secs(5), async {
+    loop {
+      if a.state() == SerfState::Left {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A's endpoint state becomes Left");
+
+  a.shutdown().await.expect("lv-a shuts down");
+  b.shutdown().await.expect("lv-b shuts down");
+}
+
+/// The QUIC driver binds a single UDP socket and drops it (releasing its FD) before
+/// acking shutdown, so `shutdown().await` releases the bound port before it
+/// resolves: a second QUIC node binding the SAME advertise address the instant the
+/// first shuts down must construct successfully, not fail with `AddrInUse`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_shutdown_releases_bound_address_for_rebind() {
+  let first = spawn_node("rebind-first").await;
+  let addr = first.advertise_address();
+  first.shutdown().await.expect("first node shuts down");
+
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("rebind-second"))
+    .with_advertise_addr(MaybeResolved::Resolved(addr))
+    .with_quic_config(test_quic_options());
+  let second = Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    #[cfg(encryption)]
+    std::sync::Arc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("rebinding the freed UDP address must succeed, not AddrInUse");
+  assert_eq!(
+    second.advertise_address(),
+    addr,
+    "the second node rebinds the exact freed address"
+  );
+  second.shutdown().await.expect("second node shuts down");
+}
+
+/// A deterministic test secret key, selecting whichever AEAD cipher this build
+/// compiled so the encrypted tests work under either backend.
+#[cfg(encryption)]
+fn test_secret_key(fill: u8) -> SecretKey {
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes256([fill; 32]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([fill; 32]);
+  key
+}
+
+/// Build and spawn a reactor QUIC node on an ephemeral loopback port with
+/// `encryption` installed as its gossip keyring policy.
+#[cfg(encryption)]
+async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Node {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_quic_config(test_quic_options())
+    .with_encryption(encryption);
+  Serf::<SmolStr, SocketAddr, TokioRuntime>::quic(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    std::sync::Arc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn encrypted serf quic node")
+}
+
+/// Two QUIC nodes sharing one gossip keyring converge AND exchange gossip: A joins B
+/// (the reliable push/pull rides quinn's own TLS, so it merges membership
+/// regardless of the keyring), both reach the two-member cluster, and then a user
+/// event B broadcasts — which rides the AEAD-sealed GOSSIP plane, not the reliable
+/// push/pull — reaches A. The user-event delivery is the discriminating check: on
+/// QUIC the gossip keyring seals only the datagram plane (the reliable plane is
+/// quinn TLS), so it is a gossip-carried event, not the membership merge, that
+/// proves `encrypt_gossip`/`decrypt_gossip` round-trip end-to-end rather than
+/// running as identity transforms.
+#[cfg(encryption)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_node_quic_gossip_convergence_encrypted() {
+  let key = EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42)));
+  let b = spawn_encrypted_node("enc-b", key.clone()).await;
+  let a = spawn_encrypted_node("enc-a", key).await;
+  let b_addr = b.advertise_address();
+
+  // Subscribe before joining so the user event cannot race the subscription.
+  let mut a_events = a.events();
+  let reached = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted QUIC cluster");
+  assert_eq!(reached, b_addr, "join returns the reached seed address");
+
+  converge(&a, &b).await;
+
+  // The gossip-plane discriminator: B broadcasts a user event, disseminated over the
+  // AEAD-sealed gossip datagrams. With a shared keyring A decrypts and surfaces it.
+  b.user_event("greet", Bytes::from_static(b"hello"), false)
+    .await
+    .expect("user event dispatched");
+
+  let got = tokio::time::timeout(Duration::from_secs(30), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "greet" => break Some(u.payload.clone()),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("A observes B's user event over the shared-key gossip plane within the timeout");
+  assert_eq!(
+    got,
+    Some(Bytes::from_static(b"hello")),
+    "A receives B's user-event payload across the encrypted gossip plane"
+  );
+
+  a.shutdown().await.expect("enc-a shuts down");
+  b.shutdown().await.expect("enc-b shuts down");
+}
+
+/// A node holding one gossip keyring and a node holding a DIFFERENT keyring share no
+/// GOSSIP: on QUIC the reliable push/pull rides quinn's own TLS, so the join still
+/// merges membership (the gossip keyring does not gate that plane) — but a user
+/// event, which is disseminated only over the AEAD-sealed gossip datagrams, cannot
+/// cross a disjoint key. Within a window shorter than the 30s anti-entropy
+/// push/pull interval a user event rides gossip ALONE, so its ABSENCE at A proves
+/// the gossip encryption is real enforcement, not an identity pass-through — the
+/// discriminating negative the positive test above pairs with (both turn on a
+/// gossip-carried event, since the membership merge crosses regardless of the key).
+#[cfg(encryption)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_keyring_gossip_does_not_cross() {
+  let b = spawn_encrypted_node(
+    "mis-b",
+    EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x42))),
+  )
+  .await;
+  let a = spawn_encrypted_node(
+    "mis-a",
+    EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x43))),
+  )
+  .await;
+  let b_addr = b.advertise_address();
+
+  // The reliable push/pull (quinn TLS) merges membership regardless of the gossip
+  // keyring, so the await-result join still completes — B is now a known member A
+  // gossips to.
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("the reliable push/pull merges membership over quinn TLS");
+
+  // Subscribe, then have B broadcast a user event over the gossip plane. Under the
+  // mismatched keyring A cannot decrypt B's gossip datagrams, so it never surfaces
+  // the event. The window is well under the 30s anti-entropy push/pull interval, so
+  // the event rides gossip ALONE — a later push/pull cannot carry it into A here.
+  let mut a_events = a.events();
+  b.user_event("secret", Bytes::from_static(b"hidden"), false)
+    .await
+    .expect("user event dispatched");
+
+  let observed = tokio::time::timeout(Duration::from_secs(5), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "secret" => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await;
+  assert!(
+    !matches!(observed, Ok(true)),
+    "node A must NOT surface B's gossip-carried user event across a mismatched keyring"
+  );
+
+  a.shutdown().await.expect("mis-a shuts down");
+  b.shutdown().await.expect("mis-b shuts down");
+}

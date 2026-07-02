@@ -108,6 +108,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 name = "tcp"
 required-features = ["tcp", "tokio"]
 
+# The real-node QUIC test suite (two loopback nodes over a quinn config bundle:
+# join/converge, user event, query round-trip, leave/LeftCluster, shutdown, and —
+# under an encryption backend — encrypted-gossip convergence + mismatched-key
+# enforcement).
+[[test]]
+name = "quic"
+required-features = ["quic-rustls-ring", "tokio"]
+
 [package.metadata.docs.rs]
 # A single coherent crypto-provider set (ring, not aws-lc-rs; tokio, not smol) so
 # the doc build documents every gated item without pulling conflicting providers.
