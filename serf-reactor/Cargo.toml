@@ -108,6 +108,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 name = "tcp"
 required-features = ["tcp", "tokio"]
 
+# The real-node TLS test suite (two loopback nodes over a self-signed cert +
+# accept-any verifier: join/converge, user event, query round-trip, leave/shutdown).
+[[test]]
+name = "tls"
+required-features = ["tls-rustls-ring", "tokio"]
+
 # The real-node QUIC test suite (two loopback nodes over a quinn config bundle:
 # join/converge, user event, query round-trip, leave/LeftCluster, shutdown, and —
 # under an encryption backend — encrypted-gossip convergence + mismatched-key

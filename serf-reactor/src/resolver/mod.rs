@@ -10,13 +10,20 @@
 //! Built-in resolvers:
 //! - [`OsResolver`]: `getaddrinfo`-backed via the runtime's blocking pool.
 //! - [`SocketAddrResolver`]: identity pass-through for already-resolved addrs.
-//!
-//! The `hickory`-backed `DnsResolver` (`dns` feature) and the getifs
-//! `LocalAddrResolver` (`getifs` feature) are added in a later chunk.
+//! - [`DnsResolver`] (`dns` feature): TCP-first `hickory`-backed DNS over the
+//!   agnostic runtime's TCP stream.
+//! - [`LocalAddrResolver`] (`getifs` feature): auto-detect the advertise address
+//!   from the host's own network interfaces.
 
 mod advertise;
 mod os;
 mod socket_addr;
+
+#[cfg(feature = "dns")]
+mod dns;
+
+#[cfg(feature = "getifs")]
+mod getifs;
 
 pub use advertise::{
   AdvertiseAddrResolver, AdvertiseResolutionError, FirstAddrResolver, Ipv4PreferringResolver,
@@ -24,6 +31,14 @@ pub use advertise::{
 };
 pub use os::OsResolver;
 pub use socket_addr::SocketAddrResolver;
+
+#[cfg(feature = "dns")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
+pub use dns::{DEFAULT_DNS_TIMEOUT, DnsError, DnsResolver};
+
+#[cfg(feature = "getifs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "getifs")))]
+pub use getifs::{LocalAddrResolver, LocalAddrScope, local_advertise};
 
 use core::future::Future;
 use std::net::SocketAddr;
