@@ -51,9 +51,13 @@ use crate::{
 /// Embedded into the transport constructor. Bundles the local node identifier, the
 /// (possibly-unresolved) advertise address, and the caller-built [`QuicOptions`]
 /// (quinn-proto `EndpointConfig` / `ServerConfig` / `ClientConfig` /
-/// `TransportConfig` bundle plus SNI provider). The cluster label and
-/// inbound-label-check policy are supplied via the serf `Options` block (not here),
-/// feeding both planes from a single validated source.
+/// `TransportConfig` bundle plus SNI provider).
+///
+/// Serf exposes no memberlist cluster label: neither this block nor the serf
+/// `Options` carries one, so both planes run unlabeled. The reliable-plane cluster
+/// boundary is the QUIC TLS trust anchor (peer-certificate verification + SNI);
+/// gossip is segregated by the encryption keyring. memberlist-reactor's lower-level
+/// options DO surface a label; serf, layered on top, does not.
 pub struct QuicTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,

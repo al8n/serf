@@ -411,3 +411,87 @@ async fn tcp_query_empty_answers_falls_through_to_os_fallback() {
 
   handle.await.expect("DNS server task");
 }
+
+/// A loopback TCP server that ACCEPTS the connection and reads the TCP-DNS query but
+/// then STALLS forever without writing a response — modeling a slow or hostile
+/// nameserver that keeps the socket open past any deadline. The accepted stream is
+/// held alive inside the parked task (a dropped stream would send FIN and let the
+/// resolver's `read_exact` return an early EOF instead of blocking on its own
+/// timer). Returns the bound address plus the JoinHandle; the caller aborts the
+/// handle to tear the server down.
+async fn spawn_stalling_tcp_dns_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+  use futures_util::AsyncReadExt;
+
+  let listener = <<TokioRuntime as Runtime>::Net as Net>::TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind loopback DNS server");
+  let addr = listener.local_addr().expect("server local_addr");
+
+  let handle = tokio::spawn(async move {
+    let Ok((mut stream, _)) = listener.accept().await else {
+      return;
+    };
+    // Drain the 2-byte length prefix + query body so the resolver's write completes,
+    // then never respond: hold the stream open and park forever so the resolver's
+    // `read_exact` on the response blocks until its OWN `R::sleep(timeout)` fires.
+    let mut len_buf = [0u8; 2];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+      return;
+    }
+    let qlen = u16::from_be_bytes(len_buf) as usize;
+    let mut qbuf = vec![0u8; qlen];
+    // Ignoring Err: a truncated read just means the client hung up early; the test's
+    // assertion still holds because the resolver never received a response either way.
+    let _ = stream.read_exact(&mut qbuf).await;
+    // Park forever, keeping `stream` (and thus the open connection) alive. The test
+    // aborts this task via its JoinHandle once the resolver has timed out.
+    core::future::pending::<()>().await;
+  });
+
+  (addr, handle)
+}
+
+// A configured nameserver that ACCEPTS the TCP-DNS query and then STALLS (never
+// writes a response) must not hang the caller: the per-query `timeout` bounds the
+// WHOLE resolution, and the timeout is surfaced as an error rather than silently
+// escalating into the unbounded OS-resolver fallback (which runs outside the
+// deadline). Regression for the bypass where any `tcp_query` error — including
+// `TimedOut` — fell through to `self.fallback.resolve`, letting a hostile resolver
+// burn the TCP budget and THEN hang bootstrap in OS DNS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalling_server_times_out_without_os_fallback() {
+  let (server_addr, handle) = spawn_stalling_tcp_dns_server().await;
+
+  let timeout = Duration::from_millis(100);
+  let r = Dns::from_servers(vec![server_addr]).with_timeout(timeout);
+  // A fully-qualified name (contains a `.`) so the TCP-first branch is taken; the
+  // reserved `.test` TLD (RFC 6761) never resolves, so were the buggy OS fallback
+  // reached it would surface a DIFFERENT lookup error (or hang) rather than our
+  // synthetic timeout — the assertion below discriminates the fix from the regression.
+  let addr: Address = "seed.cluster.test:8300".parse().expect("parse FQDN:port");
+  assert!(matches!(addr.host(), Host::Domain(_)));
+
+  let start = std::time::Instant::now();
+  let err = r
+    .resolve(&addr)
+    .await
+    .map(|_| ())
+    .expect_err("a stalling resolver must surface the timeout, not fall through to OS DNS");
+  let elapsed = start.elapsed();
+
+  // The synthetic TCP-DNS timeout is surfaced verbatim, proving the resolution did
+  // NOT escalate into the OS fallback (which does not produce a `TimedOut`).
+  assert!(
+    matches!(&err, DnsError::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut),
+    "expected a TimedOut error bounding the whole resolution, got: {err:?}"
+  );
+  // And it returned promptly — bounded by the configured timeout, not the unbounded
+  // OS resolver. A generous ceiling (20x the 100ms budget) stays robust under CI
+  // load while still separating a bounded timeout from a fall-through hang.
+  assert!(
+    elapsed < Duration::from_secs(2),
+    "resolve must return within the configured timeout budget, took {elapsed:?}"
+  );
+
+  handle.abort();
+}
