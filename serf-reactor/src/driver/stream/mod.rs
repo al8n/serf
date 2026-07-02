@@ -354,14 +354,22 @@ where
   /// `inbound_rx` (the step-6 drain AND the shutdown drain). The reliable-plane
   /// watermark is expressed against this counter.
   inbound_drained_total: u64,
-  /// The reliable plane's pre-deadline backlog target: `inbound_drained_total`
-  /// once every item that was in flight toward `inbound_rx` when a reliable
-  /// deadline first went due has been drained. Snapshotted ONCE at that crossing;
-  /// `None` when no reliable deadline is due. The join/leave reaps and the
+  /// The reliable plane's pre-deadline backlog target: the value
+  /// `inbound_drained_total` reaches once every item that was in flight toward
+  /// `inbound_rx` as of the LATEST currently-due deadline has been drained.
+  /// `None` when no deadline is due. The join/leave reaps and the
   /// reliable-exchange deadlines inside `handle_timeout` fire only once
   /// `inbound_drained_total` reaches it — non-premature by FIFO, and (because a
   /// join completion never rides the UDP gossip flood) immune to that flood with
   /// no force-fire.
+  ///
+  /// Snapshotted to the live inbound depth and RE-snapshotted whenever the latest
+  /// due deadline advances past [`Self::reap_watermark_covers`]. `inbound_rx` is
+  /// FIFO and the backlog only grows with time, so the tail depth at the greatest
+  /// due deadline dominates every earlier due deadline's pre-deadline completions.
+  /// A single sticky snapshot taken at the FIRST due-crossing instead expires a
+  /// later overlapping deadline against the first deadline's (smaller) target,
+  /// reaping its still-buffered completion prematurely.
   ///
   /// Covers only frames a bridge has already READ (`received_at < deadline`,
   /// queued or parked). A frame still kernel-resident-but-unread at the deadline
@@ -370,6 +378,12 @@ where
   /// read-deadline outcome (a read completing after the deadline is late), NOT a
   /// dropped success, so the watermark does not (and must not) wait for it.
   reap_watermark: Option<u64>,
+  /// The latest due deadline [`Self::reap_watermark`] currently covers. The
+  /// watermark re-snapshots to the live inbound depth whenever the greatest due
+  /// deadline advances past this, so it always covers the backlog as of the
+  /// latest due deadline — not merely the first that went due. `None` exactly
+  /// when `reap_watermark` is `None`.
+  reap_watermark_covers: Option<Instant>,
   /// Wall-clock anchor for the SWIM suspicion plane: the instant the SWIM tick
   /// first deferred on a pinned UDP path (reliable backlog already clear). `None`
   /// when the SWIM tick is not deferring. The tick fires once
@@ -450,6 +464,7 @@ where
       timer_deadline: None,
       inbound_drained_total: 0,
       reap_watermark: None,
+      reap_watermark_covers: None,
       swim_stall_since: None,
       bridge_inbound_inflight: Arc::new(AtomicU64::new(0)),
       idle_wake: driver_opts.idle_wake_interval(),
@@ -1254,6 +1269,22 @@ where
     self.pending_leave.as_ref().map(|pl| pl.deadline)
   }
 
+  /// The GREATEST join/leave deadline already due (`<= now`), or `None` when none
+  /// is. Mirrors the min-deadline folds ([`Self::min_pending_join_deadline`]
+  /// filters to still-unreplied joins) but takes the max, so the reap watermark
+  /// re-snapshots to cover the backlog as of the LATEST due deadline; the FIFO
+  /// backlog then covers every earlier due deadline too.
+  fn max_due_join_leave_deadline(&self, now: Instant) -> Option<Instant> {
+    self
+      .pending_joins
+      .iter()
+      .filter(|pj| pj.reply.is_some())
+      .map(|pj| pj.deadline)
+      .chain(self.pending_leave.as_ref().map(|pl| pl.deadline))
+      .filter(|&d| d <= now)
+      .max()
+  }
+
   /// Frames that a bridge has read but the pump has not yet drained, expressed as
   /// the pair `(queued, parked)`: `queued` is the observable `inbound_rx` depth,
   /// `parked` is the residue a bridge has read (`received_at < deadline`) but is
@@ -1588,7 +1619,7 @@ where
     // input rides the reliable `inbound_rx` FIFO; a UDP gossip flood deposits ZERO
     // there. So the reliable reaps + the reliable-exchange deadlines in
     // `handle_timeout` gate on the exact `inbound_rx` backlog DEPTH — snapshotted
-    // once at deadline-crossing (`reap_watermark`) — while the refutable SWIM
+    // to cover the LATEST due deadline (`reap_watermark`) — while the refutable SWIM
     // suspicion tick, whose Ack rides only the pinned UDP path, fires bounded-early
     // after a wall-clock staleness grace.
     let endpoint_deadline = this
@@ -1609,22 +1640,43 @@ where
     let ep_due = endpoint_deadline <= now;
     let reap_due = reap_deadline.is_some_and(|d| d <= now);
 
-    // Snapshot the reliable backlog ONCE, when a reliable deadline first goes due:
-    // the drain target past which every completion in flight at the deadline (queued
-    // in `inbound_rx` OR parked on a saturated bridge hand-off) is guaranteed folded.
-    if (ep_due || reap_due) && this.reap_watermark.is_none() {
-      let (queued, parked) = this.inbound_backlog_watermark_terms();
-      this.reap_watermark = Some(this.inbound_drained_total + queued + parked);
-    }
-    if !ep_due && !reap_due {
-      this.reap_watermark = None;
-      this.swim_stall_since = None;
+    // Snapshot the reliable backlog target to cover the LATEST currently-due
+    // deadline, not merely the first that went due. `inbound_rx` is FIFO and grows
+    // only with time, so the tail depth at the greatest due deadline dominates
+    // every earlier due deadline's pre-deadline completions. Re-snapshot to the
+    // live inbound depth (queued in `inbound_rx` OR parked on a saturated bridge
+    // hand-off) whenever that max due deadline advances past what the watermark
+    // already covers — the endpoint contributes its earliest deadline (`poll_timeout`
+    // exposes only the min), each still-unreplied join and the leave its own — so a
+    // later overlapping join/leave deadline re-arms a wider target rather than
+    // reaping its still-buffered completion against the first deadline's mark.
+    let max_due = {
+      let mut m = ep_due.then_some(endpoint_deadline);
+      if let Some(d) = this.max_due_join_leave_deadline(now) {
+        m = Some(m.map_or(d, |cur| cur.max(d)));
+      }
+      m
+    };
+    match max_due {
+      Some(md) => {
+        if this.reap_watermark.is_none() || this.reap_watermark_covers.is_none_or(|c| md > c) {
+          let (queued, parked) = this.inbound_backlog_watermark_terms();
+          this.reap_watermark = Some(this.inbound_drained_total + queued + parked);
+          this.reap_watermark_covers = Some(md);
+        }
+      }
+      None => {
+        this.reap_watermark = None;
+        this.reap_watermark_covers = None;
+        this.swim_stall_since = None;
+      }
     }
     // GATE 1 (reliable plane): the pre-deadline backlog has drained. FIFO ⇒ a
     // completion buffered at the deadline is folded (resolving its join/leave)
-    // before the counter reaches the watermark; fixed at snapshot ⇒ a concurrent
-    // flood (UDP, or bridge appends behind the mark) never pushes it away, so the
-    // pump drains to it in bounded polls with no force-fire.
+    // before the counter reaches the watermark; the mark advances only on a new
+    // deadline crossing, never on a live append ⇒ a concurrent flood (UDP, or
+    // bridge appends behind the mark) never pushes it away, so the pump drains to
+    // it in bounded polls with no force-fire.
     let tcp_clear = this
       .reap_watermark
       .is_none_or(|w| this.inbound_drained_total >= w);
@@ -1660,6 +1712,7 @@ where
       this.reap_pending_joins(now);
       this.reap_pending_leave(now);
       this.reap_watermark = None;
+      this.reap_watermark_covers = None;
       this.swim_stall_since = None;
       progress = true;
       more = true;
