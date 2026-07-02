@@ -89,6 +89,7 @@ fn initial_snapshot(id: &str, advertise: SocketAddr) -> SerfSnapshot<SmolStr, So
 /// shared state.
 async fn build_driver(
   iter_drain_cap: usize,
+  bridge_inbound_cap: usize,
 ) -> (
   TestDriver,
   Receiver<Event<SmolStr, SocketAddr>>,
@@ -123,12 +124,23 @@ async fn build_driver(
     accept_shutdown_tx,
     accept_join,
     RuntimeOptions::new().with_iter_drain_cap(iter_drain_cap),
-    StreamTransportOptions::new(),
+    StreamTransportOptions::new().with_bridge_inbound_cap(bridge_inbound_cap),
     None,
     #[cfg(encryption)]
     Arc::new(crate::VoidKeyringDelegate),
   );
   (driver, obs_rx, shared)
+}
+
+/// Queue one bridge-inbound item toward the pump AS A REAL BRIDGE WOULD: bump the
+/// in-flight reservation BEFORE the hand-off, then enqueue. Test-injected frames
+/// bypass `bridge_task`, so without this the reap watermark would not account for
+/// them and could reap a join whose completion is still buffered.
+fn queue_inbound(driver: &TestDriver, tx: &Sender<BridgeInbound>, item: BridgeInbound) {
+  driver
+    .bridge_inbound_inflight
+    .fetch_add(1, Ordering::Release);
+  tx.try_send(item).expect("queue inbound item");
 }
 
 /// Drive one outbound Join push/pull on `driver.endpoint` toward `seed_addr` to a
@@ -210,23 +222,23 @@ fn drive_push_to_queued_response(
   (eid, response)
 }
 
-/// Regression: at a DUE await-result-join deadline, the pull `ExchangeCompleted`
-/// that resolves the join `Ok` is queued one bridge-inbound item behind the
-/// per-poll `iter_drain_cap`. The single `handle_timeout` site and the join
-/// deadline reap must wait for that pre-deadline completion to drain — a premature
-/// reap would surface a spurious `JoinAllFailed` against a seed that was in fact
-/// reached.
+/// Regression (Gate 1, non-premature AT DEPTH): at a DUE await-result-join
+/// deadline, the pull `ExchangeCompleted` that resolves the join `Ok` is buffered
+/// on `inbound_rx` behind a DEEP backlog (far more than the old fixed `8`-poll
+/// deferral bound), drained one item per poll at `iter_drain_cap == 1`. The exact
+/// inbound-depth watermark must defer the reap the WHOLE way — until the completion
+/// drains — so the join resolves `Ok`, not a spurious `JoinAllFailed`.
 ///
-/// Pre-fix, the first poll (bridge-inbound cap hit → `more`) still runs the
-/// past-due reap and replies `JoinAllFailed`. Post-fix, the timer + reap are gated
-/// on quiescence, so the completion drains first and the join resolves `Ok`.
+/// This is the case the old fixed-count deferral got wrong: at depth `> 8` (or a
+/// low `iter_drain_cap` / a large exchange) the count elapsed while the resolving
+/// completion was still buffered, force-firing a premature reap. The watermark is a
+/// DEPTH, not a count, so it is immune.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn due_deadline_waits_for_join_completion_behind_iter_drain_cap() {
+async fn due_deadline_waits_for_join_completion_behind_deep_backlog() {
   let now = Instant::now();
-  // iter_drain_cap = 1: the bridge-inbound loop processes at most one item per
-  // poll, so the completion staged behind the response chunk(s) is at least one
-  // poll behind at the due deadline.
-  let (mut driver, _obs_rx, _shared) = build_driver(1).await;
+  // iter_drain_cap = 1 (one inbound item per poll); a bridge cap large enough to
+  // hold the whole deep backlog at once.
+  let (mut driver, _obs_rx, _shared) = build_driver(1, 4096).await;
 
   let seed_addr = sa("127.0.0.1:7000");
 
@@ -235,25 +247,61 @@ async fn due_deadline_waits_for_join_completion_behind_iter_drain_cap() {
   // behind the per-poll cap.
   let (eid, response) = drive_push_to_queued_response(&mut driver, seed_addr, now);
   let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+
+  // A dummy 'connecting' exchange — its Connect is captured but never dialed, so no
+  // bridge is minted and the machine has no conn for it: transport data keyed by its
+  // id is ignored. That gives a benign filler id without touching the real join.
+  driver
+    .endpoint
+    .start_push_pull(sa("127.0.0.1:7001"), PushPullKind::Join, now);
+  let mut dummy = None;
+  while let Some(action) = driver.endpoint.poll_action() {
+    if let StreamAction::Connect(info) = action {
+      dummy.get_or_insert(info.id());
+    }
+  }
+  let dummy = dummy.expect("the dummy start_push_pull emitted a Connect exchange id");
+
+  // A DEEP pre-completion backlog — benign `Data` for that dummy exchange, far past
+  // the old fixed-8 bound — drained one-per-poll AHEAD of the real completion, each
+  // counted in-flight exactly as a bridge would.
+  const DEPTH: usize = 40;
+  for _ in 0..DEPTH {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid: dummy,
+        bytes: vec![0u8; 1],
+        received_at: now,
+      }),
+    );
+  }
+  // The real pull response + peer-FIN EOF (the resolving `ExchangeCompleted` rides
+  // the EOF), buffered BEHIND the deep backlog.
   for bytes in response {
-    inbound_tx
-      .try_send(BridgeInbound::Data(BridgeData {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
         eid,
         bytes,
         received_at: now,
-      }))
-      .expect("queue inbound response");
+      }),
+    );
   }
-  inbound_tx
-    .try_send(BridgeInbound::Eof(BridgeEof {
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
       eid,
       received_at: now,
-    }))
-    .expect("queue inbound EOF");
+    }),
+  );
 
   // Park an await-result join awaiting `eid` with a deadline ALREADY in the past,
   // so the deadline reap is due on the very first poll — while the completion that
-  // resolves it Ok is still queued behind the cap.
+  // resolves it Ok is far behind the deep backlog.
   let (tx, mut rx) = oneshot::channel::<JoinReply>();
   let mut pending = HashSet::new();
   pending.insert(eid);
@@ -266,11 +314,11 @@ async fn due_deadline_waits_for_join_completion_behind_iter_drain_cap() {
     reply: Some(tx),
   });
 
-  // Drive the pump by hand. The `more` self-wake re-polls, so a bounded loop drains
-  // the staged completion. Pre-fix, the first poll reaps the past-due deadline
-  // (JoinAllFailed); post-fix, the reap waits until the completion resolves Ok.
+  // The `more` self-wake re-polls; a bounded loop generous enough to drain the whole
+  // depth (DEPTH + response + EOF at one item per poll). The old fixed-8 deferral
+  // would have force-reaped `JoinAllFailed` long before this depth drained.
   let mut resolved = None;
-  for _ in 0..256 {
+  for _ in 0..(DEPTH + 64) {
     let _ = poll_once(&mut driver);
     match rx.try_recv() {
       Ok(Some(reply)) => {
@@ -285,37 +333,34 @@ async fn due_deadline_waits_for_join_completion_behind_iter_drain_cap() {
   let reached = resolved
     .expect("the join resolved within the bounded poll budget")
     .expect(
-      "the ready ExchangeCompleted resolved the join before the past-due deadline reap fired; \
-       a premature reap would surface a spurious JoinAllFailed",
+      "the deep-buffered ExchangeCompleted resolved the join Ok before the past-due reap; \
+       the old fixed-8 deferral would have force-reaped a spurious JoinAllFailed at depth > 8",
     );
   assert!(
     reached.contains(&seed_addr),
-    "the resolved join reached the seed whose completion was queued behind the cap: {reached:?}"
+    "the resolved join reached the seed whose completion was behind the deep backlog: {reached:?}"
   );
 }
 
-/// Regression (liveness / non-starving): under a SUSTAINED ingress flood that hits
-/// `iter_drain_cap` every poll (so `more` never clears), a past-due await-result
-/// join deadline must STILL be reaped within a bounded number of polls. A blunt
-/// `if !more` gate never fires the reap while `more`, so a flood would suppress the
-/// deadline forever (a liveness-denial DoS); the bounded-deferral policy fires it
-/// once `TIMER_DEFERRAL_LIVENESS_BOUND` deferrals elapse.
+/// Regression (Gate 1 flood-liveness, sub-case i): under a SUSTAINED UDP gossip
+/// flood that pins `udp_backlog` every poll, a past-due await-result join whose
+/// exchange never completes (nothing ever rides `inbound_rx` for it) must STILL be
+/// reaped `JoinAllFailed` PROMPTLY. The reap gates on the reliable `inbound_rx`
+/// watermark — clear here, since the flood is UDP and deposits nothing on the
+/// reliable plane — NOT on the flood, so `reap_due` fires the very first poll.
 ///
-/// Pre-fix, the reap is gated out every poll and the join never resolves within the
-/// poll budget. Post-fix, it resolves to `JoinAllFailed` (no seed was contacted)
-/// within the deferral bound.
+/// The old fixed-count deferral instead deferred `8` polls under the flood's `more`
+/// before firing; the watermark fires immediately because the reliable backlog is
+/// already clear (`inflight == 0`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ingress_flood_does_not_starve_due_join_deadline_reap() {
+async fn udp_flood_does_not_suppress_stuck_join_reap() {
   let now = Instant::now();
-  // A small cap makes the per-poll flood cheap. The flood keeps `more` set via the
-  // inbound-gossip surface: each fed datagram is undecodable garbage the drain
-  // drops, but it still counts toward the surface's `iter_drain_cap`.
   let cap = 4usize;
-  let (mut driver, _obs_rx, _shared) = build_driver(cap).await;
+  let (mut driver, _obs_rx, _shared) = build_driver(cap, 256).await;
 
-  // A real, live outbound exchange id whose exchange never completes (no peer ever
-  // feeds it): the parked join stays pending, so ONLY the past-due deadline reap can
-  // resolve it — to `JoinAllFailed`.
+  // A live outbound exchange with NO completion coming (no peer feeds it) and no
+  // bridge on `inbound_rx`: the reliable in-flight count stays 0, so the watermark
+  // is clear and only the past-due deadline reap can resolve it — to JoinAllFailed.
   driver
     .endpoint
     .start_push_pull(sa("127.0.0.1:7300"), PushPullKind::Join, now);
@@ -342,9 +387,9 @@ async fn ingress_flood_does_not_starve_due_join_deadline_reap() {
   let flood_src = sa("127.0.0.1:7301");
   let mut resolved = None;
   let mut polls = 0usize;
-  for _ in 0..(TIMER_DEFERRAL_LIVENESS_BOUND as usize + 4) {
-    // Refill the ingress flood BEFORE each poll so the inbound-gossip surface hits
-    // its cap and `more` is set for this poll.
+  // A tight budget: the watermark-gated reap fires the FIRST poll (reliable backlog
+  // clear), far inside a budget the old fixed-8 deferral could not meet.
+  for _ in 0..3 {
     for _ in 0..cap {
       driver
         .endpoint
@@ -363,22 +408,95 @@ async fn ingress_flood_does_not_starve_due_join_deadline_reap() {
   }
 
   let reply = resolved.expect(
-    "the past-due join deadline reap fired despite the sustained ingress flood; \
-     a blunt !more gate would starve it indefinitely",
+    "the past-due join reap fired despite the UDP flood; it gates on the reliable \
+     watermark, not the UDP flood, so the flood cannot suppress it",
   );
   assert!(
-    polls <= TIMER_DEFERRAL_LIVENESS_BOUND as usize + 1,
-    "the reap fired within the deferral bound, not later: {polls} polls",
+    polls <= 2,
+    "the reap fired at once (reliable backlog clear), not after a deferral: {polls} polls",
   );
   match reply {
     Err((ref reached, SerfError::JoinAllFailed(_))) => {
-      assert!(
-        reached.is_empty(),
-        "no seed was contacted, so the all-failed set is empty: {reached:?}"
-      );
+      assert!(reached.is_empty(), "no seed contacted: {reached:?}");
     }
     other => panic!("expected JoinAllFailed from the deadline reap, got {other:?}"),
   }
+}
+
+/// Regression (Gate 1 flood-liveness, sub-case ii): under the SAME sustained UDP
+/// flood, an await-result join whose resolving `ExchangeCompleted` is buffered on
+/// `inbound_rx` (a FUTURE deadline, so ONLY the completion — never a deadline reap —
+/// can resolve it) must resolve `Ok`. The flood pins the UDP path but the reliable
+/// inbound drain (step 6) runs every poll regardless, so it is never starved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_flood_does_not_starve_inbound_join_completion() {
+  let now = Instant::now();
+  let cap = 4usize;
+  let (mut driver, _obs_rx, _shared) = build_driver(cap, 256).await;
+
+  let seed_addr = sa("127.0.0.1:7002");
+  let (eid, response) = drive_push_to_queued_response(&mut driver, seed_addr, now);
+  let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+  for bytes in response {
+    queue_inbound(
+      &driver,
+      &inbound_tx,
+      BridgeInbound::Data(BridgeData {
+        eid,
+        bytes,
+        received_at: now,
+      }),
+    );
+  }
+  queue_inbound(
+    &driver,
+    &inbound_tx,
+    BridgeInbound::Eof(BridgeEof {
+      eid,
+      received_at: now,
+    }),
+  );
+
+  // FUTURE deadline: no deadline reap can fire, so a starved TCP drain would hang
+  // the join forever under the flood. Only the completion can resolve it.
+  let (tx, mut rx) = oneshot::channel::<JoinReply>();
+  let mut pending = HashSet::new();
+  pending.insert(eid);
+  driver.pending_joins.push(PendingJoin {
+    pending,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: now + Duration::from_secs(30),
+    reply: Some(tx),
+  });
+
+  let flood_src = sa("127.0.0.1:7003");
+  let mut resolved = None;
+  for _ in 0..256 {
+    for _ in 0..cap {
+      driver
+        .endpoint
+        .handle_gossip(flood_src, &[0xff, 0x00, 0xff], now);
+    }
+    let _ = poll_once(&mut driver);
+    match rx.try_recv() {
+      Ok(Some(reply)) => {
+        resolved = Some(reply);
+        break;
+      }
+      Ok(None) => {}
+      Err(_) => panic!("join reply sender dropped without resolving"),
+    }
+  }
+
+  let reached = resolved
+    .expect("the buffered completion resolved despite the UDP flood")
+    .expect("the completion resolved the join Ok; the flood did not starve the TCP drain");
+  assert!(
+    reached.contains(&seed_addr),
+    "the resolved join reached the seed whose completion drained under the flood: {reached:?}"
+  );
 }
 
 /// Drive an INBOUND (server-side) Join push/pull on `driver.endpoint` until its pull
@@ -455,7 +573,7 @@ async fn fixed_point_drain_releases_withheld_close_same_poll() {
   // The default (large) cap: no surface hits its cap, so a false quiescence could
   // come ONLY from the single-pass ordering — isolating the fixed-point fix.
   let cap = RuntimeOptions::new().iter_drain_cap();
-  let (mut driver, _obs_rx, _shared) = build_driver(cap).await;
+  let (mut driver, _obs_rx, _shared) = build_driver(cap, 256).await;
 
   let dialer_addr = sa("127.0.0.1:7400");
   let server_eid = drive_server_to_withheld_close(&mut driver, dialer_addr, now);
@@ -485,5 +603,170 @@ async fn fixed_point_drain_releases_withheld_close_same_poll() {
   assert!(
     matches!(out_rx.try_recv(), Ok(BridgeOut::Data(_))),
     "the pull response transmit routed to the bridge before its Close"
+  );
+}
+
+/// Regression (leave-before-reap ordering): a same-poll graceful leave whose
+/// `LeftCluster` is emitted BY `handle_timeout` inside the fire path must resolve
+/// `Ok`, not `LeaveTimeout`. The fire path folds the uncapped `poll_event` surface
+/// BETWEEN `handle_timeout` and `reap_pending_leave`, so the fresh `LeftCluster`
+/// resolves the parked leave before the reap sees a still-parked leave at a past
+/// deadline. Without that intervening fold the reap would fire a false
+/// `LeaveTimeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leave_left_cluster_from_handle_timeout_folds_before_reap() {
+  let real_now = Instant::now();
+  // A base well in the past so the (default 1s) leave-propagate deadline, armed
+  // relative to `base`, is already elapsed at the real-time driver poll — while the
+  // pump instants below stay UNDER it, so the Leaving→Left transition is withheld
+  // until the driver poll's `handle_timeout`.
+  let base = real_now - Duration::from_secs(5);
+  let (mut driver, _obs_rx, _shared) = build_driver(64, 256).await;
+
+  driver.endpoint.leave(base).expect("leave from Alive");
+  // On a lone node the inner memberlist emits `LeftCluster` immediately; the first
+  // `handle_timeout` sieves it and ARMS the serf leave-complete deadline. Pump at
+  // instants held below that deadline so serf stays `Leaving` (deadline armed but
+  // not yet fired), draining the pre-`LeftCluster` serf events as we go.
+  let mut armed = false;
+  for i in 0..64u32 {
+    let t = base + Duration::from_millis(i as u64);
+    driver.endpoint.handle_timeout(t);
+    while driver.endpoint.poll_action().is_some() {}
+    while driver.endpoint.poll_transport_transmit().is_some() {}
+    while driver.endpoint.poll_memberlist_transmit().is_some() {}
+    while driver.endpoint.poll_event().is_some() {}
+    if driver.endpoint.leave_complete_deadline().is_some() {
+      armed = true;
+      break;
+    }
+  }
+  assert!(
+    armed,
+    "the inner leave armed the serf leave-complete deadline while still Leaving"
+  );
+
+  // Park a leave waiter with an ALREADY-PAST deadline: at the driver poll both the
+  // endpoint deadline (the armed, now-elapsed leave-complete deadline) and this
+  // leave deadline are due, so the fire path runs handle_timeout (emitting
+  // LeftCluster) THEN would reap the leave — the ordering under test.
+  let (tx, mut rx) = oneshot::channel();
+  driver.pending_leave = Some(PendingLeave {
+    repliers: vec![tx],
+    deadline: base,
+  });
+
+  let mut resolved = None;
+  for _ in 0..64 {
+    let _ = poll_once(&mut driver);
+    match rx.try_recv() {
+      Ok(Some(reply)) => {
+        resolved = Some(reply);
+        break;
+      }
+      Ok(None) => {}
+      Err(_) => panic!("leave reply sender dropped without resolving"),
+    }
+  }
+
+  resolved
+    .expect("the leave resolved within the bounded poll budget")
+    .expect(
+      "the LeftCluster emitted by handle_timeout was folded before reap_pending_leave, \
+       resolving the leave Ok; without the intervening fold the reap fires LeaveTimeout",
+    );
+}
+
+/// Regression (parked saturated hand-off): a resolving completion the bridge has
+/// READ (`received_at < deadline`) but that is still PARKED on a SATURATED
+/// `inbound_rx` hand-off lives OUTSIDE `inbound_rx.len()`. It is accounted in the
+/// watermark via the in-flight reservation, so a past-due join deadline does NOT
+/// prematurely reap `JoinAllFailed` — the parked completion drains and resolves the
+/// join `Ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_saturated_handoff_completion_is_accounted_not_reaped() {
+  let now = Instant::now();
+  // bridge_inbound_cap = 1 forces every hand-off after the first to PARK; one inbound
+  // item per poll makes the parked completion strictly lag the past-due deadline.
+  let (mut driver, _obs_rx, _shared) = build_driver(1, 1).await;
+
+  let seed_addr = sa("127.0.0.1:7005");
+  let (eid, response) = drive_push_to_queued_response(&mut driver, seed_addr, now);
+  let inbound_tx = driver.inbound_tx.as_ref().expect("template alive").clone();
+
+  // The frames the parked bridge would deliver: the pull response + the peer-FIN EOF
+  // that completes the exchange. They stay OUT of inbound_rx (the parked residence),
+  // delivered one-at-a-time as the pump frees the cap-1 slot below.
+  let mut parked_frames: std::collections::VecDeque<BridgeInbound> = response
+    .into_iter()
+    .map(|bytes| {
+      BridgeInbound::Data(BridgeData {
+        eid,
+        bytes,
+        received_at: now,
+      })
+    })
+    .collect();
+  parked_frames.push_back(BridgeInbound::Eof(BridgeEof {
+    eid,
+    received_at: now,
+  }));
+
+  // RESERVE the in-flight count for EVERY held frame up front — exactly the
+  // reservation a real `bridge_task` accrues via its pre-send bump — while the
+  // frames themselves are NOT yet in inbound_rx. That is the residence a raw
+  // `inbound_rx.len()` watermark misses: a completion read (`received_at < deadline`)
+  // but still parked on a saturated `send_async`, so `inflight > len`.
+  for _ in 0..parked_frames.len() {
+    driver
+      .bridge_inbound_inflight
+      .fetch_add(1, Ordering::Release);
+  }
+
+  // Past deadline: only the watermark accounting for the parked completion stands
+  // between the pump and a premature JoinAllFailed.
+  let (tx, mut rx) = oneshot::channel::<JoinReply>();
+  let mut pending = HashSet::new();
+  pending.insert(eid);
+  driver.pending_joins.push(PendingJoin {
+    pending,
+    contacted: SmallVec::new(),
+    ignore_streams: SmallVec::new(),
+    requested: 1,
+    deadline: now - Duration::from_secs(1),
+    reply: Some(tx),
+  });
+
+  let mut resolved = None;
+  for _ in 0..512 {
+    // Land the next parked frame into the freed cap-1 slot — a deterministic,
+    // race-free stand-in for a bridge whose `send_async` unparks as the pump drains.
+    // The watermark sees the identical state a real parked hand-off produces
+    // (`inflight` reserved for the un-landed frames, `len` only the one in flight).
+    if !inbound_tx.is_full()
+      && let Some(frame) = parked_frames.pop_front()
+    {
+      inbound_tx.try_send(frame).expect("land parked frame");
+    }
+    let _ = poll_once(&mut driver);
+    match rx.try_recv() {
+      Ok(Some(reply)) => {
+        resolved = Some(reply);
+        break;
+      }
+      Ok(None) => {}
+      Err(_) => panic!("join reply sender dropped without resolving"),
+    }
+  }
+
+  let reached = resolved
+    .expect("the join resolved within the bounded poll budget")
+    .expect(
+      "the parked completion was accounted in the watermark and folded before the past-due reap; \
+       a raw inbound_rx.len() watermark would miss it and reap a spurious JoinAllFailed",
+    );
+  assert!(
+    reached.contains(&seed_addr),
+    "the resolved join reached the seed whose completion was parked on the saturated hand-off: {reached:?}"
   );
 }

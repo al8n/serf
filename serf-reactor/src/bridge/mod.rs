@@ -43,7 +43,15 @@
 //! makes NO progress for the full `close_timeout`; the bridge is then torn down,
 //! dropping the write half so the OS RSTs the stuck stream.
 
-use std::{future::Future, net::Shutdown, sync::Arc, time::Duration};
+use std::{
+  future::Future,
+  net::Shutdown,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
+  time::Duration,
+};
 
 use agnostic::{Runtime, net::TcpStream};
 use flume::{Receiver, Sender};
@@ -66,6 +74,12 @@ use crate::{
 /// Moves bytes between one exchange's TCP stream and the pump, waking it after
 /// each inbound enqueue. Reads forward to `inbound_tx`; `out_rx` drives writes
 /// and the write half-close.
+///
+/// `inflight` counts frames this bridge has read but the pump has not yet
+/// received: bumped BEFORE each (possibly parking) `inbound_tx` send and cleared
+/// by the pump on receive, so the pump's reap watermark accounts for a completion
+/// still parked on a saturated hand-off — a frame outside `inbound_rx.len()` that
+/// a raw depth watermark would miss.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn bridge_task<I, R, S>(
   stream: S,
@@ -73,6 +87,7 @@ pub(crate) async fn bridge_task<I, R, S>(
   out_rx: Receiver<BridgeOut>,
   cancel_rx: oneshot::Receiver<()>,
   inbound_tx: Sender<BridgeInbound>,
+  inflight: Arc<AtomicU64>,
   shared: Arc<Shared<I>>,
   recv_buf_len: usize,
   close_timeout: Duration,
@@ -183,8 +198,12 @@ pub(crate) async fn bridge_task<I, R, S>(
           } else {
             BridgeInbound::Eof(payload)
           };
-          // Bounded channel: await space (backpressure), then wake the pump.
+          // Bounded channel: await space (backpressure), then wake the pump. Count
+          // the frame in-flight BEFORE the (possibly parking) send so the pump's
+          // watermark covers it while parked; roll back if the pump is gone.
+          inflight.fetch_add(1, Ordering::Release);
           if inbound_tx.send_async(msg).await.is_err() {
+            inflight.fetch_sub(1, Ordering::Release);
             break;
           }
           shared.wake_driver();
@@ -196,7 +215,10 @@ pub(crate) async fn bridge_task<I, R, S>(
             bytes: buf[..n].to_vec(),
             received_at: Instant::now(),
           });
+          // Count in-flight BEFORE the (possibly parking) send; roll back if gone.
+          inflight.fetch_add(1, Ordering::Release);
           if inbound_tx.send_async(msg).await.is_err() {
+            inflight.fetch_sub(1, Ordering::Release);
             break;
           }
           shared.wake_driver();
