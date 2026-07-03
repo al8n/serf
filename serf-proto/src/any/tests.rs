@@ -1,6 +1,6 @@
 //! Round-trip tests for AnyMessage encode and decode.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 
 use bytes::Bytes;
 use memberlist_proto::Node;
@@ -146,7 +146,7 @@ fn any_message_query_round_trip() {
     filters: vec![],
     flags: QueryFlag::ACK,
     relay_factor: 1,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: SmolStr::from("my-query"),
     payload: Bytes::from_static(b"qp"),
   };
@@ -362,7 +362,7 @@ fn any_message_encode_query_round_trip() {
     filters: vec![],
     flags: QueryFlag::ACK,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: SmolStr::from("qname"),
     payload: Bytes::new(),
   });
@@ -464,7 +464,7 @@ fn sealed_types_are_crate_internal() {
   // In-crate: the sealed types still EXIST after the seal (resolve here),
   // while no longer being `pub` to dependents.
   fn _assert_crate_visible(
-    _: core::marker::PhantomData<super::AnyMessage<u32, std::net::SocketAddr>>,
+    _: core::marker::PhantomData<super::AnyMessage<u32, core::net::SocketAddr>>,
   ) {
   }
   fn _assert_public(_: core::marker::PhantomData<crate::QueryFlag>) {}

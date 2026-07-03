@@ -3,9 +3,26 @@
 //!
 //! Depends on `memberlist-proto` for the `Data`/`DataRef` codec primitives; defines serf's
 //! own message set and framing on top of them.
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
+
+// Alias `alloc` to the name `std` so genuine-heap `std::` paths compile unchanged
+// under no_std+alloc (and `#[macro_use]` brings `vec!`/`format!` crate-wide).
+// Core-resident items are imported from `core::` directly, never via this alias.
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[macro_use]
+extern crate alloc as std;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+// The protocol state is intrinsically heap-backed (Vec/Box/String/maps), so a
+// build with neither capability tier is unsupported. Fail with a clear message
+// instead of a cascade of "cannot find type `Vec`" errors.
+#[cfg(not(any(feature = "std", feature = "alloc")))]
+compile_error!("serf-proto requires the `std` or `alloc` feature");
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use any::{AnyMessage, EncodeError};
@@ -67,6 +84,8 @@ pub(crate) mod any;
 pub(crate) mod bridge;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod framing;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod mathf;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod messages;
 pub mod typed;
@@ -136,3 +155,8 @@ pub use memberlist_proto::SecretKey;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use memberlist_proto::event::{ExchangeCompleted, ExchangeId, ExchangeKind, ExchangeStatus};
+
+/// `FxHashMap`/`FxHashSet` backed by hashbrown (no_std-capable) with rustc-hash's
+/// Fx hasher — rustc-hash's own `Fx*` map aliases are std-only.
+pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
+pub(crate) type FxHashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;

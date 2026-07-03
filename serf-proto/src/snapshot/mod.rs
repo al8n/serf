@@ -27,6 +27,8 @@
 //! No file handles, no `std::fs`, no `Instant::now()`.  The driver owns I/O;
 //! this module is consumed by the snapshot replay function in the driver.
 
+use std::vec::Vec;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use memberlist_proto::{Data, DataRef};
 
@@ -516,8 +518,7 @@ where
     // input-record order — two drivers that replay the same snapshot bytes
     // produce an identical `DialRequested` sequence.
     let mut alive_vec: Vec<memberlist_proto::Node<I, A>> = Vec::new();
-    let mut alive_set: std::collections::HashSet<memberlist_proto::Node<I, A>> =
-      std::collections::HashSet::new();
+    let mut alive_set: crate::FxHashSet<memberlist_proto::Node<I, A>> = crate::FxHashSet::default();
     let mut last_clock = LamportTime::ZERO;
     let mut last_event_clock = LamportTime::ZERO;
     let mut last_query_clock = LamportTime::ZERO;

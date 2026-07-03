@@ -4,7 +4,7 @@
 //! `serf-core/src/options.rs` port.  The struct itself is a plain value type
 //! (no atomics, no locks) consistent with the single-threaded Sans-I/O machine.
 
-use std::time::Duration;
+use core::time::Duration;
 
 /// Configuration for the serf `Endpoint`.
 ///

@@ -24,7 +24,7 @@ fn member_event_kind_display_matches_as_str() {
 
 #[test]
 fn event_is_variant_helpers() {
-  use std::net::SocketAddr;
+  use core::net::SocketAddr;
 
   let ev: Event<u32, SocketAddr> = Event::Shutdown;
   assert!(ev.is_shutdown());

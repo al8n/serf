@@ -4,7 +4,12 @@
 //! the buffa side stores them as primitive protobuf types. These functions are
 //! the single boundary where those conversions happen.
 
-use std::borrow::Cow;
+use std::{
+  borrow::{Cow, ToOwned},
+  boxed::Box,
+  string::ToString,
+  vec::Vec,
+};
 
 use bytes::Bytes;
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
@@ -409,7 +414,7 @@ where
   ))?)
   .map_err(|_| BridgeError::InvalidValue("QueryMessage.relay_factor exceeds u8::MAX".into()))?;
   // Safe: query timeouts are measured in seconds to minutes, well within u64::MAX nanoseconds.
-  let timeout = std::time::Duration::from_nanos(b.timeout_nanos.ok_or(
+  let timeout = core::time::Duration::from_nanos(b.timeout_nanos.ok_or(
     BridgeError::MissingField("QueryMessage.timeout_nanos".into()),
   )?);
 
