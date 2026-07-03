@@ -1528,3 +1528,74 @@ fn poll_event_delivers_all_events_exactly_once_after_pump_fold() {
     "membership events must also be delivered through the buffer"
   );
 }
+
+// ── bounded app-event backlog (no unbounded growth) ───────────────────────────
+
+/// A driver that pumps and resolves joins but NEVER drains `poll_event` must not
+/// grow the app-event backlog without bound: `buffered_events` is capped at
+/// [`DEFAULT_EVENT_BUFFER_CAP`], surplus events are shed OLDEST-first and counted in
+/// `events_dropped()`, and — because join completions are folded BEFORE buffering —
+/// the shed app-events never affect join resolution (`poll_join` still returns
+/// `Ok(reached)`). Regression for an unbounded `buffered_events` that OOMs a
+/// long-running embedded node under the supported pump-then-poll_join flow; reverting
+/// the bound lets the backlog grow to `2 * cap` and leaves `events_dropped()` at 0.
+#[test]
+fn undrained_poll_event_backlog_is_bounded_and_counts_drops() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  let handle = link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  // Drive the push/pull to its Succeeded terminal by pumping BOTH engines, draining
+  // ONLY B's events. A's `poll_event` is NEVER called, so the pump alone folds A's
+  // join completion and every event A observes piles into `buffered_events`.
+  let mut folded = false;
+  for _ in 0..40 {
+    link.step(now);
+    while link.b.poll_event().is_some() {}
+    if matches!(
+      link.a.pending_joins.get(&handle).map(|pj| &pj.reply),
+      Some(JoinReply::Ready(_))
+    ) {
+      folded = true;
+      break;
+    }
+  }
+  assert!(
+    folded,
+    "the pump must fold the Succeeded push/pull into the join with no poll_event drain"
+  );
+
+  // Flood the app-event backlog far past the cap, still WITHOUT draining `poll_event`.
+  // This exercises the exact bounded push the pump's `drain_fold_events` uses.
+  for _ in 0..(DEFAULT_EVENT_BUFFER_CAP * 2) {
+    link.a.push_app_event(Event::LeftCluster);
+  }
+
+  // The backlog is BOUNDED — it never exceeds the cap however long the app ignores
+  // it — and every shed event is counted, so the loss is observable rather than an
+  // unbounded memory leak.
+  assert_eq!(
+    link.a.buffered_events.len(),
+    DEFAULT_EVENT_BUFFER_CAP,
+    "the undrained app-event backlog must be bounded at the cap, never growing without limit"
+  );
+  assert!(
+    link.a.events_dropped() >= DEFAULT_EVENT_BUFFER_CAP as u64,
+    "every shed event must be counted in events_dropped (got {})",
+    link.a.events_dropped()
+  );
+
+  // Join accounting is folded before buffering, so the shed app-events never affect
+  // resolution: the join still resolves `Ok(reached)` with B.
+  match link.a.poll_join(handle) {
+    Some(Ok(reached)) => assert!(
+      reached.contains(&link.b_addr),
+      "the join still resolves Ok(reached) including B despite the app-event drops"
+    ),
+    other => panic!("the bounded app-event drop must not affect join resolution, got {other:?}"),
+  }
+}

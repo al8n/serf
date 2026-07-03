@@ -88,6 +88,19 @@ fn gossip_recv_buf_size(gossip_mtu: usize) -> usize {
   (gossip_mtu + ENCRYPTED_WRAPPER_OVERHEAD).max(1500)
 }
 
+/// Cap on the application-event backlog awaiting
+/// [`poll_event`](SerfEngine::poll_event).
+///
+/// A driver using the supported pump-then-[`poll_join`](SerfEngine::poll_join)
+/// flow that never drains [`poll_event`](SerfEngine::poll_event) must not grow that
+/// queue without bound. At the cap the OLDEST buffered event is dropped
+/// (best-effort, freshest-wins) and counted in
+/// [`events_dropped`](SerfEngine::events_dropped), so app-event delivery is lossy
+/// under sustained overload while join accounting — folded BEFORE buffering — is
+/// never affected. Mirrors memberlist-embassy's bounded `app_events` queue (same
+/// cap) and the serf std drivers' load-shed counters.
+pub const DEFAULT_EVENT_BUFFER_CAP: usize = 1024;
+
 /// An [`AliveDelegate`] that admits a peer only when its advertised address is a
 /// routable destination ([`socket_addr_is_routable`]).
 ///
@@ -406,7 +419,19 @@ where
   /// machine's event queue to here, folding each `ExchangeCompleted` into its join
   /// BEFORE buffering the event, so join accounting is pump-driven and never waits
   /// on the app draining events; `poll_event` is a pure drain of this queue.
+  ///
+  /// Bounded at [`DEFAULT_EVENT_BUFFER_CAP`]: at the cap the oldest event is dropped
+  /// and counted in `events_dropped`, so a driver that never drains
+  /// [`poll_event`](Self::poll_event) cannot grow this queue without limit (which
+  /// would exhaust memory on a long-running embedded node).
   buffered_events: VecDeque<Event<I, SocketAddr>>,
+  /// Count of application events shed from `buffered_events` because the driver
+  /// never drained [`poll_event`](Self::poll_event) fast enough and the backlog hit
+  /// [`DEFAULT_EVENT_BUFFER_CAP`]. Surfaced via
+  /// [`events_dropped`](Self::events_dropped) so the best-effort loss is observable
+  /// (mirroring the serf std drivers' load-shed counter). Join completions are
+  /// folded before buffering, so a shed app-event never affects join resolution.
+  events_dropped: u64,
   /// Monotonic allocator for [`JoinId`]s, so two concurrent joins never collide.
   next_join_id: u64,
   /// Cluster label applied to the gossip codec on both encode and decode. When
@@ -590,6 +615,7 @@ where
       pending_seeds: VecDeque::new(),
       pending_joins: HashMap::new(),
       buffered_events: VecDeque::new(),
+      events_dropped: 0,
       next_join_id: 0,
       label,
       cidr_policy,
@@ -818,9 +844,31 @@ where
   /// terminal, so a driver need NOT drain events here before
   /// [`poll_join`](Self::poll_join) — `poll_join` resolves off the pump-folded
   /// state. The contract is the reactor-faithful "pump, then poll_join / poll_event".
+  ///
+  /// App-event delivery is BEST-EFFORT: the backlog is bounded at
+  /// [`DEFAULT_EVENT_BUFFER_CAP`], so a driver that pumps and resolves joins but
+  /// stops draining `poll_event` sheds the oldest surplus events (counted in
+  /// [`events_dropped`](Self::events_dropped)) rather than growing memory without
+  /// bound — matching the serf std drivers' lossy observation channel. Join
+  /// resolution is unaffected (completions are folded before buffering).
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
     self.buffered_events.pop_front()
+  }
+
+  /// The number of application events shed from the `poll_event` backlog because it
+  /// reached [`DEFAULT_EVENT_BUFFER_CAP`] before the driver drained them.
+  ///
+  /// App-event delivery is BEST-EFFORT under sustained overload: a driver that
+  /// pumps and resolves joins but never drains [`poll_event`](Self::poll_event)
+  /// sheds the oldest surplus events rather than growing memory without bound, and
+  /// each shed increments this counter (mirroring the serf std drivers'
+  /// `events_dropped`). Join resolution is unaffected — completions are folded
+  /// before buffering — so a nonzero count means only that some observational
+  /// events were not delivered, never that a join was mis-resolved.
+  #[inline]
+  pub fn events_dropped(&self) -> u64 {
+    self.events_dropped
   }
 
   /// Fold one machine event into the await-result join it terminates, if any.
@@ -856,6 +904,24 @@ where
     }
   }
 
+  /// Buffer one already-folded machine event for [`poll_event`](Self::poll_event),
+  /// bounding the backlog at [`DEFAULT_EVENT_BUFFER_CAP`].
+  ///
+  /// At the cap the OLDEST buffered event is dropped (freshest-wins, so a
+  /// never-draining driver keeps the most recent surface) and counted in
+  /// `events_dropped`, so the queue cannot grow without bound and the loss stays
+  /// observable. The dropped copy is purely the app-delivery one — the event's join
+  /// completion was already folded by [`drain_fold_events`](Self::drain_fold_events)
+  /// BEFORE this call — so a drop never affects join resolution. Mirrors
+  /// memberlist-embassy's bounded `app_events` (drop-oldest on overflow).
+  fn push_app_event(&mut self, ev: Event<I, SocketAddr>) {
+    if self.buffered_events.len() >= DEFAULT_EVENT_BUFFER_CAP {
+      self.buffered_events.pop_front();
+      self.events_dropped += 1;
+    }
+    self.buffered_events.push_back(ev);
+  }
+
   /// Drain the machine's event queue to quiescence, folding each event into its
   /// await-result join ([`fold_join_completion`](Self::fold_join_completion)) and
   /// buffering it for [`poll_event`](Self::poll_event) delivery.
@@ -865,12 +931,16 @@ where
   /// [`leave`](Self::leave) calls it before resolving its abandonment, so an
   /// already-succeeded push/pull lands in the reached set. Because it empties the
   /// endpoint queue, a later call folds only the events enqueued since — never
-  /// re-folding one already buffered — and `buffered_events` preserves the app's
-  /// event stream in arrival order.
+  /// re-folding one already buffered. The join completion is folded FIRST, then the
+  /// event is buffered via [`push_app_event`](Self::push_app_event), which bounds the
+  /// backlog at [`DEFAULT_EVENT_BUFFER_CAP`] (dropping + counting the oldest on
+  /// overflow) so a driver that never drains `poll_event` cannot grow it without
+  /// bound; `buffered_events` preserves the app's event stream in arrival order up to
+  /// that cap.
   fn drain_fold_events(&mut self) {
     while let Some(ev) = self.endpoint.poll_event() {
       self.fold_join_completion(&ev);
-      self.buffered_events.push_back(ev);
+      self.push_app_event(ev);
     }
   }
 
