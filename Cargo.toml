@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "serf-proto",
+  "serf-embedded",
   "serf-driver",
   "serf-compio",
   "serf-reactor",
