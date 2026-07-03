@@ -24,7 +24,7 @@ compile_error!("serf-embedded requires the `std` or `alloc` feature");
 mod cidr;
 pub mod engine;
 
-pub use engine::{JoinFailed, JoinId, ReachedSet, SerfEngine};
+pub use engine::{DEFAULT_EVENT_BUFFER_CAP, JoinFailed, JoinId, ReachedSet, SerfEngine};
 
 // ── Reused memberlist-embedded glue ──────────────────────────────────────────
 //
