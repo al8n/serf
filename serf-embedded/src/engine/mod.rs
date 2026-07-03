@@ -30,9 +30,10 @@ use std::{boxed::Box, collections::VecDeque, vec::Vec};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use hashbrown::{HashMap, HashSet};
 use memberlist_proto::{
-  AliveDelegate, Endpoint, EndpointOptions, Instant, LabelOptions, PushPullKind, RawRecords, Rng,
-  Transmit,
+  AliveDelegate, Endpoint, EndpointOptions, Instant, LabelOptions, RawRecords, Rng, SeedableRng,
+  StreamId, Transmit,
   codec::{
     DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
     parse_messages,
@@ -40,10 +41,10 @@ use memberlist_proto::{
   streams::{ExchangeId, StreamAction, StreamEndpoint as Coordinator},
   typed::NodeState,
 };
-use smallvec_wrapper::MediumVec;
+use smallvec_wrapper::{MediumVec, OneOrMore};
 
 use serf_proto::{
-  StreamEndpoint,
+  ExchangeKind, ExchangeStatus, StreamEndpoint,
   endpoint::{Error as SerfError, QueryId, QueryParams},
   event::{Event, QueryEvent},
   members::{Member, SerfState},
@@ -126,6 +127,161 @@ where
   }
 }
 
+/// Opaque handle for one in-flight await-result [`join`](SerfEngine::join),
+/// returned by `join` and polled via [`poll_join`](SerfEngine::poll_join).
+///
+/// A driver keys its own per-join waiter (a smoltcp poll flag, an embassy signal)
+/// on this handle. Two concurrent joins mint distinct handles, so their outcomes
+/// never cross-resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JoinId(u64);
+
+impl JoinId {
+  /// The underlying monotonically-allocated sequence number.
+  #[inline]
+  pub const fn get(&self) -> u64 {
+    self.0
+  }
+}
+
+/// The address set an await-result [`join`](SerfEngine::join) reached: one entry
+/// per outbound push/pull exchange that completed [`ExchangeStatus::Succeeded`].
+/// Duplicate seeds contribute one entry per successful exchange.
+pub type ReachedSet = OneOrMore<SocketAddr>;
+
+/// The terminal outcome of a fully-resolved await-result join that reached no
+/// seed: it dispatched a push/pull to one or more routable seeds but none
+/// completed `Succeeded` before every exchange terminated.
+///
+/// `contacted` is always `0` for this payload — a non-zero contact count resolves
+/// the join `Ok(ReachedSet)` instead. Mirrors serf's `JoinFailed` shape (a no_std
+/// twin of `serf-driver`'s, so the embedded core need not pull the std-only
+/// driver error surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinFailed {
+  requested: usize,
+  contacted: usize,
+}
+
+impl JoinFailed {
+  /// Build a payload from the requested-seed count and the contacted count.
+  #[inline]
+  pub const fn new(requested: usize, contacted: usize) -> Self {
+    Self {
+      requested,
+      contacted,
+    }
+  }
+
+  /// The number of routable seed addresses the join dispatched a push/pull to.
+  #[inline]
+  pub const fn requested(&self) -> usize {
+    self.requested
+  }
+
+  /// The number of seeds actually contacted before the join resolved. Always `0`
+  /// for this payload — a non-zero contact count resolves the join `Ok`.
+  #[inline]
+  pub const fn contacted(&self) -> usize {
+    self.contacted
+  }
+}
+
+impl core::fmt::Display for JoinFailed {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "join reached {} of {} seed(s)",
+      self.contacted, self.requested
+    )
+  }
+}
+
+impl core::error::Error for JoinFailed {}
+
+/// One seed queued by [`join`](SerfEngine::join), awaiting its per-tick
+/// `start_join_push_pull` dispatch in the pump. Carries the owning join handle so
+/// the resulting exchange folds back into the right waiter, and the join's
+/// `ignore_old` flag so the dispatch records the ignore-join stream when set.
+struct QueuedSeed {
+  join: JoinId,
+  seed: SocketAddr,
+  ignore_old: bool,
+}
+
+/// Core-owned state for one in-flight await-result join.
+///
+/// The sync analogue of serf-reactor's `PendingJoin`, adapted to the driver-poll
+/// core: contact accounting is strictly per-OUTBOUND-EXCHANGE, observed via the
+/// machine's `Event::ExchangeCompleted` filtered to [`ExchangeKind::PushPull`].
+/// The correlation token that spans dispatch → completion is the START
+/// [`StreamId`] captured at [`join`](SerfEngine::join)'s per-seed dispatch and
+/// bound to the exchange's [`ExchangeId`] when its `Connect` action surfaces; the
+/// completion then matches by that bound `ExchangeId`.
+struct PendingJoin {
+  /// `StreamId`s this join's `start_join_push_pull` calls returned. Matched
+  /// against each surfaced `Connect`'s `stream_id()` to bind the exchange, and —
+  /// for an `ignore_old` join — cleared from the machine's ignore set on terminal.
+  started: HashSet<StreamId>,
+  /// Number of this join's seeds still queued in `pending_seeds`, undispatched.
+  /// Decremented as each seed's push/pull is started in the pump; the join is
+  /// "fully dispatched" (eligible to resolve) once this reaches zero.
+  unstarted: usize,
+  /// Outbound exchange ids bound at `Connect` and still awaiting a terminal
+  /// `ExchangeCompleted`.
+  pending: HashSet<ExchangeId>,
+  /// Peer addresses of the dispatched exchanges that terminated `Succeeded`.
+  contacted: ReachedSet,
+  /// Total routable-seed count this join dispatched — the `JoinFailed` denominator.
+  requested: usize,
+  /// Whether this is an `ignore_old` join (its `started` streams are recorded in
+  /// the machine's ignore set and must be cleared on terminal).
+  ignore_old: bool,
+  /// The resolved outcome, set once every dispatched exchange has terminated (or
+  /// on `leave`). `poll_join` returns and removes the waiter once this is `Some`.
+  resolved: Option<Result<ReachedSet, JoinFailed>>,
+}
+
+impl PendingJoin {
+  /// Compute the terminal outcome from the accumulated contact set.
+  fn outcome(&self) -> Result<ReachedSet, JoinFailed> {
+    if self.contacted.is_empty() {
+      Err(JoinFailed::new(self.requested, 0))
+    } else {
+      Ok(self.contacted.clone())
+    }
+  }
+}
+
+/// Resolve `pj` if every dispatched exchange has terminated (`unstarted == 0` and
+/// `pending` empty) and it is not already resolved: compute its outcome, clear any
+/// still-recorded `ignore_old` streams from the machine's ignore set, and stash
+/// the outcome for [`poll_join`](SerfEngine::poll_join).
+///
+/// Driven on both the completion path (an `ExchangeCompleted` emptied `pending`)
+/// and the end-of-pump sweep (a join whose seeds all retired before a `Connect`,
+/// or an empty/all-non-routable seed set, never accumulates any `pending`). Clearing
+/// the ignore streams HERE — on the exchange terminal, not lazily in `poll_join` —
+/// means the machine's ignore set never leaks even if the driver drops the handle.
+fn try_resolve_join<I, G, SR>(
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RawRecords, G, SR>,
+  pj: &mut PendingJoin,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  SR: Rng + SeedableRng,
+{
+  if pj.resolved.is_some() || pj.unstarted != 0 || !pj.pending.is_empty() {
+    return;
+  }
+  if pj.ignore_old {
+    for sid in &pj.started {
+      endpoint.clear_ignore_join_stream(*sid);
+    }
+  }
+  pj.resolved = Some(pj.outcome());
+}
+
 /// The transport-agnostic serf driving core.
 ///
 /// Composes serf's super-machine with the reused pooled-stream reliable plane,
@@ -137,20 +293,22 @@ where
 /// `I` is the node identifier type (e.g. `SmolStr`); the address is pinned to
 /// [`core::net::SocketAddr`] and the record layer to the plain-TCP
 /// [`RawRecords`]. `C` is the driver's opaque connection handle
-/// ([`StreamIo::Conn`]). `R` is the memberlist gossip RNG the driver injects at
-/// construction; serf's own core RNG (query IDs, relay selection) is a
-/// deterministically-seeded `SmallRng` — a production driver that needs
-/// per-node-distinct query IDs can seed it via a future two-RNG constructor.
-pub struct SerfEngine<I, C, R = memberlist_proto::SmallRng>
+/// ([`StreamIo::Conn`]). `G` is the memberlist gossip RNG (peer selection, timing
+/// jitter) and `SR` is serf's OWN core RNG (query IDs, relay/reconnect selection);
+/// the two are seeded independently, mirroring serf's `StreamEndpoint<.., G, SR>`.
+/// A production driver seeds BOTH from its entropy source via
+/// [`try_new_at_with_rng`](Self::try_new_at_with_rng) so that fresh nodes do not
+/// share a `(ltime, id)` query-id sequence.
+pub struct SerfEngine<I, C, G = memberlist_proto::SmallRng, SR = memberlist_proto::SmallRng>
 where
   // Mandated by serf's `StreamEndpoint` field, which keys its membership store by
   // `I`. Every impl bounds `I: Id`, which implies these, so no impl restates them.
   I: Eq + Hash,
 {
-  /// serf's super-machine: serf logic over the memberlist reliable coordinator
-  /// on the plain-TCP `RawRecords` path. `G = R` (the injected gossip RNG); the
-  /// serf core RNG defaults to `SmallRng`.
-  endpoint: StreamEndpoint<I, SocketAddr, RawRecords, R>,
+  /// serf's super-machine: serf logic over the memberlist reliable coordinator on
+  /// the plain-TCP `RawRecords` path, carrying BOTH the injected gossip RNG `G`
+  /// and serf's own injected core RNG `SR`.
+  endpoint: StreamEndpoint<I, SocketAddr, RawRecords, G, SR>,
   /// Sizing / port configuration; retained for the reliable-plane paths.
   cfg: Options,
   /// Reused pooled connection handles and the exchange-to-handle map for the
@@ -161,11 +319,19 @@ where
   /// every pump. Heap-resident so a large MTU does not blow a constrained stack
   /// and the allocation happens exactly once.
   gossip_recv: std::vec::Vec<u8>,
-  /// Seed addresses queued by [`join`](Self::join) that have not yet been handed
-  /// to the machine. Drained in the machine-pump phase of each `pump` tick: one
-  /// `start_push_pull(seed, Join, now)` per entry, which queues a `Connect` the
-  /// machine services into a dial consumed later that same tick.
-  pending_seeds: VecDeque<SocketAddr>,
+  /// Seeds queued by [`join`](Self::join) that have not yet been handed to the
+  /// machine. Drained in the machine-pump phase of each `pump` tick: one
+  /// `start_join_push_pull(seed, ignore_old, now)` per entry, which queues a
+  /// `Connect` the machine services into a dial consumed later that same tick. Each
+  /// entry carries its owning [`JoinId`] so the resulting exchange folds back into
+  /// the right await-result waiter.
+  pending_seeds: VecDeque<QueuedSeed>,
+  /// In-flight await-result joins keyed by handle. Each accumulates its reached
+  /// set from the terminal `ExchangeCompleted` of the push/pulls it dispatched;
+  /// [`poll_join`](Self::poll_join) drains a resolved one.
+  pending_joins: HashMap<JoinId, PendingJoin>,
+  /// Monotonic allocator for [`JoinId`]s, so two concurrent joins never collide.
+  next_join_id: u64,
   /// Cluster label applied to the gossip codec on both encode and decode. When
   /// `Some`, the gossip codec stamps a label prefix onto every outbound datagram
   /// and rejects any inbound datagram whose label does not match. `None` disables
@@ -177,37 +343,51 @@ where
   cidr_policy: CidrFilter,
 }
 
-// Construction and pure reliable-plane accessors — needing node identity but
-// neither the connection-handle key nor the RNG.
-impl<I, C, R> SerfEngine<I, C, R>
+// Construction — needing node identity and serf's core RNG being seedable (both
+// the two-RNG production path and the deterministic single-RNG convenience wrap
+// `StreamEndpoint::new_with_rng`, which bounds serf's `SR: SeedableRng`).
+impl<I, C, G, SR> SerfEngine<I, C, G, SR>
 where
   I: memberlist_proto::Id + Clone,
+  SR: SeedableRng,
 {
-  /// Construct an engine, panicking on a misconfiguration.
+  /// Construct an engine seeding BOTH RNGs, panicking on a misconfiguration.
   ///
-  /// The convenience wrapper over [`try_new_at`](Self::try_new_at); use it only
-  /// when the configuration is a static constant known to be valid.
+  /// The convenience wrapper over
+  /// [`try_new_at_with_rng`](Self::try_new_at_with_rng); use it only when the
+  /// configuration is a static constant known to be valid.
   ///
   /// # Panics
   ///
-  /// Panics if [`try_new_at`](Self::try_new_at) returns an [`InitError`].
-  pub fn new_at(
+  /// Panics if [`try_new_at_with_rng`](Self::try_new_at_with_rng) returns an
+  /// [`InitError`].
+  pub fn new_at_with_rng(
     cfg: Options,
     transform: TransformOptions,
     ep_cfg: EndpointOptions<I, SocketAddr>,
     serf_opts: SerfOptions,
     now: Instant,
-    rng: R,
+    gossip_rng: G,
+    serf_rng: SR,
   ) -> Self {
-    Self::try_new_at(cfg, transform, ep_cfg, serf_opts, now, rng)
-      .expect("SerfEngine::new_at: invalid configuration; use try_new_at to handle")
+    Self::try_new_at_with_rng(cfg, transform, ep_cfg, serf_opts, now, gossip_rng, serf_rng).expect(
+      "SerfEngine::new_at_with_rng: invalid configuration; use try_new_at_with_rng to handle",
+    )
   }
 
-  /// Fallibly construct an engine.
+  /// Fallibly construct an engine, injecting BOTH the memberlist gossip RNG `G`
+  /// and serf's own core RNG `SR`.
+  ///
+  /// This is the production constructor: serf's core RNG drives query-id
+  /// generation and relay/reconnect selection, so a driver MUST seed it from its
+  /// entropy source (getrandom on embedded, exactly as memberlist-smoltcp /
+  /// memberlist-embassy seed their gossip RNG). Seeding it distinctly per node is
+  /// what keeps fresh nodes from emitting identical `(ltime, id)` query-id
+  /// sequences that a real cluster would drop or mis-correlate.
   ///
   /// Wires serf's super-machine over the memberlist coordinator and sizes the
-  /// gossip receive scratch. No sockets are bound — the driver owns the gossip
-  /// and reliable-stream sockets — and no I/O occurs here.
+  /// gossip receive scratch. No sockets are bound — the driver owns the gossip and
+  /// reliable-stream sockets — and no I/O occurs here.
   ///
   /// # Parameters
   ///
@@ -222,8 +402,8 @@ where
   /// - `serf_opts`: serf-level configuration (reap / reconnect / coalescing /
   ///   query timing).
   /// - `now`: the driver's clock reading at construction.
-  /// - `rng`: the memberlist gossip RNG, already seeded by the driver from its
-  ///   entropy source.
+  /// - `gossip_rng`: the memberlist gossip RNG, already seeded by the driver.
+  /// - `serf_rng`: serf's own core RNG, seeded distinctly by the driver.
   ///
   /// # Errors
   ///
@@ -231,13 +411,14 @@ where
   /// invalid: a zero/over-ceiling gossip MTU, a zero port or close timeout, a
   /// non-routable or port-mismatched advertise address, a machine-endpoint init
   /// failure, or (with an encryption backend built in) an unusable keyring.
-  pub fn try_new_at(
+  pub fn try_new_at_with_rng(
     cfg: Options,
     transform: TransformOptions,
     ep_cfg: EndpointOptions<I, SocketAddr>,
     serf_opts: SerfOptions,
     now: Instant,
-    rng: R,
+    gossip_rng: G,
+    serf_rng: SR,
   ) -> Result<Self, InitError> {
     // Validate every advertise-independent config field (port, gossip-MTU
     // ceiling, close timeout, and the encryption keyring) up front, sharing the
@@ -278,7 +459,7 @@ where
     // Build the inner memberlist `Endpoint` (the SWIM machine serf sits on) with
     // the injected gossip RNG. `try_new_at` maps a machine init failure to
     // `InitError::Endpoint` and starts its timers from a consistent origin.
-    let mut ep = Endpoint::try_new_at(ep_cfg, now, rng).map_err(InitError::Endpoint)?;
+    let mut ep = Endpoint::try_new_at(ep_cfg, now, gossip_rng).map_err(InitError::Endpoint)?;
 
     // Install the routable-address admission filter on the raw `Endpoint` BEFORE
     // it is wrapped: the machine consults it inline for every inbound Alive, so a
@@ -317,10 +498,12 @@ where
     #[cfg(encryption)]
     coord.set_encryption_options(transform.encryption);
 
-    // Wrap the coordinator in serf's super-machine. `new` seeds serf's core RNG
-    // (query IDs / relay selection) deterministically; it is independent of the
-    // injected memberlist gossip RNG `R`.
-    let endpoint = StreamEndpoint::<I, SocketAddr, RawRecords, R>::new(coord, serf_opts);
+    // Wrap the coordinator in serf's super-machine, injecting serf's own core RNG
+    // via `new_with_rng` — the fix for the zero-seeded-core-RNG footgun: serf's
+    // query IDs / relay selection now draw from the driver-seeded `serf_rng`,
+    // independent of the injected memberlist gossip RNG `G`.
+    let endpoint =
+      StreamEndpoint::<I, SocketAddr, RawRecords, G, SR>::new_with_rng(coord, serf_opts, serf_rng);
 
     Ok(Self {
       endpoint,
@@ -328,11 +511,72 @@ where
       plane: ReliablePlane::new(),
       gossip_recv,
       pending_seeds: VecDeque::new(),
+      pending_joins: HashMap::new(),
+      next_join_id: 0,
       label,
       cidr_policy,
     })
   }
 
+  /// Construct an engine with serf's core RNG ZERO-SEEDED, panicking on a
+  /// misconfiguration.
+  ///
+  /// DETERMINISTIC-ONLY convenience: use it only for tests / reproducible
+  /// fixtures. See [`try_new_at`](Self::try_new_at) for the zero-seed caveat.
+  ///
+  /// # Panics
+  ///
+  /// Panics if [`try_new_at`](Self::try_new_at) returns an [`InitError`].
+  pub fn new_at(
+    cfg: Options,
+    transform: TransformOptions,
+    ep_cfg: EndpointOptions<I, SocketAddr>,
+    serf_opts: SerfOptions,
+    now: Instant,
+    gossip_rng: G,
+  ) -> Self {
+    Self::try_new_at(cfg, transform, ep_cfg, serf_opts, now, gossip_rng)
+      .expect("SerfEngine::new_at: invalid configuration; use try_new_at to handle")
+  }
+
+  /// Fallibly construct an engine with serf's core RNG ZERO-SEEDED.
+  ///
+  /// DETERMINISTIC-ONLY: serf's core RNG is seeded from `0`, so every engine built
+  /// this way emits the SAME `(ltime, id)` query-id sequence. That is fine for
+  /// tests and reproducible fixtures but WRONG for a real cluster, where distinct
+  /// nodes must not collide their query ids — production drivers construct via
+  /// [`try_new_at_with_rng`](Self::try_new_at_with_rng), seeding serf's RNG from
+  /// entropy. Takes only the gossip RNG; the serf RNG is `SR::seed_from_u64(0)`.
+  ///
+  /// # Errors
+  ///
+  /// As [`try_new_at_with_rng`](Self::try_new_at_with_rng).
+  pub fn try_new_at(
+    cfg: Options,
+    transform: TransformOptions,
+    ep_cfg: EndpointOptions<I, SocketAddr>,
+    serf_opts: SerfOptions,
+    now: Instant,
+    gossip_rng: G,
+  ) -> Result<Self, InitError> {
+    Self::try_new_at_with_rng(
+      cfg,
+      transform,
+      ep_cfg,
+      serf_opts,
+      now,
+      gossip_rng,
+      SR::seed_from_u64(0),
+    )
+  }
+}
+
+// Pure reliable-plane accessors — needing node identity but neither the
+// connection-handle key nor either RNG.
+impl<I, C, G, SR> SerfEngine<I, C, G, SR>
+where
+  I: memberlist_proto::Id + Clone,
+{
   /// Mutable access to the reliable plane's pool, for a driver to push its
   /// pre-created connection handles and install the initial listener at
   /// construction.
@@ -392,15 +636,25 @@ where
   pub fn pending_dial_count(&self) -> usize {
     self.plane.pending_dial_count()
   }
+
+  /// Number of await-result joins currently tracked (in-flight plus resolved but
+  /// not yet drained via [`poll_join`](Self::poll_join)) — a diagnostic proving
+  /// the join table does not leak once every join resolves and is polled.
+  #[inline]
+  pub fn pending_join_count(&self) -> usize {
+    self.pending_joins.len()
+  }
 }
 
 // serf-command and read forwarders — reach serf's super-machine only (not the
-// reliable plane), so they need node identity and the gossip RNG but no
+// reliable plane), so they need node identity and BOTH RNGs (the machine driver
+// surface bounds the gossip `G: Rng` and serf's `SR: Rng + SeedableRng`) but no
 // connection-handle key.
-impl<I, C, R> SerfEngine<I, C, R>
+impl<I, C, G, SR> SerfEngine<I, C, G, SR>
 where
   I: memberlist_proto::Id + Clone,
-  R: Rng,
+  G: Rng,
+  SR: Rng + SeedableRng,
 {
   /// Arm serf's periodic probe / gossip / push-pull schedulers. Call once before
   /// the first `pump`; without it failure detection, dissemination, and
@@ -478,39 +732,155 @@ where
   /// acks, key-management requests / responses, reliable-exchange completions,
   /// and the lifecycle signals (`LeftCluster`, conflict `Shutdown`). Returns
   /// `None` when the event queue is empty; call again after the next `pump` tick.
+  ///
+  /// A driver awaiting a [`join`](Self::join) result MUST drain events here before
+  /// checking [`poll_join`](Self::poll_join): a push/pull `ExchangeCompleted` is
+  /// folded into its await-result join AS IT surfaces here (the reached-set
+  /// accumulation), and `poll_join` resolves off that folded state.
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
-    self.endpoint.poll_event()
-  }
-
-  /// Announce the local node's join intent and record intent to contact these
-  /// seed addresses.
-  ///
-  /// Returns immediately; the pump loop initiates a push/pull state exchange to
-  /// each routable seed on the next tick. serf's own `join()` rejects a non-Alive
-  /// endpoint ([`SerfError::BadJoinState`]); on that rejection no seed is queued.
-  pub fn join(&mut self, seeds: &[SocketAddr]) -> Result<(), SerfError> {
-    // Announce the serf-level join intent first (this is where the running-state
-    // gate lives); only queue seeds once it is accepted.
-    self.endpoint.join()?;
-    for s in seeds {
-      // Drop a non-routable seed: it could only produce a doomed dial. Queue only
-      // seeds a dial can actually complete.
-      if socket_addr_is_routable(s) {
-        self.pending_seeds.push_back(*s);
+    let ev = self.endpoint.poll_event();
+    // Fold a push/pull completion into its await-result join: the terminal
+    // `ExchangeCompleted`'s `eid` was bound to a join at its `Connect` (via the
+    // START `StreamId`), so a match here removes it from `pending` and — on
+    // `Succeeded` — accumulates the peer into `contacted`. Resolving off that
+    // (clearing any ignore streams) happens the instant `pending` empties.
+    if let Some(Event::ExchangeCompleted(ec)) = &ev {
+      if ec.kind() == ExchangeKind::PushPull {
+        let Self {
+          endpoint,
+          pending_joins,
+          ..
+        } = self;
+        if let Some(pj) = pending_joins
+          .values_mut()
+          .find(|pj| pj.pending.contains(&ec.eid()))
+        {
+          pj.pending.remove(&ec.eid());
+          if matches!(ec.outcome(), ExchangeStatus::Succeeded) {
+            pj.contacted.push(*ec.peer());
+          }
+          try_resolve_join(endpoint, pj);
+        }
       }
     }
-    Ok(())
+    ev
+  }
+
+  /// Announce the local node's join intent and begin an await-result join to
+  /// these seeds, returning a [`JoinId`] the driver polls via
+  /// [`poll_join`](Self::poll_join).
+  ///
+  /// Returns immediately; the pump initiates a push/pull to each routable seed on
+  /// the next tick. serf's own `join()` rejects a non-Alive endpoint
+  /// ([`SerfError::BadJoinState`]); on that rejection nothing is queued and no
+  /// handle is minted. When `ignore_old` is set, each seed's push/pull records its
+  /// ignore-join stream so the resulting merge suppresses replay of the peer's
+  /// pre-join user events; the engine clears any such stream that fails to merge
+  /// when the join terminates (no machine leak).
+  ///
+  /// The join RESOLVES — `poll_join` yields `Some` — once every dispatched
+  /// push/pull has terminated (each `ExchangeCompleted` folded in): `Ok` with the
+  /// reached-address set if any seed was contacted, else `Err(JoinFailed)`. A join
+  /// to an unreachable seed resolves `Err` after that exchange's own stream
+  /// timeout; the core imposes no separate caller deadline (a driver that wants an
+  /// earlier give-up drops the handle).
+  pub fn join(
+    &mut self,
+    seeds: &[SocketAddr],
+    ignore_old: bool,
+    now: Instant,
+  ) -> Result<JoinId, SerfError> {
+    // Ignoring `now`: the per-seed push/pulls are dispatched (with the tick's
+    // `now`) in the pump, not here — `join` only announces intent and queues. The
+    // parameter is kept for API parity with the reactor / a future synchronous
+    // dispatch.
+    let _ = now;
+    // Announce the serf-level join intent first (this is where the running-state
+    // gate lives); only mint the handle and queue seeds once it is accepted.
+    self.endpoint.join()?;
+
+    let id = JoinId(self.next_join_id);
+    self.next_join_id += 1;
+
+    let mut requested = 0usize;
+    for s in seeds {
+      // Drop a non-routable seed: it could only produce a doomed dial. Queue only
+      // seeds a dial can actually complete, and count them as the `JoinFailed`
+      // denominator.
+      if socket_addr_is_routable(s) {
+        requested += 1;
+        self.pending_seeds.push_back(QueuedSeed {
+          join: id,
+          seed: *s,
+          ignore_old,
+        });
+      }
+    }
+
+    self.pending_joins.insert(
+      id,
+      PendingJoin {
+        started: HashSet::new(),
+        unstarted: requested,
+        pending: HashSet::new(),
+        contacted: ReachedSet::new(),
+        requested,
+        ignore_old,
+        resolved: None,
+      },
+    );
+    Ok(id)
+  }
+
+  /// Drain the terminal outcome of an await-result [`join`](Self::join), or `None`
+  /// while it is still in flight.
+  ///
+  /// Returns `Some(Ok(reached))` with the address set the join contacted, or
+  /// `Some(Err(JoinFailed))` if every dispatched push/pull terminated without
+  /// contacting a seed. `None` means the join has not yet resolved — poll again
+  /// after the next `pump` + [`poll_event`](Self::poll_event) drain. Removes the
+  /// waiter on the resolving call (a sync driver polls this each tick; an async
+  /// driver awaits a signal the pump fires when it flips to `Some`). An unknown or
+  /// already-drained handle yields `None`.
+  pub fn poll_join(&mut self, handle: JoinId) -> Option<Result<ReachedSet, JoinFailed>> {
+    // Yield `None` for an unknown handle (`get?`) or one still in flight
+    // (`resolved.as_ref()?`); only a resolved join is drained AND removed.
+    self.pending_joins.get(&handle)?.resolved.as_ref()?;
+    self
+      .pending_joins
+      .remove(&handle)
+      .and_then(|pj| pj.resolved)
   }
 
   /// Begin leaving the cluster.
   ///
   /// Forwards to serf's graceful-leave path, which gossips the departure and
   /// ultimately emits [`Event::LeftCluster`] via [`poll_event`](Self::poll_event).
-  /// Any seeds still queued from a pre-leave join are dropped: the pump initiates
-  /// no new push/pull once leaving.
+  /// Any seeds still queued from a pre-leave join are dropped, and every in-flight
+  /// await-result join is resolved from its current reached set (clearing any
+  /// still-recorded ignore streams so the machine's ignore set never leaks): the
+  /// pump initiates no new push/pull once leaving.
   pub fn leave(&mut self, now: Instant) -> Result<(), SerfError> {
     self.pending_seeds.clear();
+    // Force every in-flight join to its terminal from whatever it accumulated so
+    // far: leaving means no further push/pull dispatch, so an unresolved join
+    // would otherwise linger forever (and leak its ignore-join streams).
+    let Self {
+      endpoint,
+      pending_joins,
+      ..
+    } = self;
+    for pj in pending_joins.values_mut() {
+      if pj.resolved.is_none() {
+        if pj.ignore_old {
+          for sid in &pj.started {
+            endpoint.clear_ignore_join_stream(*sid);
+          }
+        }
+        pj.resolved = Some(pj.outcome());
+      }
+    }
     self.endpoint.leave(now)
   }
 
@@ -625,12 +995,13 @@ where
 
 // Reliable-plane lifecycle helpers that move the connection handle `C` by value
 // (into the pool, the listener slot, and the `StreamIo` socket calls) and reach
-// serf's machine, so they need `C: Copy + Eq + Hash` and the gossip RNG.
-impl<I, C, R> SerfEngine<I, C, R>
+// serf's machine, so they need `C: Copy + Eq + Hash` and both RNGs.
+impl<I, C, G, SR> SerfEngine<I, C, G, SR>
 where
   I: memberlist_proto::Id + Clone,
   C: Copy + Eq + Hash,
-  R: Rng,
+  G: Rng,
+  SR: Rng + SeedableRng,
 {
   /// Advance serf's state machine once over the driver's already-ticked sockets.
   /// Returns the next wakeup deadline: the minimum of the machine's next timer
@@ -656,15 +1027,16 @@ where
   ///     back via `handle_message`.
   /// 3. Reliable ingress: drain each connection's rx into `handle_transport_data`;
   ///     deliver a one-shot EOF on peer FIN.
-  /// 5. Join-seed drain: `start_push_pull(seed, Join, now)` per queued seed.
+  /// 5. Join-seed drain: `start_join_push_pull(seed, ignore_old, now)` per queued
+  ///     seed, capturing its `StreamId` for await-result correlation.
   /// 6. Machine tick: `handle_timeout` fires due serf + coordinator timers.
   /// 7a–7e. Drain `poll_action`, promote, pump outbound, flush deferred FINs,
   ///     complete `Closing` drains, re-rebalance, then drain + send outbound
   ///     gossip.
   /// 8. Deadline: `min(machine_next, closing_next)`.
-  pub fn pump<G, S>(&mut self, now: Instant, gossip: &mut G, stream: &mut S) -> Option<Instant>
+  pub fn pump<GI, S>(&mut self, now: Instant, gossip: &mut GI, stream: &mut S) -> Option<Instant>
   where
-    G: GossipIo,
+    GI: GossipIo,
     S: StreamIo<Conn = C>,
   {
     // 1a. Reap gracefully-closing connections the driver's stack tick advanced to
@@ -723,14 +1095,20 @@ where
     // machine (including the peer-FIN EOF) before the machine tick.
     self.pump_inbound_reliable(now, stream);
 
-    // 5. Drain join seeds: each queued seed gets a push/pull exchange initiated
-    // now. Skipped once leaving/left — a left node initiates no join push/pull.
+    // 5. Drain join seeds: each queued seed starts a join push/pull now. Skipped
+    // once leaving/left — a left node initiates no join push/pull. The returned
+    // `StreamId` is the await-result correlation token: it is recorded on the
+    // owning join and matched against the resulting `Connect`'s `stream_id()`
+    // (phase 7a) to bind that exchange's `ExchangeId` into the join's pending set.
     if self.is_running() {
-      while let Some(seed) = self.pending_seeds.pop_front() {
-        // The StreamId is the machine's correlation token; the dial is correlated
-        // via the ExchangeId carried in the resulting Connect action, so the
-        // driver does not need to retain it here.
-        let _sid = self.endpoint.start_push_pull(seed, PushPullKind::Join, now);
+      while let Some(qs) = self.pending_seeds.pop_front() {
+        let sid = self
+          .endpoint
+          .start_join_push_pull(qs.seed, qs.ignore_old, now);
+        if let Some(pj) = self.pending_joins.get_mut(&qs.join) {
+          pj.started.insert(sid);
+          pj.unstarted = pj.unstarted.saturating_sub(1);
+        }
       }
     }
 
@@ -759,6 +1137,23 @@ where
 
     // 7e. Egress: drain outbound gossip transmits, encode + encrypt, and send.
     self.drain_gossip_transmits(gossip);
+
+    // 7f. Resolve any await-result join whose exchanges all terminated. The normal
+    // (some seed contacted / failed) path resolves as each `ExchangeCompleted`
+    // folds in `poll_event`; this sweep catches the joins that never accumulate a
+    // pending exchange at all — an empty/all-non-routable seed set, or seeds that
+    // retired before a `Connect` — now that this tick's `Connect`s have been
+    // captured (phase 7a).
+    {
+      let Self {
+        endpoint,
+        pending_joins,
+        ..
+      } = self;
+      for pj in pending_joins.values_mut() {
+        try_resolve_join(endpoint, pj);
+      }
+    }
 
     // 8. Next deadline = min(machine, closing).
     let machine = self.endpoint.poll_timeout();
@@ -954,6 +1349,19 @@ where
         StreamAction::Connect(info) => {
           let eid = info.id();
           let peer = info.peer();
+          // Bind this exchange to its await-result join, if any: the `Connect`'s
+          // `stream_id()` is the START `StreamId` a join's `start_join_push_pull`
+          // returned (phase 5). Matching it here records the machine-allocated
+          // `ExchangeId` into that join's pending set, so the terminal
+          // `ExchangeCompleted` (which reports by `eid`) folds back to the right
+          // waiter — never by the ambiguous peer address.
+          let sid = info.stream_id();
+          for pj in self.pending_joins.values_mut() {
+            if pj.started.contains(&sid) {
+              pj.pending.insert(eid);
+              break;
+            }
+          }
           // Only a reset, reuse-ready slot may back a fresh dial; a freed-but-
           // still-resetting slot defers to `PendingDial` until its worker resets.
           match self.plane.pool.take_where(|&c| stream.reuse_ready(c)) {
@@ -1282,9 +1690,9 @@ where
   /// label frame and, under an encryption backend, the AEAD wrapper. Encoding
   /// errors and a full tx ring both silently drop the datagram; gossip is
   /// best-effort and SWIM recovers on the next round.
-  fn drain_gossip_transmits<G>(&mut self, gossip: &mut G)
+  fn drain_gossip_transmits<GI>(&mut self, gossip: &mut GI)
   where
-    G: GossipIo,
+    GI: GossipIo,
   {
     let enc = EncodeOptions::new(self.label.clone());
     while let Some(transmit) = self.endpoint.poll_memberlist_transmit() {
