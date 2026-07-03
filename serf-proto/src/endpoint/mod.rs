@@ -1077,9 +1077,9 @@ where
     self.fire_due_query_closes(now);
 
     // Prune expired received-query tokens.  Entries for which respond() succeeded
-    // are removed there; this loop catches those whose deadline elapsed without a
+    // are removed there; this catches those whose deadline elapsed without a
     // respond() call (driver missed the response window).
-    self.received_queries.retain(|_, rq| now < rq.deadline);
+    self.prune_expired_received_queries(now);
 
     // Leave-complete: Leaving → Left after inner LeftCluster + leave_propagate_delay.
     if let Some(dl) = self.leave_complete_deadline {
@@ -1100,6 +1100,18 @@ where
         self.leave_broadcast_deadline = None;
       }
     }
+  }
+
+  /// Drop received-query tokens whose response deadline has elapsed.
+  ///
+  /// A past-deadline entry is unanswerable — `respond` / `respond_key` reject it
+  /// via the G7 deadline guard — so evicting it loses nothing while freeing an
+  /// inbound-cap slot.  Single-sources the liveness predicate shared by the
+  /// periodic reclaim in `after_inner_timeout` and the inline reclaim in
+  /// `handle_query` (which runs before the inbound overflow cap so the cap counts
+  /// only live entries).
+  fn prune_expired_received_queries(&mut self, now: Instant) {
+    self.received_queries.retain(|_, rq| now < rq.deadline);
   }
 
   // ── inner-event sieve ─────────────────────────────────────────────────────
@@ -2974,20 +2986,29 @@ where
       }
     }
 
-    // Hard-cap (INBOUND only): when `received_queries` is already at
-    // MAX_RECEIVED_QUERIES, drop the inbound query BEFORE any state mutation —
-    // no clock witness, no dedup write, no ACK, no event emission, no
-    // rebroadcast.  Every already-inserted entry was surfaced to the driver
-    // (Event::Query or Event::KeyRequest) and its token must remain answerable
-    // via respond / respond_key until the deadline or until the driver responds.
-    // The deadline-pruning in handle_timeout regularly reclaims expired entries;
-    // the cap is only hit under peer flood.
+    // Hard-cap (INBOUND only): when `received_queries` holds MAX_RECEIVED_QUERIES
+    // LIVE tokens, drop the inbound query BEFORE any state mutation — no clock
+    // witness, no dedup write, no ACK, no event emission, no rebroadcast.  Every
+    // live entry was surfaced to the driver (Event::Query or Event::KeyRequest)
+    // and its token must remain answerable via respond / respond_key until its
+    // deadline or until the driver responds.
+    //
+    // Prune expired tokens inline first, using the ingress `now` (drain_now), so
+    // the cap counts only LIVE entries.  Ingress precedes the periodic
+    // deadline-prune in after_inner_timeout within a tick, so without this a
+    // flood of stale past-deadline tokens — already unanswerable — could pin the
+    // cap and drop a new live query.  Evicting a past-deadline token here is
+    // safe: respond / respond_key would reject it via the G7 deadline guard.
     //
     // Local queries (QueryOrigin::Local) bypass this cap: the initiating node
     // MUST always self-process its own query regardless of inbound saturation.
     // Local query volume is app-controlled and not an adversarial flood vector.
-    if origin == QueryOrigin::Inbound && self.received_queries.len() >= MAX_RECEIVED_QUERIES {
-      return false;
+    if origin == QueryOrigin::Inbound {
+      let now = self.drain_now;
+      self.prune_expired_received_queries(now);
+      if self.received_queries.len() >= MAX_RECEIVED_QUERIES {
+        return false;
+      }
     }
 
     // Witness a potentially newer query clock.
@@ -4282,6 +4303,17 @@ where
     A: Clone + Data,
   {
     self.handle_query(t, msg, QueryOrigin::Inbound)
+  }
+
+  /// Overwrite `drain_now` (test adapter).
+  ///
+  /// Production ingress entry points latch `drain_now`; tests that drive a
+  /// handler directly (e.g. `test_handle_query`) use this to advance the
+  /// endpoint's current-time reference between calls without going through
+  /// `handle_timeout`.
+  #[cfg(test)]
+  pub(crate) fn test_set_drain_now(&mut self, now: Instant) {
+    self.drain_now = now;
   }
 
   /// Return the `QueryId` of the last pending query entry (test adapter).
