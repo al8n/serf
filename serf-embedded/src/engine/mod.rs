@@ -420,14 +420,21 @@ where
   /// (the driver must apply the op and `respond_key`), and an
   /// [`Event::DialRequested`] (the driver must dial and report back).
   ///
-  /// UNLIKE `buffered_events` this queue is never dropped-on-overflow: evicting a
-  /// mandatory event would leave a conflict loser running or a key op timing out.
-  /// [`poll_event`](Self::poll_event) drains it FIRST, so a burst of observations can
-  /// neither evict nor postpone a mandatory action. It cannot itself flood — these
-  /// events are non-bursty (`Shutdown` is terminal; a `KeyRequest` / `DialRequested`
-  /// is rare and MTU-bounded per pump) and a driver acting on them drains
-  /// `poll_event` every pump, so it is emptied each tick rather than accumulating
-  /// like a Member observation flood.
+  /// UNLIKE `buffered_events` this queue is never dropped WHILE LIVE: evicting a
+  /// live mandatory event would leave a conflict loser running or an answerable key
+  /// op unhandled. [`poll_event`](Self::poll_event) drains it FIRST, so a burst of
+  /// observations can neither evict nor postpone a mandatory action.
+  ///
+  /// It is still bounded, by LIVENESS rather than drop-oldest. An encrypted peer can
+  /// flood distinct inbound [`Event::KeyRequest`]s (each pinning raw key material),
+  /// so every pump prunes the ones past their response deadline — dead and
+  /// unanswerable, losing nothing real — via
+  /// [`prune_expired_control_events`](Self::prune_expired_control_events). That
+  /// mirrors the `now < deadline` retain the serf endpoint applies to its own
+  /// `received_queries`, and because the endpoint caps the live key queries it emits
+  /// at a fixed inbound maximum, the live `KeyRequest`s held here are transitively
+  /// bounded by that same cap. `Shutdown` is idempotent-terminal (deduped to one);
+  /// `DialRequested` carries no deadline and does not flood.
   control_events: VecDeque<Event<I, SocketAddr>>,
   /// Machine events the pump (and [`leave`](Self::leave)) drained and folded into
   /// the pending joins, held so [`poll_event`](Self::poll_event) hands them to the
@@ -905,10 +912,13 @@ where
   /// and each shed increments this counter (mirroring the serf std drivers'
   /// `events_dropped`). MANDATORY driver-actioned events ([`Event::Shutdown`],
   /// [`Event::KeyRequest`], [`Event::DialRequested`]) take the non-lossy control
-  /// path and are NEVER shed, so they are never counted here. Join resolution is
-  /// unaffected — completions are folded before buffering — so a nonzero count means
-  /// only that some observations were not delivered, never that a join was
-  /// mis-resolved or a mandatory action was lost.
+  /// path and are never shed WHILE LIVE, so they are never counted here — a
+  /// past-deadline `KeyRequest` pruned by
+  /// [`prune_expired_control_events`](Self::prune_expired_control_events) is dead, not
+  /// a dropped live event, and is likewise uncounted. Join resolution is unaffected —
+  /// completions are folded before buffering — so a nonzero count means only that
+  /// some observations were not delivered, never that a join was mis-resolved or a
+  /// mandatory action was lost.
   #[inline]
   pub fn events_dropped(&self) -> u64 {
     self.events_dropped
@@ -972,15 +982,16 @@ where
   ///
   /// Mandatory events ([`is_mandatory_event`]) carry a side effect the driver MUST
   /// perform — stop on `Shutdown`, apply + `respond_key` a `KeyRequest`, dial a
-  /// `DialRequested` — so they are NEVER dropped (dropping one is the bug this split
-  /// fixes: a burst over the observation cap could otherwise evict a `Shutdown`
-  /// before any driver acted on it). This queue carries no drop-bound because it
-  /// cannot flood: the events are non-bursty (`Shutdown` is terminal;
-  /// `KeyRequest` / `DialRequested` is rare and MTU-bounded per pump) and a driver
-  /// acting on them drains [`poll_event`](Self::poll_event) every pump, so it is
-  /// emptied each tick — unlike the observation backlog a pump-then-`poll_join`
-  /// driver legitimately never drains. `Shutdown` is idempotent-terminal, so at most
-  /// one is ever queued.
+  /// `DialRequested` — so a LIVE one is NEVER dropped (dropping one is the bug the
+  /// control/observation split fixes: a burst over the observation cap could
+  /// otherwise evict a `Shutdown` before any driver acted on it).
+  ///
+  /// The queue is NOT drop-oldest, but it is still bounded — by LIVENESS, not
+  /// cardinality. An encrypted peer can flood distinct inbound `KeyRequest`s
+  /// (each pinning raw key material), so
+  /// [`prune_expired_control_events`](Self::prune_expired_control_events) sheds every
+  /// past-deadline (dead, unanswerable) `KeyRequest` on each pump; this method only
+  /// appends. `Shutdown` is idempotent-terminal, so at most one is ever queued.
   fn push_control_event(&mut self, ev: Event<I, SocketAddr>) {
     if matches!(ev, Event::Shutdown)
       && self
@@ -991,6 +1002,30 @@ where
       return;
     }
     self.control_events.push_back(ev);
+  }
+
+  /// Shed every past-deadline `KeyRequest` from the non-lossy `control_events`
+  /// queue, mirroring the endpoint's own `received_queries` liveness prune.
+  ///
+  /// A `KeyRequest` past its response `deadline` is dead: the endpoint rejects a
+  /// `respond_key` sent after the deadline, so the driver can no longer act on it.
+  /// Dropping it here loses nothing real, promptly releases the raw key material
+  /// pinned in its payload, and bounds `control_events` to the LIVE mandatory set —
+  /// the same `now < deadline` retain the serf endpoint applies to its
+  /// `received_queries` on every `handle_timeout`. Because the endpoint caps its
+  /// LIVE `received_queries` at a fixed inbound maximum and emits exactly one
+  /// `Event::KeyRequest` per kept entry (sharing this deadline), the live
+  /// `KeyRequest`s retained here are transitively bounded by that same cap — no
+  /// separate engine-side count cap is needed. `Shutdown` / `DialRequested` carry no
+  /// deadline and are always kept; a repeated `Shutdown` stays deduped by
+  /// [`push_control_event`](Self::push_control_event).
+  #[cfg(encryption)]
+  fn prune_expired_control_events(&mut self, now: Instant) {
+    // Keep everything that is NOT a past-deadline KeyRequest — mirroring the
+    // endpoint's `retain(|_, rq| now < rq.deadline)` over received_queries.
+    self
+      .control_events
+      .retain(|ev| !matches!(ev, Event::KeyRequest(kr) if now >= kr.deadline()));
   }
 
   /// Fold one drained machine event into its await-result join, then route it to the
@@ -1209,6 +1244,12 @@ where
     // `poll_event` (already folded, delivered in order), preserving delivery.
     // Mirrors serf-reactor's shutdown/leave, which drains-and-folds before it reaps.
     self.drain_fold_events();
+
+    // Shed any now past-deadline KeyRequests the drain just routed, on the same
+    // liveness rule the pump applies, so a leave without a following pump still bounds
+    // the control queue.
+    #[cfg(encryption)]
+    self.prune_expired_control_events(now);
 
     // Accepted: no seed dispatches once leaving, so drop the queue and mark every
     // still-pending join fully dispatched, then deliver each still-pending caller
@@ -1491,6 +1532,12 @@ where
     // app ever drains `poll_event`, matching serf-reactor (which folds in its poll
     // loop before the observation hand-off).
     self.drain_fold_events();
+
+    // 7f'. Shed past-deadline (dead, unanswerable) KeyRequests from the non-lossy
+    // control queue so an encrypted peer flooding distinct key queries cannot grow it
+    // without bound or pin their key material — bounding it to the live mandatory set.
+    #[cfg(encryption)]
+    self.prune_expired_control_events(now);
 
     // 7g. Resolve await-result joins whose exchanges all terminated, then reap only
     // those whose result the caller has already retrieved. [`try_resolve_join`]

@@ -1701,3 +1701,155 @@ fn control_queue_dedupes_shutdown_and_leads_observations() {
     "both queues are drained after delivering the control event and observations"
   );
 }
+
+// ── mandatory control queue bounded by KeyRequest liveness (encrypted flood) ──
+
+/// Build an `Event::KeyRequest` with a distinct `id` and an explicit response
+/// `deadline`, carrying real key material so a prune demonstrably releases it. This
+/// mirrors the endpoint's own emission — one `Event::KeyRequest` whose `deadline`
+/// equals its registered `received_queries` entry — via the serf-proto
+/// `test-support` constructor (the wire fields are `pub(crate)`, so a downstream
+/// test cannot build one directly).
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn key_request(id: u32, deadline: Instant) -> Event<SmolStr, SocketAddr> {
+  let from = memberlist_proto::Node::new(SmolStr::new("flooder"), node_addr(6000));
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([0x11u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([0x11u8; 32]);
+  Event::KeyRequest(KeyRequest::test_with_deadline(
+    id,
+    from,
+    Some(key),
+    deadline,
+  ))
+}
+
+/// An encrypted peer flooding distinct `KeyRequest`s across successive deadline
+/// windows cannot grow the non-lossy control queue without bound, even when the
+/// driver pumps and resolves joins but NEVER drains `poll_event`. Each window's
+/// batch is routed to `control_events`, then `now` advances past its deadline and a
+/// `pump` prunes it (dead + unanswerable) — so the queue holds at most one live
+/// window's worth, never `windows * batch`.
+///
+/// This is the fail-on-revert regression: without the pump's deadline-prune the
+/// queue accumulates every window's batch, so the `<= BATCH` bound fails on the
+/// second window (and the heap grows without limit under a sustained flood).
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_request_flood_across_deadline_windows_is_bounded_without_poll_event() {
+  let mut engine = make_engine();
+  let base = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(base);
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(2);
+  // Settle the construction self-join; its events are passive (buffered_events),
+  // never mandatory, so they cannot enter control_events.
+  engine.pump(base, &mut gossip, &mut stream);
+
+  const BATCH: usize = 64;
+  const WINDOWS: usize = 8;
+  const WINDOW: Duration = Duration::from_secs(10);
+
+  let mut id = 0u32;
+  let mut now = base;
+  let mut peak = 0usize;
+  for w in 0..WINDOWS {
+    // This window's KeyRequests are live until `now + WINDOW`.
+    let deadline = now + WINDOW;
+    for _ in 0..BATCH {
+      engine.route_drained_event(key_request(id, deadline));
+      id += 1;
+    }
+    peak = peak.max(engine.control_events.len());
+
+    // Advance PAST this window's deadline and pump — WITHOUT draining poll_event —
+    // so the pump's prune sheds this now-dead batch.
+    now = deadline + Duration::from_secs(1);
+    engine.pump(now, &mut gossip, &mut stream);
+
+    assert!(
+      engine.control_events.len() <= BATCH,
+      "control queue must stay bounded to one live window, got {} at window {w}",
+      engine.control_events.len()
+    );
+  }
+
+  // The queue never accumulated across windows: its peak is one batch, not
+  // WINDOWS * BATCH, and every window's expired batch is gone.
+  assert!(
+    peak <= BATCH,
+    "control queue peaked at {peak}, exceeding a single {BATCH}-request window"
+  );
+  assert!(
+    engine.control_events.is_empty(),
+    "after every window's deadline passed, no KeyRequest remains queued"
+  );
+}
+
+/// A LIVE (future-deadline) `KeyRequest` is never pruned: a pump at a `now` before
+/// its deadline retains it, and `poll_event` still delivers it (mandatory events
+/// lead the observation stream). Guards the prune boundary — `now < deadline` keeps
+/// it — so the liveness bound never sheds an answerable request.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn live_key_request_is_never_pruned_and_is_delivered() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(2);
+
+  // Deadline well in the future; the pump runs at `now` (still in-window).
+  engine.route_drained_event(key_request(7, now + Duration::from_secs(30)));
+  engine.pump(now, &mut gossip, &mut stream);
+
+  assert!(
+    matches!(engine.poll_event(), Some(Event::KeyRequest(_))),
+    "a live (in-deadline) KeyRequest must survive the pump and be delivered by poll_event"
+  );
+}
+
+/// A past-deadline `KeyRequest` is pruned by the pump — releasing the raw key
+/// material pinned in its payload — and is never surfaced to the driver. Reverting
+/// the prune leaves it queued (payload retained), failing the assertions below.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn past_deadline_key_request_is_pruned_and_payload_released() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(2);
+
+  let deadline = now + Duration::from_secs(5);
+  engine.route_drained_event(key_request(9, deadline));
+  assert_eq!(
+    engine.control_events.len(),
+    1,
+    "the KeyRequest (holding its key payload) is queued on the control path"
+  );
+
+  // Advance PAST its deadline and pump: the prune drops the dead request, dropping
+  // the queue's sole reference to its key material.
+  let later = deadline + Duration::from_secs(1);
+  engine.pump(later, &mut gossip, &mut stream);
+
+  assert!(
+    !engine
+      .control_events
+      .iter()
+      .any(|ev| matches!(ev, Event::KeyRequest(_))),
+    "a past-deadline KeyRequest must be pruned from the control queue (its payload released)"
+  );
+  // It is dropped, not deferred: poll_event never surfaces the pruned request.
+  while let Some(ev) = engine.poll_event() {
+    assert!(
+      !matches!(ev, Event::KeyRequest(_)),
+      "a pruned past-deadline KeyRequest must never surface via poll_event"
+    );
+  }
+}
