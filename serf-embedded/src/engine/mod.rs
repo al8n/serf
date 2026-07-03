@@ -400,10 +400,12 @@ where
   /// set from the terminal `ExchangeCompleted` of the push/pulls it dispatched;
   /// [`poll_join`](Self::poll_join) drains a resolved one.
   pending_joins: HashMap<JoinId, PendingJoin>,
-  /// Machine events [`leave`](Self::leave) drained (and folded into the pending
-  /// joins) BEFORE resolving its abandonment, held so [`poll_event`](Self::poll_event)
-  /// still hands them to the driver in order — already folded, never re-folded.
-  /// Empty outside a `leave` that raced queued completions.
+  /// Machine events the pump (and [`leave`](Self::leave)) drained and folded into
+  /// the pending joins, held so [`poll_event`](Self::poll_event) hands them to the
+  /// driver in order — already folded, never re-folded. Every `pump` drains the
+  /// machine's event queue to here, folding each `ExchangeCompleted` into its join
+  /// BEFORE buffering the event, so join accounting is pump-driven and never waits
+  /// on the app draining events; `poll_event` is a pure drain of this queue.
   buffered_events: VecDeque<Event<I, SocketAddr>>,
   /// Monotonic allocator for [`JoinId`]s, so two concurrent joins never collide.
   next_join_id: u64,
@@ -801,33 +803,24 @@ where
     self.endpoint.members_snapshot()
   }
 
-  /// Drain one application-visible serf event, if any.
+  /// Drain one application-visible serf event buffered by the last `pump`, if any.
   ///
-  /// Returns events emitted by the machine during the last `pump` tick — the full
-  /// serf surface: membership changes, user events, queries, query responses /
-  /// acks, key-management requests / responses, reliable-exchange completions,
-  /// and the lifecycle signals (`LeftCluster`, conflict `Shutdown`). Returns
-  /// `None` when the event queue is empty; call again after the next `pump` tick.
+  /// Each [`pump`](Self::pump) drains the machine's event queue to quiescence,
+  /// folding every push/pull `ExchangeCompleted` into its await-result join and
+  /// buffering every event — the full serf surface: membership changes, user
+  /// events, queries, query responses / acks, key-management requests / responses,
+  /// reliable-exchange completions, and the lifecycle signals (`LeftCluster`,
+  /// conflict `Shutdown`). This call hands those buffered events to the driver in
+  /// order, exactly once; it does NOT re-fold (the pump already folded). Returns
+  /// `None` when the buffer is empty; call again after the next `pump` tick.
   ///
-  /// A driver awaiting a [`join`](Self::join) result MUST drain events here before
-  /// checking [`poll_join`](Self::poll_join): a push/pull `ExchangeCompleted` is
-  /// folded into its await-result join AS IT surfaces here (the reached-set
-  /// accumulation), and `poll_join` resolves off that folded state.
-  ///
-  /// Events a [`leave`](Self::leave) drained early — to fold already-queued
-  /// completions before resolving its abandonment — are delivered here first, in
-  /// order and already folded, ahead of any newer machine event.
+  /// Join resolution and ignore cleanup are driven by the pump on the exchange
+  /// terminal, so a driver need NOT drain events here before
+  /// [`poll_join`](Self::poll_join) — `poll_join` resolves off the pump-folded
+  /// state. The contract is the reactor-faithful "pump, then poll_join / poll_event".
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
-    // A `leave` that raced queued completions has already drained + folded them
-    // into the pending joins; hand those buffered events to the driver first
-    // (NEVER re-folding), ahead of any newer machine event.
-    if let Some(ev) = self.buffered_events.pop_front() {
-      return Some(ev);
-    }
-    let ev = self.endpoint.poll_event()?;
-    self.fold_join_completion(&ev);
-    Some(ev)
+    self.buffered_events.pop_front()
   }
 
   /// Fold one machine event into the await-result join it terminates, if any.
@@ -836,9 +829,9 @@ where
   /// `Connect` (via the START `StreamId`) is removed from that join's `pending`
   /// and — on `Succeeded` — accumulates the peer into `contacted`; then
   /// [`try_resolve_join`] resolves the join (clearing any ignore streams) the
-  /// instant `pending` empties. A no-op for every other event. Shared by
-  /// [`poll_event`](Self::poll_event) and [`leave`](Self::leave)'s
-  /// pre-resolution drain so both fold identically.
+  /// instant `pending` empties. A no-op for every other event. Called by
+  /// [`drain_fold_events`](Self::drain_fold_events) for every drained event, so the
+  /// pump and [`leave`](Self::leave) fold identically.
   fn fold_join_completion(&mut self, ev: &Event<I, SocketAddr>) {
     let Event::ExchangeCompleted(ec) = ev else {
       return;
@@ -860,6 +853,24 @@ where
         pj.contacted.push(*ec.peer());
       }
       try_resolve_join(endpoint, pj);
+    }
+  }
+
+  /// Drain the machine's event queue to quiescence, folding each event into its
+  /// await-result join ([`fold_join_completion`](Self::fold_join_completion)) and
+  /// buffering it for [`poll_event`](Self::poll_event) delivery.
+  ///
+  /// The SOLE drain of the endpoint's event queue. The pump calls it every tick, so
+  /// join accounting is pump-driven and never gated on the app polling events; and
+  /// [`leave`](Self::leave) calls it before resolving its abandonment, so an
+  /// already-succeeded push/pull lands in the reached set. Because it empties the
+  /// endpoint queue, a later call folds only the events enqueued since — never
+  /// re-folding one already buffered — and `buffered_events` preserves the app's
+  /// event stream in arrival order.
+  fn drain_fold_events(&mut self) {
+    while let Some(ev) = self.endpoint.poll_event() {
+      self.fold_join_completion(&ev);
+      self.buffered_events.push_back(ev);
     }
   }
 
@@ -936,7 +947,8 @@ where
   /// Returns `Some(Ok(reached))` with the address set the join contacted, or
   /// `Some(Err(JoinFailed))` if every dispatched push/pull terminated without
   /// contacting a seed. `None` means the join has not yet resolved — poll again
-  /// after the next `pump` + [`poll_event`](Self::poll_event) drain. The outcome
+  /// after the next `pump` (which folds the terminal `ExchangeCompleted` into the
+  /// join; no [`poll_event`](Self::poll_event) drain is required first). The outcome
   /// is delivered EXACTLY ONCE: a second poll of the same handle yields `None`.
   /// This call is the DELIVERY that lets the entry be reaped: once the caller has
   /// retrieved the result AND every dispatched exchange has terminated the entry is
@@ -971,9 +983,12 @@ where
   /// exchange ever started, the entry is reaped immediately. If a push/pull is
   /// still in flight the reply is forgotten but that exchange's ignore token is
   /// RETAINED until its terminal (a late merge still suppresses the seed's pre-join
-  /// user events), then the pump reaps the entry — so only actually-started
-  /// exchanges keep an ignore token, and neither the join table nor the machine's
-  /// ignore set leaks. An unknown or already-consumed handle is a no-op.
+  /// user events), then the pump — which folds the terminal `ExchangeCompleted` —
+  /// reaps the entry and clears the token. So only actually-started exchanges keep
+  /// an ignore token, and neither the join table nor the machine's ignore set leaks.
+  /// Like [`poll_join`](Self::poll_join) this reflects the pump-folded state (the
+  /// reactor-faithful "pump, then cancel_join" contract) and does not itself drain
+  /// the machine. An unknown or already-consumed handle is a no-op.
   pub fn cancel_join(&mut self, handle: JoinId) {
     let Self {
       endpoint,
@@ -1015,11 +1030,12 @@ where
   /// [`Event::LeftCluster`] via [`poll_event`](Self::poll_event) — the pump
   /// initiates no further push/pull, so any queued seeds are dropped and every
   /// in-flight await-result join is handed its caller reply once from its reached
-  /// set. Any push/pull `ExchangeCompleted` ALREADY QUEUED in the endpoint (a
-  /// success the driver has not yet drained via `poll_event`) is folded into that
-  /// reached set FIRST, so a race between a successful join and `leave` resolves
-  /// `Ok(reached)` rather than a stale `JoinFailed`; the drained events are
-  /// buffered and still delivered, in order, by the next `poll_event`. The
+  /// set. Any push/pull `ExchangeCompleted` still queued in the endpoint that the
+  /// pump has not already folded — a `leave` without a fresh `pump`, or a completion
+  /// `endpoint.leave()` itself enqueues — is folded into that reached set FIRST (via
+  /// [`drain_fold_events`](Self::drain_fold_events)), so a successful join resolves
+  /// `Ok(reached)` rather than a stale `JoinFailed`; the drained events are buffered
+  /// and still delivered, in order, by the next `poll_event`. The
   /// `ignore_old` cleanup is deliberately NOT run here: it stays gated on the
   /// exchange terminal ([`try_resolve_join`], driven by the pump fold), so a late
   /// successful push/pull that merges after leave still finds its ignore token in
@@ -1030,17 +1046,15 @@ where
     // the join state must stay untouched too.
     self.endpoint.leave(now)?;
 
-    // Fold every ALREADY-QUEUED machine completion into its await-result join
-    // BEFORE computing any abandonment outcome, so a push/pull that already
-    // succeeded — its `ExchangeCompleted` queued but not yet drained by the driver
-    // — lands in the reached set rather than being frozen out as a stale
-    // `JoinFailed`. The drained events are buffered for `poll_event` (already
-    // folded, delivered in order), preserving delivery. Mirrors serf-reactor's
-    // shutdown/leave, which drains-and-folds before it reaps.
-    while let Some(ev) = self.endpoint.poll_event() {
-      self.fold_join_completion(&ev);
-      self.buffered_events.push_back(ev);
-    }
+    // Fold every still-queued machine completion into its await-result join BEFORE
+    // computing any abandonment outcome, so a push/pull that already succeeded — its
+    // `ExchangeCompleted` not yet folded by a pump — lands in the reached set rather
+    // than being frozen out as a stale `JoinFailed`. The pump normally folds these
+    // each tick; this covers a `leave` without a fresh `pump` and any completion
+    // `endpoint.leave()` just enqueued. The drained events are buffered for
+    // `poll_event` (already folded, delivered in order), preserving delivery.
+    // Mirrors serf-reactor's shutdown/leave, which drains-and-folds before it reaps.
+    self.drain_fold_events();
 
     // Accepted: no seed dispatches once leaving, so drop the queue and mark every
     // still-pending join fully dispatched, then deliver each still-pending caller
@@ -1206,6 +1220,9 @@ where
   /// 7a–7e. Drain `poll_action`, promote, pump outbound, flush deferred FINs,
   ///     complete `Closing` drains, re-rebalance, then drain + send outbound
   ///     gossip.
+  /// 7f. Drain + fold machine events: fold every push/pull `ExchangeCompleted`
+  ///     into its await-result join and buffer every event for `poll_event`.
+  /// 7g. Resolve + reap await-result joins on the exchange terminal.
   /// 8. Deadline: `min(machine_next, closing_next)`.
   pub fn pump<GI, S>(&mut self, now: Instant, gossip: &mut GI, stream: &mut S) -> Option<Instant>
   where
@@ -1311,15 +1328,25 @@ where
     // 7e. Egress: drain outbound gossip transmits, encode + encrypt, and send.
     self.drain_gossip_transmits(gossip);
 
-    // 7f. Resolve await-result joins whose exchanges all terminated, then reap only
+    // 7f. Drain the machine's event queue to quiescence, folding every push/pull
+    // `ExchangeCompleted` into its await-result join (reducing `pending`,
+    // accumulating the reached peer on `Succeeded`) and buffering every drained
+    // event for later `poll_event` delivery. Folding HERE — in the pump, after this
+    // tick's `Connect`s bound their exchanges (phase 7a) — is what makes join
+    // resolution and ignore cleanup terminal-gated and INDEPENDENT of whether the
+    // app ever drains `poll_event`, matching serf-reactor (which folds in its poll
+    // loop before the observation hand-off).
+    self.drain_fold_events();
+
+    // 7g. Resolve await-result joins whose exchanges all terminated, then reap only
     // those whose result the caller has already retrieved. [`try_resolve_join`]
     // clears the machine's ignore set and resolves the caller reply on the exchange
     // terminal — INDEPENDENT of caller polling, so the machine never leaks — which
     // also catches the joins that never accumulate a pending exchange at all (an
     // empty/all-non-routable seed set, or seeds that retired before a `Connect`) now
-    // that this tick's `Connect`s have been captured (phase 7a). The entry itself is
-    // reaped ONLY once its reply is `Delivered` (the caller polled it, or
-    // `cancel_join` forgot it) AND every exchange has terminated, so a
+    // that this tick's `Connect`s have been captured (phase 7a) and folded (phase
+    // 7f). The entry itself is reaped ONLY once its reply is `Delivered` (the caller
+    // polled it, or `cancel_join` forgot it) AND every exchange has terminated, so a
     // resolved-but-unpolled result is retained until the caller retrieves it rather
     // than dropped out from under a slow/async waiter. A dropped-without-cancel
     // handle then lingers as the small result entry alone — its ignore set already
