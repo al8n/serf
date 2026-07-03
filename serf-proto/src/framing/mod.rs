@@ -15,6 +15,8 @@
 //! the memberlist-proto `merge(WireType::LengthDelimited, TAG)` scheme);
 //! serf-proto forms new-wire-only clusters.
 
+use std::vec::Vec;
+
 use bytes::Bytes;
 
 // ── MessageType ──────────────────────────────────────────────────────────────

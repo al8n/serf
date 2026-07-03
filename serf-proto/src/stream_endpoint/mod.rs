@@ -24,7 +24,7 @@
 //! the core's drain over `poll_inner_event`, and never reaches into the stream
 //! lifecycle itself.
 
-use std::sync::Arc;
+use std::{sync::Arc, vec::Vec};
 
 use bytes::Bytes;
 use memberlist_proto::{
@@ -681,7 +681,7 @@ where
   pub(crate) fn test_seed_member(&mut self, id: I, status: MemberStatus, status_time: LamportTime)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_seed_member(id, status, status_time)
   }
@@ -696,7 +696,7 @@ where
     status_time: LamportTime,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self
       .core
@@ -712,7 +712,7 @@ where
     now: Instant,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self
       .core
@@ -728,7 +728,7 @@ where
     now: Instant,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self
       .core
@@ -760,7 +760,7 @@ where
   pub(crate) fn test_inner_node_joined(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_inner_node_joined(id, now)
   }
@@ -770,7 +770,7 @@ where
   pub(crate) fn test_inner_node_left(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_inner_node_left(id, now)
   }
@@ -780,7 +780,7 @@ where
   pub(crate) fn test_inner_node_updated(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_inner_node_updated(id, now)
   }
@@ -894,7 +894,7 @@ where
   pub(crate) fn test_seed_left_member(&mut self, id: I, status_time: LamportTime)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_seed_left_member(id, status_time)
   }
@@ -1218,7 +1218,7 @@ where
   pub(crate) fn test_inject_inner_joined(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     self.core.test_inject_inner_joined(id, now)
   }
@@ -1261,7 +1261,7 @@ where
   pub(crate) fn test_ping_completed(
     &mut self,
     node_id: I,
-    rtt: std::time::Duration,
+    rtt: core::time::Duration,
     payload: Bytes,
   ) {
     self

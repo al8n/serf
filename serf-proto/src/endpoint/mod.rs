@@ -56,7 +56,7 @@
 //! Sans-I/O contract.  Per-source rate-limiting of a flooding peer is likewise
 //! driver-side responsibility.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, vec::Vec};
 
 use bytes::Bytes;
 use memberlist_proto::{
@@ -229,7 +229,7 @@ const MAX_RECEIVED_QUERIES: usize = 2048;
 /// the response deadline, preventing a flooder from pinning `received_queries`
 /// entries open for an arbitrarily long time.  The bound mirrors the originator's
 /// own default-timeout heuristic ceiling (several minutes at cluster scale).
-const MAX_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_QUERY_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(600);
 
 /// Distinguishes the two call sites of `handle_query`.
 ///
@@ -383,7 +383,7 @@ pub struct QueryParams<I> {
   ///
   /// A value of `Duration::ZERO` causes the machine to substitute
   /// `gossip_interval * query_timeout_mult * log10(n_members + 1)`.
-  pub timeout: std::time::Duration,
+  pub timeout: core::time::Duration,
 }
 
 // ── PendingQuery ──────────────────────────────────────────────────────────────
@@ -415,11 +415,11 @@ pub(crate) struct KeyResponseTally<I> {
   /// Number of nodes that responded with `result = false`.
   pub(crate) num_err: usize,
   /// Key → count of nodes reporting that key.
-  pub(crate) keys: std::collections::HashMap<memberlist_proto::SecretKey, usize>,
+  pub(crate) keys: crate::FxHashMap<memberlist_proto::SecretKey, usize>,
   /// Primary key → count of nodes reporting it as primary.
-  pub(crate) primary_keys: std::collections::HashMap<memberlist_proto::SecretKey, usize>,
+  pub(crate) primary_keys: crate::FxHashMap<memberlist_proto::SecretKey, usize>,
   /// Per-node error message for nodes that reported result=false.
-  pub(crate) messages: std::collections::HashMap<I, smol_str::SmolStr>,
+  pub(crate) messages: crate::FxHashMap<I, smol_str::SmolStr>,
 }
 
 /// Bookkeeping for an in-flight query this node originated.
@@ -437,13 +437,13 @@ pub(crate) struct PendingQuery<I> {
   /// Tracks which responders have already replied (dedup by id).
   ///
   /// The value is `()` — membership is the only information we need.
-  pub(crate) responses: std::collections::HashMap<I, ()>,
+  pub(crate) responses: crate::FxHashMap<I, ()>,
   /// Tracks which peers have already acknowledged (dedup by id).
   ///
   /// Kept separate from `responses` because a single peer may send both an ack
   /// (on receipt) and a later response; deduping them in the same set would
   /// drop the response after the ack.  Non-empty only for `request_ack` queries.
-  pub(crate) acks: std::collections::HashMap<I, ()>,
+  pub(crate) acks: crate::FxHashMap<I, ()>,
   /// The composite `(ltime, id)` key of the query.
   pub(crate) query_id: QueryId,
   /// Whether the originating `query()` requested acks from responders.
@@ -725,7 +725,7 @@ where
   /// a query passes filters and is emitted as `Event::Query`.  `respond()` looks
   /// up the entry to enforce the three guards (size, once-only, deadline) and
   /// to obtain the originator address for the directed send.
-  received_queries: std::collections::HashMap<QueryId, ReceivedQuery<A>>,
+  received_queries: crate::FxHashMap<QueryId, ReceivedQuery<A>>,
   /// serf-level events queued for the driver to drain via `poll_event`.
   pending_events: VecDeque<Event<I, A>>,
   /// The most recent directed-send (address, bytes) produced by
@@ -754,7 +754,7 @@ where
   /// Updated on every successful `PingCompleted` RTT feed.  Keyed by node id.
   /// Removed when a node is reaped from membership (G13).
   #[cfg(feature = "coordinates")]
-  coord_cache: std::collections::HashMap<I, crate::typed::Coordinate>,
+  coord_cache: crate::FxHashMap<I, crate::typed::Coordinate>,
   /// The `now` instant threaded into the most recent poll/handle call.
   ///
   /// The inner `poll_event` loop (drain_inner) fires synchronously from
@@ -863,7 +863,7 @@ where
       event_buffer: EventBuffer::new(event_buf_size),
       query_buffer: QueryBuffer::new(query_buf_size),
       pending_queries: Vec::new(),
-      received_queries: std::collections::HashMap::new(),
+      received_queries: crate::FxHashMap::default(),
       pending_events: VecDeque::new(),
       drain_now: Instant::ORIGIN,
       // The snapshot starts dirty so the first push-pull always ships a fresh
@@ -873,7 +873,7 @@ where
       #[cfg(feature = "coordinates")]
       coord_client,
       #[cfg(feature = "coordinates")]
-      coord_cache: std::collections::HashMap::new(),
+      coord_cache: crate::FxHashMap::default(),
       #[cfg(test)]
       last_dial_addr: None,
       #[cfg(test)]
@@ -1562,7 +1562,7 @@ where
     // Entries whose ltime is not acceptable are silently excluded — they would
     // write a permanent status_time tombstone that no finite join intent can
     // ever outrank.
-    let status_map: std::collections::HashMap<&I, LamportTime> = pp
+    let status_map: crate::FxHashMap<&I, LamportTime> = pp
       .status_ltimes
       .iter()
       .filter(|(_, lt)| ltime_is_acceptable(lt.0))
@@ -1570,7 +1570,7 @@ where
       .collect();
 
     // Build a fast lookup set for left_members so the join pass can skip them.
-    let left_set: std::collections::HashSet<&I> = pp.left_members.iter().collect();
+    let left_set: crate::FxHashSet<&I> = pp.left_members.iter().collect();
 
     let now = self.drain_now;
 
@@ -2789,8 +2789,8 @@ where
     let timeout = if params.timeout.is_zero() {
       let n = self.members.states.len();
       let mult = self.opts.query_timeout_mult();
-      let log_factor = ((n as f64 + 1.0).log10().ceil() as u32).max(1);
-      std::time::Duration::from_millis(200) * mult as u32 * log_factor
+      let log_factor = (crate::mathf::ceil(crate::mathf::log10(n as f64 + 1.0)) as u32).max(1);
+      core::time::Duration::from_millis(200) * mult as u32 * log_factor
     } else {
       params.timeout
     };
@@ -2837,8 +2837,8 @@ where
     self.pending_queries.push(PendingQuery {
       kind: QueryPurpose::App,
       deadline,
-      responses: std::collections::HashMap::new(),
-      acks: std::collections::HashMap::new(),
+      responses: crate::FxHashMap::default(),
+      acks: crate::FxHashMap::default(),
       query_id,
       request_ack: params.request_ack,
       conflict_matching: 0,
@@ -3771,9 +3771,9 @@ where
   pub(crate) fn test_seed_member(&mut self, id: I, status: MemberStatus, status_time: LamportTime)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let node = memberlist_proto::Node::new(id.clone(), addr);
     let member = Member::new(node, Tags::new(), status);
     self
@@ -3796,9 +3796,9 @@ where
     status_time: LamportTime,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let node = memberlist_proto::Node::new(id.clone(), addr);
     let member = Member::new(node, tags, status);
     self
@@ -3816,9 +3816,9 @@ where
     now: Instant,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let node = memberlist_proto::Node::new(id.clone(), addr);
     let member = Member::new(node, Tags::new(), MemberStatus::Failed);
     self
@@ -3837,9 +3837,9 @@ where
     now: Instant,
   ) where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let node = memberlist_proto::Node::new(id.clone(), addr);
     let member = Member::new(node, Tags::new(), MemberStatus::Left);
     self
@@ -3880,10 +3880,10 @@ where
   pub(crate) fn test_inner_node_joined(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     use std::sync::Arc;
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let ns = Arc::new(memberlist_proto::typed::NodeState::new(
       id,
       addr,
@@ -3898,10 +3898,10 @@ where
   pub(crate) fn test_inner_node_left(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     use std::sync::Arc;
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let ns = Arc::new(memberlist_proto::typed::NodeState::new(
       id,
       addr,
@@ -3916,10 +3916,10 @@ where
   pub(crate) fn test_inner_node_updated(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     use std::sync::Arc;
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let ns = Arc::new(memberlist_proto::typed::NodeState::new(
       id,
       addr,
@@ -4099,9 +4099,9 @@ where
   pub(crate) fn test_seed_left_member(&mut self, id: I, status_time: LamportTime)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let node = memberlist_proto::Node::new(id.clone(), addr);
     let member = Member::new(node, Tags::new(), MemberStatus::Left);
     self.members.states.insert(
@@ -4501,8 +4501,8 @@ where
 
     let n = self.members.states.len();
     let mult = self.opts.query_timeout_mult();
-    let log_factor = ((n as f64 + 1.0).log10().ceil() as u32).max(1);
-    let timeout = std::time::Duration::from_millis(200) * mult as u32 * log_factor;
+    let log_factor = (crate::mathf::ceil(crate::mathf::log10(n as f64 + 1.0)) as u32).max(1);
+    let timeout = core::time::Duration::from_millis(200) * mult as u32 * log_factor;
 
     let q = QueryMessage {
       ltime,
@@ -4543,9 +4543,9 @@ where
     let key_tally = if purpose == QueryPurpose::Key {
       Some(KeyResponseTally {
         num_err: 0,
-        keys: std::collections::HashMap::new(),
-        primary_keys: std::collections::HashMap::new(),
-        messages: std::collections::HashMap::new(),
+        keys: crate::FxHashMap::default(),
+        primary_keys: crate::FxHashMap::default(),
+        messages: crate::FxHashMap::default(),
       })
     } else {
       None
@@ -4554,8 +4554,8 @@ where
     self.pending_queries.push(PendingQuery {
       kind: purpose,
       deadline,
-      responses: std::collections::HashMap::new(),
-      acks: std::collections::HashMap::new(),
+      responses: crate::FxHashMap::default(),
+      acks: crate::FxHashMap::default(),
       query_id,
       request_ack: false, // Internal queries never request per-hop acks.
       conflict_matching: 0,
@@ -4812,9 +4812,9 @@ where
     use crate::event::KeyResponse;
     let tally = pq.key_tally.unwrap_or_else(|| KeyResponseTally {
       num_err: 0,
-      keys: std::collections::HashMap::new(),
-      primary_keys: std::collections::HashMap::new(),
-      messages: std::collections::HashMap::new(),
+      keys: crate::FxHashMap::default(),
+      primary_keys: crate::FxHashMap::default(),
+      messages: crate::FxHashMap::default(),
     });
     let num_resp = pq.responses.len();
     // num_nodes was captured at query-issue time from members.states.len()
@@ -4971,8 +4971,8 @@ where
     self.pending_queries.push(PendingQuery {
       kind: QueryPurpose::Conflict,
       deadline,
-      responses: std::collections::HashMap::new(),
-      acks: std::collections::HashMap::new(),
+      responses: crate::FxHashMap::default(),
+      acks: crate::FxHashMap::default(),
       query_id,
       request_ack: false,
       conflict_matching: 0,
@@ -5001,17 +5001,17 @@ where
     self.pending_queries.push(PendingQuery {
       kind: QueryPurpose::Key,
       deadline,
-      responses: std::collections::HashMap::new(),
-      acks: std::collections::HashMap::new(),
+      responses: crate::FxHashMap::default(),
+      acks: crate::FxHashMap::default(),
       query_id,
       request_ack: false,
       conflict_matching: 0,
       num_nodes,
       key_tally: Some(KeyResponseTally {
         num_err: 0,
-        keys: std::collections::HashMap::new(),
-        primary_keys: std::collections::HashMap::new(),
-        messages: std::collections::HashMap::new(),
+        keys: crate::FxHashMap::default(),
+        primary_keys: crate::FxHashMap::default(),
+        messages: crate::FxHashMap::default(),
       }),
     });
     query_id
@@ -5089,10 +5089,10 @@ where
   pub(crate) fn test_inject_inner_joined(&mut self, id: I, now: Instant)
   where
     I: Clone,
-    A: Clone + From<std::net::SocketAddr>,
+    A: Clone + From<core::net::SocketAddr>,
   {
     use std::sync::Arc;
-    let addr: A = std::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
+    let addr: A = core::net::SocketAddr::from(([127, 0, 0, 1], 0u16)).into();
     let ns = Arc::new(memberlist_proto::typed::NodeState::new(
       id,
       addr,
@@ -5233,7 +5233,7 @@ where
     &mut self,
     t: &mut T,
     node_id: &I,
-    rtt: std::time::Duration,
+    rtt: core::time::Duration,
     payload: &Bytes,
   ) where
     T: Reliable<I, A>,
@@ -5300,7 +5300,7 @@ where
     &mut self,
     t: &mut T,
     node_id: I,
-    rtt: std::time::Duration,
+    rtt: core::time::Duration,
     payload: Bytes,
   ) where
     T: Reliable<I, A>,

@@ -1197,7 +1197,7 @@ where
   pub(crate) fn test_ping_completed(
     &mut self,
     node_id: I,
-    rtt: std::time::Duration,
+    rtt: core::time::Duration,
     payload: Bytes,
   ) {
     self

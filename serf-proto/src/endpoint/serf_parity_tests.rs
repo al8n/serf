@@ -19,7 +19,7 @@ use crate::{
   typed::{PushPullMessage, UserEvent, UserEvents},
 };
 
-fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner =
@@ -27,8 +27,8 @@ fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
   let coord = memberlist_proto::streams::StreamEndpoint::<_, _, RawRecords>::new(
     inner,
     LabelOptions::new_in(Some(b"serf-test".to_vec()), ()),
-    Box::new(|_addr: &std::net::SocketAddr| None),
-    Box::new(|addr: &std::net::SocketAddr| *addr),
+    Box::new(|_addr: &core::net::SocketAddr| None),
+    Box::new(|addr: &core::net::SocketAddr| *addr),
   );
   let mut e = StreamEndpoint::new(coord, Options::new());
   let _ = e.poll_event();
@@ -36,8 +36,8 @@ fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
 }
 
 /// A distinct loopback peer address for the per-peer ignore-join tests.
-fn peer(port: u16) -> std::net::SocketAddr {
-  std::net::SocketAddr::from(([127, 0, 0, 1], port))
+fn peer(port: u16) -> core::net::SocketAddr {
+  core::net::SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 // ── base.rs handle_node_join invariants ───────────────────────────────────────
@@ -242,7 +242,7 @@ fn push_pull_body(
     events,
     LamportTime::new(query_ltime),
   );
-  AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed in test")
 }
@@ -556,7 +556,7 @@ fn tick_drains_inner_before_firing_reap() {
 
   // Advance to a time far past reconnect_timeout (24h + 1h) so the reaper
   // would normally remove member 2.
-  let past_timeout = t0 + std::time::Duration::from_secs(3600 * 25);
+  let past_timeout = t0 + core::time::Duration::from_secs(3600 * 25);
 
   // Inject a NodeJoined event for member 2 directly through the sieve
   // (simulates an inner event produced during inner.handle_timeout but before

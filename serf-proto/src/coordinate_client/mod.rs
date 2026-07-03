@@ -15,7 +15,8 @@
 //!   host-based network coordinate systems." IEEE/ACM Transactions on
 //!   Networking, 2010.
 
-use std::{collections::HashMap, time::Duration};
+use core::time::Duration;
+use std::collections::HashMap;
 
 use memberlist_proto::Rng;
 use rand::RngExt;

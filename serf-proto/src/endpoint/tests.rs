@@ -20,13 +20,13 @@ type TestTransport = RawRecords;
 /// ignores it).  A fixed cluster label keeps the handshake well-formed for the
 /// loopback tests that complete a real exchange.
 fn coord(
-  inner: memberlist_proto::Endpoint<u32, std::net::SocketAddr>,
-) -> memberlist_proto::streams::StreamEndpoint<u32, std::net::SocketAddr, TestTransport> {
+  inner: memberlist_proto::Endpoint<u32, core::net::SocketAddr>,
+) -> memberlist_proto::streams::StreamEndpoint<u32, core::net::SocketAddr, TestTransport> {
   memberlist_proto::streams::StreamEndpoint::new(
     inner,
     LabelOptions::new_in(Some(b"serf-test".to_vec()), ()),
-    Box::new(|_addr: &std::net::SocketAddr| None),
-    Box::new(|addr: &std::net::SocketAddr| *addr),
+    Box::new(|_addr: &core::net::SocketAddr| None),
+    Box::new(|addr: &core::net::SocketAddr| *addr),
   )
 }
 
@@ -34,7 +34,7 @@ fn coord(
 ///
 /// Uses `u32` node ids and `SocketAddr` addresses with a deterministically
 /// seeded `SmallRng` so tests are reproducible.
-fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -51,7 +51,7 @@ fn ep() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
 
 /// Build a serf `Endpoint` with coordinates enabled (for coordinate-gated tests).
 #[cfg(feature = "coordinates")]
-fn ep_with_coords() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep_with_coords() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -464,7 +464,7 @@ fn leave_from_already_left_is_idempotent() {
   e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
   // Simulate the leave chain completing: inner LeftCluster + delay elapses.
   e.test_inner_left_cluster();
-  let delay = std::time::Duration::from_secs(2); // > leave_propagate_delay (1s)
+  let delay = core::time::Duration::from_secs(2); // > leave_propagate_delay (1s)
   e.handle_timeout(memberlist_proto::Instant::ORIGIN + delay);
   assert!(e.state().is_left(), "should have transitioned to Left");
   // A second leave from Left is Ok(()).
@@ -518,7 +518,7 @@ fn inner_left_cluster_drives_serf_to_left_and_emits_left_cluster_event() {
   // Simulate the inner emitting LeftCluster (no live peers → immediate).
   e.test_inner_left_cluster();
   // Advance time past leave_propagate_delay (default 1s).
-  let after_delay = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(2);
+  let after_delay = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(2);
   e.handle_timeout(after_delay);
   // State must be Left.
   assert!(
@@ -542,7 +542,7 @@ fn leave_complete_deadline_not_fired_before_delay() {
   e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
   e.test_inner_left_cluster();
   // Tick to just before the propagation deadline (< 1s).
-  let before_delay = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_millis(500);
+  let before_delay = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_millis(500);
   e.handle_timeout(before_delay);
   // SerfState must still be Leaving (the deadline hasn't fired yet).
   assert!(e.state().is_leaving(), "must still be Leaving before delay");
@@ -565,7 +565,7 @@ fn shutdown_prevents_leaving_to_left_transition() {
   e.test_inner_left_cluster();
   // Force Shutdown before the deadline fires.
   e.core_mut().state = SerfState::Shutdown;
-  let after_delay = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(2);
+  let after_delay = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(2);
   e.handle_timeout(after_delay);
   // Must remain Shutdown, not Left.
   assert!(
@@ -593,7 +593,7 @@ fn leave_arms_broadcast_deadline() {
   // Default broadcast_timeout is 5s; deadline = ORIGIN + 5s.
   assert_eq!(
     dl,
-    memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(5)
+    memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(5)
   );
 }
 
@@ -701,7 +701,7 @@ fn poll_timeout_includes_leave_deadlines_when_armed() {
   let timeout = e
     .poll_timeout()
     .expect("must have a deadline after leave()");
-  let expected = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(5);
+  let expected = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(5);
   assert!(
     timeout <= expected,
     "poll_timeout must be ≤ leave_broadcast_deadline ({expected:?}), got {timeout:?}"
@@ -713,9 +713,9 @@ fn poll_timeout_includes_leave_deadlines_when_armed() {
 // Helper: seed a failed member with an explicit address so we can assert what
 // addr is dialled by the reconnector.
 fn seed_failed(
-  e: &mut StreamEndpoint<u32, std::net::SocketAddr, RawRecords>,
+  e: &mut StreamEndpoint<u32, core::net::SocketAddr, RawRecords>,
   id: u32,
-  addr: std::net::SocketAddr,
+  addr: core::net::SocketAddr,
   leave_time: memberlist_proto::Instant,
 ) {
   e.test_seed_failed_member(id, addr, leave_time);
@@ -723,7 +723,7 @@ fn seed_failed(
 
 // Helper: seed the endpoint's one alive member (the local node) explicitly so
 // the probability computation has a stable num_alive value.
-fn seed_alive(e: &mut StreamEndpoint<u32, std::net::SocketAddr, RawRecords>, id: u32) {
+fn seed_alive(e: &mut StreamEndpoint<u32, core::net::SocketAddr, RawRecords>, id: u32) {
   e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(0));
 }
 
@@ -733,14 +733,14 @@ fn reap_failed_removes_after_reconnect_timeout() {
   let t0 = memberlist_proto::Instant::ORIGIN;
   seed_failed(&mut e, 2, "127.0.0.1:1002".parse().unwrap(), t0);
   // 25 hours > reconnect_timeout (24h)
-  let past_timeout = t0 + std::time::Duration::from_secs(3600 * 25);
+  let past_timeout = t0 + core::time::Duration::from_secs(3600 * 25);
   e.test_fire_reap(past_timeout);
   assert_eq!(
     e.test_member_status(2),
     None,
     "failed member should be reaped after reconnect_timeout"
   );
-  let reaped = std::iter::from_fn(|| e.poll_event())
+  let reaped = core::iter::from_fn(|| e.poll_event())
     .any(|ev| matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Reap));
   assert!(reaped, "a Member(Reap) event should have been emitted");
 }
@@ -751,7 +751,7 @@ fn reap_failed_keeps_member_before_reconnect_timeout() {
   let t0 = memberlist_proto::Instant::ORIGIN;
   seed_failed(&mut e, 2, "127.0.0.1:1002".parse().unwrap(), t0);
   // 1 hour < reconnect_timeout (24h) — should NOT reap
-  let before_timeout = t0 + std::time::Duration::from_secs(3600);
+  let before_timeout = t0 + core::time::Duration::from_secs(3600);
   e.test_fire_reap(before_timeout);
   assert_eq!(
     e.test_member_status(2),
@@ -767,14 +767,14 @@ fn reap_left_removes_after_tombstone_timeout() {
   let t0 = memberlist_proto::Instant::ORIGIN;
   e.test_seed_left_member_by_status(2, LamportTime::new(3), t0);
   // 25 hours > tombstone_timeout (24h)
-  let past_timeout = t0 + std::time::Duration::from_secs(3600 * 25);
+  let past_timeout = t0 + core::time::Duration::from_secs(3600 * 25);
   e.test_fire_reap(past_timeout);
   assert_eq!(
     e.test_member_status(2),
     None,
     "left member should be reaped after tombstone_timeout"
   );
-  let reaped = std::iter::from_fn(|| e.poll_event())
+  let reaped = core::iter::from_fn(|| e.poll_event())
     .any(|ev| matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Reap));
   assert!(reaped, "a Member(Reap) event should have been emitted");
 }
@@ -786,7 +786,7 @@ fn reap_intents_removes_stale_intents() {
   // Buffer a leave intent for an unknown node at t0.
   e.test_handle_leave_intent(99, LamportTime::new(3), t0);
   // recent_intent_timeout is 600s (10 min). At t0 + 700s the intent is stale.
-  let past_intent_timeout = t0 + std::time::Duration::from_secs(700);
+  let past_intent_timeout = t0 + core::time::Duration::from_secs(700);
   e.test_fire_reap(past_intent_timeout);
   // The intent buffer should be empty now (no state was created, the node was unknown).
   // Verify by checking that the intent is no longer present — seeded as Leave intent for 99.
@@ -844,7 +844,7 @@ fn reconnect_deadline_armed_and_polls_in_poll_timeout() {
   // Before arming: next_reconnect is None internally but poll_timeout may still
   // return Some from the inner.  After handle_timeout fires and re-arms:
   // drive handle_timeout past the first reconnect_interval (30s).
-  let after_interval = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(31);
+  let after_interval = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(31);
   e.handle_timeout(after_interval);
   // After the tick the reconnect deadline is re-armed, so poll_timeout is Some.
   let _ = e.poll_timeout(); // must not panic
@@ -856,7 +856,7 @@ fn reap_deadline_fires_via_handle_timeout() {
   let t0 = memberlist_proto::Instant::ORIGIN;
   seed_failed(&mut e, 2, "127.0.0.1:1002".parse().unwrap(), t0);
   // Drive handle_timeout well past reconnect_timeout (24h) + reap_interval (15s).
-  let far_future = t0 + std::time::Duration::from_secs(3600 * 25 + 16);
+  let far_future = t0 + core::time::Duration::from_secs(3600 * 25 + 16);
   e.handle_timeout(far_future);
   // Member should be reaped.
   assert_eq!(
@@ -983,7 +983,7 @@ fn user_event_arrives_over_user_packet_and_surfaces() {
   // Event::User, and re-queue the ORIGINAL bytes on the event broadcast
   // tier (relay-retain: no re-encode).
   let mut e = ep();
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 1.into(),
     cc: false,
     name: "deploy".into(),
@@ -991,7 +991,7 @@ fn user_event_arrives_over_user_packet_and_surfaces() {
   })
   .encode()
   .unwrap();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes, memberlist_proto::Instant::ORIGIN);
 
   let ev = e.poll_event().expect("user event must surface");
@@ -1007,7 +1007,7 @@ fn duplicate_user_event_over_user_packet_is_deduped() {
   // The relay-retain property: first-sight re-queues original bytes; second
   // sight is dropped without touching the broadcast queue.
   let mut e = ep();
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 3.into(),
     cc: false,
     name: "once".into(),
@@ -1016,7 +1016,7 @@ fn duplicate_user_event_over_user_packet_is_deduped() {
   .encode()
   .unwrap();
 
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes.clone(), memberlist_proto::Instant::ORIGIN);
   let first = e.poll_event();
   assert!(
@@ -1039,11 +1039,11 @@ fn join_intent_over_user_packet_buffers_and_requeues_on_intent_tier() {
   // broadcast tier (rank 0 = highest priority).
   let mut e = ep();
   let serf_bytes =
-    AnyMessage::<u32, std::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(7), 2u32))
+    AnyMessage::<u32, core::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(7), 2u32))
       .encode()
       .unwrap();
   let before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes, memberlist_proto::Instant::ORIGIN);
 
   assert!(
@@ -1059,7 +1059,7 @@ fn leave_intent_over_user_packet_dispatches_and_requeues() {
   // intent broadcast tier.
   let mut e = ep();
   e.test_seed_member(2u32, MemberStatus::Alive, LamportTime::new(3));
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::Leave(LeaveMessage::new(
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::Leave(LeaveMessage::new(
     LamportTime::new(8),
     2u32,
     false,
@@ -1067,7 +1067,7 @@ fn leave_intent_over_user_packet_dispatches_and_requeues() {
   .encode()
   .unwrap();
   let before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes, memberlist_proto::Instant::ORIGIN);
 
   assert_eq!(
@@ -1088,11 +1088,11 @@ fn stale_join_intent_over_user_packet_is_not_requeued() {
   let mut e = ep();
   e.test_seed_member(2u32, MemberStatus::Alive, LamportTime::new(10));
   let serf_bytes =
-    AnyMessage::<u32, std::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(3), 2u32))
+    AnyMessage::<u32, core::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(3), 2u32))
       .encode()
       .unwrap();
   let before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes, memberlist_proto::Instant::ORIGIN);
 
   assert_eq!(
@@ -1108,7 +1108,7 @@ fn user_event_over_user_packet_witnesses_event_clock() {
   // UserPacket.  Both Reliable and Unreliable paths run through the same
   // handler; this test verifies the clock-witness side-effect.
   let mut e = ep();
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 5.into(),
     cc: false,
     name: "ping".into(),
@@ -1116,7 +1116,7 @@ fn user_event_over_user_packet_witnesses_event_clock() {
   })
   .encode()
   .unwrap();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, serf_bytes, memberlist_proto::Instant::ORIGIN);
 
   let ev = e.poll_event().expect("event must surface");
@@ -1135,7 +1135,7 @@ fn user_event_over_user_packet_witnesses_event_clock() {
 fn malformed_bytes_in_user_packet_are_silently_dropped() {
   // A UserPacket carrying garbage bytes must not panic or emit events.
   let mut e = ep();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(
     from,
     bytes::Bytes::from_static(b"\xff\xff\xfe"),
@@ -1154,7 +1154,7 @@ fn user_event_rebroadcast_uses_original_bytes() {
   // not re-encoded).  We verify this by checking that the queue grows by
   // exactly the original encoding.
   let mut e = ep();
-  let original_bytes = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let original_bytes = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 2.into(),
     cc: false,
     name: "ship".into(),
@@ -1164,7 +1164,7 @@ fn user_event_rebroadcast_uses_original_bytes() {
   .unwrap();
 
   let queue_before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(
     from,
     original_bytes.clone(),
@@ -1267,7 +1267,7 @@ fn ignore_join_stream_recorded_and_consumed_one_shot() {
   // (idempotently); the matching merge consumes the one-shot entry, and an
   // unrecorded stream is never present.
   let mut e = ep();
-  let p = std::net::SocketAddr::from(([127, 0, 0, 1], 6100));
+  let p = core::net::SocketAddr::from(([127, 0, 0, 1], 6100));
   let s = e.start_join_push_pull(
     p,
     /*ignore_old*/ true,
@@ -1314,7 +1314,7 @@ fn push_pull_local_state_bytes_deterministic() {
   // produce byte-identical push-pull wire output after resync_local_state.
   // This verifies that HashMap iteration order in `members.states` does NOT
   // leak into the encoded PushPullMessage.
-  fn build_ep_asc() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+  fn build_ep_asc() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
     let mut e = ep();
     e.test_set_clocks(5, 10, 15);
     // Insert members in ascending id order: 1, 2, 3, 4, 5.
@@ -1324,7 +1324,7 @@ fn push_pull_local_state_bytes_deterministic() {
     e.resync_local_state();
     e
   }
-  fn build_ep_desc() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+  fn build_ep_desc() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
     let mut e = ep();
     e.test_set_clocks(5, 10, 15);
     // Insert members in descending id order: 5, 4, 3, 2, 1.
@@ -1354,7 +1354,7 @@ fn push_pull_local_state_bytes_deterministic() {
 ///
 /// Uses `ltime`, `id`, no filters, no flags, no relay, 5 s timeout,
 /// and a sentinel from-address.
-fn test_query(ltime: LamportTime, id: u32) -> QueryMessage<u32, std::net::SocketAddr> {
+fn test_query(ltime: LamportTime, id: u32) -> QueryMessage<u32, core::net::SocketAddr> {
   QueryMessage {
     ltime,
     id,
@@ -1362,7 +1362,7 @@ fn test_query(ltime: LamportTime, id: u32) -> QueryMessage<u32, std::net::Socket
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "ping".into(),
     payload: bytes::Bytes::new(),
   }
@@ -1432,7 +1432,7 @@ fn query_processes_locally_and_emits_event_query() {
   assert!(
     matches!(ev, Event::Query(_)),
     "expected Event::Query, got {:?}",
-    std::mem::discriminant(&ev)
+    core::mem::discriminant(&ev)
   );
 }
 
@@ -1612,7 +1612,7 @@ fn invalid_tag_regex_does_not_advance_rng() {
   let make_ep = |seed: u64| {
     let inner_opts = EndpointOptions::new(
       1u32,
-      "127.0.0.1:7946".parse::<std::net::SocketAddr>().unwrap(),
+      "127.0.0.1:7946".parse::<core::net::SocketAddr>().unwrap(),
     )
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
     let inner = memberlist_proto::Endpoint::new_at(
@@ -1686,19 +1686,19 @@ fn invalid_tag_regex_does_not_advance_rng() {
 
 // ── Task 4.2: respond() three guards + query-response fold ───────────────────
 
-fn addr(port: u16) -> std::net::SocketAddr {
+fn addr(port: u16) -> core::net::SocketAddr {
   format!("127.0.0.1:{port}").parse().unwrap()
 }
 
 fn t_secs(s: u64) -> memberlist_proto::Instant {
-  memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(s)
+  memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(s)
 }
 
 fn qresp(
   ltime: LamportTime,
   id: u32,
   from_port: u16,
-) -> crate::typed::QueryResponseMessage<u32, std::net::SocketAddr> {
+) -> crate::typed::QueryResponseMessage<u32, core::net::SocketAddr> {
   crate::typed::QueryResponseMessage {
     ltime,
     id,
@@ -1962,14 +1962,14 @@ fn query_response_via_user_packet_wire_path_surfaces_event() {
 
   // Encode a QueryResponseMessage as serf-level bytes and inject via the
   // UserPacket path (mimicking the gossip plane delivery).
-  let resp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let resp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: id.ltime,
     id: id.id,
     from: memberlist_proto::Node::new(2u32, addr(1002)),
     flags: QueryFlag::empty(),
     payload: bytes::Bytes::new(),
   };
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::QueryResponse(resp)
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::QueryResponse(resp)
     .encode()
     .unwrap();
   e.test_inject_user_packet(addr(1002), serf_bytes, memberlist_proto::Instant::ORIGIN);
@@ -1986,7 +1986,7 @@ fn query_response_via_user_packet_wire_path_surfaces_event() {
 // ── Task 4.3: responder-side relay ───────────────────────────────────────────
 
 /// Build a `Node<u32, SocketAddr>` at `127.0.0.1:<port>` with `id = port as u32`.
-fn relay_node(port: u16) -> memberlist_proto::Node<u32, std::net::SocketAddr> {
+fn relay_node(port: u16) -> memberlist_proto::Node<u32, core::net::SocketAddr> {
   memberlist_proto::Node::new(port as u32, addr(port))
 }
 
@@ -2106,7 +2106,7 @@ fn relay_sieve_arm_decodes_relay_message_from_user_packet() {
   let mut e = ep();
   let inner_payload = bytes::Bytes::from_static(b"\x06fake-resp");
   let relay = RelayMessage::new(relay_node(1002), inner_payload.clone());
-  let serf_bytes = AnyMessage::<u32, std::net::SocketAddr>::Relay(relay)
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::Relay(relay)
     .encode()
     .unwrap();
 
@@ -2123,7 +2123,7 @@ fn relay_sieve_arm_decodes_relay_message_from_user_packet() {
 /// Build a serf `StreamEndpoint<u32, SocketAddr>` with an explicit RNG seed for the
 /// serf-level RNG (the relay/reconnect draws).  The inner Endpoint uses a fixed
 /// seed 0; the serf-level seed is the caller-supplied `serf_seed`.
-fn ep_with_serf_seed(serf_seed: u64) -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep_with_serf_seed(serf_seed: u64) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2197,8 +2197,8 @@ fn relay_response_candidate_selection_is_deterministic() {
   // The selected peer addresses must be identical in both order and identity.
   // Any divergence here indicates the candidate ordering was not stabilised
   // before the Fisher-Yates shuffle.
-  let addrs_a: Vec<std::net::SocketAddr> = sends_a.iter().map(|(a, _)| *a).collect();
-  let addrs_b: Vec<std::net::SocketAddr> = sends_b.iter().map(|(a, _)| *a).collect();
+  let addrs_a: Vec<core::net::SocketAddr> = sends_a.iter().map(|(a, _)| *a).collect();
+  let addrs_b: Vec<core::net::SocketAddr> = sends_b.iter().map(|(a, _)| *a).collect();
   assert_eq!(
     addrs_a, addrs_b,
     "relay peer selection must be identical across endpoints with the same RNG seed \
@@ -2209,7 +2209,7 @@ fn relay_response_candidate_selection_is_deterministic() {
 // ── Task 4.4: conflict-resolution and key-management queries ─────────────────
 
 fn far_future() -> memberlist_proto::Instant {
-  memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3600)
+  memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3600)
 }
 
 #[test]
@@ -2224,7 +2224,7 @@ fn conflict_win_does_not_shut_down() {
   e.test_fold_conflict_response(qid, 101u32, true);
   e.test_fold_conflict_response(qid, 102u32, false);
 
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3601);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
   assert!(
@@ -2245,7 +2245,7 @@ fn conflict_loss_emits_shutdown() {
   e.test_fold_conflict_response(qid, 201u32, false);
   e.test_fold_conflict_response(qid, 202u32, false);
 
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3601);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
   let ev = e.poll_event().expect("conflict loss must emit an event");
@@ -2262,7 +2262,7 @@ fn app_query_close_is_silent() {
   let mut e = ep();
   let now = memberlist_proto::Instant::ORIGIN;
   let params = QueryParams {
-    timeout: std::time::Duration::from_millis(1),
+    timeout: core::time::Duration::from_millis(1),
     ..Default::default()
   };
   let _ = e.query("test", Bytes::new(), params, now);
@@ -2270,7 +2270,7 @@ fn app_query_close_is_silent() {
   while e.poll_event().is_some() {}
 
   // Advance time past the deadline.
-  let past = now + std::time::Duration::from_secs(1);
+  let past = now + core::time::Duration::from_secs(1);
   e.test_fire_due_query_closes(past);
 
   // No serf event should be emitted (App queries close silently).
@@ -2308,7 +2308,7 @@ fn conflict_query_with_trailing_junk_is_dropped_entirely() {
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "_serf_conflict".into(),
     payload: Bytes::from(payload_with_junk),
   };
@@ -2368,7 +2368,7 @@ fn conflict_query_with_exact_payload_processes_normally() {
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "_serf_conflict".into(),
     payload: Bytes::from(id_bytes.to_vec()),
   };
@@ -2392,7 +2392,7 @@ fn conflict_query_with_exact_payload_processes_normally() {
 
 use crate::snapshot::ReplayResult;
 
-fn snapshot_node(id: u32, port: u16) -> memberlist_proto::Node<u32, std::net::SocketAddr> {
+fn snapshot_node(id: u32, port: u16) -> memberlist_proto::Node<u32, core::net::SocketAddr> {
   memberlist_proto::Node::new(id, format!("127.0.0.1:{port}").parse().unwrap())
 }
 
@@ -2474,7 +2474,7 @@ fn load_snapshot_skips_self_on_rejoin() {
   );
   assert_eq!(
     dialled[0],
-    "127.0.0.1:1002".parse::<std::net::SocketAddr>().unwrap(),
+    "127.0.0.1:1002".parse::<core::net::SocketAddr>().unwrap(),
     "rejoin dial must target node 2's address"
   );
 }
@@ -2560,7 +2560,7 @@ fn ping_completed_updates_local_coordinate_and_caches_remote() {
   };
   let payload = make_coord_payload(&peer_coord);
 
-  e.test_ping_completed(2u32, std::time::Duration::from_millis(40), payload);
+  e.test_ping_completed(2u32, core::time::Duration::from_millis(40), payload);
 
   // Half 1: remote coord is cached under node id 2.
   assert!(
@@ -2584,7 +2584,7 @@ fn ping_completed_is_noop_when_coordinates_disabled() {
   let payload = Bytes::from_static(b"\x01garbage");
   // Must not panic; test_ping_completed is a no-op without the feature or when disabled.
   #[cfg(feature = "coordinates")]
-  e.test_ping_completed(2u32, std::time::Duration::from_millis(40), payload);
+  e.test_ping_completed(2u32, core::time::Duration::from_millis(40), payload);
   #[cfg(not(feature = "coordinates"))]
   let _ = payload; // consume without calling the cfg-gated adapter
   assert!(
@@ -2599,7 +2599,7 @@ fn ping_completed_bad_version_is_noop() {
   // A PingCompleted payload with a wrong version byte must be silently dropped.
   let mut e = ep_with_coords();
   let payload = Bytes::from_static(b"\x02garbage"); // version 2, not 1
-  e.test_ping_completed(2u32, std::time::Duration::from_millis(10), payload);
+  e.test_ping_completed(2u32, core::time::Duration::from_millis(10), payload);
   assert!(
     e.cached_coordinate(&2u32).is_none(),
     "bad version byte must not update coord_cache"
@@ -2611,7 +2611,7 @@ fn ping_completed_bad_version_is_noop() {
 fn ping_completed_empty_payload_is_noop() {
   // An empty PingCompleted payload must be silently dropped.
   let mut e = ep_with_coords();
-  e.test_ping_completed(2u32, std::time::Duration::from_millis(10), Bytes::new());
+  e.test_ping_completed(2u32, core::time::Duration::from_millis(10), Bytes::new());
   assert!(
     e.cached_coordinate(&2u32).is_none(),
     "empty payload must not update coord_cache"
@@ -2632,7 +2632,7 @@ fn reap_forgets_coordinate() {
     height: 0.0,
   };
   let payload = make_coord_payload(&peer_coord);
-  e.test_ping_completed(42u32, std::time::Duration::from_millis(20), payload);
+  e.test_ping_completed(42u32, core::time::Duration::from_millis(20), payload);
   assert!(
     e.cached_coordinate(&42u32).is_some(),
     "coordinate should be cached before reap"
@@ -2643,7 +2643,7 @@ fn reap_forgets_coordinate() {
   e.test_seed_failed_member(42u32, "127.0.0.1:7947".parse().unwrap(), Instant::ORIGIN);
 
   // Fire the reaper at a time past reconnect_timeout (default = 24 h = 86 400 s).
-  let past = Instant::ORIGIN + std::time::Duration::from_secs(90_000);
+  let past = Instant::ORIGIN + core::time::Duration::from_secs(90_000);
   e.test_fire_reap(past);
 
   // The coordinate cache entry for 42 must be gone.
@@ -2659,7 +2659,7 @@ fn reap_forgets_coordinate() {
 //
 // Use a tiny buffer (size=4) so ltime=1 and ltime=5 map to the same ring index
 // without needing a high clock that would make ltime=1 "too old".
-fn ep_tiny_event_buf() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep_tiny_event_buf() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2724,12 +2724,12 @@ fn ack_query_produces_immediate_ack_directed_send() {
   // The destination must be the querier's address (127.0.0.1:9999 from test_query).
   assert_eq!(
     dest_addr,
-    "127.0.0.1:9999".parse::<std::net::SocketAddr>().unwrap(),
+    "127.0.0.1:9999".parse::<core::net::SocketAddr>().unwrap(),
     "ACK must be directed to the querier"
   );
 
   // Decode the sent bytes and verify it is a QueryResponse with ACK flag.
-  let decoded = AnyMessage::<u32, std::net::SocketAddr>::decode(&sent_bytes)
+  let decoded = AnyMessage::<u32, core::net::SocketAddr>::decode(&sent_bytes)
     .expect("ACK bytes must decode as AnyMessage");
   match decoded {
     AnyMessage::QueryResponse(resp) => {
@@ -2744,7 +2744,7 @@ fn ack_query_produces_immediate_ack_directed_send() {
 }
 
 // Bug 3: Oversized query responses silently consumed.
-fn ep_small_resp_limit() -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+fn ep_small_resp_limit() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   let inner_opts = memberlist_proto::EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
     .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2825,7 +2825,7 @@ fn leave_broadcast_deadline_is_cleared_after_expiry() {
   );
 
   // Tick past the deadline.
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(6);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(6);
   e.handle_timeout(past);
 
   // The deadline must be cleared.
@@ -2918,14 +2918,14 @@ fn malformed_conflict_response_does_not_inflate_denominator() {
   let qid = e.test_register_conflict_query(deadline);
 
   // Build a QueryResponseMessage carrying the wrong inner type (UserEvent bytes).
-  let bad_inner = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let bad_inner = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 1.into(),
     cc: false,
     name: "bad".into(),
     payload: bytes::Bytes::new(),
   });
   let bad_payload = bad_inner.encode().expect("encode must succeed");
-  let bad_resp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let bad_resp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: memberlist_proto::Node::new(200u32, addr(2000)),
@@ -2938,7 +2938,7 @@ fn malformed_conflict_response_does_not_inflate_denominator() {
   e.test_fold_conflict_response(qid, 201u32, true);
 
   // Fire query close at a time past the deadline.
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3601);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
   // Fix: malformed not counted → num_resp=1, majority=1, matching=1 → WIN → no Shutdown.
@@ -2958,7 +2958,7 @@ fn respond_send_failure_returns_err_and_leaves_responded_false() {
   // pushing the total past 512.  The serf query_response_size_limit is raised
   // to 50_000 so our guard passes and the inner's MTU check is the one that fires.
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap())
       .with_gossip_mtu(512); // minimum MTU: a 490-byte payload + framing exceeds it.
   let inner = memberlist_proto::Endpoint::new_at(
@@ -2967,7 +2967,7 @@ fn respond_send_failure_returns_err_and_leaves_responded_false() {
     SmallRng::seed_from_u64(0),
   );
   let opts = Options::new().with_query_response_size_limit(50_000);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
   let qid = QueryId {
@@ -3103,7 +3103,7 @@ fn zero_conflict_responses_does_not_shut_down() {
   // increment responses; we just confirm close_conflict_query also handles
   // the num_resp==0 case correctly when even no malformed response is present.
   // Fire query close: no responses at all (responses is empty).
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3601);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
   assert!(
@@ -3122,14 +3122,14 @@ fn zero_valid_conflict_responses_all_malformed_does_not_shut_down() {
   let qid = e.test_register_conflict_query(deadline);
 
   // Inject a QueryResponseMessage carrying wrong inner type (dropped by Bug 2 fix).
-  let bad_inner = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let bad_inner = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 1.into(),
     cc: false,
     name: "bad".into(),
     payload: bytes::Bytes::new(),
   });
   let bad_payload = bad_inner.encode().expect("encode must succeed");
-  let bad_resp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let bad_resp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: memberlist_proto::Node::new(300u32, addr(3000)),
@@ -3145,7 +3145,7 @@ fn zero_valid_conflict_responses_all_malformed_does_not_shut_down() {
     "malformed conflict response must not be counted"
   );
 
-  let past = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3601);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
   assert!(
@@ -3169,14 +3169,14 @@ fn malformed_key_response_does_not_inflate_num_resp() {
   let qid = e.test_register_key_query(deadline);
 
   // Build a QueryResponseMessage carrying wrong inner type.
-  let bad_inner = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let bad_inner = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 1.into(),
     cc: false,
     name: "bad".into(),
     payload: bytes::Bytes::new(),
   });
   let bad_payload = bad_inner.encode().expect("encode must succeed");
-  let bad_resp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let bad_resp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: memberlist_proto::Node::new(400u32, addr(4000)),
@@ -3248,14 +3248,14 @@ fn ingress_max_ltime_query_does_not_regress_clock() {
   use crate::typed::{QueryFlag, QueryMessage};
   let mut e = ep();
   e.test_set_clocks(0, 0, 20);
-  let msg = QueryMessage::<u32, std::net::SocketAddr> {
+  let msg = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(u64::MAX),
     id: 42,
     from: memberlist_proto::Node::new(1u32, addr(9000)),
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: "flood".into(),
     payload: bytes::Bytes::new(),
   };
@@ -3339,14 +3339,14 @@ fn endpoint_query_buffer_slot_capped_via_adapter() {
 
   // Push unique ids up to the cap through handle_query.
   for id in 0..MAX_QUERY_IDS_PER_LTIME as u32 {
-    let msg = QueryMessage::<u32, std::net::SocketAddr> {
+    let msg = QueryMessage::<u32, core::net::SocketAddr> {
       ltime: LamportTime::new(ltime),
       id,
       from: memberlist_proto::Node::new(id + 10, addr(9000)),
       filters: vec![],
       flags: QueryFlag::NO_BROADCAST,
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(1),
+      timeout: core::time::Duration::from_secs(1),
       name: "flood".into(),
       payload: bytes::Bytes::new(),
     };
@@ -3360,14 +3360,14 @@ fn endpoint_query_buffer_slot_capped_via_adapter() {
   );
 
   // One more unique id: must not grow the slot.
-  let overflow_msg = QueryMessage::<u32, std::net::SocketAddr> {
+  let overflow_msg = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(ltime),
     id: MAX_QUERY_IDS_PER_LTIME as u32,
     from: memberlist_proto::Node::new(9999u32, addr(9999)),
     filters: vec![],
     flags: QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: "overflow".into(),
     payload: bytes::Bytes::new(),
   };
@@ -3393,7 +3393,7 @@ fn resync_keeps_dirty_when_inner_snapshot_rejects() {
   // (1 MiB) which saturating_sub-underflows to 0, so any non-empty serf
   // PushPull (encoded_len > 0) exceeds the budget and is rejected.
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap())
       .with_max_stream_frame_size(547); // passes construction but rejects serf PushPull.
   let inner = memberlist_proto::Endpoint::new_at(
@@ -3401,7 +3401,7 @@ fn resync_keeps_dirty_when_inner_snapshot_rejects() {
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), Options::new());
 
   // Force dirty and call resync.
@@ -3417,7 +3417,7 @@ fn resync_keeps_dirty_when_inner_snapshot_rejects() {
 
 // ── Bug 1: class sweep — reject u64::MAX Lamport times at all ingress sites ──
 
-fn sa(port: u16) -> std::net::SocketAddr {
+fn sa(port: u16) -> core::net::SocketAddr {
   format!("127.0.0.1:{port}").parse().unwrap()
 }
 
@@ -3526,14 +3526,14 @@ fn query_max_ltime_is_dropped_no_state_mutation() {
   let mut e = ep();
   let clock_before = e.query_time();
 
-  let msg = QueryMessage::<u32, std::net::SocketAddr> {
+  let msg = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(u64::MAX),
     id: 1,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
     filters: vec![],
     flags: QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: "test".into(),
     payload: bytes::Bytes::new(),
   };
@@ -3576,7 +3576,7 @@ fn merge_remote_state_max_member_clock_is_ignored() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   e.test_merge_remote_state(encoded);
@@ -3737,7 +3737,7 @@ fn key_query_num_nodes_equals_member_count_at_issue_time() {
   }
   assert_eq!(e.num_members(), 4);
 
-  let far_future = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(9999);
+  let far_future = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(9999);
   let _query_id = e.test_register_key_query(far_future);
 
   // num_nodes is captured at registration time.
@@ -3750,7 +3750,7 @@ fn key_query_num_nodes_equals_member_count_at_issue_time() {
   );
 
   // Fire the timeout: close_key_query emits Event::KeyResponse.
-  let after_deadline = far_future + std::time::Duration::from_nanos(1);
+  let after_deadline = far_future + core::time::Duration::from_nanos(1);
   e.test_fire_due_query_closes(after_deadline);
 
   let ev = e
@@ -3778,7 +3778,7 @@ fn key_query_num_nodes_is_captured_at_issue_not_at_close() {
   e.test_seed_member(10u32, MemberStatus::Alive, LamportTime::new(1));
   assert_eq!(e.num_members(), 2);
 
-  let far_future = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(9999);
+  let far_future = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(9999);
   let _query_id = e.test_register_key_query(far_future);
 
   // Now add 2 more members after the query was issued.
@@ -3787,7 +3787,7 @@ fn key_query_num_nodes_is_captured_at_issue_not_at_close() {
   assert_eq!(e.num_members(), 4);
 
   // Close the query: num_nodes must reflect membership AT ISSUE TIME (2), not now (4).
-  let after_deadline = far_future + std::time::Duration::from_nanos(1);
+  let after_deadline = far_future + core::time::Duration::from_nanos(1);
   e.test_fire_due_query_closes(after_deadline);
 
   let ev = e.poll_event().expect("Event::KeyResponse must be emitted");
@@ -3912,14 +3912,14 @@ fn query_max_minus_one_ltime_is_dropped() {
   let mut e = ep();
   let clock_before = e.query_time();
 
-  let msg = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+  let msg = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(u64::MAX - 1),
     id: 1,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
     filters: vec![],
     flags: crate::typed::QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: "bad".into(),
     payload: bytes::Bytes::new(),
   };
@@ -3969,7 +3969,7 @@ fn merge_remote_state_max_minus_one_member_clock_drops_entire_message() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   e.test_merge_remote_state(encoded);
@@ -4011,7 +4011,7 @@ fn merge_remote_state_max_minus_one_event_clock_drops_entire_message() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   e.test_merge_remote_state(encoded);
@@ -4046,7 +4046,7 @@ fn conflict_response_from_unknown_responder_is_not_counted() {
   let qid = e.test_register_conflict_query(far_future);
 
   // Send a response claiming to be from id=999 — unknown, not in members.states.
-  let forged = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let forged = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: memberlist_proto::Node::new(999u32, addr(9999)),
@@ -4082,7 +4082,7 @@ fn conflict_response_flood_of_unknown_ids_does_not_inflate_denominator() {
 
   // Send 1000 responses each from a different unknown id.
   for forger_id in 1000u32..2000 {
-    let resp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+    let resp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
       ltime: qid.ltime,
       id: qid.id,
       from: memberlist_proto::Node::new(forger_id, addr(9000)),
@@ -4110,9 +4110,9 @@ fn conflict_response_from_known_member_is_counted() {
   let qid = e.test_register_conflict_query(far_future);
 
   // Build a valid ConflictResponseMessage payload so the payload check passes.
-  let member_node = memberlist_proto::Node::<u32, std::net::SocketAddr>::new(10u32, addr(7946));
+  let member_node = memberlist_proto::Node::<u32, core::net::SocketAddr>::new(10u32, addr(7946));
   let conflict_resp = ConflictResponseMessage::new(member_node);
-  let payload = AnyMessage::<u32, std::net::SocketAddr>::ConflictResponse(conflict_resp)
+  let payload = AnyMessage::<u32, core::net::SocketAddr>::ConflictResponse(conflict_resp)
     .encode()
     .expect("encode conflict response");
 
@@ -4181,7 +4181,7 @@ fn recent_intents_capped_on_leave_intent_flood() {
 #[test]
 fn zero_event_buffer_size_does_not_panic_on_first_event() {
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
     inner_opts,
@@ -4190,7 +4190,7 @@ fn zero_event_buffer_size_does_not_panic_on_first_event() {
   );
   // event_buffer_size = 0 should be clamped to 1 internally.
   let opts = crate::options::Options::new().with_event_buffer_size(0);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
   // Must NOT panic.
@@ -4205,7 +4205,7 @@ fn zero_event_buffer_size_does_not_panic_on_merge_remote_state() {
   use crate::typed::PushPullMessage;
 
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
     inner_opts,
@@ -4213,7 +4213,7 @@ fn zero_event_buffer_size_does_not_panic_on_merge_remote_state() {
     SmallRng::seed_from_u64(0),
   );
   let opts = crate::options::Options::new().with_event_buffer_size(0);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
   let pp = PushPullMessage::<u32> {
@@ -4230,7 +4230,7 @@ fn zero_event_buffer_size_does_not_panic_on_merge_remote_state() {
       }],
     }],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
 
@@ -4338,14 +4338,14 @@ fn received_queries_capped_at_max_via_handle_query() {
   // Send MAX_RECEIVED_QUERIES + 20 unique (ltime=1, id=i) queries.
   // Each passes filter (no filters = broadcast all) and unique id = first sight.
   for i in 0..(MAX_RECEIVED_QUERIES + 20) as u32 {
-    let msg = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+    let msg = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
       ltime: LamportTime::new(1),
       id: i,
       from: memberlist_proto::Node::new(99u32, sa(9001)),
       filters: vec![],
       flags: QueryFlag::NO_BROADCAST,
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(3600), // huge timeout
+      timeout: core::time::Duration::from_secs(3600), // huge timeout
       name: "flood".into(),
       payload: bytes::Bytes::new(),
     };
@@ -4368,14 +4368,14 @@ fn inbound_query_timeout_clamped() {
   let now = memberlist_proto::Instant::ORIGIN;
 
   // Inject a query with a 1-hour timeout (far exceeds MAX_QUERY_TIMEOUT = 600s).
-  let msg = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+  let msg = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(1),
     id: 77,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
     filters: vec![],
     flags: QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(3600),
+    timeout: core::time::Duration::from_secs(3600),
     name: "test".into(),
     payload: bytes::Bytes::new(),
   };
@@ -4437,25 +4437,25 @@ fn inbound_query_oversized_is_dropped_before_state_mutation() {
     memberlist_proto::SmallRng::seed_from_u64(0),
   );
   let opts = crate::options::Options::new().with_query_size_limit(64);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
   // Drain the construction self-join so it does not appear as a spurious event.
   let _ = e.poll_event();
 
   // Encode a QueryMessage whose payload pushes the wire encoding over 64 bytes.
   let oversized_payload = bytes::Bytes::from(vec![0u8; 100]);
-  let q = QueryMessage::<u32, std::net::SocketAddr> {
+  let q = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(3),
     id: 0xabcd_ef01,
     from: memberlist_proto::Node::new(2u32, sa(9002)),
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "ping".into(),
     payload: oversized_payload,
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::Query(q)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::Query(q)
     .encode()
     .unwrap();
   assert!(
@@ -4503,18 +4503,18 @@ fn inbound_query_oversized_is_dropped_before_state_mutation() {
 fn inbound_query_within_size_limit_is_accepted() {
   let mut e = ep(); // query_size_limit = 1024 (default)
 
-  let q = QueryMessage::<u32, std::net::SocketAddr> {
+  let q = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(1),
     id: 0x1234_5678,
     from: memberlist_proto::Node::new(2u32, sa(9002)),
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "ok".into(),
     payload: bytes::Bytes::from_static(b"small"),
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::Query(q)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::Query(q)
     .encode()
     .unwrap();
   assert!(
@@ -4550,7 +4550,7 @@ fn inbound_query_within_size_limit_is_accepted() {
 #[test]
 fn ack_for_non_ack_query_is_dropped() {
   let mut e = ep();
-  let deadline = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(10);
+  let deadline = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(10);
 
   // Register a pending query WITHOUT request_ack.
   let qid = QueryId {
@@ -4560,8 +4560,8 @@ fn ack_for_non_ack_query_is_dropped() {
   e.core_mut().pending_queries.push(PendingQuery {
     kind: QueryPurpose::App,
     deadline,
-    responses: std::collections::HashMap::new(),
-    acks: std::collections::HashMap::new(),
+    responses: crate::FxHashMap::default(),
+    acks: crate::FxHashMap::default(),
     query_id: qid,
     request_ack: false,
     conflict_matching: 0,
@@ -4572,7 +4572,7 @@ fn ack_for_non_ack_query_is_dropped() {
   });
 
   // Inject an ACK response for that query.
-  let ack_msg = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let ack_msg = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(1),
     id: 42,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
@@ -4592,7 +4592,7 @@ fn ack_for_non_ack_query_is_dropped() {
 #[test]
 fn ack_for_ack_query_is_delivered() {
   let mut e = ep();
-  let deadline = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(10);
+  let deadline = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(10);
 
   let qid = QueryId {
     ltime: LamportTime::new(1),
@@ -4601,8 +4601,8 @@ fn ack_for_ack_query_is_delivered() {
   e.core_mut().pending_queries.push(PendingQuery {
     kind: QueryPurpose::App,
     deadline,
-    responses: std::collections::HashMap::new(),
-    acks: std::collections::HashMap::new(),
+    responses: crate::FxHashMap::default(),
+    acks: crate::FxHashMap::default(),
     query_id: qid,
     request_ack: true, // <-- requesting acks
     conflict_matching: 0,
@@ -4613,7 +4613,7 @@ fn ack_for_ack_query_is_delivered() {
   });
 
   // Inject an ACK response.
-  let ack_msg = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let ack_msg = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(1),
     id: 42,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
@@ -4644,7 +4644,7 @@ fn user_event_with_trailing_junk_is_dropped_no_event_no_clock_advance() {
   let mut e = ep();
 
   // Build a valid UserEvent frame.
-  let valid = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let valid = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 7.into(),
     cc: false,
     name: "op".into(),
@@ -4660,7 +4660,7 @@ fn user_event_with_trailing_junk_is_dropped_no_event_no_clock_advance() {
 
   let clock_before = e.event_time();
   let queue_before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
   e.test_inject_user_packet(from, padded, memberlist_proto::Instant::ORIGIN);
 
@@ -4687,7 +4687,7 @@ fn join_intent_with_trailing_junk_is_dropped() {
   let mut e = ep();
 
   let valid =
-    AnyMessage::<u32, std::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(5), 99u32))
+    AnyMessage::<u32, core::net::SocketAddr>::Join(JoinMessage::new(LamportTime::new(5), 99u32))
       .encode()
       .unwrap();
   let mut padded = valid.to_vec();
@@ -4696,7 +4696,7 @@ fn join_intent_with_trailing_junk_is_dropped() {
 
   let clock_before = e.member_time();
   let queue_before = e.user_broadcast_queue_len();
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
   e.test_inject_user_packet(from, padded, memberlist_proto::Instant::ORIGIN);
 
@@ -4739,7 +4739,7 @@ fn merge_remote_state_with_trailing_junk_is_dropped() {
     events: vec![],
     query_ltime: LamportTime::new(2),
   };
-  let valid = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let valid = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   // Append trailing junk.
@@ -4776,17 +4776,17 @@ fn conflict_response_with_trailing_junk_is_not_counted() {
   use memberlist_proto::Node;
 
   let mut e = ep();
-  let local_addr: std::net::SocketAddr = "127.0.0.1:7946".parse().unwrap();
-  let deadline = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3600);
+  let local_addr: core::net::SocketAddr = "127.0.0.1:7946".parse().unwrap();
+  let deadline = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3600);
   let qid = e.test_register_conflict_query(deadline);
 
   // Seed the responder as a known Alive member so the membership gate passes.
-  let responder_addr: std::net::SocketAddr = "127.0.0.1:2000".parse().unwrap();
+  let responder_addr: core::net::SocketAddr = "127.0.0.1:2000".parse().unwrap();
   e.test_seed_member(200u32, MemberStatus::Alive, LamportTime::new(1));
 
   // Encode a ConflictResponseMessage that points to the local address (would agree if counted).
   let resp_msg = ConflictResponseMessage::new(Node::new(999u32, local_addr));
-  let valid = AnyMessage::<u32, std::net::SocketAddr>::ConflictResponse(resp_msg)
+  let valid = AnyMessage::<u32, core::net::SocketAddr>::ConflictResponse(resp_msg)
     .encode()
     .expect("encode must succeed");
   // Append trailing junk — must be dropped.
@@ -4795,7 +4795,7 @@ fn conflict_response_with_trailing_junk_is_not_counted() {
   let padded = bytes::Bytes::from(padded);
 
   // Inject via handle_query_response (which routes to handle_conflict_response_fold).
-  let qresp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let qresp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: Node::new(200u32, responder_addr),
@@ -4820,7 +4820,7 @@ fn key_response_with_trailing_junk_is_not_tallied() {
   use memberlist_proto::Node;
 
   let mut e = ep();
-  let deadline = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(3600);
+  let deadline = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3600);
   let qid = e.test_register_key_query(deadline);
 
   // Seed the responder as a known Alive member so the membership gate passes.
@@ -4833,7 +4833,7 @@ fn key_response_with_trailing_junk_is_not_tallied() {
     keys: vec![],
     primary_key: None,
   };
-  let valid = AnyMessage::<u32, std::net::SocketAddr>::KeyResponse(key_msg)
+  let valid = AnyMessage::<u32, core::net::SocketAddr>::KeyResponse(key_msg)
     .encode()
     .expect("encode must succeed");
   // Append trailing junk — must be dropped.
@@ -4842,7 +4842,7 @@ fn key_response_with_trailing_junk_is_not_tallied() {
   padded.push(0xef);
   let padded = bytes::Bytes::from(padded);
 
-  let qresp = crate::typed::QueryResponseMessage::<u32, std::net::SocketAddr> {
+  let qresp = crate::typed::QueryResponseMessage::<u32, core::net::SocketAddr> {
     ltime: qid.ltime,
     id: qid.id,
     from: Node::new(300u32, "127.0.0.1:3000".parse().unwrap()),
@@ -4866,19 +4866,19 @@ fn key_response_with_trailing_junk_is_not_tallied() {
 #[test]
 fn zero_reap_interval_advances_deadline() {
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
     inner_opts,
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  let opts = Options::new().with_reap_interval(std::time::Duration::ZERO);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let opts = Options::new().with_reap_interval(core::time::Duration::ZERO);
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
   // Advance time past the first reap deadline so handle_timeout fires it.
-  let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
+  let now = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(1);
   e.handle_timeout(now);
 
   // The deadline must be strictly after `now` — clamp prevents busy-loop.
@@ -4897,18 +4897,18 @@ fn zero_reap_interval_advances_deadline() {
 #[test]
 fn zero_reconnect_interval_advances_deadline() {
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
     inner_opts,
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  let opts = Options::new().with_reconnect_interval(std::time::Duration::ZERO);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let opts = Options::new().with_reconnect_interval(core::time::Duration::ZERO);
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
-  let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
+  let now = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(1);
   e.handle_timeout(now);
 
   if let Some(dl) = e.poll_timeout() {
@@ -4926,18 +4926,18 @@ fn zero_reconnect_interval_advances_deadline() {
 #[test]
 fn zero_queue_check_interval_advances_deadline() {
   let inner_opts =
-    EndpointOptions::<u32, std::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    EndpointOptions::<u32, core::net::SocketAddr>::new(1u32, "127.0.0.1:7946".parse().unwrap())
       .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
   let inner = memberlist_proto::Endpoint::new_at(
     inner_opts,
     memberlist_proto::Instant::ORIGIN,
     SmallRng::seed_from_u64(0),
   );
-  let opts = Options::new().with_queue_check_interval(std::time::Duration::ZERO);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let opts = Options::new().with_queue_check_interval(core::time::Duration::ZERO);
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
 
-  let now = memberlist_proto::Instant::ORIGIN + std::time::Duration::from_secs(1);
+  let now = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(1);
   e.handle_timeout(now);
 
   if let Some(dl) = e.poll_timeout() {
@@ -4965,13 +4965,13 @@ fn user_event_total_packet_with_junk_exceeding_size_limit_is_dropped() {
   );
   // Set a tight size limit: 32 bytes.
   let opts = crate::options::Options::new().with_max_user_event_size(32);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
   // Drain the construction self-join so it does not appear as a spurious event.
   let _ = e.poll_event();
 
   // A small valid UserEvent that fits within 32 bytes on its own.
-  let valid = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let valid = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 3.into(),
     cc: false,
     name: "x".into(),
@@ -4986,7 +4986,7 @@ fn user_event_total_packet_with_junk_exceeding_size_limit_is_dropped() {
   }
   let padded = bytes::Bytes::from(padded);
 
-  let from: std::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
   e.test_inject_user_packet(from, padded, memberlist_proto::Instant::ORIGIN);
 
   assert!(
@@ -5014,24 +5014,24 @@ fn pre_decode_fence_drops_oversized_valid_query_frame() {
   );
   // Small limit (64 bytes) so that a query with a 100-byte payload exceeds it.
   let opts = crate::options::Options::new().with_query_size_limit(64);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
   // Drain the construction self-join so it does not appear as a spurious event.
   let _ = e.poll_event();
 
   // Construct a syntactically valid Query whose encoded frame exceeds 64 bytes.
-  let q = QueryMessage::<u32, std::net::SocketAddr> {
+  let q = QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(7),
     id: 0xdead_beef,
     from: memberlist_proto::Node::new(2u32, sa(9002)),
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "oversized".into(),
     payload: bytes::Bytes::from(vec![0xffu8; 100]),
   };
-  let frame = AnyMessage::<u32, std::net::SocketAddr>::Query(q)
+  let frame = AnyMessage::<u32, core::net::SocketAddr>::Query(q)
     .encode()
     .expect("encode must succeed");
   assert!(
@@ -5082,13 +5082,13 @@ fn pre_decode_fence_drops_oversized_valid_user_event_frame() {
   );
   // Tight limit: 32 bytes.
   let opts = crate::options::Options::new().with_max_user_event_size(32);
-  let mut e: StreamEndpoint<u32, std::net::SocketAddr, RawRecords> =
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
     StreamEndpoint::new(coord(inner), opts);
   // Drain the construction self-join so it does not appear as a spurious event.
   let _ = e.poll_event();
 
   // Construct a syntactically valid UserEvent whose encoded frame exceeds 32 bytes.
-  let frame = AnyMessage::<u32, std::net::SocketAddr>::UserEvent(UserEventMessage {
+  let frame = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
     ltime: 5.into(),
     cc: false,
     name: "big-event".into(),
@@ -5211,12 +5211,12 @@ fn duplicate_query_does_not_set_local_state_dirty() {
     id: 0xdead_beef,
     from: memberlist_proto::Node::new(
       42u32,
-      "127.0.0.1:9999".parse::<std::net::SocketAddr>().unwrap(),
+      "127.0.0.1:9999".parse::<core::net::SocketAddr>().unwrap(),
     ),
     filters: vec![],
     flags: QueryFlag::empty(),
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(1),
+    timeout: core::time::Duration::from_secs(1),
     name: "test-query".into(),
     payload: bytes::Bytes::new(),
   };
@@ -5273,17 +5273,17 @@ fn surfaced_token_survives_overflow_and_overflow_never_surfaces() {
   let n = MAX_RECEIVED_QUERIES + 1;
   for i in 0..n as u32 {
     let req = KeyRequestMessage::new(Some(test_key));
-    let payload = AnyMessage::<u32, std::net::SocketAddr>::KeyRequest(req)
+    let payload = AnyMessage::<u32, core::net::SocketAddr>::KeyRequest(req)
       .encode()
       .expect("encode KeyRequestMessage");
-    let q = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+    let q = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
       ltime: LamportTime::new(i as u64 + 1),
       id: i,
       from: memberlist_proto::Node::new(99u32, sa(9001)),
       filters: vec![],
       flags: QueryFlag::NO_BROADCAST,
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(3600),
+      timeout: core::time::Duration::from_secs(3600),
       name: "_serf_install_key".into(),
       payload,
     };
@@ -5308,7 +5308,7 @@ fn surfaced_token_survives_overflow_and_overflow_never_surfaces() {
     Event::KeyRequest(kr) => kr,
     other => panic!(
       "expected Event::KeyRequest for first query, got {:?}",
-      std::mem::discriminant(&other)
+      core::mem::discriminant(&other)
     ),
   };
   assert!(
@@ -5337,7 +5337,7 @@ fn surfaced_token_survives_overflow_and_overflow_never_surfaces() {
     assert!(
       matches!(ev, Event::KeyRequest(_)),
       "all remaining events must be KeyRequest, got {:?}",
-      std::mem::discriminant(&ev)
+      core::mem::discriminant(&ev)
     );
     remaining += 1;
   }
@@ -5377,17 +5377,17 @@ fn local_key_op_self_applies_when_inbound_cap_is_full() {
   // so none expire during the test.
   for i in 0..MAX_RECEIVED_QUERIES as u32 {
     let req = KeyRequestMessage::new(Some(test_key));
-    let payload = AnyMessage::<u32, std::net::SocketAddr>::KeyRequest(req)
+    let payload = AnyMessage::<u32, core::net::SocketAddr>::KeyRequest(req)
       .encode()
       .expect("encode KeyRequestMessage for inbound flood");
-    let q = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+    let q = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
       ltime: LamportTime::new(i as u64 + 1),
       id: i,
       from: memberlist_proto::Node::new(99u32, sa(9001)),
       filters: vec![],
       flags: QueryFlag::NO_BROADCAST,
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(3600),
+      timeout: core::time::Duration::from_secs(3600),
       name: "_serf_install_key".into(),
       payload,
     };
@@ -5422,7 +5422,7 @@ fn local_key_op_self_applies_when_inbound_cap_is_full() {
     }
     other => panic!(
       "expected Event::KeyRequest from local install_key, got {:?}",
-      std::mem::discriminant(&other)
+      core::mem::discriminant(&other)
     ),
   }
 }
@@ -5441,17 +5441,17 @@ fn key_must_ops_without_key_are_dropped() {
     let mut e = ep();
     // Encode a KeyRequestMessage with key = None (shape mismatch for must-have-key ops).
     let req = KeyRequestMessage::new(None);
-    let payload = AnyMessage::<u32, std::net::SocketAddr>::KeyRequest(req)
+    let payload = AnyMessage::<u32, core::net::SocketAddr>::KeyRequest(req)
       .encode()
       .expect("encode KeyRequestMessage");
-    let q = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+    let q = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
       ltime: LamportTime::new(1),
       id: 42,
       from: memberlist_proto::Node::new(99u32, sa(9001)),
       filters: vec![],
       flags: QueryFlag::NO_BROADCAST,
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(5),
+      timeout: core::time::Duration::from_secs(5),
       name: name.into(),
       payload,
     };
@@ -5490,17 +5490,17 @@ fn list_keys_with_key_is_dropped() {
 
   let mut e = ep();
   let req = KeyRequestMessage::new(Some(test_key));
-  let payload = AnyMessage::<u32, std::net::SocketAddr>::KeyRequest(req)
+  let payload = AnyMessage::<u32, core::net::SocketAddr>::KeyRequest(req)
     .encode()
     .expect("encode KeyRequestMessage");
-  let q = crate::typed::QueryMessage::<u32, std::net::SocketAddr> {
+  let q = crate::typed::QueryMessage::<u32, core::net::SocketAddr> {
     ltime: LamportTime::new(1),
     id: 77,
     from: memberlist_proto::Node::new(99u32, sa(9001)),
     filters: vec![],
     flags: QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(5),
+    timeout: core::time::Duration::from_secs(5),
     name: "_serf_list_keys".into(),
     payload,
   };
@@ -5545,7 +5545,7 @@ fn stale_push_pull_does_not_set_dirty() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode PushPull");
   e.test_merge_remote_state(encoded);
@@ -5574,7 +5574,7 @@ fn clock_advancing_push_pull_sets_dirty() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode PushPull");
   e.test_merge_remote_state(encoded);
@@ -5600,13 +5600,13 @@ mod tag_filter_regex {
 
   /// Seed the local node (id=1) with the given tags and return an endpoint
   /// ready for tag-filter query tests.
-  fn ep_with_tags(tags: Tags) -> StreamEndpoint<u32, std::net::SocketAddr, RawRecords> {
+  fn ep_with_tags(tags: Tags) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
     let mut e = ep();
     e.test_seed_member_with_tags(1u32, tags, MemberStatus::Alive, LamportTime::new(0));
     e
   }
 
-  fn tag_query(tag: &str, expr: Option<&str>) -> QueryMessage<u32, std::net::SocketAddr> {
+  fn tag_query(tag: &str, expr: Option<&str>) -> QueryMessage<u32, core::net::SocketAddr> {
     QueryMessage {
       filters: vec![Filter::Tag(TagFilter {
         tag: tag.into(),
@@ -5860,10 +5860,10 @@ mod key_request_responder {
   fn make_key_query(
     name: &str,
     key: Option<SecretKey>,
-  ) -> crate::typed::QueryMessage<u32, std::net::SocketAddr> {
+  ) -> crate::typed::QueryMessage<u32, core::net::SocketAddr> {
     use crate::{AnyMessage, KeyRequestMessage};
     let req = KeyRequestMessage::new(key);
-    let payload = AnyMessage::<u32, std::net::SocketAddr>::KeyRequest(req)
+    let payload = AnyMessage::<u32, core::net::SocketAddr>::KeyRequest(req)
       .encode()
       .expect("encode KeyRequestMessage");
     crate::typed::QueryMessage {
@@ -5873,7 +5873,7 @@ mod key_request_responder {
       filters: vec![],
       flags: crate::typed::QueryFlag::empty(),
       relay_factor: 0,
-      timeout: std::time::Duration::from_secs(5),
+      timeout: core::time::Duration::from_secs(5),
       name: name.into(),
       payload,
     }
@@ -5913,7 +5913,7 @@ mod key_request_responder {
       }
       other => panic!(
         "expected Event::KeyRequest, got {:?}",
-        std::mem::discriminant(&other)
+        core::mem::discriminant(&other)
       ),
     }
     // Must not also emit Event::Query.
@@ -5936,7 +5936,7 @@ mod key_request_responder {
       }
       other => panic!(
         "expected Event::KeyRequest, got {:?}",
-        std::mem::discriminant(&other)
+        core::mem::discriminant(&other)
       ),
     }
   }
@@ -5990,7 +5990,7 @@ mod key_request_responder {
       Event::KeyRequest(kr) => kr,
       other => panic!(
         "expected KeyRequest, got {:?}",
-        std::mem::discriminant(&other)
+        core::mem::discriminant(&other)
       ),
     };
     // Verify received_queries entry exists before respond_key.
@@ -6020,14 +6020,14 @@ mod key_request_responder {
       .expect("must have directed send");
     assert_eq!(
       dest,
-      "127.0.0.1:9999".parse::<std::net::SocketAddr>().unwrap()
+      "127.0.0.1:9999".parse::<core::net::SocketAddr>().unwrap()
     );
   }
 
   #[test]
   fn key_request_event_debug_does_not_leak_key_bytes() {
     let key = test_key();
-    let req = KeyRequest::<u32, std::net::SocketAddr> {
+    let req = KeyRequest::<u32, core::net::SocketAddr> {
       op: KeyRequestOperation::Install,
       key: Some(key),
       id: 1,
@@ -6036,7 +6036,7 @@ mod key_request_responder {
       relay_factor: 0,
       deadline: memberlist_proto::Instant::ORIGIN,
     };
-    let ev = Event::<u32, std::net::SocketAddr>::KeyRequest(req);
+    let ev = Event::<u32, core::net::SocketAddr>::KeyRequest(req);
     let debug_str = format!("{:?}", ev);
     // SecretKey's Debug impl uses "<redacted>" — check the raw bytes don't appear.
     // For Aes128([0u8;16]) the raw bytes would be "0, 0, 0, 0".
@@ -6438,7 +6438,7 @@ fn left_member_replay_at_watermark_boundary_skips_leave() {
     left_members: vec![99u32],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   // Must not panic.
@@ -6660,7 +6660,7 @@ fn push_pull_near_watermark_status_time_integrity_floor() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   e.test_merge_remote_state(encoded);
@@ -6835,7 +6835,7 @@ fn push_pull_near_watermark_event_floor_integrity_and_delivery() {
     left_members: vec![],
     events: vec![],
   };
-  let encoded = AnyMessage::<u32, std::net::SocketAddr>::PushPull(pp)
+  let encoded = AnyMessage::<u32, core::net::SocketAddr>::PushPull(pp)
     .encode()
     .expect("encode must succeed");
   // A suppressed (ignore-join) merge triggers the G4 event_buffer.min_time

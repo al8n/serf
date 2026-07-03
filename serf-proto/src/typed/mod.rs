@@ -3,7 +3,9 @@
 //! These types are what the serf state machine works with directly. The
 //! `bridge` module converts them to/from the buffa-generated codec types.
 
-use std::collections::HashMap;
+use std::vec::Vec;
+
+use crate::FxHashMap;
 
 use bytes::Bytes;
 use smol_str::SmolStr;
@@ -82,22 +84,22 @@ impl Default for Coordinate {
 
 /// Node metadata: a string→string map gossiped via node meta.
 ///
-/// Thin newtype over [`HashMap<SmolStr, SmolStr>`] so the rest of the crate
+/// Thin newtype over a `FxHashMap<SmolStr, SmolStr>` so the rest of the crate
 /// can name the concept without spelling out the full map type.
 /// Proto3 `map` wire encoding does not guarantee key order, so encoded bytes
 /// are not canonical for a given set of tags.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Tags(pub HashMap<SmolStr, SmolStr>);
+pub struct Tags(pub FxHashMap<SmolStr, SmolStr>);
 
 impl Tags {
   /// Creates an empty `Tags` map.
   pub fn new() -> Self {
-    Self(HashMap::new())
+    Self(FxHashMap::default())
   }
 
   /// Creates a `Tags` map with the given initial capacity.
   pub fn with_capacity(cap: usize) -> Self {
-    Self(HashMap::with_capacity(cap))
+    Self(FxHashMap::with_capacity_and_hasher(cap, Default::default()))
   }
 
   /// Returns the number of tag entries.
@@ -182,7 +184,7 @@ pub struct QueryMessage<I, A> {
   /// Number of relayed duplicate responses requested.
   pub relay_factor: u8,
   /// Maximum time allowed between delivery and response.
-  pub timeout: std::time::Duration,
+  pub timeout: core::time::Duration,
   /// Query name.
   pub name: SmolStr,
   /// Query payload.

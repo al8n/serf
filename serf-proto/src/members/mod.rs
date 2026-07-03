@@ -11,7 +11,9 @@
 //! `memberlist_proto::Instant` threaded in from the driver — no wall-clock
 //! reads occur inside the pure machine.
 
-use std::collections::HashMap;
+use std::vec::Vec;
+
+use crate::FxHashMap;
 
 /// Hard cardinality cap on `Members::recent_intents`.
 ///
@@ -293,10 +295,10 @@ where
   I: Eq + core::hash::Hash,
 {
   /// Full state for every known node (alive, leaving, left, or failed).
-  pub(crate) states: HashMap<I, MemberState<I, A>>,
+  pub(crate) states: FxHashMap<I, MemberState<I, A>>,
   /// Buffered join/leave intents whose inner memberlist event has not yet
   /// arrived.  Newest ltime wins (upsert_intent).
-  pub(crate) recent_intents: HashMap<I, NodeIntent>,
+  pub(crate) recent_intents: FxHashMap<I, NodeIntent>,
   /// Ids of nodes in the `Left` state, for tombstone reaping.
   pub(crate) left_members: Vec<I>,
   /// Ids of nodes in the `Failed` state, for reconnect and reaping.
@@ -315,8 +317,8 @@ where
 {
   fn default() -> Self {
     Self {
-      states: HashMap::default(),
-      recent_intents: HashMap::default(),
+      states: FxHashMap::default(),
+      recent_intents: FxHashMap::default(),
       left_members: Vec::new(),
       failed_members: Vec::new(),
       recent_intent_seq: 0,

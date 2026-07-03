@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 
 use buffa::Message as _;
 use memberlist_proto::Node;
@@ -347,7 +347,7 @@ fn query_message_roundtrip_pb_no_filters() {
     filters: vec![],
     flags: QueryFlag::ACK,
     relay_factor: 3,
-    timeout: std::time::Duration::from_millis(500),
+    timeout: core::time::Duration::from_millis(500),
     name: smol_str::SmolStr::from("my-query"),
     payload: bytes::Bytes::from_static(b"query-payload"),
   };
@@ -385,7 +385,7 @@ fn query_message_roundtrip_pb_with_filters() {
     ],
     flags: QueryFlag::ACK | QueryFlag::NO_BROADCAST,
     relay_factor: 0,
-    timeout: std::time::Duration::from_secs(2),
+    timeout: core::time::Duration::from_secs(2),
     name: smol_str::SmolStr::from("filtered-query"),
     payload: bytes::Bytes::new(),
   };
@@ -456,7 +456,8 @@ fn query_to_pb_timeout_overflow_is_error() {
   // A duration whose nanosecond count exceeds u64::MAX (requires u128) must
   // produce BridgeError::InvalidValue, not a silent truncation.
   // u64::MAX nanos ≈ 584 years; add one second to guarantee overflow.
-  let huge_timeout = std::time::Duration::from_nanos(u64::MAX) + std::time::Duration::from_secs(1);
+  let huge_timeout =
+    core::time::Duration::from_nanos(u64::MAX) + core::time::Duration::from_secs(1);
   let typed: QueryMessage<I, A> = QueryMessage {
     ltime: LamportTime::new(1),
     id: 1,

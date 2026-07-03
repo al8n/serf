@@ -1,6 +1,6 @@
 //! Unit tests for the pure Vivaldi `CoordinateClient` engine.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use memberlist_proto::SmallRng;
 use rand::SeedableRng;

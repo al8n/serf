@@ -18,7 +18,7 @@ use super::*;
 fn upsert_intent_cap_eviction_is_deterministic() {
   use memberlist_proto::Instant;
 
-  type TestMembers = Members<u32, std::net::SocketAddr>;
+  type TestMembers = Members<u32, core::net::SocketAddr>;
 
   // Use cap + a surplus so we trigger exactly one eviction per surplus insert.
   let n = MAX_RECENT_INTENTS + 16;
@@ -128,7 +128,7 @@ fn serf_state_display_matches_as_str() {
 fn upsert_intent_newest_ltime_wins() {
   use memberlist_proto::Instant;
 
-  type TestMembers = Members<u32, std::net::SocketAddr>;
+  type TestMembers = Members<u32, core::net::SocketAddr>;
   let mut m = TestMembers::default();
   let t0 = Instant::ORIGIN;
 
@@ -162,7 +162,7 @@ fn upsert_intent_newest_ltime_wins() {
 fn recent_intent_kind_mismatch_returns_none() {
   use memberlist_proto::Instant;
 
-  type TestMembers = Members<u32, std::net::SocketAddr>;
+  type TestMembers = Members<u32, core::net::SocketAddr>;
   let mut m = TestMembers::default();
 
   m.upsert_intent(

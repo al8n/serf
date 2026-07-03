@@ -4,7 +4,7 @@
 //! control signals through this enum rather than callbacks, mirroring the
 //! quinn-proto / memberlist-proto pull-style event model.
 
-use std::sync::Arc;
+use std::{sync::Arc, vec::Vec};
 
 use bytes::Bytes;
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
@@ -281,11 +281,11 @@ pub struct KeyResponse<I> {
   /// Number with `result = false` (error) in their response.
   pub num_err: usize,
   /// Key → count of nodes that have that key installed.
-  pub keys: std::collections::HashMap<SecretKey, usize>,
+  pub keys: crate::FxHashMap<SecretKey, usize>,
   /// Primary key → count of nodes using it as primary.
-  pub primary_keys: std::collections::HashMap<SecretKey, usize>,
+  pub primary_keys: crate::FxHashMap<SecretKey, usize>,
   /// Per-node error messages (only for nodes with `result = false`).
-  pub messages: std::collections::HashMap<I, smol_str::SmolStr>,
+  pub messages: crate::FxHashMap<I, smol_str::SmolStr>,
 }
 
 // ── KeyRequestOperation ───────────────────────────────────────────────────────
