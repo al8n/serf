@@ -62,6 +62,12 @@ tls = ["std", "tcp", "memberlist-proto/tls"]
 # quinn-proto is std-only.
 quic = ["std", "dep:libm", "memberlist-proto/quic"]
 quic-rustls-ring = ["quic", "memberlist-proto/quic-rustls-ring"]
+# Test-support seams: exposes the `StreamEndpoint` / `Endpoint` helpers that
+# overwrite the Lamport clocks and inspect the ignore-join set, for a DOWNSTREAM
+# crate's tests only. Non-default and never pulled by a production build, so a
+# plain `tcp` / `tls` / `quic` build never exposes clock mutation. Enable it from
+# a `[dev-dependencies]` edge (e.g. serf-embedded) so it is active for tests alone.
+test-support = []
 
 [dependencies]
 memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false }

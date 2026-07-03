@@ -4084,10 +4084,12 @@ where
 
   /// Set all three Lamport clocks in one call (test fixture).
   ///
-  /// Compiled under `test` or the `tcp` feature: the `StreamEndpoint` test-support
-  /// seam ([`StreamEndpoint::test_set_clocks`](crate::StreamEndpoint::test_set_clocks))
-  /// forwards here so a downstream crate's tests can reach the member clock.
-  #[cfg(any(test, feature = "tcp"))]
+  /// Compiled under `test` or the non-default `test-support` feature: the
+  /// `StreamEndpoint` test-support seam
+  /// ([`StreamEndpoint::test_set_clocks`](crate::StreamEndpoint::test_set_clocks))
+  /// forwards here so a downstream crate's tests can reach the member clock. Not a
+  /// production build path — a plain `tcp` build never compiles this.
+  #[cfg(any(test, feature = "test-support"))]
   pub(crate) fn test_set_clocks(&mut self, member: u64, event: u64, query: u64) {
     self.clock = member;
     self.event_clock = event;
@@ -4177,10 +4179,12 @@ where
   /// Whether exchange `id` is currently a recorded `ignore_old` join (test
   /// adapter for cancellation / one-shot-consume / per-exchange assertions).
   ///
-  /// Compiled under `test` or the `tcp` feature: the `StreamEndpoint` test-support
-  /// seam ([`StreamEndpoint::test_has_ignore_join_stream`](crate::StreamEndpoint::test_has_ignore_join_stream))
-  /// forwards here so a downstream crate's tests can observe the ignore set.
-  #[cfg(any(test, feature = "tcp"))]
+  /// Compiled under `test` or the non-default `test-support` feature: the
+  /// `StreamEndpoint` test-support seam
+  /// ([`StreamEndpoint::test_has_ignore_join_stream`](crate::StreamEndpoint::test_has_ignore_join_stream))
+  /// forwards here so a downstream crate's tests can observe the ignore set. Not a
+  /// production build path — a plain `tcp` build never compiles this.
+  #[cfg(any(test, feature = "test-support"))]
   pub(crate) fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
     self.ignore_join_streams.contains(&id)
   }
