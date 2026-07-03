@@ -1103,13 +1103,14 @@ fn leave_folds_queued_success_before_resolving_join() {
   );
 }
 
-/// A never-polled terminal join does NOT leak: once its (failed) exchange
-/// terminates, the pump reaps the waiter and clears its `ignore_old` stream WITHOUT
-/// any `poll_join` and without arming a pending-join deadline — the caller simply
-/// dropped the handle. Regression for a reap gated on caller delivery
-/// (`pending_joins` would linger `Ready` forever).
+/// A never-polled terminal join clears its MACHINE state on the exchange terminal
+/// but retains the small caller-result entry until delivery/cancel. Once its
+/// (failed) exchange terminates the pump clears the `ignore_old` stream WITHOUT any
+/// `poll_join` — so the machine's ignore set never leaks — while the resolved-but-
+/// undelivered result entry lingers (it is NOT dropped out from under a caller that
+/// has not yet retrieved it). `cancel_join` is the give-up that reaps that entry.
 #[test]
-fn dropped_never_polled_join_is_reaped_on_exchange_terminal() {
+fn dropped_never_polled_join_clears_machine_ignore_on_terminal_then_cancel_reaps() {
   let mut engine = make_engine();
   let now = Instant::from_origin(Duration::from_secs(86_400));
   engine.start(now);
@@ -1140,24 +1141,42 @@ fn dropped_never_polled_join_is_reaped_on_exchange_terminal() {
     "the ignore token is recorded while the exchange is in flight"
   );
 
-  // Drive to the reap WITHOUT ever polling the join: the driver folds the failed
-  // completion via poll_event (the caller dropped the handle), then a later pump
-  // reaps the terminal waiter independent of any delivery.
+  // Drive the failed exchange to its terminal WITHOUT ever polling the join (the
+  // caller dropped the handle): fold the completion via poll_event, then pump so the
+  // end-of-pump resolution clears the machine ignore set.
   for _ in 0..8 {
     while engine.poll_event().is_some() {}
-    if engine.pending_join_count() == 0 {
+    if !engine.endpoint.test_has_ignore_join_stream(sid) {
       break;
     }
     engine.pump(now, &mut gossip, &mut stream);
   }
-  assert_eq!(
-    engine.pending_join_count(),
-    0,
-    "a never-polled terminal join must be reaped (no pending-join leak)"
-  );
+  // The MACHINE state is cleared on the exchange terminal — no machine-ignore leak —
+  // regardless of caller polling.
   assert!(
     !engine.endpoint.test_has_ignore_join_stream(sid),
     "its ignore stream must be cleared on the exchange terminal (no machine leak)"
+  );
+  // The small caller-result entry is RETAINED until delivery/cancel: it resolved
+  // `Ready` but was never delivered, so the result is not lost by a never-polled
+  // reap.
+  assert_eq!(
+    engine.pending_join_count(),
+    1,
+    "the resolved-but-undelivered entry is retained until poll_join or cancel_join"
+  );
+  assert!(
+    matches!(engine.pending_joins[&handle].reply, JoinReply::Ready(_)),
+    "its reply resolved Ready, awaiting delivery"
+  );
+
+  // cancel_join is the supported give-up for a dropped handle: it reaps the retained
+  // terminal entry (its exchanges already terminal, ignore set already cleared).
+  engine.cancel_join(handle);
+  assert_eq!(
+    engine.pending_join_count(),
+    0,
+    "cancel_join reaps the retained terminal entry (no pending-join leak)"
   );
 }
 
@@ -1221,5 +1240,121 @@ fn cancel_join_forgets_in_flight_join_leak_free() {
   assert!(
     !link.a.endpoint.test_has_ignore_join_stream(sid),
     "the ignore token is cleared on the exchange terminal (no machine leak)"
+  );
+}
+
+/// A resolved-but-undelivered join result survives a `pump` that runs between its
+/// resolution and the caller's `poll_join`. The push/pull succeeds and its
+/// completion is FOLDED (via `poll_event`) into a `Ready(Ok(..))` reply without the
+/// caller polling; a further `pump` then runs the end-of-pump join sweep, which
+/// must RETAIN the undelivered result. Regression for a one-tick / exchange-work-
+/// done reap that dropped the result under a slow/async waiter — reverting it makes
+/// the poll below observe `None`.
+#[test]
+fn join_result_survives_pump_after_resolve_until_polled() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  let handle = link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  // Drive the push/pull to its terminal and FOLD the Succeeded completion (via
+  // poll_event) WITHOUT ever calling poll_join, so the reply resolves to
+  // `Ready(Ok(..))` yet is not delivered to the caller.
+  let mut resolved = false;
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if matches!(
+      link.a.pending_joins.get(&handle).map(|pj| &pj.reply),
+      Some(JoinReply::Ready(_))
+    ) {
+      resolved = true;
+      break;
+    }
+  }
+  assert!(
+    resolved,
+    "the join must resolve Ready off the folded Succeeded push/pull"
+  );
+
+  // Pump A ONCE MORE before the caller polls. The end-of-pump join sweep must
+  // RETAIN a resolved-but-undelivered result (a one-tick / exchange-work-done reap
+  // would drop it here, so the poll below would see None).
+  link.a.pump(now, &mut link.a_gossip, &mut link.a_rel);
+
+  // The successful result is STILL retrievable after the extra pump.
+  match link.a.poll_join(handle) {
+    Some(Ok(reached)) => assert!(
+      reached.contains(&link.b_addr),
+      "the reached set retained across the extra pump must include B"
+    ),
+    other => {
+      panic!("a resolved join result must survive a pump before the caller polls, got {other:?}")
+    }
+  }
+  assert_eq!(
+    link.a.pending_join_count(),
+    0,
+    "the delivered join is reaped once the caller retrieves its result"
+  );
+}
+
+/// A `join` immediately cancelled BEFORE any pump dispatches no push/pull: its
+/// queued seed is removed, so the pump initiates nothing for the handle, and the
+/// waiter is reaped at once with zero network side effect. Regression for a
+/// `cancel_join` that left un-dispatched seeds queued — reverting it lets the pump
+/// dial the cancelled seed (it parks as a PendingDial) and the join reappear.
+#[test]
+fn cancel_before_pump_dispatches_no_seed_and_reaps() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  // A listener but an empty dial pool: a dispatched seed's Connect parks as
+  // PendingDial, so `pending_dial_count` is a precise "a push/pull was started"
+  // probe.
+  engine.set_listener(9);
+
+  let handle = engine
+    .join(&[node_addr(7002)], /*ignore_old*/ true, now)
+    .expect("join announces intent and mints a handle");
+  assert_eq!(engine.pending_seeds.len(), 1, "the routable seed is queued");
+  assert_eq!(
+    engine.pending_join_count(),
+    1,
+    "the in-flight join is tracked"
+  );
+
+  // Cancel BEFORE any pump: the queued seed is removed and — no exchange having
+  // started — the waiter is reaped immediately.
+  engine.cancel_join(handle);
+  assert!(
+    engine.pending_seeds.is_empty(),
+    "cancel_join must drop the never-dispatched seed so the pump initiates no push/pull"
+  );
+  assert_eq!(
+    engine.pending_join_count(),
+    0,
+    "a cancel-before-pump forgets everything and reaps the waiter immediately"
+  );
+
+  // The pump now dispatches nothing for that handle: no push/pull is started, so no
+  // exchange parks as PendingDial (a buggy cancel that left the seed queued would
+  // dial it here).
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(0);
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.pending_dial_count(),
+    0,
+    "no push/pull may be dispatched for a seed cancelled before the pump"
+  );
+  assert_eq!(
+    engine.pending_join_count(),
+    0,
+    "no join reappears after the pump"
   );
 }
