@@ -888,3 +888,138 @@ fn two_engine_join_folds_reached_set_and_poll_join_resolves_ok() {
     "A must have learned B through the push/pull merge"
   );
 }
+
+// ── leave / ignore_old decoupling ─────────────────────────────────────────────
+
+/// An `ignore_old` join whose `leave()` races an in-flight push/pull: `leave` must
+/// NOT clear the exchange's ignore token, because the exchange can still merge and
+/// a merge past a removed token replays the seed's pre-join user events. The token
+/// is instead cleared only on the exchange terminal (the pump fold), so it is
+/// retained across leave yet never leaks. Regression for a `leave()` that cleared
+/// the ignore streams before the exchange terminal.
+#[test]
+fn leave_retains_ignore_token_until_exchange_terminal() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  // A starts an `ignore_old` join to B and dispatches the dial with a single step,
+  // so the push/pull is IN FLIGHT (its ignore token recorded, its exchange bound
+  // into `pending`) — not yet terminal — when A leaves.
+  let handle = link
+    .a
+    .join(&[link.b_addr], /*ignore_old*/ true, now)
+    .expect("join announces intent and mints a handle");
+  link.step(now);
+
+  // The dispatched seed recorded exactly one ignore-join StreamId, and its exchange
+  // is still in flight (no terminal `ExchangeCompleted` yet).
+  let sid = {
+    let pj = &link.a.pending_joins[&handle];
+    assert_eq!(
+      pj.started.len(),
+      1,
+      "the ignore_old seed recorded its StreamId"
+    );
+    assert!(
+      !pj.pending.is_empty(),
+      "its push/pull exchange is bound and in flight"
+    );
+    *pj.started.iter().next().expect("one started stream")
+  };
+  assert!(
+    link.a.endpoint.test_has_ignore_join_stream(sid),
+    "the ignore token is recorded while the exchange is in flight"
+  );
+
+  // A leaves mid-exchange. The fix RETAINS the token (its exchange can still
+  // merge); the buggy leave cleared it right here, so a late merge would replay
+  // the seed's pre-join events.
+  link
+    .a
+    .leave(now)
+    .expect("leave from a running node succeeds");
+  assert!(
+    link.a.endpoint.test_has_ignore_join_stream(sid),
+    "leave must NOT clear the ignore token while the exchange can still merge"
+  );
+
+  // Driving the exchange to its terminal clears the token via the pump fold — the
+  // SOLE cleanup site — so the machine's ignore set never leaks.
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if !link.a.endpoint.test_has_ignore_join_stream(sid) {
+      break;
+    }
+  }
+  assert!(
+    !link.a.endpoint.test_has_ignore_join_stream(sid),
+    "the ignore token must be cleared on the exchange terminal (no leak)"
+  );
+}
+
+/// A refused `leave` — the `LeaveClockExhausted` watermark guard, which leaves the
+/// node `Alive` without mutating serf state — must NOT touch the in-flight join
+/// state: the queued seed survives, the pending join is neither force-resolved nor
+/// reaped, and the endpoint stays `Alive`. The engine calls `endpoint.leave`
+/// BEFORE abandoning any join, so a refusal (`?`) returns with the join
+/// bookkeeping untouched. Regression for a `leave()` that cleared seeds and
+/// force-resolved joins before the machine leave was accepted.
+#[test]
+fn refused_leave_leaves_join_state_untouched() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  engine.set_listener(9);
+
+  let handle = engine
+    .join(&[node_addr(7002)], /*ignore_old*/ true, now)
+    .expect("join announces intent and mints a handle");
+  assert_eq!(
+    engine.pending_join_count(),
+    1,
+    "the in-flight join is tracked"
+  );
+  assert_eq!(engine.pending_seeds.len(), 1, "the routable seed is queued");
+
+  // Drive serf's member clock to the LTIME_MAX integrity floor so the next leave
+  // stamp reaches LTIME_MAX and is refused — the watermark serf-proto's own
+  // leave-watermark test drives the clock to. LTIME_MAX is serf-proto's private
+  // integrity floor `1 << 63`.
+  const LTIME_MAX: u64 = 1u64 << 63;
+  engine.endpoint.test_set_clocks(LTIME_MAX - 1, 0, 0);
+
+  let err = engine
+    .leave(now)
+    .expect_err("a leave whose stamp reaches LTIME_MAX must be refused");
+  assert!(
+    matches!(err, SerfError::LeaveClockExhausted),
+    "expected LeaveClockExhausted, got {err:?}"
+  );
+
+  // The node stays Alive and every scrap of join bookkeeping is untouched.
+  assert_eq!(
+    engine.state(),
+    SerfState::Alive,
+    "a refused leave must leave the node Alive"
+  );
+  assert_eq!(
+    engine.pending_seeds.len(),
+    1,
+    "the queued seed must survive a refused leave"
+  );
+  assert_eq!(
+    engine.pending_join_count(),
+    1,
+    "a refused leave must not reap the pending join"
+  );
+  assert!(
+    matches!(engine.pending_joins[&handle].reply, JoinReply::Pending),
+    "a refused leave must not force-resolve the pending join"
+  );
+  assert!(
+    engine.poll_join(handle).is_none(),
+    "the refused-leave join is still in flight"
+  );
+}
