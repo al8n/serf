@@ -1004,15 +1004,21 @@ where
     self.control_events.push_back(ev);
   }
 
-  /// Shed every past-deadline `KeyRequest` from the non-lossy `control_events`
-  /// queue, mirroring the endpoint's own `received_queries` liveness prune.
+  /// Shed every strictly-past-deadline `KeyRequest` from the non-lossy
+  /// `control_events` queue, mirroring the endpoint's own `received_queries`
+  /// liveness prune.
   ///
-  /// A `KeyRequest` past its response `deadline` is dead: the endpoint rejects a
-  /// `respond_key` sent after the deadline, so the driver can no longer act on it.
-  /// Dropping it here loses nothing real, promptly releases the raw key material
-  /// pinned in its payload, and bounds `control_events` to the LIVE mandatory set —
-  /// the same `now < deadline` retain the serf endpoint applies to its
-  /// `received_queries` on every `handle_timeout`. Because the endpoint caps its
+  /// A `KeyRequest` is retained while `now <= deadline` and dropped only once
+  /// strictly past its deadline (`now > deadline`) — the exact point at which
+  /// `respond_key` stops accepting a response for it, since its deadline guard
+  /// rejects only `now > deadline` and a `respond_key` at the exact instant
+  /// `now == deadline` is still valid. Retaining through the inclusive boundary
+  /// therefore never sheds a request a pending `respond_key` could still answer,
+  /// while a strictly-past request is dead: dropping it loses nothing real,
+  /// promptly releases the raw key material pinned in its payload, and bounds
+  /// `control_events` to the LIVE mandatory set — the same `now <= deadline`
+  /// retain the serf endpoint applies to its `received_queries` on every
+  /// `handle_timeout`. Because the endpoint caps its
   /// LIVE `received_queries` at a fixed inbound maximum and emits exactly one
   /// `Event::KeyRequest` per kept entry (sharing this deadline), the live
   /// `KeyRequest`s retained here are transitively bounded by that same cap — no
@@ -1021,11 +1027,11 @@ where
   /// [`push_control_event`](Self::push_control_event).
   #[cfg(encryption)]
   fn prune_expired_control_events(&mut self, now: Instant) {
-    // Keep everything that is NOT a past-deadline KeyRequest — mirroring the
-    // endpoint's `retain(|_, rq| now < rq.deadline)` over received_queries.
+    // Keep everything except a strictly-past-deadline KeyRequest — mirroring the
+    // endpoint's `retain(|_, rq| now <= rq.deadline)` over received_queries.
     self
       .control_events
-      .retain(|ev| !matches!(ev, Event::KeyRequest(kr) if now >= kr.deadline()));
+      .retain(|ev| !matches!(ev, Event::KeyRequest(kr) if now > kr.deadline()));
   }
 
   /// Fold one drained machine event into its await-result join, then route it to the

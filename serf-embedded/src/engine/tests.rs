@@ -1853,3 +1853,34 @@ fn past_deadline_key_request_is_pruned_and_payload_released() {
     );
   }
 }
+
+/// A `KeyRequest` at EXACTLY its response `deadline` is still answerable —
+/// `respond_key` rejects only `now > deadline`, so a `respond_key` at the exact
+/// instant `now == deadline` succeeds. The pump's prune must therefore RETAIN it
+/// at `now == deadline`, and `poll_event` must still deliver it. Guards the
+/// inclusive prune boundary: dropping it at `now == deadline` would shed a live
+/// mandatory key request out from under a response the originator could still
+/// send. Reverting the predicate to `now >= deadline` prunes it here, so
+/// `poll_event` no longer delivers the request and this fails.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_request_at_exact_deadline_survives_prune_and_is_delivered() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(2);
+
+  // Deadline equal to the pump instant: the request is answerable at exactly D
+  // (respond_key rejects only now > D), so the prune must keep it.
+  let deadline = now + Duration::from_secs(5);
+  engine.route_drained_event(key_request(11, deadline));
+  engine.pump(deadline, &mut gossip, &mut stream);
+
+  assert!(
+    matches!(engine.poll_event(), Some(Event::KeyRequest(_))),
+    "a KeyRequest at exactly its deadline is still answerable, so the prune must \
+     retain it and poll_event must deliver it"
+  );
+}
