@@ -1,0 +1,73 @@
+[package]
+name = "serf-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version = "1.96"
+description = "Transport-agnostic no_std driving core shared by the embedded serf drivers."
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+# `std` and `alloc` are INDEPENDENT capability tiers (std does NOT pull alloc):
+# under `std` the real `std` crate supplies the heap; under `alloc` the
+# no_std+alloc path aliases `alloc`. Each layers the matching feature on every
+# dependency that has one.
+std = ["serf-proto/std", "memberlist-embedded/std", "memberlist-proto/std"]
+alloc = ["serf-proto/alloc", "memberlist-embedded/alloc", "memberlist-proto/alloc"]
+
+# CIDR peer-admission allow-list. A `CidrPolicy` set via `Options::with_cidr_policy`
+# filters inbound gossip by datagram source and inbound reliable connections by
+# peer address at the transport boundary, AND inbound alives by the peer's
+# self-advertised address at membership admission. no_std+alloc (the policy holds
+# a set of `ipnet` networks), so it pulls the heap tier.
+cidr = ["alloc", "memberlist-embedded/cidr", "memberlist-proto/cidr"]
+
+# Gossip + reliable-plane AEAD encryption backends. Each pass-through enables the
+# matching serf-proto, memberlist-embedded, and machine backend so a
+# `TransformOptions` carrying a `Keyring` for that cipher can actually encrypt,
+# and serf's key-management queries (install/use/remove/list) become available.
+# Both AEAD backends are no_std+alloc.
+aes-gcm = [
+  "alloc",
+  "serf-proto/aes-gcm",
+  "memberlist-embedded/aes-gcm",
+  "memberlist-proto/aes-gcm",
+]
+chacha20-poly1305 = [
+  "alloc",
+  "serf-proto/chacha20-poly1305",
+  "memberlist-embedded/chacha20-poly1305",
+  "memberlist-proto/chacha20-poly1305",
+]
+# Umbrella that activates both AEAD backends (convenient for tests / CI).
+encryption = ["aes-gcm", "chacha20-poly1305"]
+
+[dependencies]
+# The alloc-tier plain-TCP (`RawRecords`) path of serf's super-machine.
+serf-proto = { path = "../serf-proto", default-features = false, features = [
+  "tcp",
+] }
+# The payload-agnostic driving glue (ReliablePlane / IO seams / transform /
+# resolver) serf-embedded reuses directly; and the shared machine types.
+memberlist-embedded = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false }
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = [
+  "tcp",
+] }
+getrandom = "0.4"
+bytes = { version = "1", default-features = false }
+# Named in the `user_event` / `query` forwarder signatures (`impl Into<SmolStr>`).
+smol_str = { version = "0.3", default-features = false }
+smallvec-wrapper = { version = "0.4", default-features = false }
+hashbrown = { version = "0.17", default-features = false, features = [
+  "default-hasher",
+] }
+# The fixed-capacity, no-heap `ResolvedAddrs` resolver result shares the single
+# version smoltcp already pulls into the graph (no second heapless major).
+heapless = { version = "0.9", default-features = false }

@@ -1,0 +1,1352 @@
+//! The transport-agnostic serf driving core: construction, accessors, the serf
+//! command API, and the link-layer-independent `pump`.
+//!
+//! [`SerfEngine`] owns serf's super-machine ([`StreamEndpoint`]) — serf logic
+//! composed over the memberlist reliable stream coordinator on the plain-TCP
+//! [`RawRecords`] path — and the reused reliable-plane connection state machine
+//! ([`ReliablePlane`]), the gossip scratch buffer, and the join-seed queue. It
+//! performs NO socket I/O: a driver supplies the link-layer stack tick plus a
+//! [`GossipIo`] and a [`StreamIo`], and [`SerfEngine::pump`] drives the machine
+//! over them. A driver wraps the engine, owning the actual sockets/interface; the
+//! future `serf-smoltcp` / `serf-embassy` drivers are built on it.
+//!
+//! This is the serf port of memberlist-embedded's `Engine`: the reliable-plane
+//! glue, the [`GossipIo`] / [`StreamIo`] seams, and the transform pipeline are
+//! reused from [`memberlist-embedded`](https://docs.rs/memberlist-embedded)
+//! directly; only the [`SerfEngine`] here differs, driving serf's richer machine
+//! (folding serf's query / user-event / key-management events into the pump on
+//! top of membership) instead of the membership-only memberlist machine.
+
+use core::{hash::Hash, net::SocketAddr, num::NonZeroU8};
+
+// Under `no_std + alloc` the prelude does not bring `Box` / `Vec` / `VecDeque`
+// into scope; import them explicitly from the aliased `std` (which is `alloc` in
+// that build).
+#[cfg(feature = "std")]
+use std::collections::VecDeque;
+#[cfg(not(feature = "std"))]
+use std::{boxed::Box, collections::VecDeque, vec::Vec};
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use memberlist_proto::{
+  AliveDelegate, Endpoint, EndpointOptions, Instant, LabelOptions, PushPullKind, RawRecords, Rng,
+  Transmit,
+  codec::{
+    DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
+    parse_messages,
+  },
+  streams::{ExchangeId, StreamAction, StreamEndpoint as Coordinator},
+  typed::NodeState,
+};
+use smallvec_wrapper::MediumVec;
+
+use serf_proto::{
+  StreamEndpoint,
+  endpoint::{Error as SerfError, QueryId, QueryParams},
+  event::{Event, QueryEvent},
+  members::{Member, SerfState},
+  options::Options as SerfOptions,
+  typed::Tags,
+};
+
+#[cfg(encryption)]
+use serf_proto::{SecretKey, event::KeyRequest, event::KeyResponseArgs};
+
+use memberlist_embedded::{
+  GossipIo, InitError, Options, StreamIo, TransformOptions,
+  reliable::{ConnState, Connection, ReliablePlane},
+  socket_addr_is_routable, validate_runtime_config,
+};
+
+use crate::cidr::{CidrFilter, cidr_blocks};
+
+/// The largest the encrypted wrapper can inflate a gossip datagram, or `0` when
+/// no encryption backend is built in. serf's gossip plane carries only the
+/// encryption wrapper (no checksum / compression), so this is the whole on-wire
+/// inflation the receive scratch must accommodate.
+#[cfg(encryption)]
+const ENCRYPTED_WRAPPER_OVERHEAD: usize = memberlist_proto::ENCRYPTED_WRAPPER_OVERHEAD;
+#[cfg(not(encryption))]
+const ENCRYPTED_WRAPPER_OVERHEAD: usize = 0;
+
+/// Size the inbound-gossip receive scratch from the effective gossip MTU.
+///
+/// The machine caps an outbound gossip datagram's PLAINTEXT at the configured
+/// [`EndpointOptions`] `gossip_mtu`; the on-wire datagram can then exceed that by
+/// up to `ENCRYPTED_WRAPPER_OVERHEAD` (the AEAD wrapper header, nonce, and tag)
+/// when encryption is enabled. The buffer must hold the largest such datagram, so
+/// it is sized to `gossip_mtu + ENCRYPTED_WRAPPER_OVERHEAD`, floored at 1500 (the
+/// common Ethernet payload) so a sub-1500 MTU never under-sizes it. A driver's
+/// datagram receive may POP a datagram before checking the caller's slice length,
+/// so a datagram larger than this buffer is consumed and lost; sizing from the
+/// same knob the machine bounds outbound gossip with means a correctly-configured
+/// cluster never truncates an in-budget datagram.
+fn gossip_recv_buf_size(gossip_mtu: usize) -> usize {
+  (gossip_mtu + ENCRYPTED_WRAPPER_OVERHEAD).max(1500)
+}
+
+/// An [`AliveDelegate`] that admits a peer only when its advertised address is a
+/// routable destination ([`socket_addr_is_routable`]).
+///
+/// The machine consults `notify_alive` inline for EVERY admitted Alive — gossip
+/// and join push/pull alike — so this one filter drops a non-routable address at
+/// admission on both planes. The bad address is never stored as a member and so
+/// is never re-gossiped, stopping cluster-wide propagation of a member address no
+/// node could ever send a useful packet to.
+struct RoutableAddrFilter;
+
+impl<I> AliveDelegate<I, SocketAddr> for RoutableAddrFilter
+where
+  I: memberlist_proto::Id,
+{
+  fn notify_alive(&self, peer: &NodeState<I, SocketAddr>) -> bool {
+    socket_addr_is_routable(peer.address_ref())
+  }
+}
+
+/// An [`AliveDelegate`] that admits a peer only when BOTH the built-in routable
+/// filter and an inner delegate accept it.
+///
+/// The routable filter is load-bearing on the no_std core, so a configured CIDR
+/// policy composes with it (logical AND) rather than replacing it: a peer must
+/// pass routable AND the policy.
+#[cfg(feature = "cidr")]
+struct RoutableAnd<D>(D);
+
+#[cfg(feature = "cidr")]
+impl<I, D> AliveDelegate<I, SocketAddr> for RoutableAnd<D>
+where
+  I: memberlist_proto::Id,
+  D: AliveDelegate<I, SocketAddr>,
+{
+  fn notify_alive(&self, peer: &NodeState<I, SocketAddr>) -> bool {
+    socket_addr_is_routable(peer.address_ref()) && self.0.notify_alive(peer)
+  }
+}
+
+/// The transport-agnostic serf driving core.
+///
+/// Composes serf's super-machine with the reused pooled-stream reliable plane,
+/// driving both through the [`GossipIo`] / [`StreamIo`] traits a driver supplies
+/// to [`pump`](SerfEngine::pump). The engine holds NO sockets — the driver owns
+/// the link-layer stack and its UDP/stream sockets — so the same core runs under
+/// a caller-driven poll loop (smoltcp) or an async executor (embassy-net).
+///
+/// `I` is the node identifier type (e.g. `SmolStr`); the address is pinned to
+/// [`core::net::SocketAddr`] and the record layer to the plain-TCP
+/// [`RawRecords`]. `C` is the driver's opaque connection handle
+/// ([`StreamIo::Conn`]). `R` is the memberlist gossip RNG the driver injects at
+/// construction; serf's own core RNG (query IDs, relay selection) is a
+/// deterministically-seeded `SmallRng` — a production driver that needs
+/// per-node-distinct query IDs can seed it via a future two-RNG constructor.
+pub struct SerfEngine<I, C, R = memberlist_proto::SmallRng>
+where
+  // Mandated by serf's `StreamEndpoint` field, which keys its membership store by
+  // `I`. Every impl bounds `I: Id`, which implies these, so no impl restates them.
+  I: Eq + Hash,
+{
+  /// serf's super-machine: serf logic over the memberlist reliable coordinator
+  /// on the plain-TCP `RawRecords` path. `G = R` (the injected gossip RNG); the
+  /// serf core RNG defaults to `SmallRng`.
+  endpoint: StreamEndpoint<I, SocketAddr, RawRecords, R>,
+  /// Sizing / port configuration; retained for the reliable-plane paths.
+  cfg: Options,
+  /// Reused pooled connection handles and the exchange-to-handle map for the
+  /// reliable plane.
+  plane: ReliablePlane<C>,
+  /// Heap scratch for one inbound gossip datagram, sized once at construction
+  /// from the configured gossip MTU (see [`gossip_recv_buf_size`]) and reused
+  /// every pump. Heap-resident so a large MTU does not blow a constrained stack
+  /// and the allocation happens exactly once.
+  gossip_recv: std::vec::Vec<u8>,
+  /// Seed addresses queued by [`join`](Self::join) that have not yet been handed
+  /// to the machine. Drained in the machine-pump phase of each `pump` tick: one
+  /// `start_push_pull(seed, Join, now)` per entry, which queues a `Connect` the
+  /// machine services into a dial consumed later that same tick.
+  pending_seeds: VecDeque<SocketAddr>,
+  /// Cluster label applied to the gossip codec on both encode and decode. When
+  /// `Some`, the gossip codec stamps a label prefix onto every outbound datagram
+  /// and rejects any inbound datagram whose label does not match. `None` disables
+  /// labeling.
+  label: Option<Bytes>,
+  /// CIDR transport filter: a gossip datagram from a blocked source IP (recv) or
+  /// a reliable connection from a blocked peer IP (accept/dial) is dropped before
+  /// the machine sees it. `()` when the `cidr` feature is off.
+  cidr_policy: CidrFilter,
+}
+
+// Construction and pure reliable-plane accessors — needing node identity but
+// neither the connection-handle key nor the RNG.
+impl<I, C, R> SerfEngine<I, C, R>
+where
+  I: memberlist_proto::Id + Clone,
+{
+  /// Construct an engine, panicking on a misconfiguration.
+  ///
+  /// The convenience wrapper over [`try_new_at`](Self::try_new_at); use it only
+  /// when the configuration is a static constant known to be valid.
+  ///
+  /// # Panics
+  ///
+  /// Panics if [`try_new_at`](Self::try_new_at) returns an [`InitError`].
+  pub fn new_at(
+    cfg: Options,
+    transform: TransformOptions,
+    ep_cfg: EndpointOptions<I, SocketAddr>,
+    serf_opts: SerfOptions,
+    now: Instant,
+    rng: R,
+  ) -> Self {
+    Self::try_new_at(cfg, transform, ep_cfg, serf_opts, now, rng)
+      .expect("SerfEngine::new_at: invalid configuration; use try_new_at to handle")
+  }
+
+  /// Fallibly construct an engine.
+  ///
+  /// Wires serf's super-machine over the memberlist coordinator and sizes the
+  /// gossip receive scratch. No sockets are bound — the driver owns the gossip
+  /// and reliable-stream sockets — and no I/O occurs here.
+  ///
+  /// # Parameters
+  ///
+  /// - `cfg`: engine port / timeout configuration.
+  /// - `transform`: cross-transport gossip + reliable-plane encryption plus the
+  ///   cluster label. serf's gossip plane carries no compression / checksum, so
+  ///   only the encryption and label fields of `transform` take effect. A
+  ///   configured encryption keyring is probed here (see Errors).
+  /// - `ep_cfg`: memberlist machine identity (`id`, `advertise`, timing knobs).
+  ///   The user-broadcast tier count is forced to 3 — serf ranks its intent /
+  ///   event / query broadcasts on three tiers.
+  /// - `serf_opts`: serf-level configuration (reap / reconnect / coalescing /
+  ///   query timing).
+  /// - `now`: the driver's clock reading at construction.
+  /// - `rng`: the memberlist gossip RNG, already seeded by the driver from its
+  ///   entropy source.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`InitError`] instead of panicking when the configuration is
+  /// invalid: a zero/over-ceiling gossip MTU, a zero port or close timeout, a
+  /// non-routable or port-mismatched advertise address, a machine-endpoint init
+  /// failure, or (with an encryption backend built in) an unusable keyring.
+  pub fn try_new_at(
+    cfg: Options,
+    transform: TransformOptions,
+    ep_cfg: EndpointOptions<I, SocketAddr>,
+    serf_opts: SerfOptions,
+    now: Instant,
+    rng: R,
+  ) -> Result<Self, InitError> {
+    // Validate every advertise-independent config field (port, gossip-MTU
+    // ceiling, close timeout, and the encryption keyring) up front, sharing the
+    // reused preflight so the deterministic checks live in ONE place.
+    validate_runtime_config(&cfg, &transform, ep_cfg.gossip_mtu())?;
+
+    // Capture the advertise-dependent values before `ep_cfg` is moved.
+    let gossip_mtu = ep_cfg.gossip_mtu();
+    let advertise = *ep_cfg.advertise_addr_ref();
+
+    // Reject a non-routable advertise address before the endpoint exists: a node
+    // must advertise an address its peers can route a reply to.
+    if !socket_addr_is_routable(&advertise) {
+      return Err(InitError::NonRoutableAdvertiseAddr(advertise));
+    }
+    // The advertised port must match the single bound port (one port serves both
+    // the gossip and reliable planes; a direct embedded interface has no NAT).
+    if advertise.port() != cfg.port {
+      return Err(InitError::AdvertisePortMismatch);
+    }
+
+    // Size the inbound-gossip scratch from the configured gossip MTU, keeping the
+    // driver's ingress in lockstep with the machine's egress bound.
+    let gossip_recv = std::vec![0u8; gossip_recv_buf_size(gossip_mtu)];
+
+    // serf ranks its user broadcasts on three tiers (intent / event / query →
+    // ranks 0 / 1 / 2), so the inner memberlist endpoint needs at least three
+    // broadcast tiers.
+    let ep_cfg = ep_cfg.with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+
+    // The CIDR policy gates the alive delegate (composed below) and the
+    // transport-boundary recv/accept guards (stored on the engine).
+    #[cfg(feature = "cidr")]
+    let cidr_policy: CidrFilter = cfg.cidr_policy.clone();
+    #[cfg(not(feature = "cidr"))]
+    let cidr_policy: CidrFilter = ();
+
+    // Build the inner memberlist `Endpoint` (the SWIM machine serf sits on) with
+    // the injected gossip RNG. `try_new_at` maps a machine init failure to
+    // `InitError::Endpoint` and starts its timers from a consistent origin.
+    let mut ep = Endpoint::try_new_at(ep_cfg, now, rng).map_err(InitError::Endpoint)?;
+
+    // Install the routable-address admission filter on the raw `Endpoint` BEFORE
+    // it is wrapped: the machine consults it inline for every inbound Alive, so a
+    // peer advertising a non-routable address is dropped at admission. When a CIDR
+    // policy is set, the routable filter wraps it (routable AND in-policy).
+    #[cfg(feature = "cidr")]
+    match cidr_policy.clone() {
+      Some(policy) => ep.set_alive_delegate(RoutableAnd(policy)),
+      None => ep.set_alive_delegate(RoutableAddrFilter),
+    }
+    #[cfg(not(feature = "cidr"))]
+    ep.set_alive_delegate(RoutableAddrFilter);
+
+    // Build the reliable-plane label options from the single validated source
+    // (already validated at the `TransformOptions` setter, so `new_in` is
+    // infallible here). Plain TCP has no SNI (`|_| None`) and a membership
+    // address that IS the transport socket (`|addr| *addr`).
+    let mut label_opts = LabelOptions::new_in(transform.label().map(|b| b.to_vec()), ());
+    if transform.skip_inbound_label_check() {
+      label_opts = label_opts.skip_inbound_label_check();
+    }
+    // Retain the validated label for the gossip codec (same source, both planes
+    // share one label so they cannot diverge).
+    let label = transform.label().map(Bytes::copy_from_slice);
+
+    #[allow(unused_mut)]
+    let mut coord = Coordinator::new(
+      ep,
+      label_opts,
+      Box::new(|_: &SocketAddr| -> Option<std::string::String> { None }),
+      Box::new(|addr: &SocketAddr| *addr),
+    );
+    // Install the gossip-and-reliable encryption keyring; a no-keyring policy is
+    // the identity transform, so an unencrypted node is unaffected. serf's gossip
+    // plane applies only this transform (no compression / checksum on gossip).
+    #[cfg(encryption)]
+    coord.set_encryption_options(transform.encryption);
+
+    // Wrap the coordinator in serf's super-machine. `new` seeds serf's core RNG
+    // (query IDs / relay selection) deterministically; it is independent of the
+    // injected memberlist gossip RNG `R`.
+    let endpoint = StreamEndpoint::<I, SocketAddr, RawRecords, R>::new(coord, serf_opts);
+
+    Ok(Self {
+      endpoint,
+      cfg,
+      plane: ReliablePlane::new(),
+      gossip_recv,
+      pending_seeds: VecDeque::new(),
+      label,
+      cidr_policy,
+    })
+  }
+
+  /// Mutable access to the reliable plane's pool, for a driver to push its
+  /// pre-created connection handles and install the initial listener at
+  /// construction.
+  #[inline]
+  pub fn plane_mut(&mut self) -> &mut ReliablePlane<C> {
+    &mut self.plane
+  }
+
+  /// Install the initial passive-open listener handle, set by the driver after it
+  /// has `listen`ed on that connection slot at construction.
+  #[inline]
+  pub fn set_listener(&mut self, c: C) {
+    self.plane.listener = Some(c);
+  }
+
+  /// The configured local port (gossip + reliable listener both bind it).
+  #[inline]
+  pub fn port(&self) -> u16 {
+    self.cfg.port
+  }
+
+  /// Number of inbound reliable connections accepted on the listener since
+  /// construction.
+  #[inline]
+  pub fn accepted_inbound_count(&self) -> u64 {
+    self.plane.accepted_inbound
+  }
+
+  /// Number of pooled connection slots currently free.
+  #[inline]
+  pub fn pool_free_count(&self) -> usize {
+    self.plane.pool.free_len()
+  }
+
+  /// Number of connection slots currently parked mid-close.
+  #[inline]
+  pub fn closing_count(&self) -> usize {
+    self.plane.closing.len()
+  }
+
+  /// Whether a passive-open listener slot is currently installed.
+  #[inline]
+  pub fn listener_present(&self) -> bool {
+    self.plane.listener.is_some()
+  }
+
+  /// Number of reliable exchanges currently half-closed (local FIN emitted, still
+  /// mapped awaiting the peer's reply and/or FIN).
+  #[inline]
+  pub fn half_closed_count(&self) -> usize {
+    self.plane.half_closed_count()
+  }
+
+  /// Number of reliable exchanges still in `PendingDial` (dial requested, pool
+  /// exhausted, no slot assigned yet).
+  #[inline]
+  pub fn pending_dial_count(&self) -> usize {
+    self.plane.pending_dial_count()
+  }
+}
+
+// serf-command and read forwarders — reach serf's super-machine only (not the
+// reliable plane), so they need node identity and the gossip RNG but no
+// connection-handle key.
+impl<I, C, R> SerfEngine<I, C, R>
+where
+  I: memberlist_proto::Id + Clone,
+  R: Rng,
+{
+  /// Arm serf's periodic probe / gossip / push-pull schedulers. Call once before
+  /// the first `pump`; without it failure detection, dissemination, and
+  /// anti-entropy never run.
+  pub fn start(&mut self, now: Instant) {
+    self.endpoint.start_scheduling(now);
+  }
+
+  /// `Ok` only while the node is running (serf state `Alive`). After `leave()`
+  /// the schedulers stop and the machine merges no remote state, so the
+  /// operations that gate on this reject rather than queue work no peer would
+  /// observe.
+  pub fn ensure_running(&self) -> Result<(), SerfError> {
+    if self.is_running() {
+      Ok(())
+    } else {
+      Err(SerfError::BadJoinState(self.endpoint.state()))
+    }
+  }
+
+  /// Whether serf's endpoint is in the running (`Alive`) state.
+  #[inline]
+  fn is_running(&self) -> bool {
+    self.endpoint.state() == SerfState::Alive
+  }
+
+  /// serf's current lifecycle state.
+  #[inline]
+  pub fn state(&self) -> SerfState {
+    self.endpoint.state()
+  }
+
+  /// Number of serf members currently tracked.
+  #[inline]
+  pub fn num_members(&self) -> usize {
+    self.endpoint.num_members()
+  }
+
+  /// The local node's serf member Lamport clock.
+  #[inline]
+  pub fn member_time(&self) -> u64 {
+    self.endpoint.member_time()
+  }
+
+  /// The local node's serf event Lamport clock.
+  #[inline]
+  pub fn event_time(&self) -> u64 {
+    self.endpoint.event_time()
+  }
+
+  /// The local node's serf query Lamport clock.
+  #[inline]
+  pub fn query_time(&self) -> u64 {
+    self.endpoint.query_time()
+  }
+
+  /// The local node's id.
+  #[inline]
+  pub fn local_id(&self) -> &I {
+    self.endpoint.local_id()
+  }
+
+  /// A snapshot of every serf member currently tracked (alive, leaving, left, or
+  /// failed within the reap window), for the observable membership view a driver
+  /// publishes after each membership change.
+  #[inline]
+  pub fn members_snapshot(&self) -> Vec<Arc<Member<I, SocketAddr>>> {
+    self.endpoint.members_snapshot()
+  }
+
+  /// Drain one application-visible serf event, if any.
+  ///
+  /// Returns events emitted by the machine during the last `pump` tick — the full
+  /// serf surface: membership changes, user events, queries, query responses /
+  /// acks, key-management requests / responses, reliable-exchange completions,
+  /// and the lifecycle signals (`LeftCluster`, conflict `Shutdown`). Returns
+  /// `None` when the event queue is empty; call again after the next `pump` tick.
+  #[inline]
+  pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
+    self.endpoint.poll_event()
+  }
+
+  /// Announce the local node's join intent and record intent to contact these
+  /// seed addresses.
+  ///
+  /// Returns immediately; the pump loop initiates a push/pull state exchange to
+  /// each routable seed on the next tick. serf's own `join()` rejects a non-Alive
+  /// endpoint ([`SerfError::BadJoinState`]); on that rejection no seed is queued.
+  pub fn join(&mut self, seeds: &[SocketAddr]) -> Result<(), SerfError> {
+    // Announce the serf-level join intent first (this is where the running-state
+    // gate lives); only queue seeds once it is accepted.
+    self.endpoint.join()?;
+    for s in seeds {
+      // Drop a non-routable seed: it could only produce a doomed dial. Queue only
+      // seeds a dial can actually complete.
+      if socket_addr_is_routable(s) {
+        self.pending_seeds.push_back(*s);
+      }
+    }
+    Ok(())
+  }
+
+  /// Begin leaving the cluster.
+  ///
+  /// Forwards to serf's graceful-leave path, which gossips the departure and
+  /// ultimately emits [`Event::LeftCluster`] via [`poll_event`](Self::poll_event).
+  /// Any seeds still queued from a pre-leave join are dropped: the pump initiates
+  /// no new push/pull once leaving.
+  pub fn leave(&mut self, now: Instant) -> Result<(), SerfError> {
+    self.pending_seeds.clear();
+    self.endpoint.leave(now)
+  }
+
+  /// Force a named node out of the cluster (an operator-driven removal).
+  pub fn force_leave(&mut self, id: I, prune: bool, now: Instant) -> Result<(), SerfError> {
+    self.endpoint.force_leave(id, prune, now)
+  }
+
+  /// Broadcast an application user event to the cluster.
+  ///
+  /// `coalesce` requests that identical events be coalesced by name over the
+  /// user-coalesce window. Peers observe it as [`Event::User`] via `poll_event`.
+  pub fn user_event(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    payload: Bytes,
+    coalesce: bool,
+  ) -> Result<(), SerfError> {
+    self.endpoint.user_event(name, payload, coalesce)
+  }
+
+  /// Issue a cluster-wide query, returning its [`QueryId`].
+  ///
+  /// Responders observe the query as [`Event::Query`] and answer via
+  /// [`respond`](Self::respond); responses surface on this node as
+  /// [`Event::QueryResponse`].
+  pub fn query(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    payload: Bytes,
+    params: QueryParams<I>,
+    now: Instant,
+  ) -> Result<QueryId, SerfError> {
+    self.endpoint.query(name, payload, params, now)
+  }
+
+  /// Answer a received query. `token` is the [`QueryEvent`] delivered via
+  /// [`Event::Query`].
+  pub fn respond(
+    &mut self,
+    token: &QueryEvent<I, SocketAddr>,
+    payload: Bytes,
+    now: Instant,
+  ) -> Result<(), SerfError> {
+    self.endpoint.respond(token, payload, now)
+  }
+
+  /// Replace the local node's tags, re-advertising them via the coordinator and
+  /// refreshing the local member in the membership store.
+  pub fn set_tags(&mut self, tags: Tags) -> Result<(), SerfError> {
+    self.endpoint.set_tags(tags)
+  }
+
+  /// Issue a cluster-wide `install_key` query to add `key` to every node's
+  /// keyring.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn install_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
+    self.endpoint.install_key(key, now)
+  }
+
+  /// Issue a cluster-wide `use_key` query to promote `key` to primary.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn use_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
+    self.endpoint.use_key(key, now)
+  }
+
+  /// Issue a cluster-wide `remove_key` query to remove `key` from all nodes.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn remove_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
+    self.endpoint.remove_key(key, now)
+  }
+
+  /// Issue a cluster-wide `list_keys` query to enumerate installed keys.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn list_keys(&mut self, now: Instant) -> Result<QueryId, SerfError> {
+    self.endpoint.list_keys(now)
+  }
+
+  /// Answer an inbound key-management request. `req` is the [`KeyRequest`]
+  /// delivered via [`Event::KeyRequest`]; the driver applies the requested op to
+  /// its keyring and passes the outcome as `resp`.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn respond_key(
+    &mut self,
+    req: &KeyRequest<I, SocketAddr>,
+    resp: KeyResponseArgs,
+    now: Instant,
+  ) -> Result<(), SerfError> {
+    self.endpoint.respond_key(req, resp, now)
+  }
+}
+
+// Reliable-plane lifecycle helpers that move the connection handle `C` by value
+// (into the pool, the listener slot, and the `StreamIo` socket calls) and reach
+// serf's machine, so they need `C: Copy + Eq + Hash` and the gossip RNG.
+impl<I, C, R> SerfEngine<I, C, R>
+where
+  I: memberlist_proto::Id + Clone,
+  C: Copy + Eq + Hash,
+  R: Rng,
+{
+  /// Advance serf's state machine once over the driver's already-ticked sockets.
+  /// Returns the next wakeup deadline: the minimum of the machine's next timer
+  /// AND the soonest gracefully-closing connection's force-abort instant. The
+  /// driver folds in its own link-layer next-event deadline.
+  ///
+  /// The driver owns the super-loop: it ticks its link-layer stack, calls `pump`,
+  /// then sleeps until `min(driver_stack_next, pump_result)`, advances the clock,
+  /// and loops.
+  ///
+  /// # Order
+  ///
+  /// `pump` runs the same ordered phases as memberlist-embedded's `Engine::pump`,
+  /// driving serf's super-machine (which threads its own serf pre/post-tick logic
+  /// through the composed `handle_timeout`):
+  ///
+  /// 1a. Reap gracefully-closed (or close-timed-out) connections.
+  /// 1b. Accept an inbound connection completed on the listener; replenish it.
+  /// 1c. Rebalance: self-heal a missing listener, then assign free slots to
+  ///     deferred dials (listener-first).
+  /// 2a/2b. Gossip ingress: drain datagrams into `handle_gossip`, then decrypt +
+  ///     label-strip + decode each buffered frame and feed the typed messages
+  ///     back via `handle_message`.
+  /// 3. Reliable ingress: drain each connection's rx into `handle_transport_data`;
+  ///     deliver a one-shot EOF on peer FIN.
+  /// 5. Join-seed drain: `start_push_pull(seed, Join, now)` per queued seed.
+  /// 6. Machine tick: `handle_timeout` fires due serf + coordinator timers.
+  /// 7a–7e. Drain `poll_action`, promote, pump outbound, flush deferred FINs,
+  ///     complete `Closing` drains, re-rebalance, then drain + send outbound
+  ///     gossip.
+  /// 8. Deadline: `min(machine_next, closing_next)`.
+  pub fn pump<G, S>(&mut self, now: Instant, gossip: &mut G, stream: &mut S) -> Option<Instant>
+  where
+    G: GossipIo,
+    S: StreamIo<Conn = C>,
+  {
+    // 1a. Reap gracefully-closing connections the driver's stack tick advanced to
+    // completion, so the freed handles back new dials/accepts this same tick.
+    self.reap_closing(now, stream);
+
+    // 1b/1c. Accept-and-replenish first (listener-first), then self-heal a missing
+    // listener and assign remaining free slots to deferred dials. Running the
+    // rebalance BEFORE the machine tick lets a prior-tick `PendingDial` be dialed
+    // before its bridge can time out.
+    self.check_listener(now, stream);
+    self.rebalance_pool(now, stream);
+
+    // 2a. Drain inbound gossip datagrams into the machine's raw ingress buffer.
+    {
+      let buf = self.gossip_recv.as_mut_slice();
+      let endpoint = &mut self.endpoint;
+      let cidr_policy = &self.cidr_policy;
+      while let Some((src, n)) = gossip.recv(buf) {
+        // Drop a gossip datagram from a CIDR-blocked source before the machine
+        // sees it.
+        if !cidr_blocks(cidr_policy, src.ip()) {
+          endpoint.handle_gossip(src, &buf[..n], now);
+        }
+      }
+    }
+
+    // 2b. Decrypt + label-strip + decode each raw gossip frame and feed typed
+    // messages back. serf's gossip plane carries only the encryption wrapper (no
+    // checksum / compression), so a plaintext build feeds the raw bytes straight
+    // to the label check.
+    while let Some((src, raw)) = self.endpoint.poll_memberlist_ingress() {
+      // With an encryption backend built in, strip (and authenticate) the wrapper
+      // first — identity when no keyring is configured, an `Err` (dropped) for a
+      // frame the keyring cannot decrypt. Gossip is lossy and self-healing.
+      #[cfg(encryption)]
+      let plain = match self.endpoint.decrypt_gossip(&raw) {
+        Ok(p) => Bytes::from(p),
+        Err(_) => continue,
+      };
+      #[cfg(not(encryption))]
+      let plain = raw;
+      let opts = DecodeOptions::new(self.label.clone());
+      // Drop malformed inbound datagrams silently — bad network input must not
+      // panic the node; SWIM is self-healing.
+      if let Ok(inner) = decode_incoming(plain, &opts) {
+        if let Ok(msgs) = parse_messages::<I, SocketAddr>(inner) {
+          for msg in msgs {
+            self.endpoint.handle_message(src, msg, now);
+          }
+        }
+      }
+    }
+
+    // 3. Reliable ingress pump: drain each active exchange's socket rx into the
+    // machine (including the peer-FIN EOF) before the machine tick.
+    self.pump_inbound_reliable(now, stream);
+
+    // 5. Drain join seeds: each queued seed gets a push/pull exchange initiated
+    // now. Skipped once leaving/left — a left node initiates no join push/pull.
+    if self.is_running() {
+      while let Some(seed) = self.pending_seeds.pop_front() {
+        // The StreamId is the machine's correlation token; the dial is correlated
+        // via the ExchangeId carried in the resulting Connect action, so the
+        // driver does not need to retain it here.
+        let _sid = self.endpoint.start_push_pull(seed, PushPullKind::Join, now);
+      }
+    }
+
+    // 6. Machine tick: fire due serf + coordinator timers.
+    self.endpoint.handle_timeout(now);
+
+    // 7a. Drain stream actions: open dials, half-close, or tear down exchanges.
+    self.drain_stream_actions(now, stream);
+    // 7b. Promote dialing connections whose handshake completed this tick.
+    self.promote_established(stream);
+    // 7c. Reliable egress pump: append new transmits, then flush each queue.
+    self.pump_outbound_reliable(stream);
+    // 7d. Emit deferred graceful write-half FINs now fully drained.
+    self.flush_pending_shutdowns(stream);
+    // 7d'. Complete deferred terminal closes of connections draining in `Closing`.
+    self.flush_closing(now, stream);
+    // 7d''. Re-run the listener/dial rebalance over every slot the machine tick
+    // and teardown just freed back to the pool THIS tick.
+    self.rebalance_pool(now, stream);
+
+    debug_assert!(
+      !self.plane.pool.any_where(|&c| stream.reuse_ready(c))
+        || (self.plane.listener.is_some() && self.plane.pending_dial_count() == 0),
+      "end-of-tick: a reuse-ready reliable slot left a listener missing or a PendingDial unserviced"
+    );
+
+    // 7e. Egress: drain outbound gossip transmits, encode + encrypt, and send.
+    self.drain_gossip_transmits(gossip);
+
+    // 8. Next deadline = min(machine, closing).
+    let machine = self.endpoint.poll_timeout();
+    let closing = self
+      .plane
+      .closing
+      .values()
+      .chain(
+        self
+          .plane
+          .connections
+          .values()
+          .filter_map(|c| c.close_deadline.as_ref()),
+      )
+      .min()
+      .copied();
+    min_opt(machine, closing)
+  }
+
+  /// Reclaim gracefully-closing connections that have finished closing or whose
+  /// close has exceeded `cfg.close_timeout`.
+  fn reap_closing<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let pool = &mut self.plane.pool;
+    self.plane.closing.retain(|&c, &mut deadline| {
+      if !stream.is_open(c) {
+        pool.give(c);
+        return false;
+      }
+      if now >= deadline {
+        // Peer vanished mid-FIN: force the socket Closed and reclaim so the pool
+        // (and the listener replenished from it) recover.
+        stream.abort(c);
+        pool.give(c);
+        return false;
+      }
+      true
+    });
+  }
+
+  /// Consume an accept-ready listener, hand its exchange to the machine, and
+  /// replenish a fresh listener from the pool.
+  ///
+  /// The accept gate is `accepted_peer(c).is_some()`, which a driver reports only
+  /// once the socket is at/after Established with a known remote — never a
+  /// not-yet-established handshake an RST could revert.
+  fn check_listener<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let c = match self.plane.listener {
+      Some(c) => c,
+      None => return,
+    };
+    let Some(peer) = stream.accepted_peer(c) else {
+      return;
+    };
+
+    // Reject a reliable connection from a CIDR-blocked peer at the transport
+    // boundary: abort the connected socket and reclaim it WITHOUT registering the
+    // exchange, then re-arm a fresh listener.
+    if cidr_blocks(&self.cidr_policy, peer.ip()) {
+      stream.abort(c);
+      self.plane.pool.give(c);
+      self.plane.listener = None;
+      self.ensure_listener(stream);
+      return;
+    }
+
+    match self.endpoint.accept_connection(peer, now) {
+      Some(eid) => {
+        self
+          .plane
+          .connections
+          .insert(eid, Connection::accepted(peer, c));
+        self.plane.accepted_inbound += 1;
+      }
+      // Not admitted (leaving, the inbound-stream cap, or a record-layer config
+      // error): abort the socket AND return its handle to the pool so a rejection
+      // does not shrink the finite pool one slot at a time.
+      None => {
+        stream.abort(c);
+        self.plane.pool.give(c);
+      }
+    }
+
+    self.plane.listener = None;
+    // Replenish immediately if a slot is free — the same self-heal the poll-phase
+    // rebalance uses, giving the listener first claim on a free slot.
+    self.ensure_listener(stream);
+  }
+
+  /// Re-establish the passive-open listener if it is missing and the pool can
+  /// supply a reuse-ready slot. A no-op when a listener already exists or the pool
+  /// has no reuse-ready slot.
+  fn ensure_listener<S>(&mut self, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    if self.plane.listener.is_some() {
+      return;
+    }
+    if let Some(c) = self.plane.pool.take_where(|&c| stream.reuse_ready(c)) {
+      // `listen()` only fails on port 0 or an already-open socket; a pooled socket
+      // is Closed and `cfg.port` is the user-supplied non-zero port.
+      // Ignoring Err: both failure modes are unreachable for a pooled slot here.
+      let _ = stream.listen(c, self.cfg.port);
+      self.plane.listener = Some(c);
+    }
+  }
+
+  /// Give the listener and any deferred dials first claim on whatever is currently
+  /// in the pool: self-heal a missing listener, then assign the rest to
+  /// `PendingDial` connections oldest-first (listener-first).
+  fn rebalance_pool<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    self.ensure_listener(stream);
+    self.drain_pending_dials(now, stream);
+  }
+
+  /// Assign a freed slot to each connection still waiting in `PendingDial`,
+  /// oldest-first by ascending `ExchangeId`, and dial it. Stops the moment the
+  /// pool empties again so the rest stay parked for a later tick.
+  fn drain_pending_dials<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let mut waiting: MediumVec<(ExchangeId, SocketAddr)> = self
+      .plane
+      .connections
+      .iter()
+      .filter(|(_, c)| c.state == ConnState::PendingDial)
+      .map(|(&eid, c)| (eid, c.peer))
+      .collect();
+    if waiting.is_empty() {
+      return;
+    }
+    waiting.sort_by_key(|(eid, _)| eid.get());
+
+    for (eid, peer) in waiting {
+      let Some(c) = self.plane.pool.take_where(|&c| stream.reuse_ready(c)) else {
+        break;
+      };
+      if let Some(conn) = self.plane.connections.get_mut(&eid) {
+        conn.assign_socket(c);
+      }
+      self.dial(eid, peer, c, now, stream);
+    }
+  }
+
+  /// Open a TCP dial for the `Dialing` connection `eid` on its assigned slot `c`.
+  ///
+  /// A CIDR-blocked or non-routable peer, or a `connect` rejection, reclaims the
+  /// socket and terminalizes the exchange as a dial FAILURE via
+  /// `handle_dial_failed` — never a benign EOF that a one-way exchange would read
+  /// as success.
+  fn dial<S>(&mut self, eid: ExchangeId, peer: SocketAddr, c: C, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    if cidr_blocks(&self.cidr_policy, peer.ip()) || !socket_addr_is_routable(&peer) {
+      stream.abort(c);
+      self.plane.pool.give(c);
+      self.plane.connections.remove(&eid);
+      self.endpoint.handle_dial_failed(eid, now);
+      return;
+    }
+
+    // Derive an ephemeral local port from the ExchangeId so each dial uses a
+    // distinct port within the IANA ephemeral range (49152–65535).
+    let local_port = 49152u16 + (eid.get() as u16 % 16384);
+    if stream.connect(c, peer, local_port).is_err() {
+      stream.abort(c);
+      self.plane.pool.give(c);
+      self.plane.connections.remove(&eid);
+      self.endpoint.handle_dial_failed(eid, now);
+    }
+  }
+
+  /// Drain all `StreamAction`s emitted by the machine this tick: open dials
+  /// (`Connect`), defer a graceful write-half FIN (`Shutdown`), tear down
+  /// gracefully (`Close`), or hard-abort a FAILED exchange (`Abort`).
+  fn drain_stream_actions<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    while let Some(action) = self.endpoint.poll_action() {
+      match action {
+        StreamAction::Connect(info) => {
+          let eid = info.id();
+          let peer = info.peer();
+          // Only a reset, reuse-ready slot may back a fresh dial; a freed-but-
+          // still-resetting slot defers to `PendingDial` until its worker resets.
+          match self.plane.pool.take_where(|&c| stream.reuse_ready(c)) {
+            Some(c) => {
+              self
+                .plane
+                .connections
+                .insert(eid, Connection::dialing(peer, c));
+              self.dial(eid, peer, c, now, stream);
+            }
+            // Pool exhausted: record a `PendingDial` (no slot) so the dial intent
+            // is not lost; `drain_pending_dials` assigns a slot once one frees.
+            None => {
+              self
+                .plane
+                .connections
+                .insert(eid, Connection::pending_dial(peer));
+            }
+          }
+        }
+        StreamAction::Shutdown(r) => {
+          // Deferred write-half FIN: set the flag; `flush_pending_shutdowns`
+          // emits it once the socket is Established and its tx ring has drained.
+          if let Some(conn) = self.plane.connections.get_mut(&r.id()) {
+            conn.fin_pending = true;
+          }
+        }
+        StreamAction::Close(r) => {
+          self.teardown(r.id(), now, stream);
+        }
+        StreamAction::Abort(r) => {
+          self.abort_exchange(r.id(), stream);
+        }
+      }
+    }
+  }
+
+  /// Abort a FAILED exchange (dial failure, label/encryption rejection, or an
+  /// elapsed deadline): discard its buffered `out`, hard-reset the socket, and
+  /// reclaim the slot straight to the pool.
+  fn abort_exchange<S>(&mut self, eid: ExchangeId, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let Some(conn) = self.plane.connections.remove(&eid) else {
+      return;
+    };
+    if let Some(c) = conn.socket {
+      stream.abort(c);
+      self.plane.pool.give(c);
+    }
+  }
+
+  /// Tear down a GRACEFULLY completed exchange (`StreamAction::Close`), draining
+  /// any undelivered outbound bytes before the terminal FIN and reclaiming the
+  /// slot by socket state.
+  ///
+  /// The one case that does NOT remove the connection on the spot is a graceful
+  /// close whose send-capable socket still holds undelivered bytes: it parks in
+  /// [`ConnState::Closing`] so the egress pump keeps flushing them, and
+  /// `flush_closing` FINs + detaches once they are delivered (or the close
+  /// deadline forces an abort). A graceful close never discards undelivered bytes.
+  fn teardown<S>(&mut self, eid: ExchangeId, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let Some(conn) = self.plane.connections.get(&eid) else {
+      return;
+    };
+    let Some(c) = conn.socket else {
+      // PendingDial: no socket, nothing to reclaim. Removing it is the whole
+      // teardown, so a retired exchange is never later dialed.
+      self.plane.connections.remove(&eid);
+      return;
+    };
+
+    let was_half_closed = conn.state == ConnState::HalfClosed;
+    let out_pending = !conn.out_is_empty();
+    let is_open = stream.is_open(c);
+    let may_send = stream.may_send(c);
+    let tx_unacked = stream.send_queue(c);
+
+    if !is_open {
+      // `Closed | TimeWait`: both FINs already exchanged. Reclaim directly.
+      self.plane.connections.remove(&eid);
+      self.plane.pool.give(c);
+    } else if was_half_closed {
+      // Our FIN is in flight and the tx half is closed, so any `out` remainder is
+      // undeliverable. Park for the reap backstop.
+      self.plane.connections.remove(&eid);
+      self.plane.closing.insert(c, now + self.cfg.close_timeout);
+    } else if may_send && (out_pending || tx_unacked != 0) {
+      // Send-capable with outbound bytes the peer has NOT received. FIN-ing now
+      // would truncate the reply; defer via `Closing` so the egress pump keeps
+      // draining `out` into the tx ring.
+      if let Some(conn) = self.plane.connections.get_mut(&eid) {
+        conn.state = ConnState::Closing;
+        conn.close_deadline = Some(now + self.cfg.close_timeout);
+        conn.close_drain_mark = conn.out_bytes() + tx_unacked;
+        conn.fin_pending = false;
+      }
+    } else if may_send {
+      // Send-capable with nothing left to deliver: emit the graceful FIN now and
+      // park the handle for the reap backstop.
+      self.plane.connections.remove(&eid);
+      stream.close(c);
+      self.plane.closing.insert(c, now + self.cfg.close_timeout);
+    } else {
+      // Abrupt teardown of a socket the peer never established: RST and reclaim.
+      self.plane.connections.remove(&eid);
+      stream.abort(c);
+      self.plane.pool.give(c);
+    }
+  }
+
+  /// Complete the deferred terminal close of every connection draining in
+  /// [`ConnState::Closing`]: FIN once `out` and the tx ring are fully drained, or
+  /// force-abort one past its (no-progress) close deadline.
+  fn flush_closing<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    enum ClosingAction<C> {
+      Fin(C),
+      Abort(C),
+      Progress(usize),
+    }
+
+    let mut actions: MediumVec<(ExchangeId, ClosingAction<C>)> = MediumVec::new();
+    for (&eid, conn) in self.plane.connections.iter() {
+      if conn.state != ConnState::Closing {
+        continue;
+      }
+      let Some(c) = conn.socket else { continue };
+      // Undelivered shrinks ONLY when the peer acks, so a shrink is the
+      // peer-liveness signal: `close_timeout` bounds a STALL, not the total drain.
+      let undelivered = conn.out_bytes() + stream.send_queue(c);
+      if undelivered == 0 {
+        actions.push((eid, ClosingAction::Fin(c)));
+      } else if undelivered < conn.close_drain_mark {
+        actions.push((eid, ClosingAction::Progress(undelivered)));
+      } else if conn.close_deadline.is_some_and(|d| now >= d) {
+        actions.push((eid, ClosingAction::Abort(c)));
+      }
+    }
+
+    for (eid, outcome) in actions {
+      match outcome {
+        ClosingAction::Fin(c) => {
+          self.plane.connections.remove(&eid);
+          stream.close(c);
+          self.plane.closing.insert(c, now + self.cfg.close_timeout);
+        }
+        ClosingAction::Abort(c) => {
+          self.plane.connections.remove(&eid);
+          stream.abort(c);
+          self.plane.pool.give(c);
+        }
+        ClosingAction::Progress(mark) => {
+          if let Some(conn) = self.plane.connections.get_mut(&eid) {
+            conn.close_drain_mark = mark;
+            conn.close_deadline = Some(now + self.cfg.close_timeout);
+          }
+        }
+      }
+    }
+  }
+
+  /// Flush partially-written outbound bytes and drain new transport transmits from
+  /// the machine into each connection's tx ring, preserving per-connection byte
+  /// order under partial-write backpressure.
+  fn pump_outbound_reliable<S>(&mut self, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    // Pass 1: append new transmits to their connection's out queue (in order,
+    // regardless of state — a Dialing / PendingDial connection holds them until
+    // its socket is writable). Bytes for a torn-down exchange are dropped.
+    while let Some((eid, _peer, bytes)) = self.endpoint.poll_transport_transmit() {
+      if let Some(conn) = self.plane.connections.get_mut(&eid) {
+        conn.out.push_back(bytes);
+      }
+    }
+
+    // Pass 2: flush each connection's out queue to its socket.
+    let pairs: MediumVec<_> = self
+      .plane
+      .connections
+      .iter()
+      .filter_map(|(&eid, c)| {
+        if c.out.is_empty() {
+          return None;
+        }
+        c.socket.map(|h| (eid, h))
+      })
+      .collect();
+
+    for (eid, c) in pairs {
+      // A still-handshaking socket is `!may_send`; leave the queue parked and
+      // retry once Established, so a push/pull half is never dropped mid-open.
+      if !stream.may_send(c) {
+        continue;
+      }
+      while let Some(front) = self
+        .plane
+        .connections
+        .get(&eid)
+        .and_then(|conn| conn.out.front().cloned())
+      {
+        let sent = stream.send(c, &front);
+        if sent >= front.len() {
+          if let Some(conn) = self.plane.connections.get_mut(&eid) {
+            conn.out.pop_front();
+          }
+        } else {
+          // Partial write: replace the front with its unsent tail and stop, so the
+          // tail stays at the front and later entries are not reordered.
+          if let Some(conn) = self.plane.connections.get_mut(&eid) {
+            if let Some(slot) = conn.out.front_mut() {
+              *slot = front.slice(sent..);
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  /// Promote each `Dialing` connection whose TCP handshake has completed to
+  /// `Established`.
+  fn promote_established<S>(&mut self, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let promote: MediumVec<ExchangeId> = self
+      .plane
+      .connections
+      .iter()
+      .filter(|(_, c)| c.state == ConnState::Dialing)
+      .filter_map(|(&eid, c)| c.socket.map(|h| (eid, h)))
+      .filter(|&(_, h)| stream.may_send(h))
+      .map(|(eid, _)| eid)
+      .collect();
+    for eid in promote {
+      if let Some(conn) = self.plane.connections.get_mut(&eid) {
+        conn.state = ConnState::Established;
+      }
+    }
+  }
+
+  /// Emit deferred graceful write-half FINs for connections whose socket can now
+  /// carry one losslessly — KEEPING the connection mapped so its inbound reply
+  /// still pumps. The socket is reclaimed only later, by the machine's `Close`.
+  fn flush_pending_shutdowns<S>(&mut self, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    let ready: MediumVec<_> = self
+      .plane
+      .connections
+      .iter()
+      .filter(|(_, c)| c.fin_pending && c.state == ConnState::Established && c.out_is_empty())
+      .filter_map(|(&eid, c)| c.socket.map(|h| (eid, h)))
+      // …and the tx ring is fully drained and acknowledged, so every byte reached
+      // the peer before the FIN.
+      .filter(|&(_, h)| stream.may_send(h) && stream.send_queue(h) == 0)
+      .collect();
+
+    for (eid, c) in ready {
+      stream.close(c);
+      if let Some(conn) = self.plane.connections.get_mut(&eid) {
+        conn.fin_pending = false;
+        conn.state = ConnState::HalfClosed;
+      }
+    }
+  }
+
+  /// Drain each active connection's socket rx into the machine, delivering a
+  /// one-shot EOF once the peer's FIN has been received AND the rx buffer is fully
+  /// drained ([`StreamIo::recv_finished`]).
+  fn pump_inbound_reliable<S>(&mut self, now: Instant, stream: &mut S)
+  where
+    S: StreamIo<Conn = C>,
+  {
+    const READ_BUF: usize = 4096;
+    let mut buf = [0u8; READ_BUF];
+
+    let pairs: MediumVec<_> = self
+      .plane
+      .connections
+      .iter()
+      .filter_map(|(&eid, c)| c.socket.map(|h| (eid, h)))
+      .collect();
+
+    for (eid, c) in pairs {
+      loop {
+        match stream.recv(c, &mut buf) {
+          Some(n) if n > 0 => {
+            self
+              .endpoint
+              .handle_transport_data(eid, &buf[..n], false, now);
+          }
+          _ => {
+            // No data this tick. Deliver the peer FIN exactly once when the receive
+            // half is gracefully closed and drained.
+            if stream.recv_finished(c) {
+              if let Some(conn) = self.plane.connections.get_mut(&eid) {
+                if !conn.eof_delivered {
+                  conn.eof_delivered = true;
+                  self.endpoint.handle_transport_data(eid, &[], true, now);
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  /// Drain all outbound gossip transmits from the machine, encode each, apply the
+  /// encryption wrapper (when a backend is built in), and write it to the gossip
+  /// socket.
+  ///
+  /// serf's gossip plane carries no compression / checksum wrappers — only the
+  /// label frame and, under an encryption backend, the AEAD wrapper. Encoding
+  /// errors and a full tx ring both silently drop the datagram; gossip is
+  /// best-effort and SWIM recovers on the next round.
+  fn drain_gossip_transmits<G>(&mut self, gossip: &mut G)
+  where
+    G: GossipIo,
+  {
+    let enc = EncodeOptions::new(self.label.clone());
+    while let Some(transmit) = self.endpoint.poll_memberlist_transmit() {
+      let (dest, bytes) = match encode_transmit::<I>(transmit, &enc) {
+        Some(pair) => pair,
+        None => continue,
+      };
+      // Apply the encryption wrapper before the wire (identity when no keyring is
+      // configured). Drop rather than emit plaintext on an encrypted-cluster path
+      // if the backend rejects the request.
+      #[allow(unused_mut)]
+      let mut on_wire: Vec<u8> = bytes.to_vec();
+      #[cfg(encryption)]
+      {
+        on_wire = match self.endpoint.encrypt_gossip(&on_wire) {
+          Ok(b) => b,
+          Err(_) => continue,
+        };
+      }
+      // Last-line egress screens: never emit to a non-routable destination or one
+      // our own CIDR policy excludes.
+      if !socket_addr_is_routable(&dest) || cidr_blocks(&self.cidr_policy, dest.ip()) {
+        continue;
+      }
+      gossip.send(&on_wire, dest);
+    }
+  }
+}
+
+/// Returns the earlier of two optional deadlines. If only one is `Some`, that
+/// deadline wins; if both are `None` the result is `None`.
+fn min_opt(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+  match (a, b) {
+    (Some(x), Some(y)) => Some(core::cmp::min(x, y)),
+    (x, y) => x.or(y),
+  }
+}
+
+/// Encode one outbound gossip transmit using the shared no-std codec.
+///
+/// Returns `(dest, encoded_bytes)` on success, or `None` if encoding fails (the
+/// caller silently skips the datagram — gossip is lossy).
+fn encode_transmit<I>(
+  t: Transmit<I, SocketAddr>,
+  enc: &EncodeOptions,
+) -> Option<(SocketAddr, Bytes)>
+where
+  I: memberlist_proto::Data,
+{
+  match t {
+    Transmit::Packet(pkt) => {
+      let (to, msg) = pkt.into_parts();
+      let bytes = encode_outgoing(&msg, enc).ok()?;
+      Some((to, bytes))
+    }
+    Transmit::Compound(cmp) => {
+      let (to, msgs) = cmp.into_parts();
+      let bytes = encode_outgoing_compound(&msgs, enc).ok()?;
+      Some((to, bytes))
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests;
