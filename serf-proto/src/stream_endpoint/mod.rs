@@ -885,11 +885,13 @@ where
 
   /// Overwrite all three Lamport clocks in one call.
   ///
-  /// A test-support seam (hidden from the public API) that a downstream crate's
-  /// tests use to drive the member clock to the `LTIME_MAX` integrity floor and
-  /// exercise the refused-leave (`LeaveClockExhausted`) path without 2^63 real
-  /// membership events. Forwards to [`Endpoint::test_set_clocks`].
-  #[doc(hidden)]
+  /// A test-support seam gated behind the non-default `test-support` feature (NOT
+  /// exposed by a production `tcp` build) that a downstream crate's tests use to
+  /// drive the member clock to the `LTIME_MAX` integrity floor and exercise the
+  /// refused-leave (`LeaveClockExhausted`) path without 2^63 real membership
+  /// events. Forwards to [`Endpoint::test_set_clocks`].
+  #[cfg(any(test, feature = "test-support"))]
+  #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
   pub fn test_set_clocks(&mut self, member: u64, event: u64, query: u64) {
     self.core.test_set_clocks(member, event, query)
   }
@@ -966,10 +968,12 @@ where
 
   /// Whether exchange `id` is still recorded as an `ignore_old` join target.
   ///
-  /// A test-support seam (hidden from the public API) that a downstream crate's
-  /// tests use to assert a join's ignore token survives `leave` until the exchange
-  /// terminal. Forwards to [`Endpoint::test_has_ignore_join_stream`].
-  #[doc(hidden)]
+  /// A test-support seam gated behind the non-default `test-support` feature (NOT
+  /// exposed by a production `tcp` build) that a downstream crate's tests use to
+  /// assert a join's ignore token survives `leave` until the exchange terminal.
+  /// Forwards to [`Endpoint::test_has_ignore_join_stream`].
+  #[cfg(any(test, feature = "test-support"))]
+  #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
   pub fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
     self.core.test_has_ignore_join_stream(id)
   }

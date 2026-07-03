@@ -1023,3 +1023,203 @@ fn refused_leave_leaves_join_state_untouched() {
     "the refused-leave join is still in flight"
   );
 }
+
+// ── fold-before-leave / leak-free reap / cancel_join ──────────────────────────
+
+/// `leave()` folds an ALREADY-QUEUED successful push/pull completion into the
+/// await-result join BEFORE computing its abandonment, so a join that succeeded on
+/// the wire but whose `ExchangeCompleted(Succeeded)` the driver had not yet drained
+/// resolves `Ok(reached)` — never a stale `JoinFailed`. Regression for a `leave`
+/// that froze the reply from the pre-fold (empty) reached set.
+#[test]
+fn leave_folds_queued_success_before_resolving_join() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  let handle = link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  // Drive ONLY the shared reliable fabric (pumping both engines ferries it
+  // automatically) and NEVER the gossip relay, so A learns B SOLELY through the
+  // push/pull — making `num_members()==2` a precise "the push/pull merged" signal.
+  // A's events are left UNDRAINED, so the terminal `ExchangeCompleted(Succeeded)`
+  // sits queued-and-unfolded in A's machine when A leaves.
+  for _ in 0..40 {
+    link.a.pump(now, &mut link.a_gossip, &mut link.a_rel);
+    link.b.pump(now, &mut link.b_gossip, &mut link.b_rel);
+    // Drain B so its machine advances the push/pull response; discard both sides'
+    // emitted gossip so it never teaches A about B out of band.
+    while link.b.poll_event().is_some() {}
+    link.a_gossip.outbound.borrow_mut().clear();
+    link.b_gossip.outbound.borrow_mut().clear();
+    if link.a.num_members() == 2 {
+      break;
+    }
+  }
+  assert_eq!(
+    link.a.num_members(),
+    2,
+    "the push/pull merged B into A (the exchange completed at the machine level)"
+  );
+  {
+    let pj = &link.a.pending_joins[&handle];
+    assert!(
+      matches!(pj.reply, JoinReply::Pending),
+      "the completion is queued but NOT yet folded/resolved"
+    );
+    assert!(
+      pj.contacted.is_empty(),
+      "contacted is empty until the queued completion folds"
+    );
+    assert!(
+      !pj.pending.is_empty(),
+      "the exchange is still in the join's pending set (unfolded)"
+    );
+  }
+
+  // leave folds the queued Succeeded completion BEFORE its abandonment, so the
+  // caller gets Ok(reached) including B — the buggy leave froze a stale JoinFailed
+  // from the pre-fold (empty) reached set.
+  link
+    .a
+    .leave(now)
+    .expect("leave from a running node succeeds");
+
+  // The buffered (already-folded) events still deliver in order.
+  while link.a.poll_event().is_some() {}
+  match link.a.poll_join(handle) {
+    Some(Ok(reached)) => assert!(
+      reached.contains(&link.b_addr),
+      "the folded reached set must include B"
+    ),
+    other => panic!("expected Ok(reached) including B (fold-before-leave), got {other:?}"),
+  }
+  assert_eq!(
+    link.a.pending_join_count(),
+    0,
+    "the resolved join is reaped after delivery"
+  );
+}
+
+/// A never-polled terminal join does NOT leak: once its (failed) exchange
+/// terminates, the pump reaps the waiter and clears its `ignore_old` stream WITHOUT
+/// any `poll_join` and without arming a pending-join deadline — the caller simply
+/// dropped the handle. Regression for a reap gated on caller delivery
+/// (`pending_joins` would linger `Ready` forever).
+#[test]
+fn dropped_never_polled_join_is_reaped_on_exchange_terminal() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  engine.plane_mut().pool.push(5);
+  engine.set_listener(9);
+
+  let handle = engine
+    .join(&[node_addr(7002)], /*ignore_old*/ true, now)
+    .expect("join announces intent and mints a handle");
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(0);
+  // One pump dispatches the seed (recording its ignore stream), captures the
+  // Connect, and fails the dial (`NoStream::connect` errors) — queuing the terminal
+  // ExchangeCompleted(Failed).
+  engine.pump(now, &mut gossip, &mut stream);
+  let sid = {
+    let pj = &engine.pending_joins[&handle];
+    assert_eq!(
+      pj.started.len(),
+      1,
+      "the ignore_old seed recorded its StreamId"
+    );
+    *pj.started.iter().next().expect("one started stream")
+  };
+  assert!(
+    engine.endpoint.test_has_ignore_join_stream(sid),
+    "the ignore token is recorded while the exchange is in flight"
+  );
+
+  // Drive to the reap WITHOUT ever polling the join: the driver folds the failed
+  // completion via poll_event (the caller dropped the handle), then a later pump
+  // reaps the terminal waiter independent of any delivery.
+  for _ in 0..8 {
+    while engine.poll_event().is_some() {}
+    if engine.pending_join_count() == 0 {
+      break;
+    }
+    engine.pump(now, &mut gossip, &mut stream);
+  }
+  assert_eq!(
+    engine.pending_join_count(),
+    0,
+    "a never-polled terminal join must be reaped (no pending-join leak)"
+  );
+  assert!(
+    !engine.endpoint.test_has_ignore_join_stream(sid),
+    "its ignore stream must be cleared on the exchange terminal (no machine leak)"
+  );
+}
+
+/// `cancel_join` forgets an in-flight await-result join leak-free: the caller's
+/// reply is discarded (a later `poll_join` yields nothing), the ignore token is
+/// RETAINED while the push/pull can still merge, and once the exchange terminates
+/// the pump clears that token and reaps the waiter — no pending-join or ignore-set
+/// leak, and no further poll.
+#[test]
+fn cancel_join_forgets_in_flight_join_leak_free() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  let handle = link
+    .a
+    .join(&[link.b_addr], /*ignore_old*/ true, now)
+    .expect("join announces intent and mints a handle");
+  // One step dispatches the seed and binds the exchange IN FLIGHT (its ignore token
+  // recorded, not yet terminal).
+  link.step(now);
+  let sid = {
+    let pj = &link.a.pending_joins[&handle];
+    assert!(
+      !pj.pending.is_empty(),
+      "its push/pull exchange is bound and in flight"
+    );
+    *pj.started.iter().next().expect("one started stream")
+  };
+  assert!(
+    link.a.endpoint.test_has_ignore_join_stream(sid),
+    "the ignore token is recorded while the exchange is in flight"
+  );
+
+  // The caller gives up: cancel_join forgets the reply but RETAINS the ignore token
+  // (the exchange can still merge).
+  link.a.cancel_join(handle);
+  assert!(
+    link.a.poll_join(handle).is_none(),
+    "a cancelled join yields no outcome to the caller"
+  );
+  assert!(
+    link.a.endpoint.test_has_ignore_join_stream(sid),
+    "cancel_join must NOT clear the ignore token while the exchange can still merge"
+  );
+
+  // Driving the exchange to its terminal clears the ignore token AND reaps the
+  // forgotten waiter — no poll, no leak.
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if link.a.pending_join_count() == 0 {
+      break;
+    }
+  }
+  assert_eq!(
+    link.a.pending_join_count(),
+    0,
+    "a cancelled join is reaped once its exchange terminates (no pending-join leak)"
+  );
+  assert!(
+    !link.a.endpoint.test_has_ignore_join_stream(sid),
+    "the ignore token is cleared on the exchange terminal (no machine leak)"
+  );
+}

@@ -71,3 +71,14 @@ hashbrown = { version = "0.17", default-features = false, features = [
 # The fixed-capacity, no-heap `ResolvedAddrs` resolver result shares the single
 # version smoltcp already pulls into the graph (no second heapless major).
 heapless = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+# Re-declares serf-proto solely to layer its non-default `test-support` feature
+# on for the engine tests (clock overwrite + ignore-set inspection). With the
+# resolver-3 dev/normal split this edge is active ONLY for test/bench builds, so a
+# production `serf-embedded` still pulls serf-proto without `test-support` and
+# never exposes clock mutation.
+serf-proto = { path = "../serf-proto", default-features = false, features = [
+  "tcp",
+  "test-support",
+] }
