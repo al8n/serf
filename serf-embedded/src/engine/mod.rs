@@ -413,24 +413,47 @@ where
   /// set from the terminal `ExchangeCompleted` of the push/pulls it dispatched;
   /// [`poll_join`](Self::poll_join) drains a resolved one.
   pending_joins: HashMap<JoinId, PendingJoin>,
+  /// Mandatory, driver-actioned control events the pump (and [`leave`](Self::leave))
+  /// drained — the NON-LOSSY delivery path. Holds exactly the events a driver must
+  /// take a side effect on beyond observing them ([`is_mandatory_event`]): the
+  /// conflict [`Event::Shutdown`] (the driver must STOP), an [`Event::KeyRequest`]
+  /// (the driver must apply the op and `respond_key`), and an
+  /// [`Event::DialRequested`] (the driver must dial and report back).
+  ///
+  /// UNLIKE `buffered_events` this queue is never dropped-on-overflow: evicting a
+  /// mandatory event would leave a conflict loser running or a key op timing out.
+  /// [`poll_event`](Self::poll_event) drains it FIRST, so a burst of observations can
+  /// neither evict nor postpone a mandatory action. It cannot itself flood — these
+  /// events are non-bursty (`Shutdown` is terminal; a `KeyRequest` / `DialRequested`
+  /// is rare and MTU-bounded per pump) and a driver acting on them drains
+  /// `poll_event` every pump, so it is emptied each tick rather than accumulating
+  /// like a Member observation flood.
+  control_events: VecDeque<Event<I, SocketAddr>>,
   /// Machine events the pump (and [`leave`](Self::leave)) drained and folded into
   /// the pending joins, held so [`poll_event`](Self::poll_event) hands them to the
-  /// driver in order — already folded, never re-folded. Every `pump` drains the
-  /// machine's event queue to here, folding each `ExchangeCompleted` into its join
-  /// BEFORE buffering the event, so join accounting is pump-driven and never waits
-  /// on the app draining events; `poll_event` is a pure drain of this queue.
+  /// driver in order — already folded, never re-folded — the LOSSY, best-effort
+  /// delivery path for PASSIVE observations only (membership changes, user events,
+  /// queries and their responses / acks, relay-drop notices, key-query results,
+  /// exchange completions, and the `LeftCluster` notice). Mandatory driver-actioned
+  /// events are routed to `control_events` instead; see
+  /// [`route_drained_event`](Self::route_drained_event). Every `pump` drains the
+  /// machine's event queue, folding each `ExchangeCompleted` into its join BEFORE
+  /// buffering the observation, so join accounting is pump-driven and never waits on
+  /// the app draining events.
   ///
-  /// Bounded at [`DEFAULT_EVENT_BUFFER_CAP`]: at the cap the oldest event is dropped
-  /// and counted in `events_dropped`, so a driver that never drains
+  /// Bounded at [`DEFAULT_EVENT_BUFFER_CAP`]: at the cap the oldest observation is
+  /// dropped and counted in `events_dropped`, so a driver that never drains
   /// [`poll_event`](Self::poll_event) cannot grow this queue without limit (which
   /// would exhaust memory on a long-running embedded node).
   buffered_events: VecDeque<Event<I, SocketAddr>>,
-  /// Count of application events shed from `buffered_events` because the driver
-  /// never drained [`poll_event`](Self::poll_event) fast enough and the backlog hit
-  /// [`DEFAULT_EVENT_BUFFER_CAP`]. Surfaced via
+  /// Count of PASSIVE observation events shed from `buffered_events` because the
+  /// driver never drained [`poll_event`](Self::poll_event) fast enough and the
+  /// backlog hit [`DEFAULT_EVENT_BUFFER_CAP`]. Surfaced via
   /// [`events_dropped`](Self::events_dropped) so the best-effort loss is observable
-  /// (mirroring the serf std drivers' load-shed counter). Join completions are
-  /// folded before buffering, so a shed app-event never affects join resolution.
+  /// (mirroring the serf std drivers' load-shed counter). Mandatory control events
+  /// are never dropped (they take the non-lossy `control_events` path) and so are
+  /// never counted here. Join completions are folded before buffering, so a shed
+  /// observation never affects join resolution.
   events_dropped: u64,
   /// Monotonic allocator for [`JoinId`]s, so two concurrent joins never collide.
   next_join_id: u64,
@@ -614,6 +637,7 @@ where
       gossip_recv,
       pending_seeds: VecDeque::new(),
       pending_joins: HashMap::new(),
+      control_events: VecDeque::new(),
       buffered_events: VecDeque::new(),
       events_dropped: 0,
       next_join_id: 0,
@@ -829,43 +853,62 @@ where
     self.endpoint.members_snapshot()
   }
 
-  /// Drain one application-visible serf event buffered by the last `pump`, if any.
+  /// Drain one serf event the last `pump` delivered, if any — mandatory
+  /// driver-actioned control events FIRST, then passive observations.
   ///
   /// Each [`pump`](Self::pump) drains the machine's event queue to quiescence,
   /// folding every push/pull `ExchangeCompleted` into its await-result join and
-  /// buffering every event — the full serf surface: membership changes, user
-  /// events, queries, query responses / acks, key-management requests / responses,
+  /// routing each event — the full serf surface: membership changes, user events,
+  /// queries, query responses / acks, key-management requests / responses,
   /// reliable-exchange completions, and the lifecycle signals (`LeftCluster`,
-  /// conflict `Shutdown`). This call hands those buffered events to the driver in
-  /// order, exactly once; it does NOT re-fold (the pump already folded). Returns
-  /// `None` when the buffer is empty; call again after the next `pump` tick.
+  /// conflict `Shutdown`) — by class ([`route_drained_event`](Self::route_drained_event)).
+  /// This call hands those events to the driver exactly once; it does NOT re-fold
+  /// (the pump already folded). Returns `None` when both queues are empty; call
+  /// again after the next `pump` tick.
+  ///
+  /// A MANDATORY control event ([`Event::Shutdown`], [`Event::KeyRequest`],
+  /// [`Event::DialRequested`]) is delivered ahead of any queued observation and is
+  /// NEVER dropped: promoting it changes no serf semantics — `Shutdown` is terminal,
+  /// and a `KeyRequest` / `DialRequested` side effect is independent of
+  /// membership-observation order — while guaranteeing an observation flood can
+  /// neither evict nor delay a driver action.
   ///
   /// Join resolution and ignore cleanup are driven by the pump on the exchange
   /// terminal, so a driver need NOT drain events here before
   /// [`poll_join`](Self::poll_join) — `poll_join` resolves off the pump-folded
   /// state. The contract is the reactor-faithful "pump, then poll_join / poll_event".
   ///
-  /// App-event delivery is BEST-EFFORT: the backlog is bounded at
+  /// PASSIVE observation delivery is BEST-EFFORT: that backlog is bounded at
   /// [`DEFAULT_EVENT_BUFFER_CAP`], so a driver that pumps and resolves joins but
-  /// stops draining `poll_event` sheds the oldest surplus events (counted in
+  /// stops draining `poll_event` sheds the oldest surplus observations (counted in
   /// [`events_dropped`](Self::events_dropped)) rather than growing memory without
-  /// bound — matching the serf std drivers' lossy observation channel. Join
-  /// resolution is unaffected (completions are folded before buffering).
+  /// bound — matching the serf std drivers' lossy observation channel. Mandatory
+  /// control events are exempt (non-lossy), and join resolution is unaffected
+  /// (completions are folded before buffering).
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
+    // Mandatory control signals first: a burst of buffered observations must never
+    // starve or delay a Shutdown / KeyRequest / DialRequested. They live on a
+    // separate non-lossy queue, so this ordering also makes eviction impossible.
+    if let Some(ev) = self.control_events.pop_front() {
+      return Some(ev);
+    }
     self.buffered_events.pop_front()
   }
 
-  /// The number of application events shed from the `poll_event` backlog because it
-  /// reached [`DEFAULT_EVENT_BUFFER_CAP`] before the driver drained them.
+  /// The number of PASSIVE observation events shed from the `poll_event` backlog
+  /// because it reached [`DEFAULT_EVENT_BUFFER_CAP`] before the driver drained them.
   ///
-  /// App-event delivery is BEST-EFFORT under sustained overload: a driver that
+  /// Observation delivery is BEST-EFFORT under sustained overload: a driver that
   /// pumps and resolves joins but never drains [`poll_event`](Self::poll_event)
-  /// sheds the oldest surplus events rather than growing memory without bound, and
-  /// each shed increments this counter (mirroring the serf std drivers'
-  /// `events_dropped`). Join resolution is unaffected — completions are folded
-  /// before buffering — so a nonzero count means only that some observational
-  /// events were not delivered, never that a join was mis-resolved.
+  /// sheds the oldest surplus observations rather than growing memory without bound,
+  /// and each shed increments this counter (mirroring the serf std drivers'
+  /// `events_dropped`). MANDATORY driver-actioned events ([`Event::Shutdown`],
+  /// [`Event::KeyRequest`], [`Event::DialRequested`]) take the non-lossy control
+  /// path and are NEVER shed, so they are never counted here. Join resolution is
+  /// unaffected — completions are folded before buffering — so a nonzero count means
+  /// only that some observations were not delivered, never that a join was
+  /// mis-resolved or a mandatory action was lost.
   #[inline]
   pub fn events_dropped(&self) -> u64 {
     self.events_dropped
@@ -904,16 +947,18 @@ where
     }
   }
 
-  /// Buffer one already-folded machine event for [`poll_event`](Self::poll_event),
-  /// bounding the backlog at [`DEFAULT_EVENT_BUFFER_CAP`].
+  /// Buffer one PASSIVE observation for [`poll_event`](Self::poll_event), bounding the
+  /// backlog at [`DEFAULT_EVENT_BUFFER_CAP`].
   ///
-  /// At the cap the OLDEST buffered event is dropped (freshest-wins, so a
+  /// At the cap the OLDEST buffered observation is dropped (freshest-wins, so a
   /// never-draining driver keeps the most recent surface) and counted in
   /// `events_dropped`, so the queue cannot grow without bound and the loss stays
-  /// observable. The dropped copy is purely the app-delivery one — the event's join
-  /// completion was already folded by [`drain_fold_events`](Self::drain_fold_events)
-  /// BEFORE this call — so a drop never affects join resolution. Mirrors
-  /// memberlist-embassy's bounded `app_events` (drop-oldest on overflow).
+  /// observable. Only observations reach here — a mandatory driver-actioned event
+  /// takes the non-lossy [`push_control_event`](Self::push_control_event) path — and
+  /// the dropped copy is purely the app-delivery one: the event's join completion
+  /// was already folded by [`route_drained_event`](Self::route_drained_event) BEFORE
+  /// this call, so a drop never affects join resolution. Mirrors memberlist-embassy's
+  /// bounded `app_events` (drop-oldest on overflow).
   fn push_app_event(&mut self, ev: Event<I, SocketAddr>) {
     if self.buffered_events.len() >= DEFAULT_EVENT_BUFFER_CAP {
       self.buffered_events.pop_front();
@@ -922,25 +967,64 @@ where
     self.buffered_events.push_back(ev);
   }
 
-  /// Drain the machine's event queue to quiescence, folding each event into its
-  /// await-result join ([`fold_join_completion`](Self::fold_join_completion)) and
-  /// buffering it for [`poll_event`](Self::poll_event) delivery.
+  /// Enqueue one MANDATORY driver-actioned event on the non-lossy `control_events`
+  /// queue, deduplicating the terminal [`Event::Shutdown`].
+  ///
+  /// Mandatory events ([`is_mandatory_event`]) carry a side effect the driver MUST
+  /// perform — stop on `Shutdown`, apply + `respond_key` a `KeyRequest`, dial a
+  /// `DialRequested` — so they are NEVER dropped (dropping one is the bug this split
+  /// fixes: a burst over the observation cap could otherwise evict a `Shutdown`
+  /// before any driver acted on it). This queue carries no drop-bound because it
+  /// cannot flood: the events are non-bursty (`Shutdown` is terminal;
+  /// `KeyRequest` / `DialRequested` is rare and MTU-bounded per pump) and a driver
+  /// acting on them drains [`poll_event`](Self::poll_event) every pump, so it is
+  /// emptied each tick — unlike the observation backlog a pump-then-`poll_join`
+  /// driver legitimately never drains. `Shutdown` is idempotent-terminal, so at most
+  /// one is ever queued.
+  fn push_control_event(&mut self, ev: Event<I, SocketAddr>) {
+    if matches!(ev, Event::Shutdown)
+      && self
+        .control_events
+        .iter()
+        .any(|e| matches!(e, Event::Shutdown))
+    {
+      return;
+    }
+    self.control_events.push_back(ev);
+  }
+
+  /// Fold one drained machine event into its await-result join, then route it to the
+  /// correct delivery queue by class.
+  ///
+  /// The SOLE per-event routing site, shared by
+  /// [`drain_fold_events`](Self::drain_fold_events) (the pump and
+  /// [`leave`](Self::leave)), so the classification is single-sourced. The join
+  /// completion is folded FIRST ([`fold_join_completion`](Self::fold_join_completion)),
+  /// so join accounting is pump-driven and never gated on the app polling events;
+  /// then a MANDATORY event ([`is_mandatory_event`]) goes to the non-lossy
+  /// `control_events` and a PASSIVE observation to the bounded, drop-oldest
+  /// `buffered_events`.
+  fn route_drained_event(&mut self, ev: Event<I, SocketAddr>) {
+    self.fold_join_completion(&ev);
+    if is_mandatory_event(&ev) {
+      self.push_control_event(ev);
+    } else {
+      self.push_app_event(ev);
+    }
+  }
+
+  /// Drain the machine's event queue to quiescence, folding + routing each event via
+  /// [`route_drained_event`](Self::route_drained_event).
   ///
   /// The SOLE drain of the endpoint's event queue. The pump calls it every tick, so
   /// join accounting is pump-driven and never gated on the app polling events; and
   /// [`leave`](Self::leave) calls it before resolving its abandonment, so an
   /// already-succeeded push/pull lands in the reached set. Because it empties the
   /// endpoint queue, a later call folds only the events enqueued since — never
-  /// re-folding one already buffered. The join completion is folded FIRST, then the
-  /// event is buffered via [`push_app_event`](Self::push_app_event), which bounds the
-  /// backlog at [`DEFAULT_EVENT_BUFFER_CAP`] (dropping + counting the oldest on
-  /// overflow) so a driver that never drains `poll_event` cannot grow it without
-  /// bound; `buffered_events` preserves the app's event stream in arrival order up to
-  /// that cap.
+  /// re-folding one already delivered.
   fn drain_fold_events(&mut self) {
     while let Some(ev) = self.endpoint.poll_event() {
-      self.fold_join_completion(&ev);
-      self.push_app_event(ev);
+      self.route_drained_event(ev);
     }
   }
 
@@ -1997,6 +2081,60 @@ where
       }
       gossip.send(&on_wire, dest);
     }
+  }
+}
+
+/// Classify a drained machine [`Event`] as a MANDATORY driver-actioned control
+/// signal (the driver must take a side effect beyond observing it) versus a PASSIVE
+/// observation (which [`SerfEngine`] has already accounted for, or which is pure
+/// app-level information).
+///
+/// The MANDATORY set is exactly what serf's reliable-stream drivers act on in their
+/// synchronous drain — no more, no less — mirroring serf-reactor's `account_event`
+/// and serf-compio's `drain_events`:
+///
+/// - [`Event::Shutdown`] — the local node lost an id-conflict vote and the driver
+///   MUST stop (serf-reactor flags `begin_shutdown`; serf-compio sets its terminal
+///   flag), then still delivers the event to subscribers.
+/// - [`Event::KeyRequest`] — the driver MUST apply the key op and answer the
+///   originator via `respond_key` (both reference drivers do so ahead of the
+///   observation hand-off); without it the inbound key op silently times out.
+/// - [`Event::DialRequested`] — the driver MUST dial the peer and report back via
+///   `dial_succeeded` / `dial_failed`. On the reliable-stream path the coordinator
+///   sieves the inner dial request into its own dial queue (surfaced as a
+///   `poll_action` `Connect` the pump already services), so this event never
+///   actually reaches the drain here; it is classified mandatory so that, were any
+///   transport to surface it, a driver-owned dial could never be silently evicted.
+///
+/// Every other variant is a PASSIVE observation, delivered best-effort:
+/// [`Event::ExchangeCompleted`] (its await-result join is folded non-lossily by
+/// [`fold_join_completion`](SerfEngine::fold_join_completion) BEFORE buffering),
+/// [`Event::LeftCluster`] (the engine's [`leave`](SerfEngine::leave) resolves its
+/// join replies synchronously, so nothing resolves off the event here),
+/// [`Event::Member`] / [`Event::User`] / [`Event::Query`] (app observations, a
+/// `Query` response being optional), and [`Event::QueryResponse`] /
+/// [`Event::QueryAck`] / [`Event::KeyResponse`] / [`Event::RelayDropped`]
+/// (correlated internally by the machine, forwarded to the app only).
+fn is_mandatory_event<I, A>(ev: &Event<I, A>) -> bool {
+  match ev {
+    Event::Shutdown | Event::DialRequested(_) => true,
+    #[cfg(encryption)]
+    Event::KeyRequest(_) => true,
+    Event::Member(_)
+    | Event::User(_)
+    | Event::Query(_)
+    | Event::QueryResponse(_)
+    | Event::QueryAck(_)
+    | Event::RelayDropped(_)
+    | Event::LeftCluster
+    | Event::ExchangeCompleted(_) => false,
+    #[cfg(encryption)]
+    Event::KeyResponse(_) => false,
+    // `Event` is `#[non_exhaustive]`, so an exhaustive match is impossible from a
+    // downstream crate: an unknown future variant defaults to a best-effort
+    // observation. Add it to the mandatory arm above if a new driver-actioned event
+    // is ever introduced upstream.
+    _ => false,
   }
 }
 

@@ -1599,3 +1599,105 @@ fn undrained_poll_event_backlog_is_bounded_and_counts_drops() {
     other => panic!("the bounded app-event drop must not affect join resolution, got {other:?}"),
   }
 }
+
+// ── mandatory control events survive an observation flood (non-lossy path) ────
+
+/// A MANDATORY driver-actioned event survives an observation flood far exceeding the
+/// passive backlog cap. Routed through the SAME per-event path the pump uses
+/// ([`SerfEngine::route_drained_event`]), a `Event::Shutdown` lands on the non-lossy
+/// control queue while `> DEFAULT_EVENT_BUFFER_CAP` passive `Event::LeftCluster`
+/// observations flood the bounded buffer. `poll_event` must STILL yield the Shutdown
+/// (delivered ahead of observations, never evicted), the passive backlog must be
+/// bounded at the cap, and `events_dropped()` must count the shed observations.
+///
+/// This is the fail-on-revert regression: reverting to a single lossy queue routes
+/// the Shutdown through the drop-oldest buffer, where the over-cap flood evicts it
+/// before any driver could act on it — so the final assertion fails. `Shutdown` is
+/// the only mandatory variant constructible from a downstream crate (`KeyRequest` /
+/// `DialRequested` carry `pub(crate)` payloads and, on the stream path, the
+/// coordinator sieves the dial into a `poll_action` `Connect`), and all three route
+/// through the identical `is_mandatory_event` → non-lossy control path exercised
+/// here.
+#[test]
+fn mandatory_event_survives_observation_flood() {
+  let mut engine = make_engine();
+
+  // The mandatory event is enqueued FIRST, then a flood of passive observations far
+  // past the cap — so a single lossy queue (drop-oldest) would evict the Shutdown.
+  engine.route_drained_event(Event::Shutdown);
+  for _ in 0..(DEFAULT_EVENT_BUFFER_CAP * 2) {
+    engine.route_drained_event(Event::LeftCluster);
+  }
+
+  // The passive backlog is bounded at the cap and every shed observation is counted.
+  assert_eq!(
+    engine.buffered_events.len(),
+    DEFAULT_EVENT_BUFFER_CAP,
+    "the passive observation backlog must be bounded at the cap"
+  );
+  assert!(
+    engine.events_dropped() >= 1,
+    "the over-cap observation flood must shed and count observations (got {})",
+    engine.events_dropped()
+  );
+
+  // The mandatory Shutdown is delivered FIRST and was never evicted by the flood.
+  assert!(
+    matches!(engine.poll_event(), Some(Event::Shutdown)),
+    "the mandatory Shutdown must survive the flood and lead the observations"
+  );
+
+  // Nothing after it is a Shutdown (only one is ever queued), and exactly the bounded
+  // passive backlog remains.
+  let mut remaining = 0usize;
+  while let Some(ev) = engine.poll_event() {
+    remaining += 1;
+    assert!(
+      !matches!(ev, Event::Shutdown),
+      "only one Shutdown is ever queued; it was already delivered first"
+    );
+  }
+  assert_eq!(
+    remaining, DEFAULT_EVENT_BUFFER_CAP,
+    "after the Shutdown, exactly the bounded passive backlog is delivered"
+  );
+}
+
+/// The non-lossy control queue dedupes the idempotent-terminal `Event::Shutdown` — a
+/// repeated conflict signal queues at most one — and delivers control events ahead of
+/// passive observations regardless of arrival order. Together these keep the
+/// unbounded control queue from being grown by a duplicated terminal signal and
+/// guarantee a mandatory action is never delayed behind queued observations.
+#[test]
+fn control_queue_dedupes_shutdown_and_leads_observations() {
+  let mut engine = make_engine();
+
+  // Observations arrive first, then several Shutdowns.
+  engine.route_drained_event(Event::LeftCluster);
+  engine.route_drained_event(Event::LeftCluster);
+  engine.route_drained_event(Event::Shutdown);
+  engine.route_drained_event(Event::Shutdown);
+  engine.route_drained_event(Event::Shutdown);
+
+  assert_eq!(
+    engine.control_events.len(),
+    1,
+    "repeated Shutdowns dedupe to a single queued terminal signal"
+  );
+
+  // Control-first: the Shutdown leads despite the earlier-enqueued observations, then
+  // the two observations follow in arrival order.
+  assert!(
+    matches!(engine.poll_event(), Some(Event::Shutdown)),
+    "the mandatory Shutdown is delivered ahead of the earlier observations"
+  );
+  assert!(
+    matches!(engine.poll_event(), Some(Event::LeftCluster)),
+    "the buffered observations follow the control event, in arrival order"
+  );
+  assert!(matches!(engine.poll_event(), Some(Event::LeftCluster)));
+  assert!(
+    engine.poll_event().is_none(),
+    "both queues are drained after delivering the control event and observations"
+  );
+}
