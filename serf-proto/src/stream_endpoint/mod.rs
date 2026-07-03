@@ -883,9 +883,14 @@ where
       .test_inject_user_packet(&mut self.transport, from, data, now)
   }
 
-  /// Forwards to [`Endpoint::test_set_clocks`].
-  #[cfg(test)]
-  pub(crate) fn test_set_clocks(&mut self, member: u64, event: u64, query: u64) {
+  /// Overwrite all three Lamport clocks in one call.
+  ///
+  /// A test-support seam (hidden from the public API) that a downstream crate's
+  /// tests use to drive the member clock to the `LTIME_MAX` integrity floor and
+  /// exercise the refused-leave (`LeaveClockExhausted`) path without 2^63 real
+  /// membership events. Forwards to [`Endpoint::test_set_clocks`].
+  #[doc(hidden)]
+  pub fn test_set_clocks(&mut self, member: u64, event: u64, query: u64) {
     self.core.test_set_clocks(member, event, query)
   }
 
@@ -959,9 +964,13 @@ where
     self.core.test_note_ignore_join_stream(id)
   }
 
-  /// Forwards to [`Endpoint::test_has_ignore_join_stream`].
-  #[cfg(test)]
-  pub(crate) fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
+  /// Whether exchange `id` is still recorded as an `ignore_old` join target.
+  ///
+  /// A test-support seam (hidden from the public API) that a downstream crate's
+  /// tests use to assert a join's ignore token survives `leave` until the exchange
+  /// terminal. Forwards to [`Endpoint::test_has_ignore_join_stream`].
+  #[doc(hidden)]
+  pub fn test_has_ignore_join_stream(&self, id: StreamId) -> bool {
     self.core.test_has_ignore_join_stream(id)
   }
 

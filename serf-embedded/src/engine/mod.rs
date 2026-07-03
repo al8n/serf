@@ -209,6 +209,27 @@ struct QueuedSeed {
   ignore_old: bool,
 }
 
+/// The caller-reply lifecycle of an await-result join, kept SEPARATE from the
+/// `ignore_old` stream cleanup so the two terminals resolve independently.
+///
+/// The reply is resolved once — from all-exchanges-done or from
+/// [`leave`](SerfEngine::leave) — and delivered to the caller exactly once via
+/// [`poll_join`](SerfEngine::poll_join); the ignore-stream cleanup lives on
+/// [`PendingJoin`] and stays gated on the exchange terminal. Decoupling them lets
+/// `leave` hand the caller its result while a still-in-flight `ignore_old`
+/// push/pull keeps its ignore token until it actually merges — mirroring
+/// serf-reactor's `PendingJoin`, whose reply and ignore-cleanup terminals are
+/// likewise distinct.
+enum JoinReply {
+  /// Not yet resolved; `poll_join` yields `None`.
+  Pending,
+  /// Resolved and awaiting the caller; `poll_join` delivers it once, then flips
+  /// this to `Delivered`.
+  Ready(Result<ReachedSet, JoinFailed>),
+  /// Already delivered to the caller; further `poll_join` calls yield `None`.
+  Delivered,
+}
+
 /// Core-owned state for one in-flight await-result join.
 ///
 /// The sync analogue of serf-reactor's `PendingJoin`, adapted to the driver-poll
@@ -218,14 +239,23 @@ struct QueuedSeed {
 /// [`StreamId`] captured at [`join`](SerfEngine::join)'s per-seed dispatch and
 /// bound to the exchange's [`ExchangeId`] when its `Connect` action surfaces; the
 /// completion then matches by that bound `ExchangeId`.
+///
+/// The caller [`reply`](Self::reply) and the `ignore_old` cleanup are DISTINCT
+/// terminals: the reply resolves and is delivered once (on all-exchanges-done or
+/// on `leave`), while the ignore streams are cleared only when every dispatched
+/// exchange has terminated (`pending` empty). Keeping them separate is what lets a
+/// `leave` abandon the join for the caller without pulling the ignore token out
+/// from under a push/pull that can still merge.
 struct PendingJoin {
   /// `StreamId`s this join's `start_join_push_pull` calls returned. Matched
   /// against each surfaced `Connect`'s `stream_id()` to bind the exchange, and —
-  /// for an `ignore_old` join — cleared from the machine's ignore set on terminal.
+  /// for an `ignore_old` join — cleared from the machine's ignore set on the
+  /// exchange terminal.
   started: HashSet<StreamId>,
   /// Number of this join's seeds still queued in `pending_seeds`, undispatched.
   /// Decremented as each seed's push/pull is started in the pump; the join is
-  /// "fully dispatched" (eligible to resolve) once this reaches zero.
+  /// "fully dispatched" once this reaches zero. `leave` forces it to zero — no
+  /// seed dispatches once the node is leaving.
   unstarted: usize,
   /// Outbound exchange ids bound at `Connect` and still awaiting a terminal
   /// `ExchangeCompleted`.
@@ -235,11 +265,15 @@ struct PendingJoin {
   /// Total routable-seed count this join dispatched — the `JoinFailed` denominator.
   requested: usize,
   /// Whether this is an `ignore_old` join (its `started` streams are recorded in
-  /// the machine's ignore set and must be cleared on terminal).
+  /// the machine's ignore set and must be cleared on the exchange terminal).
   ignore_old: bool,
-  /// The resolved outcome, set once every dispatched exchange has terminated (or
-  /// on `leave`). `poll_join` returns and removes the waiter once this is `Some`.
-  resolved: Option<Result<ReachedSet, JoinFailed>>,
+  /// Whether the `ignore_old` streams have already been cleared from the machine's
+  /// ignore set, so the cleanup runs exactly once when the last exchange
+  /// terminates.
+  ignore_cleared: bool,
+  /// The caller-reply lifecycle, resolved and delivered once, independent of the
+  /// ignore-stream cleanup above.
+  reply: JoinReply,
 }
 
 impl PendingJoin {
@@ -251,18 +285,41 @@ impl PendingJoin {
       Ok(self.contacted.clone())
     }
   }
+
+  /// Deliver the resolved outcome to the caller exactly once: transition
+  /// `Ready → Delivered` and hand back the outcome, or `None` while still
+  /// `Pending` (unresolved) or once already `Delivered`.
+  fn take_ready_reply(&mut self) -> Option<Result<ReachedSet, JoinFailed>> {
+    if !matches!(self.reply, JoinReply::Ready(_)) {
+      return None;
+    }
+    let JoinReply::Ready(outcome) = core::mem::replace(&mut self.reply, JoinReply::Delivered)
+    else {
+      unreachable!("reply matched Ready immediately above");
+    };
+    Some(outcome)
+  }
+
+  /// Both terminals reached: the caller has consumed the reply AND every
+  /// dispatched exchange has terminated, so the waiter can be reaped.
+  fn is_done(&self) -> bool {
+    matches!(self.reply, JoinReply::Delivered) && self.unstarted == 0 && self.pending.is_empty()
+  }
 }
 
-/// Resolve `pj` if every dispatched exchange has terminated (`unstarted == 0` and
-/// `pending` empty) and it is not already resolved: compute its outcome, clear any
-/// still-recorded `ignore_old` streams from the machine's ignore set, and stash
-/// the outcome for [`poll_join`](SerfEngine::poll_join).
+/// Advance `pj` toward its terminals once every dispatched exchange has terminated
+/// (`unstarted == 0` and `pending` empty): clear any still-recorded `ignore_old`
+/// streams from the machine's ignore set (once), then resolve the caller reply if
+/// it is still pending.
 ///
-/// Driven on both the completion path (an `ExchangeCompleted` emptied `pending`)
-/// and the end-of-pump sweep (a join whose seeds all retired before a `Connect`,
-/// or an empty/all-non-routable seed set, never accumulates any `pending`). Clearing
-/// the ignore streams HERE — on the exchange terminal, not lazily in `poll_join` —
-/// means the machine's ignore set never leaks even if the driver drops the handle.
+/// This is the SOLE site that clears a join's ignore streams, and it is gated on
+/// the exchange terminal — never on `leave`, never lazily in `poll_join` — so a
+/// still-in-flight `ignore_old` push/pull keeps its ignore token until it actually
+/// merges (or its exchange is torn down), and the machine's ignore set never leaks
+/// even if the driver drops the handle. Driven on the completion path (an
+/// `ExchangeCompleted` emptied `pending`) and the end-of-pump sweep (a join whose
+/// seeds all retired before a `Connect`, or an empty/all-non-routable seed set,
+/// never accumulates any `pending`).
 fn try_resolve_join<I, G, SR>(
   endpoint: &mut StreamEndpoint<I, SocketAddr, RawRecords, G, SR>,
   pj: &mut PendingJoin,
@@ -271,15 +328,18 @@ fn try_resolve_join<I, G, SR>(
   G: Rng,
   SR: Rng + SeedableRng,
 {
-  if pj.resolved.is_some() || pj.unstarted != 0 || !pj.pending.is_empty() {
+  if pj.unstarted != 0 || !pj.pending.is_empty() {
     return;
   }
-  if pj.ignore_old {
+  if pj.ignore_old && !pj.ignore_cleared {
     for sid in &pj.started {
       endpoint.clear_ignore_join_stream(*sid);
     }
+    pj.ignore_cleared = true;
   }
-  pj.resolved = Some(pj.outcome());
+  if matches!(pj.reply, JoinReply::Pending) {
+    pj.reply = JoinReply::Ready(pj.outcome());
+  }
 }
 
 /// The transport-agnostic serf driving core.
@@ -827,7 +887,8 @@ where
         contacted: ReachedSet::new(),
         requested,
         ignore_old,
-        resolved: None,
+        ignore_cleared: false,
+        reply: JoinReply::Pending,
       },
     );
     Ok(id)
@@ -839,49 +900,58 @@ where
   /// Returns `Some(Ok(reached))` with the address set the join contacted, or
   /// `Some(Err(JoinFailed))` if every dispatched push/pull terminated without
   /// contacting a seed. `None` means the join has not yet resolved — poll again
-  /// after the next `pump` + [`poll_event`](Self::poll_event) drain. Removes the
-  /// waiter on the resolving call (a sync driver polls this each tick; an async
-  /// driver awaits a signal the pump fires when it flips to `Some`). An unknown or
-  /// already-drained handle yields `None`.
+  /// after the next `pump` + [`poll_event`](Self::poll_event) drain. The outcome
+  /// is delivered EXACTLY ONCE: a second poll of the same handle yields `None`.
+  /// The waiter is reaped on this call once its `ignore_old` cleanup has ALSO
+  /// completed (every dispatched exchange terminated); until then it lingers so
+  /// the pump can finish clearing the ignore streams on the exchange terminal
+  /// (never premature). An unknown or already-delivered handle yields `None`.
   pub fn poll_join(&mut self, handle: JoinId) -> Option<Result<ReachedSet, JoinFailed>> {
-    // Yield `None` for an unknown handle (`get?`) or one still in flight
-    // (`resolved.as_ref()?`); only a resolved join is drained AND removed.
-    self.pending_joins.get(&handle)?.resolved.as_ref()?;
-    self
-      .pending_joins
-      .remove(&handle)
-      .and_then(|pj| pj.resolved)
+    // Deliver the resolved outcome once (`Ready → Delivered`); yield `None` for an
+    // unknown handle, one still in flight, or one already delivered.
+    let pj = self.pending_joins.get_mut(&handle)?;
+    let outcome = pj.take_ready_reply()?;
+    // The caller has consumed the reply. Reap the waiter only if its ignore-stream
+    // cleanup terminal has also been reached; otherwise keep it so the pump can
+    // still fold the outstanding `ExchangeCompleted`s and clear the ignore streams.
+    if pj.is_done() {
+      self.pending_joins.remove(&handle);
+    }
+    Some(outcome)
   }
 
   /// Begin leaving the cluster.
   ///
-  /// Forwards to serf's graceful-leave path, which gossips the departure and
-  /// ultimately emits [`Event::LeftCluster`] via [`poll_event`](Self::poll_event).
-  /// Any seeds still queued from a pre-leave join are dropped, and every in-flight
-  /// await-result join is resolved from its current reached set (clearing any
-  /// still-recorded ignore streams so the machine's ignore set never leaks): the
-  /// pump initiates no new push/pull once leaving.
+  /// Calls serf's graceful-leave path FIRST, so a refused leave that leaves the
+  /// node `Alive` (e.g. `LeaveClockExhausted`, the `LTIME_MAX` watermark guard)
+  /// returns its error with the in-flight join state untouched — `?` returns
+  /// before any of the abandonment below runs.
+  ///
+  /// On an ACCEPTED leave — which gossips the departure and ultimately emits
+  /// [`Event::LeftCluster`] via [`poll_event`](Self::poll_event) — the pump
+  /// initiates no further push/pull, so any queued seeds are dropped and every
+  /// in-flight await-result join is handed its caller reply once from its
+  /// reached-so-far set. The `ignore_old` cleanup is deliberately NOT run here: it
+  /// stays gated on the exchange terminal ([`try_resolve_join`], driven by the
+  /// pump fold), so a late successful push/pull that merges after leave still
+  /// finds its ignore token in place and suppresses the seed's pre-join user
+  /// events — the same reply-vs-cleanup decoupling serf-reactor uses.
   pub fn leave(&mut self, now: Instant) -> Result<(), SerfError> {
+    // Machine leave FIRST: a refused leave returns without mutating serf state, so
+    // the join state must stay untouched too.
+    self.endpoint.leave(now)?;
+
+    // Accepted: no seed dispatches once leaving, so drop the queue and mark every
+    // join fully dispatched, then deliver each still-pending caller reply once.
+    // Ignore-stream cleanup stays with `try_resolve_join` on the exchange terminal.
     self.pending_seeds.clear();
-    // Force every in-flight join to its terminal from whatever it accumulated so
-    // far: leaving means no further push/pull dispatch, so an unresolved join
-    // would otherwise linger forever (and leak its ignore-join streams).
-    let Self {
-      endpoint,
-      pending_joins,
-      ..
-    } = self;
-    for pj in pending_joins.values_mut() {
-      if pj.resolved.is_none() {
-        if pj.ignore_old {
-          for sid in &pj.started {
-            endpoint.clear_ignore_join_stream(*sid);
-          }
-        }
-        pj.resolved = Some(pj.outcome());
+    for pj in self.pending_joins.values_mut() {
+      pj.unstarted = 0;
+      if matches!(pj.reply, JoinReply::Pending) {
+        pj.reply = JoinReply::Ready(pj.outcome());
       }
     }
-    self.endpoint.leave(now)
+    Ok(())
   }
 
   /// Force a named node out of the cluster (an operator-driven removal).
@@ -1138,21 +1208,25 @@ where
     // 7e. Egress: drain outbound gossip transmits, encode + encrypt, and send.
     self.drain_gossip_transmits(gossip);
 
-    // 7f. Resolve any await-result join whose exchanges all terminated. The normal
-    // (some seed contacted / failed) path resolves as each `ExchangeCompleted`
-    // folds in `poll_event`; this sweep catches the joins that never accumulate a
-    // pending exchange at all — an empty/all-non-routable seed set, or seeds that
-    // retired before a `Connect` — now that this tick's `Connect`s have been
-    // captured (phase 7a).
+    // 7f. Resolve + reap await-result joins whose exchanges all terminated. The
+    // normal (some seed contacted / failed) path resolves as each
+    // `ExchangeCompleted` folds in `poll_event`; this sweep catches the joins that
+    // never accumulate a pending exchange at all — an empty/all-non-routable seed
+    // set, or seeds that retired before a `Connect` — now that this tick's
+    // `Connect`s have been captured (phase 7a). It also reaps any waiter that has
+    // reached BOTH terminals (caller reply delivered AND every exchange
+    // terminated), which is where a leave-abandoned join whose ignore streams
+    // clear only once its post-leave exchange finally merges is retired.
     {
       let Self {
         endpoint,
         pending_joins,
         ..
       } = self;
-      for pj in pending_joins.values_mut() {
+      pending_joins.retain(|_, pj| {
         try_resolve_join(endpoint, pj);
-      }
+        !pj.is_done()
+      });
     }
 
     // 8. Next deadline = min(machine, closing).
