@@ -3175,6 +3175,68 @@ fn expired_received_queries_pruned_before_inbound_cap() {
   );
 }
 
+#[test]
+fn received_query_answerable_at_exact_deadline_survives_inbound_prune() {
+  // A received query is answerable up to and including its deadline: respond
+  // rejects only now > deadline.  The ingress prune in handle_query must not
+  // drop a token at the exact instant now == deadline, or a still-valid response
+  // fails with AlreadyResponded.  Register an inbound query, advance to exactly
+  // its deadline, run the ingress prune by handling a second inbound query at
+  // that instant, then answer the first token at now == deadline: it must
+  // succeed.  Reverting the prune to `now < deadline` drops the token here and
+  // makes the respond fail.
+  let mut e = ep();
+
+  // First inbound query at ORIGIN → deadline D = ORIGIN + timeout.
+  e.test_set_drain_now(t_secs(0));
+  let original = QueryMessage::<u32, core::net::SocketAddr> {
+    ltime: LamportTime::new(1),
+    id: 1,
+    from: memberlist_proto::Node::new(99u32, addr(9001)),
+    filters: vec![],
+    flags: QueryFlag::NO_BROADCAST,
+    relay_factor: 0,
+    timeout: core::time::Duration::from_secs(5),
+    name: "original".into(),
+    payload: bytes::Bytes::new(),
+  };
+  let _ = e.test_handle_query(original);
+
+  // Capture the original token from the surfaced Event::Query; its deadline is D.
+  let token = match e
+    .poll_event()
+    .expect("the original inbound query must surface as Event::Query")
+  {
+    Event::Query(qe) => qe,
+    other => panic!(
+      "expected Event::Query, got {:?}",
+      core::mem::discriminant(&other)
+    ),
+  };
+  let deadline = token.deadline();
+
+  // Advance to EXACTLY the deadline and handle a DIFFERENT inbound query, which
+  // runs the ingress prune at now == deadline.
+  e.test_set_drain_now(deadline);
+  let other = QueryMessage::<u32, core::net::SocketAddr> {
+    ltime: LamportTime::new(2),
+    id: 2,
+    from: memberlist_proto::Node::new(7u32, addr(7000)),
+    filters: vec![],
+    flags: QueryFlag::NO_BROADCAST,
+    relay_factor: 0,
+    timeout: core::time::Duration::from_secs(30),
+    name: "other".into(),
+    payload: bytes::Bytes::new(),
+  };
+  let _ = e.test_handle_query(other);
+
+  // The original token, answerable at now == deadline, must NOT have been pruned:
+  // respond at exactly the deadline must succeed.
+  e.respond(&token, bytes::Bytes::new(), deadline)
+    .expect("respond at exactly the deadline must succeed: the token is still answerable");
+}
+
 // ── Bug 1: zero valid conflict responses must not emit Event::Shutdown ────────
 
 #[test]
@@ -6111,6 +6173,65 @@ mod key_request_responder {
       dest,
       "127.0.0.1:9999".parse::<core::net::SocketAddr>().unwrap()
     );
+  }
+
+  #[test]
+  fn key_request_answerable_at_exact_deadline_survives_inbound_prune() {
+    // A KeyRequest token is answerable up to and including its deadline:
+    // respond_key rejects only now > deadline.  The ingress prune in handle_query
+    // must not drop the token at the exact instant now == deadline, or a mandatory
+    // key response fails with AlreadyResponded.  Register a key query, advance to
+    // exactly its deadline, run the ingress prune by handling a second inbound
+    // query at that instant, then answer the key token at now == deadline: it must
+    // succeed.  Reverting the prune to `now < deadline` drops the token here and
+    // makes respond_key fail.
+    let mut e = ep();
+
+    // Inbound key query at ORIGIN → deadline D = ORIGIN + timeout.
+    e.test_set_drain_now(t_secs(0));
+    let key = test_key();
+    let q = make_key_query("_serf_install_key", Some(key));
+    let _ = e.test_handle_query(q);
+
+    // Capture the KeyRequest token; its deadline is D.
+    let req = match e.poll_event().expect("must emit Event::KeyRequest") {
+      Event::KeyRequest(kr) => kr,
+      other => panic!(
+        "expected Event::KeyRequest, got {:?}",
+        core::mem::discriminant(&other)
+      ),
+    };
+    let deadline = req.deadline();
+
+    // Advance to EXACTLY the deadline and handle a DIFFERENT inbound query, which
+    // runs the ingress prune at now == deadline.
+    e.test_set_drain_now(deadline);
+    let other = QueryMessage::<u32, core::net::SocketAddr> {
+      ltime: LamportTime::new(2),
+      id: 2,
+      from: memberlist_proto::Node::new(7u32, addr(7000)),
+      filters: vec![],
+      flags: QueryFlag::NO_BROADCAST,
+      relay_factor: 0,
+      timeout: core::time::Duration::from_secs(30),
+      name: "other".into(),
+      payload: bytes::Bytes::new(),
+    };
+    let _ = e.test_handle_query(other);
+
+    // The key token, answerable at now == deadline, must NOT have been pruned:
+    // respond_key at exactly the deadline must succeed.
+    e.respond_key(
+      &req,
+      KeyResponseArgs {
+        result: true,
+        message: smol_str::SmolStr::default(),
+        keys: vec![key],
+        primary_key: Some(key),
+      },
+      deadline,
+    )
+    .expect("respond_key at exactly the deadline must succeed: the token is still answerable");
   }
 
   #[test]
