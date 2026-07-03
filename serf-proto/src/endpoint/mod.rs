@@ -1102,16 +1102,20 @@ where
     }
   }
 
-  /// Drop received-query tokens whose response deadline has elapsed.
+  /// Drop received-query tokens that are strictly past their response deadline.
   ///
-  /// A past-deadline entry is unanswerable — `respond` / `respond_key` reject it
-  /// via the G7 deadline guard — so evicting it loses nothing while freeing an
-  /// inbound-cap slot.  Single-sources the liveness predicate shared by the
+  /// An entry is pruned only once `now > deadline` — exactly the point at which
+  /// `respond` / `respond_key` stop accepting a response for it, since their
+  /// deadline guard rejects only `now > deadline` and a response sent at the
+  /// exact instant `now == deadline` is still valid.  Retaining while
+  /// `now <= deadline` therefore never evicts a token a pending response could
+  /// still answer, while a strictly-past token is unanswerable so freeing its
+  /// inbound-cap slot loses nothing.  Single-sources the predicate shared by the
   /// periodic reclaim in `after_inner_timeout` and the inline reclaim in
   /// `handle_query` (which runs before the inbound overflow cap so the cap counts
-  /// only live entries).
+  /// only answerable entries).
   fn prune_expired_received_queries(&mut self, now: Instant) {
-    self.received_queries.retain(|_, rq| now < rq.deadline);
+    self.received_queries.retain(|_, rq| now <= rq.deadline);
   }
 
   // ── inner-event sieve ─────────────────────────────────────────────────────
