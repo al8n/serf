@@ -3086,6 +3086,95 @@ fn expired_received_queries_are_pruned_in_handle_timeout() {
   );
 }
 
+#[test]
+fn expired_received_queries_pruned_before_inbound_cap() {
+  // A query/key-request flood can leave received_queries full of STALE
+  // (past-deadline, not-yet-pruned) tokens when a new LIVE inbound query
+  // arrives: every driver ingests inbound data before it runs the periodic
+  // deadline-prune in after_inner_timeout.  handle_query must therefore prune
+  // expired tokens inline before the inbound cap, so the cap counts only live
+  // entries and the live query is admitted.  Reverting the inline prune (leaving
+  // only the after_inner_timeout prune) makes the stale-full cap drop the live
+  // query and fails this test.
+  let mut e = ep();
+
+  // Fill received_queries to the cap with inbound queries carrying a short (1s)
+  // deadline, at drain_now = ORIGIN.  Distinct (ltime = i + 1, id = i) pairs are
+  // each first-sight, so all MAX_RECEIVED_QUERIES entries are inserted (all live
+  // at ORIGIN, so the inline prune is a no-op during the fill).
+  e.test_set_drain_now(t_secs(0));
+  for i in 0..MAX_RECEIVED_QUERIES as u32 {
+    let q = QueryMessage::<u32, core::net::SocketAddr> {
+      ltime: LamportTime::new(i as u64 + 1),
+      id: i,
+      from: memberlist_proto::Node::new(99u32, addr(9001)),
+      filters: vec![],
+      flags: QueryFlag::NO_BROADCAST,
+      relay_factor: 0,
+      timeout: core::time::Duration::from_secs(1),
+      name: "flood".into(),
+      payload: bytes::Bytes::new(),
+    };
+    let _ = e.test_handle_query(q);
+  }
+  assert_eq!(
+    e.test_received_queries_len(),
+    MAX_RECEIVED_QUERIES,
+    "received_queries must be exactly at the cap after the flood"
+  );
+
+  // Advance the endpoint's clock PAST the fill deadlines (ORIGIN + 1s) WITHOUT
+  // calling handle_timeout, so the only thing that can reclaim the now-stale
+  // tokens is the inline prune in handle_query.
+  e.test_set_drain_now(t_secs(10));
+
+  // Drain the queued flood events so the live query's event is observed alone.
+  while e.poll_event().is_some() {}
+
+  // A new LIVE inbound query (future deadline, distinct ltime/id) must be
+  // ADMITTED: the inline prune reclaims all the stale slots before the cap check.
+  let live_ltime = LamportTime::new(MAX_RECEIVED_QUERIES as u64 + 100);
+  let live_id = MAX_RECEIVED_QUERIES as u32 + 100;
+  let live = QueryMessage::<u32, core::net::SocketAddr> {
+    ltime: live_ltime,
+    id: live_id,
+    from: memberlist_proto::Node::new(7u32, addr(7000)),
+    filters: vec![],
+    flags: QueryFlag::NO_BROADCAST,
+    relay_factor: 0,
+    timeout: core::time::Duration::from_secs(30),
+    name: "live".into(),
+    payload: bytes::Bytes::new(),
+  };
+  let _ = e.test_handle_query(live);
+
+  // The live query surfaced as Event::Query (it was not dropped at the cap) ...
+  let ev = e
+    .poll_event()
+    .expect("the live inbound query must be admitted and surfaced as Event::Query");
+  match ev {
+    Event::Query(qe) => {
+      assert_eq!(
+        qe.ltime(),
+        live_ltime,
+        "surfaced event must be the live query"
+      );
+      assert_eq!(qe.id(), live_id, "surfaced event must be the live query");
+    }
+    other => panic!(
+      "expected Event::Query for the live query, got {:?}",
+      core::mem::discriminant(&other)
+    ),
+  }
+
+  // ... and its token is the only entry left: the stale tokens were pruned.
+  assert_eq!(
+    e.test_received_queries_len(),
+    1,
+    "the stale tokens must be pruned inline, leaving only the live token"
+  );
+}
+
 // ── Bug 1: zero valid conflict responses must not emit Event::Shutdown ────────
 
 #[test]

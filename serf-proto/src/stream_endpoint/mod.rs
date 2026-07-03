@@ -1049,6 +1049,12 @@ where
     self.core.test_handle_query(&mut self.transport, msg)
   }
 
+  /// Forwards to [`Endpoint::test_set_drain_now`].
+  #[cfg(test)]
+  pub(crate) fn test_set_drain_now(&mut self, now: Instant) {
+    self.core.test_set_drain_now(now)
+  }
+
   /// Forwards to [`Endpoint::test_last_query_id`].
   #[cfg(test)]
   pub(crate) fn test_last_query_id(&self) -> Option<QueryId> {
