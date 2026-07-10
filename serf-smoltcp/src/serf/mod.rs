@@ -75,6 +75,17 @@ const ENCRYPTED_WRAPPER_OVERHEAD: usize = 0;
 /// The transmit buffer has no such limit and is not capped.
 const TCP_RX_BUFFER_MAX: usize = 1 << 30;
 
+/// The most pump → drain passes one [`Serf::poll`] makes to reach quiescence.
+///
+/// A single `poll` re-pumps while a pass produced new work the current deadline /
+/// egress has not yet reflected: a `respond_key` the drain just queued, or a
+/// self-addressed datagram the pump's egress just looped back (see
+/// [`SmoltcpGossip`]). Each self query / key response settles in a few passes; this
+/// caps a pathological self-delivery cycle so a single `poll` cannot spin forever.
+/// On hitting the cap with work still pending, `poll` folds `now` into its returned
+/// deadline so the caller re-polls at once rather than sleeping past it.
+const MAX_SELF_DELIVERY_ITERS: usize = 8;
+
 /// Whether `addr` is a destination the smoltcp stack can actually use.
 ///
 /// `to_endpoint(*addr).addr.is_unicast()` calls smoltcp's OWN `IpAddress::is_unicast`
@@ -278,6 +289,13 @@ where
   /// Count of app events shed from `app_events` because the app never drained
   /// [`poll_event`](Self::poll_event) fast enough and the backlog hit the cap.
   app_events_dropped: u64,
+  /// Driver-owned self-delivery buffer for gossip datagrams this node addressed to
+  /// its OWN advertise address (a response to its own query / key-request). smoltcp
+  /// does not loop a self-addressed datagram back into recv like an OS UDP socket,
+  /// so [`SmoltcpGossip`] diverts such datagrams here on send and replays them on
+  /// recv, and [`poll`](Self::poll) drives the pump to quiescence so the looped-back
+  /// datagram is ingested and its response collected within the same tick.
+  loopback: VecDeque<Vec<u8>>,
   /// Set once the driver observed a lost id-conflict [`Event::Shutdown`]; the
   /// caller reads it via [`is_shutdown`](Self::is_shutdown) and stops polling.
   shutdown: bool,
@@ -722,6 +740,7 @@ where
       advertise,
       app_events: VecDeque::new(),
       app_events_dropped: 0,
+      loopback: VecDeque::new(),
       shutdown: false,
       #[cfg(encryption)]
       keyring,
@@ -762,13 +781,6 @@ where
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
     self.app_events.pop_front()
-  }
-
-  /// The number of app events shed from the [`poll_event`](Self::poll_event) backlog
-  /// because it reached [`DEFAULT_EVENT_BUFFER_CAP`] before the app drained them.
-  #[inline]
-  pub fn events_dropped(&self) -> u64 {
-    self.app_events_dropped
   }
 
   /// Number of inbound reliable connections accepted since construction.
@@ -847,6 +859,22 @@ where
   #[inline]
   pub fn num_members(&self) -> usize {
     self.engine.num_members()
+  }
+
+  /// The number of app events shed because a consumer did not keep up: the engine's
+  /// own passive-observation drops plus this driver's
+  /// [`poll_event`](Self::poll_event) backlog drops.
+  ///
+  /// Both stages are bounded at [`DEFAULT_EVENT_BUFFER_CAP`] with drop-oldest, and a
+  /// single pump can shed observations INSIDE the engine (its bounded queue) before
+  /// the driver's queue — freshly drained each poll — ever fills, so this sums BOTH
+  /// counters; reporting only the driver's would under-count real loss.
+  #[inline]
+  pub fn events_dropped(&self) -> u64 {
+    self
+      .engine
+      .events_dropped()
+      .saturating_add(self.app_events_dropped)
   }
 
   /// The local node's id.
@@ -1029,26 +1057,37 @@ where
     self.engine.list_keys(now)
   }
 
-  /// Advance both the smoltcp stack and serf's state machine once, then act on
-  /// serf's mandatory driver-actioned events. Returns the next wakeup deadline:
-  /// the minimum of the smoltcp stack's next scheduled event, the machine's next
-  /// timer, and any engine-owned deadline (the soonest closing socket's abort).
+  /// Advance both the smoltcp stack and serf's state machine, act on serf's
+  /// mandatory driver-actioned events, and drive to quiescence within the tick.
+  /// Returns the next wakeup deadline: the minimum of the smoltcp stack's next
+  /// scheduled event, the machine's next timer, and any engine-owned deadline (the
+  /// soonest closing socket's abort).
   ///
   /// # Order
   ///
   /// 1. **Stack tick** — `iface.poll` drains the device and services TCP/UDP.
-  /// 2. **Engine pump** — the engine runs every protocol phase over a
-  ///    [`SmoltcpGossip`] + [`SmoltcpStream`] view of the just-ticked sockets.
-  /// 3. **Mandatory events** — drain the engine's events (mandatory-first) and act
-  ///    on the driver-actioned ones: [`Event::Shutdown`] flips the stop flag; an
-  ///    [`Event::KeyRequest`] is applied to the local keyring and answered via
+  /// 2. **Pump → drain, to quiescence** — the engine runs every protocol phase over
+  ///    a [`SmoltcpGossip`] + [`SmoltcpStream`] view of the just-ticked sockets
+  ///    (computing the next deadline and egressing outbound gossip), then the drain
+  ///    acts on the driver-actioned events: [`Event::Shutdown`] flips the stop flag;
+  ///    an [`Event::KeyRequest`] is applied to the local keyring and answered via
   ///    `respond_key`. Every drained event is buffered for the app's own
   ///    [`poll_event`](Self::poll_event), so membership / user / query observations
-  ///    and the mandatory events alike remain visible AFTER the driver acted. A key
-  ///    response issued here is a directed gossip transmit the engine emits on the
-  ///    NEXT `poll`'s pump.
-  /// 4. **Deadline** — fold the stack's next scheduled event into the engine's
-  ///    returned wakeup.
+  ///    and the mandatory events alike remain visible AFTER the driver acted.
+  ///
+  ///    The pump computes its deadline and egresses BEFORE the drain runs, so a
+  ///    `respond_key` the drain queues — or a self-addressed datagram the pump's
+  ///    egress diverts into the [`loopback`](SmoltcpGossip) buffer — would not be
+  ///    reflected by that pass. This step therefore re-pumps at the SAME `now` while
+  ///    a pass queued a key response OR left the loopback non-empty (re-pumping at an
+  ///    unchanged `now` is safe: due timers already fired, so the extra pass only
+  ///    egresses the queued send and ingests the looped-back datagram), bounded by
+  ///    [`MAX_SELF_DELIVERY_ITERS`]. A remote `respond_key` is thus egressed within
+  ///    this `poll`, and a self-addressed response is looped back, ingested, and its
+  ///    query response collected — all before `poll` returns.
+  /// 3. **Deadline** — fold the stack's next scheduled event into the settled
+  ///    engine deadline. If the quiescence loop exhausted its budget with work still
+  ///    pending, fold `now` in too so the caller re-polls immediately.
   pub fn poll(&mut self, now: Instant, device: &mut D) -> Option<Instant>
   where
     D: Device,
@@ -1058,21 +1097,35 @@ where
     // 1. Stack tick.
     self.iface.poll(s_now, device, &mut self.sockets);
 
-    // 2. Engine pump over a view of the just-ticked sockets. The gossip and stream
-    // views share mutable access to the one `SocketSet` through a `RefCell` held for
-    // the pump; each takes a brief borrow and never holds one across a call into the
-    // other, so the borrows never overlap.
-    let next = {
-      let sockets = RefCell::new(&mut self.sockets);
-      let mut gossip = SmoltcpGossip::new(&sockets, self.udp);
-      let mut stream = SmoltcpStream::new(&mut self.iface, &sockets);
-      self.engine.pump(now, &mut gossip, &mut stream)
-    };
+    // 2. Pump → drain, re-running at the same `now` until neither a queued key
+    // response nor a looped-back self-datagram remains, so both are handled within
+    // this tick. The gossip and stream views share the one `SocketSet` through a
+    // `RefCell` held for each pump; each takes a brief borrow and never holds one
+    // across a call into the other, and the loopback buffer is a separate field
+    // outside that borrow.
+    let mut next = None;
+    let mut settled = false;
+    for _ in 0..MAX_SELF_DELIVERY_ITERS {
+      next = {
+        let sockets = RefCell::new(&mut self.sockets);
+        let loopback = RefCell::new(&mut self.loopback);
+        let mut gossip = SmoltcpGossip::new(&sockets, self.udp, &loopback, self.advertise);
+        let mut stream = SmoltcpStream::new(&mut self.iface, &sockets);
+        self.engine.pump(now, &mut gossip, &mut stream)
+      };
+      let queued = self.drain_engine_events(now);
+      if !queued && self.loopback.is_empty() {
+        settled = true;
+        break;
+      }
+    }
 
-    // 3. Mandatory-event handling in the poll cycle (driver-owned).
-    self.drain_engine_events(now);
-
-    // 4. Fold the stack's next scheduled event into the engine's deadline.
+    // 3. Fold the stack's next scheduled event into the engine's deadline. On an
+    // unsettled loop (work still pending at the iteration cap), fold `now` so the
+    // caller re-polls at once rather than sleeping past the stranded work.
+    if !settled {
+      next = min_opt(next, Some(now));
+    }
     let stack = self
       .iface
       .poll_at(s_now, &self.sockets)
@@ -1082,30 +1135,42 @@ where
 
   /// Drain the engine's event queue (mandatory-first), take the driver-owned side
   /// effect on each mandatory event, and buffer every event for the app.
-  fn drain_engine_events(&mut self, now: Instant) {
-    // Ignoring: `now` is consumed only by the encryption `KeyRequest` arm below,
-    // so a build without an AEAD backend does not read it.
+  ///
+  /// Returns whether the drain queued outbound gossip work the current pump's egress
+  /// did not see — a successful `respond_key` — so [`poll`](Self::poll) knows to
+  /// re-pump and egress it within the same tick.
+  fn drain_engine_events(&mut self, now: Instant) -> bool {
+    // `now` and the queued-outbound signal are consumed only by the encryption
+    // `KeyRequest` arm; a build without an AEAD backend reads neither and queues no
+    // key response, so its drain never re-pumps on this account.
     #[cfg(not(encryption))]
     let _ = now;
+    #[cfg(encryption)]
+    let mut queued = false;
+    #[cfg(not(encryption))]
+    let queued = false;
     while let Some(ev) = self.engine.poll_event() {
       match &ev {
         // A lost id-conflict vote means the local node MUST stop; flag it. The event
         // still reaches the app via `poll_event`.
         Event::Shutdown => self.shutdown = true,
         // An inbound key-management request: apply the op to the local keyring and
-        // answer the originator. The response is a directed gossip transmit emitted
-        // on the next pump.
+        // answer the originator. The response is a directed gossip transmit egressed
+        // on the re-pump [`poll`](Self::poll) runs while `queued` is set.
         #[cfg(encryption)]
         Event::KeyRequest(req) => {
           let resp = apply_key_request(&mut self.keyring, req);
           // Ignoring Err: `respond_key` fails only when the response cannot be
           // routed; the key op has already applied to the driver keyring.
-          let _ = self.engine.respond_key(req, resp, now);
+          if self.engine.respond_key(req, resp, now).is_ok() {
+            queued = true;
+          }
         }
         _ => {}
       }
       self.push_app_event(ev);
     }
+    queued
   }
 
   /// Buffer one event for [`poll_event`](Self::poll_event), bounding the backlog at
