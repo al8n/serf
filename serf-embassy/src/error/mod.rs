@@ -207,6 +207,12 @@ pub enum JoinError {
   /// Every dispatched push/pull terminated without contacting a seed. The
   /// [`JoinFailed`] payload carries the requested-seed count.
   Failed(JoinFailed),
+  /// The run loop stopped after a lost id-conflict `Event::Shutdown` before this
+  /// join could resolve — the node is no longer active. A join in flight when the
+  /// conflict-loss lands resolves here rather than hanging, and a join attempted
+  /// after shutdown fails fast with it. Mirrors serf-reactor's `SerfError::Shutdown`
+  /// for the join reply.
+  Shutdown,
 }
 
 impl JoinError {
@@ -233,6 +239,13 @@ impl JoinError {
   pub const fn is_failed(&self) -> bool {
     matches!(self, JoinError::Failed(_))
   }
+
+  /// Whether the run loop stopped after a lost id-conflict shutdown before the
+  /// join resolved.
+  #[inline]
+  pub const fn is_shutdown(&self) -> bool {
+    matches!(self, JoinError::Shutdown)
+  }
 }
 
 impl fmt::Display for JoinError {
@@ -242,6 +255,9 @@ impl fmt::Display for JoinError {
       JoinError::Control(e) => write!(f, "join was rejected: {e}"),
       JoinError::NoAddresses => f.write_str("no wire address resolved for any seed"),
       JoinError::Failed(e) => write!(f, "{e}"),
+      JoinError::Shutdown => {
+        f.write_str("the node shut down after losing an id-conflict vote before the join resolved")
+      }
     }
   }
 }
@@ -260,7 +276,81 @@ impl std::error::Error for JoinError {
       JoinError::Resolve(e) => Some(e.as_ref()),
       JoinError::Control(e) => Some(e),
       JoinError::Failed(e) => Some(e),
-      JoinError::NoAddresses => None,
+      JoinError::NoAddresses | JoinError::Shutdown => None,
+    }
+  }
+}
+
+/// Why a [`Serf`](crate::Serf) command (`user_event`, `query`, `leave`,
+/// `force_leave`, `respond`, `set_tags`, key management) could not run.
+///
+/// Either the engine rejected the command ([`Serf`](Self::Serf)), or the run loop
+/// has already stopped after a lost id-conflict `Event::Shutdown`
+/// ([`Shutdown`](Self::Shutdown)) — after which the node is no longer active and
+/// the handle rejects every command up front, before touching the (now
+/// winding-down) engine, so a losing node cannot keep mutating serf state under the
+/// duplicate identity.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OpError {
+  /// The run loop stopped after a lost id-conflict `Event::Shutdown`; the node is
+  /// no longer active and rejects further commands. Mirrors serf-reactor's
+  /// `SerfError::Shutdown`.
+  Shutdown,
+  /// The engine rejected the command (e.g. an oversized user event, a
+  /// past-deadline `respond`, or a leave/join from an invalid lifecycle state).
+  Serf(SerfError),
+}
+
+impl OpError {
+  /// Whether the node has shut down after a lost id-conflict vote and no longer
+  /// accepts commands.
+  #[inline]
+  pub const fn is_shutdown(&self) -> bool {
+    matches!(self, OpError::Shutdown)
+  }
+
+  /// Whether the engine rejected the command.
+  #[inline]
+  pub const fn is_serf(&self) -> bool {
+    matches!(self, OpError::Serf(_))
+  }
+
+  /// The underlying [`SerfError`] when the engine rejected the command, else
+  /// `None` (a shutdown refusal carries no engine error).
+  #[inline]
+  pub const fn as_serf(&self) -> Option<&SerfError> {
+    match self {
+      OpError::Serf(e) => Some(e),
+      OpError::Shutdown => None,
+    }
+  }
+}
+
+impl fmt::Display for OpError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      OpError::Shutdown => f.write_str(
+        "the node has shut down after losing an id-conflict vote; it no longer accepts commands",
+      ),
+      OpError::Serf(e) => write!(f, "{e}"),
+    }
+  }
+}
+
+impl From<SerfError> for OpError {
+  fn from(e: SerfError) -> Self {
+    OpError::Serf(e)
+  }
+}
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+impl std::error::Error for OpError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      OpError::Serf(e) => Some(e),
+      OpError::Shutdown => None,
     }
   }
 }

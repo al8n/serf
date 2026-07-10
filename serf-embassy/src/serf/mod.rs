@@ -25,7 +25,7 @@ use embassy_net::{tcp::TcpSocket, udp::UdpSocket};
 use embassy_time::Timer;
 use memberlist_proto::{EndpointOptions, Instant, Rng, SeedableRng, SmallRng};
 use serf_embedded::{
-  Event, JoinId, MaybeResolved, ReachedSet, SerfEngine, SerfError, SerfOptions, TransformOptions,
+  Event, JoinId, MaybeResolved, ReachedSet, SerfEngine, SerfOptions, TransformOptions,
   validate_runtime_config,
 };
 use serf_proto::{
@@ -40,7 +40,7 @@ use serf_embedded::{Keyring, SecretKey};
 
 use crate::{
   config::Options,
-  error::{InitError, JoinError, SocketTimeoutOutOfRange},
+  error::{InitError, JoinError, OpError, SocketTimeoutOutOfRange},
   mailbox::{Command, Mailbox},
   resolver::AddressResolver,
   runner::Runner,
@@ -472,6 +472,23 @@ where
     self.shared.is_shutdown()
   }
 
+  /// Stand in for a lost id-conflict vote in driver tests: buffer the terminal
+  /// [`Event::Shutdown`] for [`poll_event`](Self::poll_event) and poison the shared
+  /// state, exactly as the run loop's post-pump drain does when the engine emits
+  /// `Event::Shutdown` from its conflict-resolution tally.
+  ///
+  /// The engine emits `Event::Shutdown` only from that vote tally, which the paired
+  /// two-node test harness cannot drive to a deterministic majority, so this exposes
+  /// the same terminal input to exercise the driver's shutdown enforcement (pump
+  /// stop, socket teardown, command rejection, join poisoning) end-to-end. Present
+  /// only in the host (`std`) test build.
+  #[cfg(any(test, feature = "std"))]
+  #[doc(hidden)]
+  #[inline]
+  pub fn simulate_conflict_shutdown(&self) {
+    self.shared.simulate_conflict_shutdown();
+  }
+
   /// Drain one application-visible serf event the run loop buffered, mandatory
   /// driver-actioned events first (the run loop has ALREADY acted on them), then
   /// passive observations. `None` when the queue is empty.
@@ -621,6 +638,13 @@ where
   where
     Res: AddressResolver<Address = A>,
   {
+    // Fail fast if the node already lost an id-conflict vote: a join under a
+    // duplicate identity is meaningless, and the stopped run loop would never
+    // dispatch its push/pulls.
+    if self.shared.is_shutdown() {
+      return Err(JoinError::Shutdown);
+    }
+
     let now = time::now();
     let mut resolved = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -663,6 +687,13 @@ where
         guard.disarm();
         return outcome.map_err(JoinError::Failed);
       }
+      // The run loop stopped mid-join after a lost id-conflict shutdown: resolve
+      // with the shutdown error rather than spin the backstop forever. The guard is
+      // left armed so its drop cancels the now-orphaned engine-side join entry
+      // exactly once (no borrow is live here, so the drop's `borrow_mut` is safe).
+      if self.shared.is_shutdown() {
+        return Err(JoinError::Shutdown);
+      }
       // Ignoring the `Either`: whichever of the join wake or the timer fired, the
       // loop simply re-checks `poll_join`.
       let _ = select(
@@ -676,48 +707,78 @@ where
   /// Begin leaving the cluster. Gossips the departure and ultimately emits
   /// [`Event::LeftCluster`] via [`poll_event`](Self::poll_event).
   ///
-  /// Returns [`SerfError`] if the node is not in a running state (already left or a
-  /// refused leave).
-  pub fn leave(&self) -> Result<(), SerfError> {
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] if the node already lost an id-conflict vote (the run
+  /// loop has stopped), or [`OpError::Serf`] if the engine rejects the leave (not in
+  /// a running state — already left or a refused leave).
+  pub fn leave(&self) -> Result<(), OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().leave(now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Force a named node out of the cluster (an operator-driven removal).
-  pub fn force_leave(&self, id: I, prune: bool) -> Result<(), SerfError> {
+  ///
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] after a lost id-conflict vote, else the engine's
+  /// rejection as [`OpError::Serf`].
+  pub fn force_leave(&self, id: I, prune: bool) -> Result<(), OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().force_leave(id, prune, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Broadcast an application user event to the cluster. `coalesce` requests that
   /// identical events be coalesced by name. Peers observe it as [`Event::User`].
+  ///
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] after a lost id-conflict vote, else the engine's
+  /// rejection as [`OpError::Serf`] (e.g. an oversized event).
   pub fn user_event(
     &self,
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
-  ) -> Result<(), SerfError> {
+  ) -> Result<(), OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let r = self
       .shared
       .engine
       .borrow_mut()
       .user_event(name, payload, coalesce);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Issue a cluster-wide query, returning its [`QueryId`]. Responders observe it as
   /// [`Event::Query`] and answer via [`respond`](Self::respond).
+  ///
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] after a lost id-conflict vote, else the engine's
+  /// rejection as [`OpError::Serf`].
   pub fn query(
     &self,
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     params: QueryParams<I>,
-  ) -> Result<QueryId, SerfError> {
+  ) -> Result<QueryId, OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self
       .shared
@@ -725,28 +786,44 @@ where
       .borrow_mut()
       .query(name, payload, params, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Answer a received query. `token` is the [`QueryEvent`] delivered via
   /// [`Event::Query`].
+  ///
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] after a lost id-conflict vote, else the engine's
+  /// rejection as [`OpError::Serf`] (e.g. a duplicate or past-deadline respond).
   pub fn respond(
     &self,
     token: &QueryEvent<I, SocketAddr>,
     payload: bytes::Bytes,
-  ) -> Result<(), SerfError> {
+  ) -> Result<(), OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().respond(token, payload, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Replace the local node's tags, re-advertising them and refreshing the local
   /// member in the membership store.
-  pub fn set_tags(&self, tags: Tags) -> Result<(), SerfError> {
+  ///
+  /// # Errors
+  ///
+  /// [`OpError::Shutdown`] after a lost id-conflict vote, else the engine's
+  /// rejection as [`OpError::Serf`].
+  pub fn set_tags(&self, tags: Tags) -> Result<(), OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let r = self.shared.engine.borrow_mut().set_tags(tags);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Issue a cluster-wide `install_key` query to add `key` to every node's keyring.
@@ -755,11 +832,14 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn install_key(&self, key: SecretKey) -> Result<QueryId, SerfError> {
+  pub fn install_key(&self, key: SecretKey) -> Result<QueryId, OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().install_key(key, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Issue a cluster-wide `use_key` query to promote `key` to primary.
@@ -768,11 +848,14 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn use_key(&self, key: SecretKey) -> Result<QueryId, SerfError> {
+  pub fn use_key(&self, key: SecretKey) -> Result<QueryId, OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().use_key(key, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Issue a cluster-wide `remove_key` query to remove `key` from all nodes.
@@ -781,11 +864,14 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn remove_key(&self, key: SecretKey) -> Result<QueryId, SerfError> {
+  pub fn remove_key(&self, key: SecretKey) -> Result<QueryId, OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().remove_key(key, now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// Issue a cluster-wide `list_keys` query to enumerate installed keys.
@@ -794,11 +880,14 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn list_keys(&self) -> Result<QueryId, SerfError> {
+  pub fn list_keys(&self) -> Result<QueryId, OpError> {
+    if self.shared.is_shutdown() {
+      return Err(OpError::Shutdown);
+    }
     let now = time::now();
     let r = self.shared.engine.borrow_mut().list_keys(now);
     self.shared.wake_pump();
-    r
+    r.map_err(OpError::from)
   }
 
   /// A clone of the node's LIVE wire keyring — the keyring the gossip and reliable
