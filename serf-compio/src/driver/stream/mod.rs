@@ -70,7 +70,7 @@ use crate::{
   snapshot::{SerfSnapshot, SnapshotCell},
 };
 #[cfg(encryption)]
-use serf_proto::{KeyRequestOperation, KeyResponseArgs, event::KeyRequest};
+use serf_proto::{KeyResponseArgs, event::KeyRequest};
 
 /// Driver-side state for one outstanding await-result join call.
 ///
@@ -1562,29 +1562,43 @@ where
   progress
 }
 
-/// Apply one inbound [`KeyRequest`] to the driver's keyring delegate, producing
-/// the [`KeyResponseArgs`] the pump forwards to `respond_key`.
+/// Read-modify-write `endpoint`'s LIVE wire keyring for one inbound [`KeyRequest`],
+/// returning the [`KeyResponseArgs`] built from the post-op live state.
 ///
-/// `Install` / `Use` / `Remove` carry a key (the machine enforces op-shape, so a
-/// missing key is reported as a failed response rather than panicking); `List`
-/// carries no key and enumerates the keyring.
+/// The endpoint-facing wrapper over [`serf_driver::apply_key_request`]: it reads
+/// the coordinator's live `encryption_options`, applies the op variant-exactly
+/// against the live ring, and on a real mutation publishes the rotated ring back
+/// via `set_encryption_options` — so the gossip and reliable planes re-key in
+/// lockstep — then notifies the keyring observer for persistence. A node with no
+/// keyring configured answers `result = false` and makes no wire change; a
+/// read-only `list` or a refused op leaves the wire untouched.
 #[cfg(encryption)]
-fn apply_key_request<I, A>(
-  keyring: &dyn KeyringDelegate,
-  req: &KeyRequest<I, A>,
-) -> KeyResponseArgs {
-  match (req.op(), req.key()) {
-    (KeyRequestOperation::Install, Some(key)) => keyring.install(*key),
-    (KeyRequestOperation::Use, Some(key)) => keyring.use_key(*key),
-    (KeyRequestOperation::Remove, Some(key)) => keyring.remove(*key),
-    (KeyRequestOperation::List, _) => keyring.list(),
-    (_, None) => KeyResponseArgs {
+fn apply_key_request_live<I, RT, G, R>(
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  delegate: &dyn KeyringDelegate,
+  req: &KeyRequest<I, SocketAddr>,
+) -> KeyResponseArgs
+where
+  I: memberlist_proto::Id + Clone,
+  RT: StreamTransport,
+  G: rand::Rng,
+  R: rand::Rng + SeedableRng,
+{
+  let mut encryption = endpoint.encryption_options().clone();
+  let Some(current) = encryption.keyring() else {
+    return KeyResponseArgs {
       result: false,
-      message: "key-management request missing its required key".into(),
-      keys: Vec::new(),
-      primary_key: None,
-    },
+      message: "no keyring configured on this node".into(),
+      ..Default::default()
+    };
+  };
+  let (resp, rotated) = serf_driver::apply_key_request(current, req.op(), req.key()).into_parts();
+  if let Some(new_ring) = rotated {
+    encryption.set_keyring(new_ring.clone());
+    endpoint.set_encryption_options(encryption);
+    delegate.keyring_updated(&new_ring);
   }
+  resp
 }
 
 /// Drain every queued serf [`Event`]: synchronous protocol accounting (leave
@@ -1655,9 +1669,10 @@ where
     // `respond_key`) ahead of the observation hand-off below.
     #[cfg(encryption)]
     if let Event::KeyRequest(req) = &ev {
-      let resp = apply_key_request(keyring, req);
+      let resp = apply_key_request_live(endpoint, keyring, req);
       // Ignoring Err: `respond_key` fails only when the response cannot be routed
-      // (originator gone / relay dropped); the key op has already applied locally.
+      // (originator gone / relay dropped); the key op has already applied to the
+      // live wire keyring.
       let _ = endpoint.respond_key(req, resp, Instant::now());
     }
 
