@@ -1,12 +1,3 @@
-# INACTIVE PLACEHOLDER — GitHub Actions does NOT run `.bk` files.
-#
-# This is a ready-to-activate template for FUTURE serf no_std / embedded driver
-# support. serf has no embedded/smoltcp/embassy crates yet; the crate names below
-# (serf-embedded / serf-smoltcp / serf-embassy) are anticipated equivalents of
-# memberlist's embedded stack. When those crates exist, rename this file
-# `embedded.yml.bk` -> `embedded.yml` and adjust the crate names / feature flags
-# to match what the crates actually expose.
-
 name: embedded
 
 on:
@@ -83,9 +74,9 @@ jobs:
       - name: Format
         run: cargo fmt -p serf-smoltcp -p serf-embassy --check
       - name: Clippy
-        run: cargo clippy -p serf-smoltcp -p serf-embassy --all-targets --features aes-gcm,coordinates --no-deps -- -D warnings
+        run: cargo clippy -p serf-smoltcp -p serf-embassy --all-targets --features aes-gcm,cidr --no-deps -- -D warnings
       - name: Test
-        run: cargo test -p serf-smoltcp -p serf-embassy --features aes-gcm,coordinates
+        run: cargo test -p serf-smoltcp -p serf-embassy --features aes-gcm,cidr
 
   # Execution proof: build the `serf-embassy-qemu` firmware and run it under QEMU.
   # The crate's `.cargo/config.toml` supplies the target, the linker script, the
