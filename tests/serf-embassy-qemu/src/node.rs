@@ -14,7 +14,10 @@
 //! via [`StaticCell`] so the run loops can be `'static` embassy tasks. On the
 //! user-event crossing the emulator exits 0; a deadline guard exits 1.
 
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::{
+  net::{IpAddr, Ipv4Addr, SocketAddr},
+  sync::atomic::{AtomicU8, Ordering},
+};
 
 use embassy_executor::Spawner;
 use embassy_net::{
@@ -52,6 +55,32 @@ const SOCKS: usize = POOL + 2;
 const DEADLINE: Duration = Duration::from_secs(20);
 /// Poll cadence while waiting for convergence and the user event.
 const POLL: Duration = Duration::from_millis(10);
+
+/// Whole-scenario watchdog. The per-phase `DEADLINE` loops only start bounding
+/// once `join(..)` has returned, so a join (or any pre-loop await) that never
+/// resolves would otherwise hang the emulator with no exit code. Armed before
+/// the join, this exits 1 with the stalled phase after `DEADLINE` plus margin —
+/// long enough that a live run's own phase messages always fire first.
+const WATCHDOG: Duration = Duration::from_secs(30);
+
+/// The scenario phase the watchdog reports on a stall: 0 = joining,
+/// 1 = converging, 2 = awaiting the user event.
+static PHASE: AtomicU8 = AtomicU8::new(0);
+
+/// Phase names indexed by [`PHASE`].
+const PHASE_NAMES: [&str; 3] = ["joining", "converging", "awaiting the user event"];
+
+#[embassy_executor::task]
+async fn watchdog() {
+  Timer::after(WATCHDOG).await;
+  let phase = PHASE.load(Ordering::Relaxed) as usize;
+  println!(
+    "watchdog: scenario stalled while {} ({}s elapsed)",
+    PHASE_NAMES.get(phase).unwrap_or(&"in an unknown phase"),
+    WATCHDOG.as_secs(),
+  );
+  semihosting::process::exit(1);
+}
 
 /// Gossip/TCP port both nodes bind (the single-port memberlist model serf runs on).
 const PORT: u16 = 7946;
@@ -197,6 +226,9 @@ pub async fn main_task(spawner: Spawner) -> ! {
   spawner.must_spawn(net_task(net_b));
   spawner.must_spawn(serf_task(run_a));
   spawner.must_spawn(serf_task(run_b));
+  // Armed BEFORE the join so the whole scenario — including a join that never
+  // resolves — is bounded by a non-zero exit rather than an emulator hang.
+  spawner.must_spawn(watchdog());
 
   // B joins A as a seed; the convergence wait below bounds success by the deadline.
   // Ignoring Err: a failed seed join surfaces as the convergence loop timing out,
@@ -209,6 +241,7 @@ pub async fn main_task(spawner: Spawner) -> ! {
       false,
     )
     .await;
+  PHASE.store(1, Ordering::Relaxed);
   println!("join issued; waiting for convergence");
 
   let mut waited = Duration::from_secs(0);
@@ -233,6 +266,7 @@ pub async fn main_task(spawner: Spawner) -> ! {
   // Phase 2: the serf-above-memberlist proof — A broadcasts a user event and B must
   // observe it as `Event::User`, which can only happen if serf's gossip plane truly
   // disseminated it across the emulated link, not just SWIM membership.
+  PHASE.store(2, Ordering::Relaxed);
   ml_a
     .user_event("greet", Bytes::from_static(b"hello"), false)
     .expect("broadcast a user event from a running node");
