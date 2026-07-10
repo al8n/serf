@@ -5,6 +5,7 @@ members = [
   "serf-driver",
   "serf-compio",
   "serf-reactor",
+  "serf-smoltcp",
 ]
 exclude = ["legacy"]
 resolver = "3"
