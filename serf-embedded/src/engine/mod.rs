@@ -53,7 +53,7 @@ use serf_proto::{
 };
 
 #[cfg(encryption)]
-use memberlist_proto::Keyring;
+use memberlist_proto::{EncryptionError, Keyring};
 #[cfg(encryption)]
 use serf_proto::{
   SecretKey,
@@ -562,6 +562,24 @@ where
     // reused preflight so the deterministic checks live in ONE place.
     validate_runtime_config(&cfg, &transform, ep_cfg.gossip_mtu())?;
 
+    // `validate_runtime_config` probes each key's usability but not the ring's
+    // internal byte-identity. Refuse a seed keyring that already carries a
+    // cross-cipher byte twin — two keys sharing a raw byte value across different
+    // cipher variants (e.g. an AES-256 and a ChaCha20-Poly1305 key with identical
+    // bytes). `SecretKey` equality is variant-inclusive, but the coordinator's
+    // rotation ops (`promote`/`remove_secondary`) match on bytes alone, so such a
+    // ring would make every later byte-keyed op ambiguous and let a rotation
+    // promote or remove the wrong cipher's key. Failing fast here — surfaced through
+    // the existing encryption `InitError` channel, the closest typed construction
+    // error — beats a latent ambiguous rotation, and establishes the chokepoint
+    // invariant that the live keyring is cross-cipher-collision-free at all times.
+    #[cfg(encryption)]
+    if let Some(keyring) = transform.encryption.keyring() {
+      if keyring_carries_cross_cipher_twin(keyring) {
+        return Err(EncryptionError::KeyMismatch.into());
+      }
+    }
+
     // Capture the advertise-dependent values before `ep_cfg` is moved.
     let gossip_mtu = ep_cfg.gossip_mtu();
     let advertise = *ep_cfg.advertise_addr_ref();
@@ -784,6 +802,34 @@ where
   pub fn pending_join_count(&self) -> usize {
     self.pending_joins.len()
   }
+}
+
+/// Whether `keyring` already holds a key whose raw bytes equal `key`'s but whose
+/// cipher variant differs — the cross-cipher collision that makes a byte-keyed
+/// keyring lookup ambiguous.
+///
+/// [`SecretKey`] equality is variant-inclusive (an AES-256 key and a
+/// ChaCha20-Poly1305 key with identical 32 bytes are DISTINCT keys), yet
+/// [`Keyring::promote`] and [`Keyring::remove_secondary`] match on raw bytes alone.
+/// Admitting such a twin would let a byte-keyed op resolve to the wrong cipher's
+/// key, so both the install chokepoint and the construction preflight refuse it.
+#[cfg(encryption)]
+fn keyring_has_cross_cipher_twin(keyring: &Keyring, key: &SecretKey) -> bool {
+  core::iter::once(keyring.primary_ref())
+    .chain(keyring.secondaries())
+    .any(|installed| installed.as_bytes() == key.as_bytes() && installed != key)
+}
+
+/// Whether `keyring` already carries a cross-cipher byte twin among its own keys —
+/// any two of {primary, secondaries} sharing a raw byte value across different
+/// cipher variants. Such a ring makes the coordinator's byte-keyed rotation ops
+/// ambiguous, so construction refuses it up front to keep the live keyring
+/// cross-cipher-collision-free.
+#[cfg(encryption)]
+fn keyring_carries_cross_cipher_twin(keyring: &Keyring) -> bool {
+  core::iter::once(keyring.primary_ref())
+    .chain(keyring.secondaries())
+    .any(|key| keyring_has_cross_cipher_twin(keyring, key))
 }
 
 // serf-command and read forwarders — reach serf's super-machine only (not the
@@ -1396,10 +1442,15 @@ where
   /// shadow the wire never sees. It is the ONLY post-construction keyring mutation
   /// path, so the reported key state and the on-wire AEAD cannot diverge:
   ///
-  /// - `install` inserts the key as a secondary (idempotent),
-  /// - `use` promotes the key to primary,
-  /// - `remove` drops a secondary — refusing the current primary,
+  /// - `install` inserts the key as a secondary (idempotent; a cross-cipher byte
+  ///   twin of an already-present key is refused),
+  /// - `use` promotes the exact (variant + bytes) key to primary,
+  /// - `remove` drops the exact secondary — refusing the current primary,
   /// - `list` snapshots the keys and primary from the post-op live state.
+  ///
+  /// Every keyed op is variant-exact; see [`apply_key_request`](Self::apply_key_request)
+  /// for the cross-cipher-collision-free invariant that keeps the byte-keyed
+  /// coordinator ops unambiguous.
   ///
   /// A node with no keyring configured answers `result = false` and makes no wire
   /// change. A failed op (unknown key, or removing the primary) answers
@@ -1431,6 +1482,21 @@ where
   /// Read-modify-write the coordinator's live keyring for one [`KeyRequest`],
   /// returning the answer built from the post-op live state. The single keyring
   /// mutation chokepoint behind [`handle_key_request`](Self::handle_key_request).
+  ///
+  /// Every mutating op is variant-exact. [`memberlist_proto::SecretKey`] equality is
+  /// variant-inclusive (an AES-256 key and a ChaCha20-Poly1305 key with the same 32
+  /// bytes are DISTINCT keys), but the coordinator's [`Keyring::promote`] and
+  /// [`Keyring::remove_secondary`] match on raw bytes alone. To keep those byte-keyed
+  /// ops unambiguous this chokepoint upholds one invariant: the live keyring is
+  /// cross-cipher-collision-free at all times — no two keys share a byte value across
+  /// different cipher variants. It is established at construction (the preflight in
+  /// [`try_new_at_with_rng`](Self::try_new_at_with_rng) rejects a seed keyring that
+  /// already carries a twin) and preserved here (an `install` whose bytes twin an
+  /// existing key of another variant is refused). Under that invariant, and after the
+  /// exact (variant + bytes) membership check each `use` / `remove` performs, the
+  /// byte-keyed promote / remove resolve to exactly the requested key — so a reported
+  /// rotation is always the key that was asked for, never a same-byte key of a
+  /// different cipher.
   #[cfg(encryption)]
   fn apply_key_request(&mut self, req: &KeyRequest<I, SocketAddr>) -> KeyResponseArgs {
     let mut encryption = self.endpoint.encryption_options().clone();
@@ -1444,49 +1510,124 @@ where
     let mut keyring = current.clone();
     let (resp, mutated) = match (req.op(), req.key()) {
       (KeyRequestOperation::Install, Some(key)) => {
-        keyring.insert_secondary(*key);
-        (
-          KeyResponseArgs {
-            result: true,
-            ..Default::default()
-          },
-          true,
-        )
+        // Refuse a key whose raw bytes collide with an already-present key of a
+        // DIFFERENT cipher variant. `SecretKey` equality is variant-inclusive, but
+        // `promote` / `remove_secondary` match on bytes alone, so admitting a
+        // cross-cipher byte twin would make every later byte-keyed op ambiguous. A
+        // same-variant re-install is the idempotent `insert_secondary` no-op and is
+        // reported as success.
+        if keyring_has_cross_cipher_twin(&keyring, key) {
+          (
+            KeyResponseArgs {
+              result: false,
+              message: "cross-cipher key collision".into(),
+              ..Default::default()
+            },
+            false,
+          )
+        } else {
+          keyring.insert_secondary(*key);
+          (
+            KeyResponseArgs {
+              result: true,
+              ..Default::default()
+            },
+            true,
+          )
+        }
       }
-      (KeyRequestOperation::Use, Some(key)) => match keyring.promote(key.as_bytes()) {
-        Ok(()) => (
-          KeyResponseArgs {
-            result: true,
-            ..Default::default()
-          },
-          true,
-        ),
-        Err(_) => (
-          KeyResponseArgs {
-            result: false,
-            message: "requested primary key is not installed".into(),
-            ..Default::default()
-          },
-          false,
-        ),
-      },
-      (KeyRequestOperation::Remove, Some(key)) => match keyring.remove_secondary(key.as_bytes()) {
-        Ok(()) => (
-          KeyResponseArgs {
-            result: true,
-            ..Default::default()
-          },
-          true,
-        ),
-        Err(_) => (
-          KeyResponseArgs {
-            result: false,
-            message: "key is not a removable secondary".into(),
-            ..Default::default()
-          },
-          false,
-        ),
-      },
+      (KeyRequestOperation::Use, Some(key)) => {
+        // Verify exact (variant + bytes) membership before the byte-keyed promote.
+        // Promoting the current primary is a trivial success with no wire change (Go
+        // keymanager parity); a key absent from the live ring is refused with no
+        // mutation, so a `use` of one cipher's key can never silently promote a
+        // byte-twin of another. The collision-free invariant then guarantees the
+        // byte-keyed promote resolves to exactly this key.
+        if keyring.primary_ref() == key {
+          (
+            KeyResponseArgs {
+              result: true,
+              ..Default::default()
+            },
+            false,
+          )
+        } else if keyring.secondaries().contains(key) {
+          match keyring.promote(key.as_bytes()) {
+            Ok(()) => (
+              KeyResponseArgs {
+                result: true,
+                ..Default::default()
+              },
+              true,
+            ),
+            // Unreachable given the exact secondary membership just verified plus the
+            // collision-free invariant; handled fail-closed rather than trusting bytes.
+            Err(_) => (
+              KeyResponseArgs {
+                result: false,
+                message: "requested key is not installed".into(),
+                ..Default::default()
+              },
+              false,
+            ),
+          }
+        } else {
+          (
+            KeyResponseArgs {
+              result: false,
+              message: "requested key is not installed".into(),
+              ..Default::default()
+            },
+            false,
+          )
+        }
+      }
+      (KeyRequestOperation::Remove, Some(key)) => {
+        // Exact (variant + bytes) membership required, mirroring `use`. Removing the
+        // current primary is refused (operators promote a secondary first); a key
+        // absent from the live ring is refused with no mutation, so a `remove` of one
+        // cipher's key can never drop a byte-twin of another. The collision-free
+        // invariant makes the byte-keyed remove exact.
+        if keyring.primary_ref() == key {
+          (
+            KeyResponseArgs {
+              result: false,
+              message: "cannot remove the primary key; promote a secondary first".into(),
+              ..Default::default()
+            },
+            false,
+          )
+        } else if keyring.secondaries().contains(key) {
+          match keyring.remove_secondary(key.as_bytes()) {
+            Ok(()) => (
+              KeyResponseArgs {
+                result: true,
+                ..Default::default()
+              },
+              true,
+            ),
+            // Unreachable given the exact secondary membership just verified plus the
+            // collision-free invariant; handled fail-closed.
+            Err(_) => (
+              KeyResponseArgs {
+                result: false,
+                message: "requested key is not installed".into(),
+                ..Default::default()
+              },
+              false,
+            ),
+          }
+        } else {
+          (
+            KeyResponseArgs {
+              result: false,
+              message: "requested key is not installed".into(),
+              ..Default::default()
+            },
+            false,
+          )
+        }
+      }
       (KeyRequestOperation::List, _) => {
         let mut keys = Vec::with_capacity(1 + keyring.secondaries().len());
         keys.push(*keyring.primary_ref());
