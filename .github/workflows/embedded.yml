@@ -90,6 +90,9 @@ jobs:
   # from the workspace, so it is built only by this `cargo run`.
   qemu:
     runs-on: ubuntu-latest
+    # Backstop for a firmware hang the in-image watchdog cannot catch (e.g. a dead
+    # SysTick stops the watchdog timer itself): bound the job, don't hang the runner.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
