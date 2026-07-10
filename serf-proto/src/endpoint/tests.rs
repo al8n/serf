@@ -7688,3 +7688,258 @@ fn set_tags_before_join_does_not_emit_update_before_join() {
     );
   }
 }
+
+// ── event coalescing (member + user) ─────────────────────────────────────────
+//
+// The endpoint owns a member + a user coalescer, each enabled iff its
+// (coalesce_period > 0 && quiescent_period > 0).  When enabled, membership /
+// coalescing user events are buffered at their emission sites and flushed via
+// the machine's own poll_timeout / handle_timeout window; when disabled (the
+// default) every event passes straight through unchanged.
+
+/// Build a serf endpoint with MEMBER coalescing enabled over the given windows.
+///
+/// Coalescing is enabled, so the construction self-join is buffered in the
+/// coalescer; drain it into the coalescer (`poll_event`) then flush its window
+/// (`handle_timeout`) so each test starts from an empty coalescer.
+fn ep_member_coalescing_at(
+  coalesce: core::time::Duration,
+  quiescent: core::time::Duration,
+) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let opts = Options::new()
+    .with_coalesce_period(coalesce)
+    .with_quiescent_period(quiescent);
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  let _ = e.poll_event();
+  e.handle_timeout(memberlist_proto::Instant::ORIGIN + quiescent);
+  while e.poll_event().is_some() {}
+  e
+}
+
+fn ep_member_coalescing() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  ep_member_coalescing_at(
+    core::time::Duration::from_secs(10),
+    core::time::Duration::from_secs(2),
+  )
+}
+
+/// Build a serf endpoint with USER coalescing enabled (member coalescing off, so
+/// the construction self-join is delivered immediately as usual).
+fn ep_user_coalescing() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let opts = Options::new()
+    .with_user_coalesce_period(core::time::Duration::from_secs(10))
+    .with_user_quiescent_period(core::time::Duration::from_secs(2));
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  let _ = e.poll_event();
+  e
+}
+
+fn member_ids(ev: &Event<u32, core::net::SocketAddr>) -> Vec<u32> {
+  match ev {
+    Event::Member(me) => {
+      let mut ids: Vec<u32> = me.members().iter().map(|m| *m.node().id_ref()).collect();
+      ids.sort_unstable();
+      ids
+    }
+    other => panic!("expected Event::Member, got {other:?}"),
+  }
+}
+
+#[test]
+fn coalescing_disabled_delivers_member_events_immediately() {
+  // Default options: coalescing disabled → exact passthrough (the pre-coalescing
+  // behavior every other test relies on).
+  let mut e = ep();
+  e.test_inner_node_joined(2, t_secs(1));
+  let ev = e
+    .poll_event()
+    .expect("member event delivered immediately when disabled");
+  assert!(matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Join));
+  assert_eq!(member_ids(&ev), vec![2]);
+  assert!(e.poll_event().is_none());
+}
+
+#[test]
+fn coalescing_disabled_delivers_user_events_immediately() {
+  // A coalescing (cc == true) user event still passes straight through when the
+  // user coalescer is disabled (default).
+  let mut e = ep();
+  e.user_event("deploy", bytes::Bytes::from_static(b"v2"), true)
+    .unwrap();
+  let ev = e
+    .poll_event()
+    .expect("user event delivered immediately when disabled");
+  assert!(matches!(ev, Event::User(ref u) if u.name == "deploy"));
+}
+
+#[test]
+fn member_coalescing_batches_rapid_joins_into_one_flush() {
+  let mut e = ep_member_coalescing();
+  // Two joins within the window are buffered, not delivered immediately.
+  e.test_inner_node_joined(2, t_secs(5));
+  e.test_inner_node_joined(3, t_secs(5));
+  assert!(
+    e.poll_event().is_none(),
+    "joins are buffered by the coalescer, not delivered immediately"
+  );
+  // The flush deadline (last event + quiescent = 2s) surfaces in serf_poll_timeout.
+  assert_eq!(
+    e.core_mut().serf_poll_timeout(),
+    Some(t_secs(7)),
+    "the coalescer flush deadline appears in serf_poll_timeout"
+  );
+  // Firing the window delivers ONE coalesced Join batch carrying both nodes.
+  e.handle_timeout(t_secs(7));
+  let ev = e
+    .poll_event()
+    .expect("one coalesced batch at the flush deadline");
+  assert!(matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Join));
+  assert_eq!(member_ids(&ev), vec![2, 3], "both joins in ONE batch");
+  assert!(e.poll_event().is_none(), "exactly one batch delivered");
+}
+
+#[test]
+fn member_coalescing_collapses_transitions_to_latest_status() {
+  let mut e = ep_member_coalescing();
+  // node 2 joins then immediately fails within the same window.
+  e.test_inner_node_joined(2, t_secs(5));
+  e.test_inner_node_left(2, t_secs(5)); // Alive -> Failed
+  assert!(e.poll_event().is_none(), "transitions buffered");
+
+  e.handle_timeout(t_secs(7));
+  let mut kinds = Vec::new();
+  while let Some(ev) = e.poll_event() {
+    if let Event::Member(me) = ev {
+      kinds.push(me.kind());
+    }
+  }
+  assert_eq!(
+    kinds,
+    vec![MemberEventKind::Failed],
+    "join collapses into the final Failed status: {kinds:?}"
+  );
+}
+
+#[test]
+fn member_coalescing_coalesce_cap_bounds_a_busy_stream() {
+  // coalesce cap 3s, quiescent 2s: a stream of events every 1s keeps re-arming
+  // the quiescent timer, but the flush deadline can never exceed first + 3s.
+  let mut e = ep_member_coalescing_at(
+    core::time::Duration::from_secs(3),
+    core::time::Duration::from_secs(2),
+  );
+  e.test_inner_node_joined(2, t_secs(5)); // cap = t8, quiescent = t7
+  assert_eq!(e.core_mut().serf_poll_timeout(), Some(t_secs(7)));
+  e.test_inner_node_joined(3, t_secs(6)); // quiescent -> t8, cap still t8
+  assert_eq!(e.core_mut().serf_poll_timeout(), Some(t_secs(8)));
+  e.test_inner_node_joined(4, t_secs(7)); // quiescent -> t9, but cap t8 binds
+  assert_eq!(
+    e.core_mut().serf_poll_timeout(),
+    Some(t_secs(8)),
+    "the coalesce cap (first event + 3s) bounds the busy stream"
+  );
+  // The cap flush delivers all three joins in one batch.
+  e.handle_timeout(t_secs(8));
+  let ev = e.poll_event().expect("cap flush delivers the batch");
+  assert_eq!(member_ids(&ev), vec![2, 3, 4]);
+}
+
+#[test]
+fn user_coalescing_batches_cc_events_and_passes_non_cc_through() {
+  let mut e = ep_user_coalescing();
+
+  // A non-coalescing user event passes straight through even when enabled.
+  e.test_set_drain_now(t_secs(5));
+  e.user_event("plain", bytes::Bytes::from_static(b"a"), false)
+    .unwrap();
+  assert!(
+    matches!(e.poll_event(), Some(Event::User(u)) if u.name == "plain"),
+    "a non-cc user event passes through immediately"
+  );
+
+  // A coalescing user event is buffered; a newer generation supersedes it.
+  e.test_set_drain_now(t_secs(5));
+  e.user_event("cc", bytes::Bytes::from_static(b"v1"), true)
+    .unwrap();
+  assert!(e.poll_event().is_none(), "cc user event buffered");
+  e.test_set_drain_now(t_secs(6));
+  e.user_event("cc", bytes::Bytes::from_static(b"v2"), true)
+    .unwrap();
+  assert!(e.poll_event().is_none());
+
+  // The user flush deadline (last event + quiescent = 2s) surfaces in poll_timeout.
+  assert_eq!(e.core_mut().serf_poll_timeout(), Some(t_secs(8)));
+  e.handle_timeout(t_secs(8));
+
+  let mut delivered = Vec::new();
+  while let Some(ev) = e.poll_event() {
+    if let Event::User(u) = ev {
+      delivered.push(u);
+    }
+  }
+  assert_eq!(
+    delivered.len(),
+    1,
+    "one coalesced user event: {delivered:?}"
+  );
+  assert_eq!(delivered[0].name, "cc");
+  assert_eq!(
+    delivered[0].payload.as_ref(),
+    b"v2",
+    "only the newest generation survives"
+  );
+}
+
+#[test]
+fn coalesced_member_batch_dropped_on_midwindow_shutdown() {
+  // A membership batch buffered mid-window is DROPPED when a lost id-conflict
+  // vote shuts the machine down (Go serf abandons the coalescer on shutdown).
+  // Nothing may follow the terminal Event::Shutdown.
+  let mut e = ep_member_coalescing();
+  e.test_inner_node_joined(2, t_secs(5));
+  assert!(e.poll_event().is_none(), "join buffered mid-window");
+
+  // A conflict query whose deadline coincides with the flush window; the vote
+  // is lost (1 agree, 2 disagree).
+  let qid = e.test_register_conflict_query(t_secs(7));
+  e.test_fold_conflict_response(qid, 200u32, true);
+  e.test_fold_conflict_response(qid, 201u32, false);
+  e.test_fold_conflict_response(qid, 202u32, false);
+
+  // Driving the tick closes the conflict (lost) → Shutdown; the buffered batch
+  // is dropped before the terminal event, not flushed after it.
+  e.handle_timeout(t_secs(7));
+
+  let mut events = Vec::new();
+  while let Some(ev) = e.poll_event() {
+    events.push(ev);
+  }
+  assert_eq!(
+    events.len(),
+    1,
+    "only Event::Shutdown drains — the buffered member batch is dropped: {events:?}"
+  );
+  assert!(matches!(events[0], Event::Shutdown));
+  assert!(e.state().is_shutdown());
+
+  // Ticking past the former flush deadline delivers nothing more.
+  e.handle_timeout(t_secs(20));
+  assert!(
+    e.poll_event().is_none(),
+    "no coalesced batch may surface after Event::Shutdown"
+  );
+}

@@ -188,6 +188,19 @@ impl Options {
     self.user_quiescent_period
   }
 
+  /// Whether member-event coalescing is enabled: both the coalesce and quiescent
+  /// periods are non-zero.  Mirrors the legacy `serf-core/src/serf/base.rs`
+  /// enable gate (`coalesce_period > 0 && quiescent_period > 0`).
+  pub const fn member_coalesce_enabled(&self) -> bool {
+    !self.coalesce_period.is_zero() && !self.quiescent_period.is_zero()
+  }
+
+  /// Whether user-event coalescing is enabled: both the user coalesce and user
+  /// quiescent periods are non-zero.  Mirrors the legacy enable gate.
+  pub const fn user_coalesce_enabled(&self) -> bool {
+    !self.user_coalesce_period.is_zero() && !self.user_quiescent_period.is_zero()
+  }
+
   /// Number of slots in the user-event dedup ring buffer.
   pub const fn event_buffer_size(&self) -> usize {
     self.event_buffer_size
@@ -322,8 +335,20 @@ impl Options {
     self
   }
 
+  /// Sets `coalesce_period` in place.
+  pub fn set_coalesce_period(&mut self, v: Duration) -> &mut Self {
+    self.coalesce_period = v;
+    self
+  }
+
   /// Sets `quiescent_period`.
   pub fn with_quiescent_period(mut self, v: Duration) -> Self {
+    self.quiescent_period = v;
+    self
+  }
+
+  /// Sets `quiescent_period` in place.
+  pub fn set_quiescent_period(&mut self, v: Duration) -> &mut Self {
     self.quiescent_period = v;
     self
   }
@@ -334,8 +359,20 @@ impl Options {
     self
   }
 
+  /// Sets `user_coalesce_period` in place.
+  pub fn set_user_coalesce_period(&mut self, v: Duration) -> &mut Self {
+    self.user_coalesce_period = v;
+    self
+  }
+
   /// Sets `user_quiescent_period`.
   pub fn with_user_quiescent_period(mut self, v: Duration) -> Self {
+    self.user_quiescent_period = v;
+    self
+  }
+
+  /// Sets `user_quiescent_period` in place.
+  pub fn set_user_quiescent_period(&mut self, v: Duration) -> &mut Self {
     self.user_quiescent_period = v;
     self
   }
@@ -425,6 +462,71 @@ impl Options {
     self.disable_coordinates = v;
     self
   }
+
+  /// Validates the coalescing configuration.
+  ///
+  /// When a coalescing pair is enabled (both periods non-zero) the quiescent
+  /// period must be strictly less than the coalesce period: the quiescent window
+  /// is the "went quiet" fast-flush, and the coalesce period is the
+  /// maximum-delay cap.  If quiescent `>=` coalesce the quiescent window can
+  /// never bind — almost always a misconfiguration.  This mirrors the semantics
+  /// documented on the legacy `serf-core/src/options.rs` period fields.
+  ///
+  /// Returns `Ok(())` when coalescing is disabled or the invariant holds for
+  /// every enabled pair.  The Sans-I/O [`Endpoint`](crate::endpoint::Endpoint)
+  /// construction is infallible and tolerates any configuration (its flush
+  /// deadline is always `min(coalesce, quiescent)`); a driver that wants to
+  /// reject a nonsensical configuration up front calls this.
+  pub fn validate(&self) -> Result<(), InvalidOptions> {
+    if self.member_coalesce_enabled() && self.quiescent_period >= self.coalesce_period {
+      return Err(InvalidOptions::MemberCoalesce(CoalesceConfig {
+        coalesce_period: self.coalesce_period,
+        quiescent_period: self.quiescent_period,
+      }));
+    }
+    if self.user_coalesce_enabled() && self.user_quiescent_period >= self.user_coalesce_period {
+      return Err(InvalidOptions::UserCoalesce(CoalesceConfig {
+        coalesce_period: self.user_coalesce_period,
+        quiescent_period: self.user_quiescent_period,
+      }));
+    }
+    Ok(())
+  }
+}
+
+/// The coalescing periods that failed [`Options::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoalesceConfig {
+  /// The configured coalesce (maximum-delay) period.
+  pub coalesce_period: Duration,
+  /// The configured quiescent (flush-after-quiet) period.
+  pub quiescent_period: Duration,
+}
+
+impl core::fmt::Display for CoalesceConfig {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "quiescent_period ({:?}) must be strictly less than coalesce_period ({:?})",
+      self.quiescent_period, self.coalesce_period
+    )
+  }
+}
+
+/// Error returned by [`Options::validate`] for a self-contradictory coalescing
+/// configuration (an enabled quiescent period not strictly less than its
+/// coalesce period).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidOptions {
+  /// The member-event quiescent period is not strictly less than the
+  /// member-event coalesce period while member coalescing is enabled.
+  #[error("member-event coalescing: {0}")]
+  MemberCoalesce(CoalesceConfig),
+  /// The user-event quiescent period is not strictly less than the user-event
+  /// coalesce period while user coalescing is enabled.
+  #[error("user-event coalescing: {0}")]
+  UserCoalesce(CoalesceConfig),
 }
 
 impl Default for Options {
