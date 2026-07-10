@@ -393,23 +393,24 @@ impl<I, A> KeyRequest<I, A> {
     self.deadline
   }
 
-  /// Construct a `KeyRequest` with an explicit response `deadline`, for the
-  /// downstream driver tests that exercise deadline-based control-queue bounding
-  /// (a driver holding these on a non-lossy queue must prune the past-deadline,
-  /// unanswerable ones). Gated behind the non-default `test-support` feature; NOT
-  /// a production build path and NOT part of the wire contract. The
-  /// operation-carrying fields are inert placeholders — only `id`, `from`, `key`,
-  /// and `deadline` are caller-chosen.
+  /// Construct a `KeyRequest` with an explicit `op` and response `deadline`, for
+  /// the downstream driver tests that exercise key-op application and
+  /// deadline-based control-queue bounding (a driver holding these on a non-lossy
+  /// queue must prune the past-deadline, unanswerable ones). Gated behind the
+  /// non-default `test-support` feature; NOT a production build path and NOT part
+  /// of the wire contract. Only `op`, `id`, `from`, `key`, and `deadline` are
+  /// caller-chosen; the remaining wire fields are inert placeholders.
   #[cfg(any(test, feature = "test-support"))]
   #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
   pub fn test_with_deadline(
+    op: KeyRequestOperation,
     id: u32,
     from: Node<I, A>,
     key: Option<SecretKey>,
     deadline: Instant,
   ) -> Self {
     Self {
-      op: KeyRequestOperation::Install,
+      op,
       key,
       id,
       ltime: LamportTime::ZERO,
