@@ -4315,7 +4315,11 @@ where
   /// handler directly (e.g. `test_handle_query`) use this to advance the
   /// endpoint's current-time reference between calls without going through
   /// `handle_timeout`.
-  #[cfg(test)]
+  ///
+  /// Gated like the unit suite that calls it (`mod tests` is `tcp`-gated because
+  /// it drives through `StreamEndpoint`), so a `quic`-only build carries no
+  /// uncalled seam.
+  #[cfg(all(test, feature = "tcp"))]
   pub(crate) fn test_set_drain_now(&mut self, now: Instant) {
     self.drain_now = now;
   }

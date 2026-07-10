@@ -79,8 +79,11 @@ jobs:
         run: cargo test -p serf-proto --features "$FEATURES"
 
   # serf-proto is pure-CPU, so exercise the interesting feature permutations on a
-  # single OS (default, the coordinate + AEAD combos, all-features, no-default,
-  # coordinates+aes+tcp, and quic-rustls-ring alone).
+  # single OS (default, the coordinate + AEAD combos, all-features, the minimal
+  # no_std alloc tier, coordinates+aes+tcp, and quic-rustls-ring alone). A bare
+  # `--no-default-features` build is impossible by design — the crate requires
+  # the `std` or `alloc` tier and fails with a deliberate compile_error — so the
+  # minimal combo pins `alloc`.
   proto-features:
     name: proto - ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -95,7 +98,7 @@ jobs:
           - { name: "coords-aes-gcm", flags: "--features coordinates,aes-gcm" }
           - { name: "coords-chacha", flags: "--features coordinates,chacha20-poly1305" }
           - { name: "all-features", flags: "--all-features" }
-          - { name: "no-default", flags: "--no-default-features" }
+          - { name: "no-default", flags: "--no-default-features --features alloc" }
           - { name: "coords-aes-gcm-tcp", flags: "--features coordinates,aes-gcm,tcp" }
           - { name: "quic-rustls-ring", flags: "--no-default-features --features quic-rustls-ring" }
     steps:
