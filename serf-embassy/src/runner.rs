@@ -117,12 +117,15 @@ where
   /// Drive the node: pump the engine and run the `N` workers concurrently.
   ///
   /// Runs forever under normal operation — spawn it as an embassy task (or drive
-  /// it with `select` against an operation in a test). It returns ONLY after a lost
-  /// id-conflict [`Event::Shutdown`](serf_embedded::Event::Shutdown): the pump loop
-  /// observes the poisoned shared state, performs its final drain, and returns,
-  /// which resolves the `select` below and drops the worker futures — so this frame
-  /// unwinds and the owned sockets (the TCP pool and the gossip UDP socket) close,
-  /// taking the losing node off the wire.
+  /// it with `select` against an operation in a test). It returns ONLY after the
+  /// shared shutdown latch is set — a lost id-conflict
+  /// [`Event::Shutdown`](serf_embedded::Event::Shutdown) or a public
+  /// [`Serf::shutdown`](crate::Serf::shutdown): the pump loop observes the latch
+  /// before its next egress-capable pump, performs one no-pump final drain, and
+  /// returns, which resolves the `select` below and drops the worker futures — so
+  /// this frame unwinds and the owned sockets (the TCP pool and the gossip UDP
+  /// socket) close, taking the stopped node off the wire without flushing queued
+  /// traffic.
   pub async fn run(self) {
     let Runner {
       shared,
@@ -193,6 +196,18 @@ async fn pump_loop<I, G, SR>(
 {
   let advertise: SocketAddr = shared.advertise;
   loop {
+    // Check the terminal latch BEFORE any egress-capable pump. A public `shutdown()`
+    // — or a lost id-conflict vote latched on a prior tick — that woke this loop must
+    // not get one more pump: an abrupt stop does not flush in-flight traffic. Run one
+    // no-pump final drain so this node's engine-buffered events still reach
+    // `app_events` for the app, then stop. `drain_events` neither pumps nor egresses,
+    // so it cannot re-arm work — any queued outbound (key responses, loopback
+    // self-datagrams, undisseminated gossip) is dropped by the abrupt-stop contract.
+    if shared.is_shutdown() {
+      shared.drain_events(time::now());
+      return;
+    }
+
     let now = time::now();
 
     // Pump → drain, re-running at the same `now` until neither a queued key
@@ -214,6 +229,17 @@ async fn pump_loop<I, G, SR>(
       // chokepoint) and buffer every observation. Returns whether a key response
       // was queued the egress above did not see.
       let queued = shared.drain_events(now);
+      // Check the latch immediately after the drain, BEFORE the re-pump decision. The
+      // drain may have observed a lost id-conflict `Event::Shutdown` and latched the
+      // terminal state; that drain was then the FINAL one — it buffered this tick's
+      // events into `app_events` — so stop now rather than re-pump. Any queued outbound
+      // (a key response, a looped-back self-datagram) is dropped by the abrupt-stop
+      // contract: a lost node does not gossip on the id it just lost, which would only
+      // confuse the winner. Returning ends this future, which resolves `Runner::run`'s
+      // `select` and collapses the workers so the sockets wind down.
+      if shared.is_shutdown() {
+        return;
+      }
       if !queued && loopback.borrow().is_empty() {
         settled = true;
         break;
@@ -224,17 +250,6 @@ async fn pump_loop<I, G, SR>(
     // deadline so the next wake re-pumps at once rather than sleeping past it.
     if !settled {
       next = min_opt(next, Some(now));
-    }
-
-    // A lost id-conflict `Event::Shutdown` observed by the drain above poisoned the
-    // shared state. The pump+drain that just ran was the FINAL one — every remaining
-    // event is buffered for the app's `poll_event` — so stop pumping now instead of
-    // sleeping. Returning ends this future, which resolves `Runner::run`'s `select`
-    // and collapses the workers so the sockets wind down (an abrupt stop: a lost
-    // node does not gossip a leave for the id it just lost, which would only
-    // confuse the winner).
-    if shared.is_shutdown() {
-      return;
     }
 
     // Wait for the next thing worth re-pumping for: an inbound gossip datagram, a
