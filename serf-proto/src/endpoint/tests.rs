@@ -871,8 +871,13 @@ fn reap_deadline_fires_via_handle_timeout() {
 #[test]
 fn user_event_increments_event_clock_and_emits_locally() {
   let mut e = ep();
-  e.user_event("deploy", bytes::Bytes::from_static(b"v2"), false)
-    .unwrap();
+  e.user_event(
+    "deploy",
+    bytes::Bytes::from_static(b"v2"),
+    false,
+    Instant::ORIGIN,
+  )
+  .unwrap();
   // Clock is incremented after stamping; local event at ltime=0 → clock now 1.
   assert_eq!(e.event_time(), 1);
   let ev = e.poll_event().expect("local user event must be pending");
@@ -935,7 +940,7 @@ fn oversized_user_event_is_rejected() {
   // 1024 bytes payload, well over the 512-byte limit.
   let big = bytes::Bytes::from(vec![0u8; 1024]);
   assert!(
-    e.user_event("big", big, false).is_err(),
+    e.user_event("big", big, false, Instant::ORIGIN).is_err(),
     "oversized user event must return Err"
   );
 }
@@ -943,8 +948,13 @@ fn oversized_user_event_is_rejected() {
 #[test]
 fn user_event_broadcast_is_queued_at_event_tier() {
   let mut e = ep();
-  e.user_event("ship", bytes::Bytes::from_static(b"ok"), false)
-    .unwrap();
+  e.user_event(
+    "ship",
+    bytes::Bytes::from_static(b"ok"),
+    false,
+    Instant::ORIGIN,
+  )
+  .unwrap();
   // After queuing, the user-broadcast queue must be non-empty (event tier = rank 2).
   assert!(
     e.user_broadcast_queue_len() > 0,
@@ -1230,7 +1240,8 @@ fn mutating_event_clock_via_user_event_marks_state_dirty() {
   let mut e = ep();
   e.test_clear_dirty();
   // user_event increments the event clock → must mark dirty.
-  e.user_event("x", bytes::Bytes::new(), false).unwrap();
+  e.user_event("x", bytes::Bytes::new(), false, Instant::ORIGIN)
+    .unwrap();
   assert!(e.test_is_dirty(), "user_event must mark local_state dirty");
 }
 
@@ -2238,7 +2249,8 @@ fn conflict_win_does_not_shut_down() {
   );
   // A won vote leaves the command surface fully open.
   assert!(
-    e.user_event("post-win", bytes::Bytes::new(), false).is_ok(),
+    e.user_event("post-win", bytes::Bytes::new(), false, Instant::ORIGIN)
+      .is_ok(),
     "a won vote must not gate commands"
   );
 }
@@ -2450,7 +2462,7 @@ fn shutdown_refuses_originating_commands() {
   // Commands that originate cluster work funnel through ensure_not_shutdown.
   assert!(
     matches!(
-      e.user_event("x", bytes::Bytes::new(), false),
+      e.user_event("x", bytes::Bytes::new(), false, Instant::ORIGIN),
       Err(Error::Shutdown)
     ),
     "user_event must be refused after shutdown"
@@ -2463,7 +2475,7 @@ fn shutdown_refuses_originating_commands() {
     "query must be refused after shutdown"
   );
   assert!(
-    matches!(e.set_tags(tags), Err(Error::Shutdown)),
+    matches!(e.set_tags(tags, Instant::ORIGIN), Err(Error::Shutdown)),
     "set_tags must be refused after shutdown"
   );
   assert!(
@@ -3331,8 +3343,13 @@ fn load_snapshot_event_clock_allows_new_events_above_floor() {
   // Drain any pending events from load_snapshot.
   while e.poll_event().is_some() {}
   // Issue a new user event — must succeed and be delivered above the floor.
-  e.user_event("post-snap", bytes::Bytes::from_static(b"ok"), false)
-    .expect("user_event after load_snapshot must succeed");
+  e.user_event(
+    "post-snap",
+    bytes::Bytes::from_static(b"ok"),
+    false,
+    Instant::ORIGIN,
+  )
+  .expect("user_event after load_snapshot must succeed");
   let ev = e
     .poll_event()
     .expect("user_event after load_snapshot must be delivered");
@@ -4424,7 +4441,7 @@ fn join_intent_max_minus_one_ltime_is_dropped() {
     "status_time must not be updated to u64::MAX-1"
   );
   // After the bad ingress a subsequent valid local user_event must still work.
-  e.user_event("ok", bytes::Bytes::new(), false)
+  e.user_event("ok", bytes::Bytes::new(), false, Instant::ORIGIN)
     .expect("user_event must succeed after rejected intent");
 }
 
@@ -4491,7 +4508,7 @@ fn user_event_max_minus_one_ltime_is_dropped() {
     "no event must be emitted for u64::MAX-1 user event"
   );
   // A subsequent valid user_event() must still work.
-  e.user_event("ok", bytes::Bytes::new(), false)
+  e.user_event("ok", bytes::Bytes::new(), false, Instant::ORIGIN)
     .expect("user_event must succeed after rejected event");
 }
 
@@ -4784,7 +4801,7 @@ fn zero_event_buffer_size_does_not_panic_on_first_event() {
     StreamEndpoint::new(coord(inner), opts);
 
   // Must NOT panic.
-  e.user_event("test", bytes::Bytes::new(), false)
+  e.user_event("test", bytes::Bytes::new(), false, Instant::ORIGIN)
     .expect("user_event must not panic when event_buffer_size was 0");
 }
 
@@ -4914,7 +4931,7 @@ fn after_high_clock_local_user_event_still_works() {
   };
   let _ = e.test_handle_user_event(msg);
   // Now emit a local user_event via user_event() — next_ltime clamps and advances.
-  let result = e.user_event("local", bytes::Bytes::new(), false);
+  let result = e.user_event("local", bytes::Bytes::new(), false, Instant::ORIGIN);
   assert!(result.is_ok(), "user_event must succeed even at high clock");
 }
 
@@ -6724,7 +6741,7 @@ fn next_ltime_integrity_floor_near_watermark() {
   // next_ltime stamps LTIME_MAX - 1 and stores LTIME_MAX.  The user_event is
   // emitted locally (it passes the min_time floor of 0); it then enters the
   // event ring.
-  let result = e.user_event("probe", bytes::Bytes::new(), false);
+  let result = e.user_event("probe", bytes::Bytes::new(), false, Instant::ORIGIN);
   assert!(
     result.is_ok(),
     "user_event must succeed with event_clock at LTIME_MAX-1: {result:?}"
@@ -6870,7 +6887,7 @@ fn load_snapshot_near_watermark_no_panic_integrity_floor() {
   assert_ne!(e.query_time(), u64::MAX, "query clock must not be u64::MAX");
 
   // user_event() must not panic (returns Ok even in the degraded state).
-  let ue_result = e.user_event("near-max", bytes::Bytes::new(), false);
+  let ue_result = e.user_event("near-max", bytes::Bytes::new(), false, Instant::ORIGIN);
   assert!(
     ue_result.is_ok(),
     "user_event must not panic/error after near-watermark snapshot: {ue_result:?}"
@@ -6971,7 +6988,12 @@ fn load_snapshot_near_watermark_integrity_floor() {
     );
 
     // user_event must not panic.
-    let stamp_result = e.user_event("after-snapshot", bytes::Bytes::new(), false);
+    let stamp_result = e.user_event(
+      "after-snapshot",
+      bytes::Bytes::new(),
+      false,
+      Instant::ORIGIN,
+    );
     assert!(
       stamp_result.is_ok(),
       "user_event must not panic after LTIME_MAX-1 snapshot"
@@ -7512,7 +7534,7 @@ fn push_pull_near_watermark_event_floor_integrity_and_delivery() {
   // witness(event_clock, LTIME_MAX-1) → event_clock = LTIME_MAX - 1.
   // next_ltime stamps LTIME_MAX - 1; handle_user_event drops if stamp < min_time
   // (LTIME_MAX - 1).  LTIME_MAX - 1 is NOT < LTIME_MAX - 1, so the event is kept.
-  e.user_event("post-join", bytes::Bytes::new(), false)
+  e.user_event("post-join", bytes::Bytes::new(), false, Instant::ORIGIN)
     .expect("user_event must succeed after near-watermark push-pull");
   assert!(
     matches!(e.poll_event(), Some(Event::User(_))),
@@ -7534,7 +7556,7 @@ fn set_tags_round_trips_via_local_meta() {
   let mut e = ep();
 
   let tags: Tags = [("role", "web"), ("dc", "us-east-1")].into_iter().collect();
-  e.set_tags(tags.clone())
+  e.set_tags(tags.clone(), Instant::ORIGIN)
     .expect("set_tags must succeed on a live endpoint");
 
   let meta = e
@@ -7569,7 +7591,7 @@ fn set_tags_local_member_state_is_observable_without_poll_event() {
   e.test_seed_member(1u32, MemberStatus::Alive, LamportTime::new(0));
 
   let tags: Tags = [("role", "db")].into_iter().collect();
-  e.set_tags(tags.clone())
+  e.set_tags(tags.clone(), Instant::ORIGIN)
     .expect("set_tags must succeed on a live endpoint");
 
   let local_tags = e.test_local_tags();
@@ -7596,7 +7618,7 @@ fn set_tags_does_not_materialize_absent_local_member() {
   let mut e = ep();
 
   let tags: Tags = [("env", "staging")].into_iter().collect();
-  e.set_tags(tags.clone())
+  e.set_tags(tags.clone(), Instant::ORIGIN)
     .expect("set_tags must succeed when the local node is in members.states");
 
   // set_tags must have updated the existing local member's tags in-place.
@@ -7637,7 +7659,8 @@ fn set_tags_does_not_mark_local_state_dirty() {
   assert!(!e.test_is_dirty(), "resync must clear the dirty flag");
 
   let tags: Tags = [("dc", "us-west-2")].into_iter().collect();
-  e.set_tags(tags).expect("set_tags must succeed");
+  e.set_tags(tags, Instant::ORIGIN)
+    .expect("set_tags must succeed");
 
   assert!(
     !e.test_is_dirty(),
@@ -7660,7 +7683,8 @@ fn set_tags_before_join_does_not_emit_update_before_join() {
   let mut e = ep();
 
   let tags: Tags = [("role", "cache")].into_iter().collect();
-  e.set_tags(tags).expect("set_tags must succeed");
+  e.set_tags(tags, Instant::ORIGIN)
+    .expect("set_tags must succeed");
 
   // Drive the serf tick so inner events (NodeUpdated) are drained.
   e.handle_timeout(t_secs(1));
@@ -7778,8 +7802,13 @@ fn coalescing_disabled_delivers_user_events_immediately() {
   // A coalescing (cc == true) user event still passes straight through when the
   // user coalescer is disabled (default).
   let mut e = ep();
-  e.user_event("deploy", bytes::Bytes::from_static(b"v2"), true)
-    .unwrap();
+  e.user_event(
+    "deploy",
+    bytes::Bytes::from_static(b"v2"),
+    true,
+    Instant::ORIGIN,
+  )
+  .unwrap();
   let ev = e
     .poll_event()
     .expect("user event delivered immediately when disabled");
@@ -7862,9 +7891,9 @@ fn member_coalescing_coalesce_cap_bounds_a_busy_stream() {
 fn user_coalescing_batches_cc_events_and_passes_non_cc_through() {
   let mut e = ep_user_coalescing();
 
+  // The command's `now` arms the window directly — no manual `test_set_drain_now`.
   // A non-coalescing user event passes straight through even when enabled.
-  e.test_set_drain_now(t_secs(5));
-  e.user_event("plain", bytes::Bytes::from_static(b"a"), false)
+  e.user_event("plain", bytes::Bytes::from_static(b"a"), false, t_secs(5))
     .unwrap();
   assert!(
     matches!(e.poll_event(), Some(Event::User(u)) if u.name == "plain"),
@@ -7872,12 +7901,10 @@ fn user_coalescing_batches_cc_events_and_passes_non_cc_through() {
   );
 
   // A coalescing user event is buffered; a newer generation supersedes it.
-  e.test_set_drain_now(t_secs(5));
-  e.user_event("cc", bytes::Bytes::from_static(b"v1"), true)
+  e.user_event("cc", bytes::Bytes::from_static(b"v1"), true, t_secs(5))
     .unwrap();
   assert!(e.poll_event().is_none(), "cc user event buffered");
-  e.test_set_drain_now(t_secs(6));
-  e.user_event("cc", bytes::Bytes::from_static(b"v2"), true)
+  e.user_event("cc", bytes::Bytes::from_static(b"v2"), true, t_secs(6))
     .unwrap();
   assert!(e.poll_event().is_none());
 
@@ -7941,5 +7968,85 @@ fn coalesced_member_batch_dropped_on_midwindow_shutdown() {
   assert!(
     e.poll_event().is_none(),
     "no coalesced batch may surface after Event::Shutdown"
+  );
+}
+
+#[test]
+fn user_event_after_idle_gap_arms_window_from_live_now() {
+  // Regression (coalescer armed from a STALE command time): a coalescing user
+  // event issued as a COMMAND after an idle gap must arm its window from the
+  // command's live `now`, not from a stale `drain_now` (which command paths did
+  // not refresh). `ep_user_coalescing` leaves `drain_now` at ORIGIN; issue the
+  // event far in the future WITHOUT touching `drain_now`.
+  let mut e = ep_user_coalescing(); // user coalesce 10s, quiescent 2s
+
+  e.user_event("cc", bytes::Bytes::from_static(b"v1"), true, t_secs(100))
+    .unwrap();
+
+  // Buffered, NOT flushed immediately.
+  assert!(
+    e.poll_event().is_none(),
+    "the coalescing user event is buffered, not delivered immediately"
+  );
+  // A FULL quiescent window applies from live now: 100 + 2 = 102 — a future
+  // deadline, not one near ORIGIN. Reverting the now-threading arms at ORIGIN
+  // (deadline t2) and this assertion fails.
+  assert_eq!(
+    e.core_mut().test_user_flush_deadline(),
+    Some(t_secs(102)),
+    "the user coalesce window must arm from the command's live now"
+  );
+  // A tick within the window does not flush (a stale-armed window would have
+  // been past-due and flushed here).
+  e.handle_timeout(t_secs(101));
+  assert!(
+    e.poll_event().is_none(),
+    "still buffered within the live window"
+  );
+  // The window closes at 102, delivering exactly the coalesced event.
+  e.handle_timeout(t_secs(102));
+  assert!(
+    matches!(e.poll_event(), Some(Event::User(u)) if u.name == "cc"),
+    "the coalesced user event flushes when its live-armed window closes"
+  );
+}
+
+#[test]
+fn set_tags_after_idle_gap_arms_member_window_from_live_now() {
+  // Regression (member side): `set_tags` emits a `Member(Update)` via the
+  // coordinator's `NodeUpdated`, which a later `poll_event` drains WITHOUT
+  // latching `drain_now`. The member window must arm from `set_tags`'s live
+  // `now`, not the stale `drain_now` left by a prior tick.
+  use crate::typed::Tags;
+
+  let mut e = ep_member_coalescing(); // member coalesce 10s, quiescent 2s
+
+  let tags: Tags = [("role", "web")].into_iter().collect();
+  e.set_tags(tags, t_secs(100))
+    .expect("set_tags must succeed");
+
+  // Drain the coordinator's NodeUpdated into the member coalescer: buffered, not
+  // delivered immediately.
+  assert!(
+    e.poll_event().is_none(),
+    "the Member(Update) is buffered by the member coalescer, not delivered immediately"
+  );
+  // A FULL quiescent window applies from live now: 100 + 2 = 102. Reverting the
+  // now-threading arms from the stale drain_now (t2, from the helper's self-join
+  // flush) → deadline t4 → this assertion fails.
+  assert_eq!(
+    e.core_mut().test_member_flush_deadline(),
+    Some(t_secs(102)),
+    "the member coalesce window must arm from set_tags's live now"
+  );
+  e.handle_timeout(t_secs(101));
+  assert!(
+    e.poll_event().is_none(),
+    "still buffered within the live window"
+  );
+  e.handle_timeout(t_secs(102));
+  assert!(
+    matches!(e.poll_event(), Some(Event::Member(me)) if me.kind() == MemberEventKind::Update),
+    "the coalesced Member(Update) flushes when its live-armed window closes"
   );
 }

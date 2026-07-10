@@ -606,7 +606,7 @@ fn three_tiers_drain_intent_then_query_then_event() {
   e.test_enqueue_query_broadcast(Bytes::from_static(b"query-bytes"));
 
   // user_event enqueues on the event tier (rank 2).
-  e.user_event("ev", Bytes::from_static(b"event"), false)
+  e.user_event("ev", Bytes::from_static(b"event"), false, Instant::ORIGIN)
     .expect("user_event must succeed");
 
   // All three tiers should be populated (user_broadcast_queue_len = total across all tiers).

@@ -77,7 +77,7 @@ fn user_event_propagates_across_the_gossip_plane() {
   assert!(joined, "nodes did not converge before the user event");
 
   // A broadcasts a user event; drive gossip until B observes it.
-  a.user_event("greeting", Bytes::from_static(b"hello"), false)
+  a.user_event("greeting", Bytes::from_static(b"hello"), false, clk.now())
     .expect("queue user event from a running node");
 
   let mut b_saw_user = false;

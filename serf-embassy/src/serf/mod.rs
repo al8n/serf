@@ -800,11 +800,12 @@ where
     if self.shared.is_shutdown() {
       return Err(OpError::Shutdown);
     }
+    let now = time::now();
     let r = self
       .shared
       .engine
       .borrow_mut()
-      .user_event(name, payload, coalesce);
+      .user_event(name, payload, coalesce, now);
     self.shared.wake_pump();
     r.map_err(OpError::from)
   }
@@ -867,7 +868,8 @@ where
     if self.shared.is_shutdown() {
       return Err(OpError::Shutdown);
     }
-    let r = self.shared.engine.borrow_mut().set_tags(tags);
+    let now = time::now();
+    let r = self.shared.engine.borrow_mut().set_tags(tags, now);
     self.shared.wake_pump();
     r.map_err(OpError::from)
   }

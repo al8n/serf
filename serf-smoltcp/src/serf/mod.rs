@@ -890,8 +890,9 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), SerfError> {
-    self.engine.user_event(name, payload, coalesce)
+    self.engine.user_event(name, payload, coalesce, now)
   }
 
   /// Issue a cluster-wide query, returning its [`QueryId`]. Responders observe it as
@@ -919,8 +920,8 @@ where
 
   /// Replace the local node's tags, re-advertising them and refreshing the local
   /// member in the membership store.
-  pub fn set_tags(&mut self, tags: Tags) -> Result<(), SerfError> {
-    self.engine.set_tags(tags)
+  pub fn set_tags(&mut self, tags: Tags, now: Instant) -> Result<(), SerfError> {
+    self.engine.set_tags(tags, now)
   }
 
   /// Issue a cluster-wide `install_key` query to add `key` to every node's keyring.

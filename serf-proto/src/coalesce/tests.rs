@@ -249,6 +249,43 @@ fn member_repeated_same_status_is_suppressed() {
 }
 
 #[test]
+fn member_reap_evicts_suppression_entry_bounding_last_to_live_membership() {
+  // The cross-flush `last` map must track only LIVE membership: a node whose
+  // flushed terminal event is `Reap` is gone from membership for good, so its id
+  // is evicted.  Churning many DISTINCT ids through join → reap must therefore
+  // NOT grow `last` — reverting the eviction makes it grow to the total ids ever
+  // seen and this assertion fails.
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+
+  // Three long-lived members that join once and never leave: they stay in `last`.
+  for id in 0..3u32 {
+    c.feed(MemberEventKind::Join, vec![member(id)], Instant::ORIGIN);
+  }
+  let mut out = VecDeque::new();
+  c.flush(&mut out);
+  assert_eq!(c.last_len(), 3, "three live members are tracked");
+
+  // Churn 1000 distinct transient ids through join (flush) → reap (flush).
+  let mut t = Instant::ORIGIN;
+  for id in 100..1100u32 {
+    c.feed(MemberEventKind::Join, vec![member(id)], t);
+    let mut j = VecDeque::new();
+    c.flush(&mut j);
+    c.feed(MemberEventKind::Reap, vec![member(id)], t);
+    let mut r = VecDeque::new();
+    c.flush(&mut r);
+    t += secs(1);
+  }
+
+  assert_eq!(
+    c.last_len(),
+    3,
+    "after 1000 join→reap cycles `last` still tracks only the 3 live members, \
+     not the 1000 reaped ids (reverting Reap-eviction grows it to 1003)"
+  );
+}
+
+#[test]
 fn member_reset_drops_buffer_without_emitting() {
   let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
   let t0 = Instant::ORIGIN;

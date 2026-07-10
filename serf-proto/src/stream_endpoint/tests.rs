@@ -60,7 +60,7 @@ fn constructs_alive_with_zero_clocks() {
 fn user_event_marks_local_state_dirty() {
   let mut e = ep(1, 7946);
   e.test_clear_dirty();
-  e.user_event("deploy", Bytes::from_static(b"v2"), false)
+  e.user_event("deploy", Bytes::from_static(b"v2"), false, Instant::ORIGIN)
     .expect("user_event on an alive endpoint");
   assert!(
     e.test_is_dirty(),

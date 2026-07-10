@@ -249,7 +249,7 @@ fn user_event_accepted_while_running() {
   let now = Instant::from_origin(Duration::from_secs(86_400));
   engine.start(now);
   engine
-    .user_event("deploy", Bytes::from_static(b"v2"), false)
+    .user_event("deploy", Bytes::from_static(b"v2"), false, now)
     .expect("a user event is accepted while the node is running");
 }
 

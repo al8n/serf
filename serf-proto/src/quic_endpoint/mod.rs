@@ -586,11 +586,11 @@ where
   /// # Errors
   ///
   /// Returns [`Error::SetTagsMeta`] if the encoded tags exceed the metadata cap.
-  pub fn set_tags(&mut self, tags: Tags) -> Result<(), Error>
+  pub fn set_tags(&mut self, tags: Tags, now: Instant) -> Result<(), Error>
   where
     I: Clone,
   {
-    self.core.set_tags(&mut self.transport, tags)
+    self.core.set_tags(&mut self.transport, tags, now)
   }
 
   /// Forwards to [`Endpoint::leave`].
@@ -615,10 +615,11 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), Error> {
     self
       .core
-      .user_event(&mut self.transport, name, payload, coalesce)
+      .user_event(&mut self.transport, name, payload, coalesce, now)
   }
 
   /// Forwards to [`Endpoint::query`].

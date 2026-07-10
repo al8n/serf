@@ -703,7 +703,7 @@ where
           let payload = cmd.payload().clone();
           self
             .endpoint
-            .user_event(name, payload, cmd.coalesce)
+            .user_event(name, payload, cmd.coalesce, now)
             .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
@@ -743,7 +743,7 @@ where
       }
       Command::SetTags(SetTagsCmd { tags, reply }) => {
         let res = if running {
-          self.endpoint.set_tags(tags).map_err(SerfError::from)
+          self.endpoint.set_tags(tags, now).map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };

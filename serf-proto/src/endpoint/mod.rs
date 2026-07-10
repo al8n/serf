@@ -1593,13 +1593,18 @@ where
   ///
   /// Returns [`Error::SetTagsMeta`] if the encoded tag map exceeds
   /// `Meta::MAX_SIZE` or the coordinator's configured `meta_max_size`.
-  pub(crate) fn set_tags<T>(&mut self, t: &mut T, tags: Tags) -> Result<(), Error>
+  pub(crate) fn set_tags<T>(&mut self, t: &mut T, tags: Tags, now: Instant) -> Result<(), Error>
   where
     T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
     use buffa::Message as _;
+
+    // Latch the command's instant so that when the coordinator's resulting
+    // `NodeUpdated` is drained (via a later `poll_event`, which does not latch)
+    // the member coalescer arms from live `now`, not a stale `drain_now`.
+    self.drain_now = now;
 
     // Refuse once the machine has shut down (lost id-conflict vote).
     self.ensure_not_shutdown()?;
@@ -2458,6 +2463,11 @@ where
     I: Clone,
     A: Clone,
   {
+    // Latch the command's instant so any coalesced member event this leave
+    // reaches arms its window from live `now`, consistent with the ingress and
+    // timeout paths and with `force_leave`.
+    self.drain_now = now;
+
     match self.state {
       SerfState::Left => return Ok(()), // idempotent
       SerfState::Leaving | SerfState::Shutdown => {
@@ -2543,6 +2553,10 @@ where
     I: Clone,
     A: Clone,
   {
+    // Latch the command's instant so the coalesced Leave/Reap this force-leave
+    // reaches arms its window from live `now`, not a stale `drain_now`.
+    self.drain_now = now;
+
     if self.state == SerfState::Shutdown {
       return Err(Error::BadLeaveState(self.state));
     }
@@ -2629,10 +2643,17 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), Error>
   where
     T: Reliable<I, A>,
   {
+    // Latch the command's instant so the coalescer arms from live `now` when
+    // this event feeds it (mirrors the ingress/timeout paths). Without this a
+    // coalescing event issued after an idle gap would arm from a stale
+    // `drain_now` and flush immediately, defeating the batching window.
+    self.drain_now = now;
+
     // Refuse once the machine has shut down (lost id-conflict vote).
     self.ensure_not_shutdown()?;
 
@@ -4500,6 +4521,25 @@ where
   #[cfg(all(test, feature = "tcp"))]
   pub(crate) fn test_set_drain_now(&mut self, now: Instant) {
     self.drain_now = now;
+  }
+
+  /// The member coalescer's current flush deadline (test adapter), unpolluted by
+  /// the periodic serf deadlines that `serf_poll_timeout` folds in.
+  #[cfg(all(test, feature = "tcp"))]
+  pub(crate) fn test_member_flush_deadline(&self) -> Option<Instant> {
+    self
+      .member_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline())
+  }
+
+  /// The user coalescer's current flush deadline (test adapter).
+  #[cfg(all(test, feature = "tcp"))]
+  pub(crate) fn test_user_flush_deadline(&self) -> Option<Instant> {
+    self
+      .user_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline())
   }
 
   /// Return the `QueryId` of the last pending query entry (test adapter).

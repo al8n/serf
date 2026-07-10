@@ -1154,7 +1154,7 @@ async fn dispatch_command<I, RT, G, R>(
         let name = cmd.name().clone();
         let payload = cmd.payload().clone();
         endpoint
-          .user_event(name, payload, cmd.coalesce)
+          .user_event(name, payload, cmd.coalesce, now)
           .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
@@ -1192,7 +1192,7 @@ async fn dispatch_command<I, RT, G, R>(
     }
     Command::SetTags(SetTagsCmd { tags, reply }) => {
       let res = if running {
-        endpoint.set_tags(tags).map_err(SerfError::from)
+        endpoint.set_tags(tags, now).map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };

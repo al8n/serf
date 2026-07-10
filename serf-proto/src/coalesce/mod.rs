@@ -162,8 +162,17 @@ where
   /// Groups the surviving observations by kind, suppressing a node whose kind is
   /// unchanged since the last flush (except `Update`), and emits one
   /// [`Event::Member`] batch per surviving kind.  The `last` map persists across
-  /// flushes so the suppression is stateful; it is bounded by the number of
-  /// distinct node ids ever observed, exactly as the reference implementation.
+  /// flushes so the suppression is stateful.
+  ///
+  /// **Eviction rule (bounds `last` to live membership):** when a node's flushed
+  /// event is [`MemberEventKind::Reap`] its id is REMOVED from `last` rather than
+  /// recorded.  `Reap` is the terminal removal-from-membership signal — the node
+  /// is gone from the endpoint's `states`, so retaining it would grow `last`
+  /// without bound as distinct ids churn through join → … → reap (the reference
+  /// serf implementation leaks here).  Forgetting a reaped id is also correct:
+  /// its later re-join is a genuinely new member, and a `Join` differs from the
+  /// forgotten `Reap` so it re-emits regardless.  Every non-`Reap` kind can still
+  /// transition, so it is retained to suppress a repeated identical status.
   pub(crate) fn flush(&mut self, out: &mut VecDeque<Event<I, A>>) {
     // At most five kinds, so a linear-probed Vec is cheaper than a hash map and
     // avoids requiring `Hash` on the public `MemberEventKind`.
@@ -176,7 +185,13 @@ where
           continue;
         }
       }
-      self.last.insert(id, latest.kind);
+      if latest.kind == MemberEventKind::Reap {
+        // Terminal: the node left membership for good — forget it so `last`
+        // tracks only live members.
+        self.last.remove(&id);
+      } else {
+        self.last.insert(id, latest.kind);
+      }
       match grouped.iter_mut().find(|(k, _)| *k == latest.kind) {
         Some((_, members)) => members.push(latest.member),
         None => grouped.push((latest.kind, std::vec![latest.member])),
@@ -197,6 +212,15 @@ where
   pub(crate) fn reset(&mut self) {
     self.latest.clear();
     self.window.reset();
+  }
+
+  /// The number of ids currently held in the cross-flush suppression map.
+  ///
+  /// Bounded by live membership because `flush` evicts a node's id on its
+  /// terminal `Reap`.
+  #[cfg(test)]
+  pub(crate) fn last_len(&self) -> usize {
+    self.last.len()
   }
 }
 
