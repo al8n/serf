@@ -316,6 +316,63 @@ fn member_reap_evicts_suppression_entry_bounding_last_to_live_membership() {
 }
 
 #[test]
+fn address_change_rejoin_is_not_suppressed() {
+  // A prior window records `last[id] = (Join, addr_a)`. When the node then leaves
+  // addr_a and rejoins at addr_b within a later window, `latest[id]` collapses to
+  // Join(addr_b). Suppression keys on (kind, address), so even though the last
+  // emitted kind was also Join the changed address defeats it and the move must
+  // be delivered — consumers would otherwise retain the stale addr_a.
+  let addr_a: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+  let addr_b: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+  let at = |a: SocketAddr| Member::new(Node::new(7u32, a), Tags::new(), MemberStatus::None);
+
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // Window 1: Join at addr_a records `last[7] = (Join, addr_a)`.
+  c.feed(MemberEventKind::Join, vec![at(addr_a)], t0);
+  let mut out = VecDeque::new();
+  c.flush(&mut out);
+  assert_eq!(member_groups(out), vec![(MemberEventKind::Join, vec![7])]);
+
+  // Window 2: Leave(addr_a) then a rejoin Join(addr_b), collapsing to Join(addr_b).
+  let t1 = t0 + secs(5);
+  c.feed(MemberEventKind::Leave, vec![at(addr_a)], t1);
+  c.feed(MemberEventKind::Join, vec![at(addr_b)], t1);
+  let mut out2 = VecDeque::new();
+  c.flush(&mut out2);
+
+  let joined: Vec<(u32, SocketAddr)> = out2
+    .iter()
+    .filter_map(|ev| match ev {
+      Event::Member(me) if me.kind() == MemberEventKind::Join => Some(
+        me.members()
+          .iter()
+          .map(|m| (*m.node().id_ref(), *m.node().addr_ref())),
+      ),
+      _ => None,
+    })
+    .flatten()
+    .collect();
+  assert_eq!(
+    joined,
+    vec![(7u32, addr_b)],
+    "the rejoin at a new address must re-emit, carrying addr_b"
+  );
+
+  // Window 3: a plain same-address repeat is STILL suppressed — the dedup is
+  // intact and only a changed address defeats it.
+  let t2 = t1 + secs(5);
+  c.feed(MemberEventKind::Join, vec![at(addr_b)], t2);
+  let mut out3 = VecDeque::new();
+  c.flush(&mut out3);
+  assert!(
+    out3.is_empty(),
+    "a repeat Join at the unchanged address is still suppressed"
+  );
+}
+
+#[test]
 fn member_reset_drops_buffer_without_emitting() {
   let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
   let t0 = Instant::ORIGIN;

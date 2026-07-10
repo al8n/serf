@@ -109,9 +109,12 @@ struct LatestMember<I, A> {
 /// * `latest` holds the LATEST `(kind, member)` per node id within the open
 ///   window, so a rapid join → leave → join for one node collapses to its final
 ///   observation.
-/// * `last` remembers the last EMITTED kind per node id ACROSS flushes, so a
-///   repeated identical status is suppressed — except [`MemberEventKind::Update`],
-///   which always re-emits because a node's tags may have changed.
+/// * `last` remembers the last EMITTED `(kind, address)` per node id ACROSS
+///   flushes, so a repeated identical observation is suppressed — except
+///   [`MemberEventKind::Update`], which always re-emits because a node's tags may
+///   have changed.  Pairing the address alongside the kind lets a rejoin at a NEW
+///   address (same id, same kind) re-emit, so consumers learn the node moved
+///   rather than retaining the stale address.
 ///
 /// A flush groups the surviving observations by kind and emits one
 /// [`Event::Member`] batch per kind.
@@ -121,7 +124,7 @@ where
 {
   window: CoalesceWindow,
   latest: FxHashMap<I, LatestMember<I, A>>,
-  last: FxHashMap<I, MemberEventKind>,
+  last: FxHashMap<I, (MemberEventKind, A)>,
 }
 
 impl<I, A> MemberEventCoalescer<I, A>
@@ -164,57 +167,6 @@ where
     self.window.due(now)
   }
 
-  /// Emit the coalesced member events into `out` and disarm the window.
-  ///
-  /// Groups the surviving observations by kind, suppressing a node whose kind is
-  /// unchanged since the last flush (except `Update`), and emits one
-  /// [`Event::Member`] batch per surviving kind.  The `last` map persists across
-  /// flushes so the suppression is stateful.
-  ///
-  /// **Eviction rule (bounds `last` to live membership):** a node's id is
-  /// forgotten from `last` at FEED time the instant a [`MemberEventKind::Reap`]
-  /// is buffered for it, and a `Reap` is never recorded on flush.  `Reap` is the
-  /// terminal removal-from-membership signal — the node is gone from the
-  /// endpoint's `states`, so retaining it would grow `last` without bound as
-  /// distinct ids churn through join → … → reap (the reference serf
-  /// implementation leaks here).  Evicting at feed time (rather than on flush)
-  /// also keeps a `Reap` that is overwritten by a rejoin `Join` within the same
-  /// window from leaving a stale `last[id]` that would wrongly suppress the
-  /// genuinely-new `Join`.  Forgetting a reaped id is correct regardless: its
-  /// later re-join is a genuinely new member, and a `Join` differs from the
-  /// absent entry so it re-emits.  Every non-`Reap` kind can still transition, so
-  /// it is retained to suppress a repeated identical status.
-  pub(crate) fn flush(&mut self, out: &mut VecDeque<Event<I, A>>) {
-    // At most five kinds, so a linear-probed Vec is cheaper than a hash map and
-    // avoids requiring `Hash` on the public `MemberEventKind`.
-    let mut grouped: Vec<(MemberEventKind, Vec<Member<I, A>>)> = Vec::new();
-    for (id, latest) in self.latest.drain() {
-      if let Some(&previous) = self.last.get(&id) {
-        // Same status as last delivered, and not an Update → suppress. An Update
-        // always re-emits: its payload (tags) may differ even at the same kind.
-        if previous == latest.kind && latest.kind != MemberEventKind::Update {
-          continue;
-        }
-      }
-      // A Reap is never recorded in `last`: `feed` already evicted the id, and
-      // storing it would grow `last` without bound as ids churn through
-      // join → … → reap. A forgotten reaped id re-emits its later Join correctly
-      // (Join differs from the absent entry). Every non-Reap kind is retained to
-      // suppress a repeated identical status.
-      if latest.kind != MemberEventKind::Reap {
-        self.last.insert(id, latest.kind);
-      }
-      match grouped.iter_mut().find(|(k, _)| *k == latest.kind) {
-        Some((_, members)) => members.push(latest.member),
-        None => grouped.push((latest.kind, std::vec![latest.member])),
-      }
-    }
-    for (kind, members) in grouped {
-      out.push_back(Event::Member(MemberEvent::new(kind, members)));
-    }
-    self.window.reset();
-  }
-
   /// Drop the buffered batch and disarm the window without emitting anything.
   ///
   /// Used when the machine transitions to `Shutdown` (a lost id-conflict vote):
@@ -233,6 +185,69 @@ where
   #[cfg(test)]
   pub(crate) fn last_len(&self) -> usize {
     self.last.len()
+  }
+}
+
+impl<I, A> MemberEventCoalescer<I, A>
+where
+  I: Eq + Hash + Clone,
+  A: Clone + PartialEq,
+{
+  /// Emit the coalesced member events into `out` and disarm the window.
+  ///
+  /// Groups the surviving observations by kind, suppressing a node whose kind AND
+  /// address are both unchanged since the last flush (except `Update`), and emits
+  /// one [`Event::Member`] batch per surviving kind.  The `last` map persists
+  /// across flushes so the suppression is stateful.
+  ///
+  /// **Eviction rule (bounds `last` to live membership):** a node's id is
+  /// forgotten from `last` at FEED time the instant a [`MemberEventKind::Reap`]
+  /// is buffered for it, and a `Reap` is never recorded on flush.  `Reap` is the
+  /// terminal removal-from-membership signal — the node is gone from the
+  /// endpoint's `states`, so retaining it would grow `last` without bound as
+  /// distinct ids churn through join → … → reap (the reference serf
+  /// implementation leaks here).  `last` stays keyed by id — one entry per id —
+  /// so pairing the address into the value leaves that live-membership bound
+  /// intact.  Evicting at feed time (rather than on flush) also keeps a `Reap`
+  /// that is overwritten by a rejoin `Join` within the same window from leaving a
+  /// stale `last[id]` that would wrongly suppress the genuinely-new `Join`.
+  /// Forgetting a reaped id is correct regardless: its later re-join is a
+  /// genuinely new member, and a `Join` differs from the absent entry so it
+  /// re-emits.  Every non-`Reap` kind can still transition, so it is retained to
+  /// suppress a repeated identical observation.
+  pub(crate) fn flush(&mut self, out: &mut VecDeque<Event<I, A>>) {
+    // At most five kinds, so a linear-probed Vec is cheaper than a hash map and
+    // avoids requiring `Hash` on the public `MemberEventKind`.
+    let mut grouped: Vec<(MemberEventKind, Vec<Member<I, A>>)> = Vec::new();
+    for (id, latest) in self.latest.drain() {
+      let addr = latest.member.node().addr_ref().clone();
+      if let Some((prev_kind, prev_addr)) = self.last.get(&id) {
+        // Suppress only a genuinely unchanged observation — same kind AND same
+        // address. A rejoin at a new address (same id, same kind) must still emit
+        // so consumers learn the node moved. An Update always re-emits: its tags
+        // may differ even at an unchanged kind and address.
+        if *prev_kind == latest.kind && *prev_addr == addr && latest.kind != MemberEventKind::Update
+        {
+          continue;
+        }
+      }
+      // A Reap is never recorded in `last`: `feed` already evicted the id, and
+      // storing it would grow `last` without bound as ids churn through
+      // join → … → reap. A forgotten reaped id re-emits its later Join correctly
+      // (Join differs from the absent entry). Every non-Reap kind is retained to
+      // suppress a repeated identical observation.
+      if latest.kind != MemberEventKind::Reap {
+        self.last.insert(id, (latest.kind, addr));
+      }
+      match grouped.iter_mut().find(|(k, _)| *k == latest.kind) {
+        Some((_, members)) => members.push(latest.member),
+        None => grouped.push((latest.kind, std::vec![latest.member])),
+      }
+    }
+    for (kind, members) in grouped {
+      out.push_back(Event::Member(MemberEvent::new(kind, members)));
+    }
+    self.window.reset();
   }
 }
 
