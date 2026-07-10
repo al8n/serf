@@ -268,6 +268,9 @@ where
     // (e.g. a zero `bridge_recv_buf_len` makes every bridge read return a
     // false EOF) BEFORE binding any socket.
     options.stream.validate()?;
+    // Refuse a seed keyring that carries a cross-cipher byte twin, before binding.
+    #[cfg(encryption)]
+    crate::transport::reject_cross_cipher_keyring(&options.encryption)?;
 
     let local_id = options.local_id.ok_or_else(|| {
       SerfError::Io(std::io::Error::new(

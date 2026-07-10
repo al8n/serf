@@ -170,3 +170,31 @@ pub(crate) fn post_bind_setup(
   validate_advertise_addr(advertise_addr)?;
   crate::os_seeded_std_rng()
 }
+
+/// Reject a construction-time encryption keyring that already carries a
+/// cross-cipher byte twin — two keys sharing a raw byte value across different
+/// cipher variants.
+///
+/// The coordinator's byte-keyed rotation ops (`promote` / `remove_secondary`)
+/// match on bytes alone, so such a ring would make every later key op ambiguous
+/// and let a rotation promote or remove the wrong cipher's key. Each transport's
+/// `Transport::new` calls this on its stored [`EncryptionOptions`] before binding
+/// a socket, establishing the invariant — upheld thereafter by the drivers' live
+/// key-op chokepoint — that the live keyring is cross-cipher-collision-free from
+/// construction on.
+///
+/// [`EncryptionOptions`]: memberlist_proto::EncryptionOptions
+#[cfg(encryption)]
+pub(crate) fn reject_cross_cipher_keyring(
+  encryption: &memberlist_proto::EncryptionOptions,
+) -> Result<(), crate::SerfError> {
+  if let Some(keyring) = encryption.keyring()
+    && serf_driver::keyring_carries_cross_cipher_twin(keyring)
+  {
+    return Err(crate::SerfError::Io(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "encryption keyring carries a cross-cipher key collision",
+    )));
+  }
+  Ok(())
+}

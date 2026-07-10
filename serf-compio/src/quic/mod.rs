@@ -204,6 +204,9 @@ where
     RES: Resolver<Address = Self::Address>,
     AR: AdvertiseAddrResolver,
   {
+    // Refuse a seed keyring that carries a cross-cipher byte twin, before binding.
+    #[cfg(encryption)]
+    crate::transport::reject_cross_cipher_keyring(&options.encryption)?;
     let local_id = options.local_id.ok_or_else(|| {
       SerfError::Io(std::io::Error::new(
         ErrorKind::InvalidInput,

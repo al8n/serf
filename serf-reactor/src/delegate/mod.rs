@@ -27,9 +27,7 @@ use std::{future::Future, sync::Arc};
 use serf_proto::{event::QueryEvent, members::Member, typed::UserEventMessage};
 
 #[cfg(encryption)]
-use memberlist_proto::SecretKey;
-#[cfg(encryption)]
-use serf_proto::KeyResponseArgs;
+use memberlist_proto::Keyring;
 
 /// Async observation hooks for serf membership events.
 ///
@@ -166,19 +164,23 @@ pub trait Delegate:
   type Address;
 }
 
-/// Synchronous delegate the driver implements to apply key-management operations
-/// to its local keyring.
+/// Observer the driver notifies after it rotates the LIVE wire keyring, so an
+/// application can persist the new key material.
 ///
-/// The driver's event loop calls the matching method when it receives a
-/// [`serf_proto::event::Event::KeyRequest`] event, then forwards the result to
-/// `StreamEndpoint::respond_key` / `QuicEndpoint::respond_key` so the response
-/// is routed back to the originating node.
+/// The wire keyring lives in the endpoint (the coordinator's `EncryptionOptions`),
+/// and the driver is its single source of truth: on an inbound
+/// [`Event::KeyRequest`](serf_proto::event::Event::KeyRequest) it read-modify-writes
+/// that live keyring directly — install adds a secondary, use promotes the primary,
+/// remove drops a secondary, every op variant-exact — and answers the originator
+/// from the post-op live state via `respond_key`. This delegate does NOT author
+/// those responses; it only OBSERVES a successful rotation, receiving the new live
+/// [`Keyring`] so the application can persist it. A `list` and every refused or
+/// no-op request do not fire it.
 ///
-/// All methods are **synchronous and non-blocking**: key storage is the
-/// driver's concern. If a key store requires async I/O, shadow the result
-/// through pre-computed state the synchronous method can read. `Send + Sync +
-/// 'static` because the driver holds it behind an `Arc` shared across worker
-/// threads.
+/// [`keyring_updated`](Self::keyring_updated) is **synchronous and non-blocking**:
+/// it runs on the driver pump. If persistence needs async I/O, hand the ring off to
+/// a channel the observer owns and drain it elsewhere. `Send + Sync + 'static`
+/// because the driver holds it behind an `Arc` shared across worker threads.
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(encryption)]
@@ -187,21 +189,14 @@ pub trait Delegate:
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
 pub trait KeyringDelegate: Send + Sync + 'static {
-  /// Install a new key into the keyring. Returns the response args passed to
-  /// `respond_key`.
-  fn install(&self, key: SecretKey) -> KeyResponseArgs;
-
-  /// Promote a key to the primary encryption key. Returns the response args
-  /// passed to `respond_key`.
-  fn use_key(&self, key: SecretKey) -> KeyResponseArgs;
-
-  /// Remove a key from the keyring. Returns the response args passed to
-  /// `respond_key`.
-  fn remove(&self, key: SecretKey) -> KeyResponseArgs;
-
-  /// List all installed keys and the current primary. Returns the response args
-  /// (with `keys` populated) passed to `respond_key`.
-  fn list(&self) -> KeyResponseArgs;
+  /// Called after a key-management request successfully rotated the live wire
+  /// keyring, with the new ring the gossip and reliable planes now encrypt under.
+  /// Not called for a `list` or any refused or no-op request. The default is a
+  /// no-op — the rotation is applied to the wire regardless; overriding this only
+  /// adds out-of-band persistence.
+  fn keyring_updated(&self, keyring: &Keyring) {
+    let _ = keyring; // Unused: default no-op; override to persist the rotation.
+  }
 }
 
 /// Async veto hook invoked by the driver on the join path before accepting

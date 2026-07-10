@@ -15,13 +15,21 @@ quic = ["serf-proto/quic"]
 quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring"]
 coordinates = ["serf-proto/coordinates"]
 tag-regex = ["serf-proto/tag-regex"]
+# Encryption backends — forward to serf-proto (the key-management projection
+# types) and memberlist-proto (the live `Keyring` the shared apply logic
+# read-modify-writes). Aggregated to the `encryption` cfg by `build.rs`.
+aes-gcm = ["serf-proto/aes-gcm", "memberlist-proto/aes-gcm"]
+chacha20-poly1305 = ["serf-proto/chacha20-poly1305", "memberlist-proto/chacha20-poly1305"]
 
 [dependencies]
 serf-proto = { path = "../serf-proto", default-features = false }
+# Pinned to the same git+branch as serf-proto to guarantee a single copy in the
+# resolver; the shared key-management apply logic rotates memberlist's live
+# `Keyring` and matches on `SecretKey` under the encryption cfg gate.
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 bytes = { workspace = true }
-memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", features = ["std"] }
 
 [package.metadata.docs.rs]
 all-features = true

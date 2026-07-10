@@ -20,8 +20,12 @@ quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring", "serf-driver/quic-rus
 coordinates = ["serf-proto/coordinates", "serf-driver/coordinates"]
 # Encryption backends — forward to serf-proto (key-management messages) and to
 # memberlist-proto (the coordinator's gossip-encryption keyring + encrypt/decrypt).
-aes-gcm = ["serf-proto/aes-gcm", "memberlist-proto/aes-gcm"]
-chacha20-poly1305 = ["serf-proto/chacha20-poly1305", "memberlist-proto/chacha20-poly1305"]
+aes-gcm = ["serf-proto/aes-gcm", "serf-driver/aes-gcm", "memberlist-proto/aes-gcm"]
+chacha20-poly1305 = [
+  "serf-proto/chacha20-poly1305",
+  "serf-driver/chacha20-poly1305",
+  "memberlist-proto/chacha20-poly1305",
+]
 # Regex-backed tag-filter matching.
 tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
 # Emit `tracing` spans around the public driver operations.

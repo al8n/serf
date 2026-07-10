@@ -9,8 +9,6 @@ use super::{Delegate, MemberDelegate, MergeDelegate, QueryDelegate, UserEventDel
 
 #[cfg(encryption)]
 use super::KeyringDelegate;
-#[cfg(encryption)]
-use serf_proto::KeyResponseArgs;
 
 /// Zero-cost default observation delegate. Every hook is a no-op.
 ///
@@ -101,14 +99,14 @@ where
   type Error = core::convert::Infallible;
 }
 
-/// A keyring delegate that manages no key material.
+/// A keyring delegate that persists nothing.
 ///
-/// The default for nodes that do not participate in key management: every
-/// operation reports `result = false` with an explanatory message and an empty
-/// key list, so a cluster-wide key query records this node as not key-managed
-/// rather than silently timing out. A node that DOES manage encryption keys
-/// supplies its own [`KeyringDelegate`](super::KeyringDelegate) bound to the
-/// keyring it shares with the transport's encryption configuration.
+/// The default for nodes that do not need to observe key rotations. The driver
+/// still applies every inbound key-management op to the live wire keyring and
+/// answers from that live state; this delegate simply does not persist the
+/// result. A node that wants to persist rotated key material supplies its own
+/// [`KeyringDelegate`](super::KeyringDelegate), overriding
+/// [`keyring_updated`](super::KeyringDelegate::keyring_updated).
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(encryption)]
@@ -119,37 +117,4 @@ where
 pub struct VoidKeyringDelegate;
 
 #[cfg(encryption)]
-impl VoidKeyringDelegate {
-  /// The response returned by every operation: not key-managed.
-  fn unmanaged() -> KeyResponseArgs {
-    KeyResponseArgs {
-      result: false,
-      message: "node has no keyring delegate configured".into(),
-      keys: Vec::new(),
-      primary_key: None,
-    }
-  }
-}
-
-#[cfg(encryption)]
-impl KeyringDelegate for VoidKeyringDelegate {
-  #[inline]
-  fn install(&self, _key: memberlist_proto::SecretKey) -> KeyResponseArgs {
-    Self::unmanaged()
-  }
-
-  #[inline]
-  fn use_key(&self, _key: memberlist_proto::SecretKey) -> KeyResponseArgs {
-    Self::unmanaged()
-  }
-
-  #[inline]
-  fn remove(&self, _key: memberlist_proto::SecretKey) -> KeyResponseArgs {
-    Self::unmanaged()
-  }
-
-  #[inline]
-  fn list(&self) -> KeyResponseArgs {
-    Self::unmanaged()
-  }
-}
+impl KeyringDelegate for VoidKeyringDelegate {}
