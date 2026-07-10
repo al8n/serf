@@ -249,6 +249,36 @@ fn member_repeated_same_status_is_suppressed() {
 }
 
 #[test]
+fn reap_then_rejoin_in_one_window_still_emits_the_join() {
+  // A prior window records `last[id] = Join`. Within a single later window the
+  // node is Reaped and then rejoins (Join) before the window closes. The Reap is
+  // forgotten from `last` at feed time, so the stale `last[id] == Join` can no
+  // longer suppress the rejoin — the Join must still be delivered.
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // Window 1: a plain Join records `last[1] = Join`.
+  c.feed(MemberEventKind::Join, vec![member(1)], t0);
+  let mut out = VecDeque::new();
+  c.flush(&mut out);
+  assert_eq!(member_groups(out), vec![(MemberEventKind::Join, vec![1])]);
+
+  // Window 2: Reap then a rejoin Join for the same id, within one window.
+  let t1 = t0 + secs(5);
+  c.feed(MemberEventKind::Reap, vec![member(1)], t1);
+  c.feed(MemberEventKind::Join, vec![member(1)], t1);
+  let mut out2 = VecDeque::new();
+  c.flush(&mut out2);
+  let groups = member_groups(out2);
+
+  assert_eq!(
+    find_group(&groups, MemberEventKind::Join).map(|(_, ids)| ids.as_slice()),
+    Some([1u32].as_slice()),
+    "the rejoin Join must not be suppressed by the pre-Reap last[id]: {groups:?}"
+  );
+}
+
+#[test]
 fn member_reap_evicts_suppression_entry_bounding_last_to_live_membership() {
   // The cross-flush `last` map must track only LIVE membership: a node whose
   // flushed terminal event is `Reap` is gone from membership for good, so its id

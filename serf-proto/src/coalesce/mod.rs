@@ -142,6 +142,13 @@ where
   pub(crate) fn feed(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>, now: Instant) {
     for member in members {
       let id = member.node().id_ref().clone();
+      // A terminal Reap forgets the node's last-emitted status at feed time: a
+      // Reap overwritten by a rejoin Join later in the same window would never
+      // reach a flush-time eviction, leaving a stale `last[id]` that suppresses
+      // the genuinely-new Join.
+      if kind == MemberEventKind::Reap {
+        self.last.remove(&id);
+      }
       self.latest.insert(id, LatestMember { kind, member });
     }
     self.window.arm(now);
@@ -164,15 +171,19 @@ where
   /// [`Event::Member`] batch per surviving kind.  The `last` map persists across
   /// flushes so the suppression is stateful.
   ///
-  /// **Eviction rule (bounds `last` to live membership):** when a node's flushed
-  /// event is [`MemberEventKind::Reap`] its id is REMOVED from `last` rather than
-  /// recorded.  `Reap` is the terminal removal-from-membership signal — the node
-  /// is gone from the endpoint's `states`, so retaining it would grow `last`
-  /// without bound as distinct ids churn through join → … → reap (the reference
-  /// serf implementation leaks here).  Forgetting a reaped id is also correct:
-  /// its later re-join is a genuinely new member, and a `Join` differs from the
-  /// forgotten `Reap` so it re-emits regardless.  Every non-`Reap` kind can still
-  /// transition, so it is retained to suppress a repeated identical status.
+  /// **Eviction rule (bounds `last` to live membership):** a node's id is
+  /// forgotten from `last` at FEED time the instant a [`MemberEventKind::Reap`]
+  /// is buffered for it, and a `Reap` is never recorded on flush.  `Reap` is the
+  /// terminal removal-from-membership signal — the node is gone from the
+  /// endpoint's `states`, so retaining it would grow `last` without bound as
+  /// distinct ids churn through join → … → reap (the reference serf
+  /// implementation leaks here).  Evicting at feed time (rather than on flush)
+  /// also keeps a `Reap` that is overwritten by a rejoin `Join` within the same
+  /// window from leaving a stale `last[id]` that would wrongly suppress the
+  /// genuinely-new `Join`.  Forgetting a reaped id is correct regardless: its
+  /// later re-join is a genuinely new member, and a `Join` differs from the
+  /// absent entry so it re-emits.  Every non-`Reap` kind can still transition, so
+  /// it is retained to suppress a repeated identical status.
   pub(crate) fn flush(&mut self, out: &mut VecDeque<Event<I, A>>) {
     // At most five kinds, so a linear-probed Vec is cheaper than a hash map and
     // avoids requiring `Hash` on the public `MemberEventKind`.
@@ -185,11 +196,12 @@ where
           continue;
         }
       }
-      if latest.kind == MemberEventKind::Reap {
-        // Terminal: the node left membership for good — forget it so `last`
-        // tracks only live members.
-        self.last.remove(&id);
-      } else {
+      // A Reap is never recorded in `last`: `feed` already evicted the id, and
+      // storing it would grow `last` without bound as ids churn through
+      // join → … → reap. A forgotten reaped id re-emits its later Join correctly
+      // (Join differs from the absent entry). Every non-Reap kind is retained to
+      // suppress a repeated identical status.
+      if latest.kind != MemberEventKind::Reap {
         self.last.insert(id, latest.kind);
       }
       match grouped.iter_mut().find(|(k, _)| *k == latest.kind) {
