@@ -20,7 +20,7 @@ use core::{marker::PhantomData, net::SocketAddr};
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use std::sync::Arc;
 
-use embassy_futures::select::select;
+use embassy_futures::select::{Either, select};
 use embassy_net::{tcp::TcpSocket, udp::UdpSocket};
 use embassy_time::Timer;
 use memberlist_proto::{EndpointOptions, Instant, Rng, SeedableRng, SmallRng};
@@ -180,6 +180,21 @@ where
     if let Some(id) = self.id.take() {
       self.shared.engine.borrow_mut().cancel_join(id);
     }
+  }
+}
+
+/// Resolve once the shared shutdown latch flips, polled on the same 20ms cadence the
+/// join wait loop uses. Raced against each unresolved-seed lookup in
+/// [`Serf::join`](Serf::join) so a resolver parked in a never-completing future cannot
+/// leave the join pending past an abrupt stop. `join_wake` is a single-consumer
+/// [`Signal`](embassy_sync::signal::Signal), so this polls the latch rather than
+/// hanging a second consumer off it.
+async fn shutdown_backstop<I, G, SR>(shared: &Shared<I, G, SR>)
+where
+  I: memberlist_proto::Id,
+{
+  while !shared.is_shutdown() {
+    Timer::after(embassy_time::Duration::from_millis(20)).await;
   }
 }
 
@@ -475,12 +490,19 @@ where
   /// Abruptly stop the local node.
   ///
   /// Latches the terminal shutdown state and wakes the run loop: the
-  /// [`Runner`](crate::Runner) returns after its next drain, collapsing its workers
-  /// so the gossip and reliable-plane sockets wind down. Pending [`join`](Self::join)s
-  /// and every subsequent command fail fast with the shutdown error
+  /// [`Runner`](crate::Runner) observes the latch BEFORE its next egress-capable pump,
+  /// runs one no-pump final drain, and returns, collapsing its workers so the gossip
+  /// and reliable-plane sockets wind down. Pending [`join`](Self::join)s and every
+  /// subsequent command fail fast with the shutdown error
   /// ([`JoinError::Shutdown`](crate::JoinError::Shutdown) /
   /// [`OpError::Shutdown`](crate::OpError::Shutdown)); events already buffered stay
   /// drainable via [`poll_event`](Self::poll_event).
+  ///
+  /// An abrupt stop does NOT flush in-flight traffic: any outbound the latch
+  /// pre-empts — an undisseminated gossip broadcast, a queued key response, a
+  /// looped-back self-datagram — is dropped rather than transmitted, so a stopped node
+  /// (a manual stop or a conflict-losing duplicate) never emits on the wire after the
+  /// terminal state is observable.
   ///
   /// This does NOT gossip a leave — call [`leave`](Self::leave) for a graceful
   /// departure that notifies peers. The node initiated the stop, so no
@@ -631,8 +653,11 @@ where
   ///
   /// [`JoinError::Control`] when the engine rejects the join (e.g. the node is not
   /// running), [`JoinError::Resolve`] on a resolver failure, [`JoinError::NoAddresses`]
-  /// when a non-empty seed set resolves to no address, or [`JoinError::Failed`] when
-  /// every dispatched push/pull terminated without contacting a seed.
+  /// when a non-empty seed set resolves to no address, [`JoinError::Failed`] when
+  /// every dispatched push/pull terminated without contacting a seed, or
+  /// [`JoinError::Shutdown`] if the node lost an id-conflict vote or was stopped —
+  /// before dispatch, while a seed was still resolving, or while the join was in
+  /// flight — so a stopped node never dispatches or hangs.
   pub async fn join<Res>(
     &self,
     resolver: &Res,
@@ -642,8 +667,8 @@ where
   where
     Res: AddressResolver<Address = A>,
   {
-    // Fail fast if the node already lost an id-conflict vote: a join under a
-    // duplicate identity is meaningless, and the stopped run loop would never
+    // Fail fast if the node already lost an id-conflict vote or was stopped: a join
+    // under a duplicate identity is meaningless, and the stopped run loop would never
     // dispatch its push/pulls.
     if self.shared.is_shutdown() {
       return Err(JoinError::Shutdown);
@@ -654,16 +679,33 @@ where
     for seed in seeds {
       match seed {
         MaybeResolved::Resolved(s) => resolved.push(*s),
-        MaybeResolved::Unresolved(a) => resolved.extend(
-          resolver
-            .resolve(a)
-            .await
-            .map_err(|e| JoinError::Resolve(Box::new(e)))?,
-        ),
+        MaybeResolved::Unresolved(a) => {
+          // Race each unresolved-seed lookup against the shutdown latch: a resolver
+          // that never completes must not leave the join pending past an abrupt stop,
+          // and one that resolves only after the stop must not reach the stopped
+          // engine. The backstop resolves only when the latch flips.
+          let result = match select(resolver.resolve(a), shutdown_backstop(&self.shared)).await {
+            Either::First(r) => r,
+            Either::Second(()) => return Err(JoinError::Shutdown),
+          };
+          // Re-check after the await so a latch that flipped just as the resolver won
+          // the race still stops the join here: a post-shutdown resolver error or empty
+          // result resolves as `Shutdown`, never `Resolve` / `NoAddresses`.
+          if self.shared.is_shutdown() {
+            return Err(JoinError::Shutdown);
+          }
+          resolved.extend(result.map_err(|e| JoinError::Resolve(Box::new(e)))?);
+        }
       }
     }
     if !seeds.is_empty() && resolved.is_empty() {
       return Err(JoinError::NoAddresses);
+    }
+
+    // A shutdown latched after the final resolver await — or during an all-`Resolved`
+    // seed set that raced no resolver — must not dispatch onto the stopped engine.
+    if self.shared.is_shutdown() {
+      return Err(JoinError::Shutdown);
     }
 
     let handle = self
