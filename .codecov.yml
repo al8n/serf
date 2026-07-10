@@ -13,6 +13,10 @@ coverage:
     project: # Overall project status
       default:
         target: auto
+        # The driver suites exercise timing-dependent async paths, so repeated
+        # runs of an identical tree differ by a few hit lines; absorb that
+        # measurement noise instead of failing a zero-line diff on a 0.02% dip.
+        threshold: 0.5%
         if_not_found: success
         only_pulls: false
     patch: # Status for the patch in pull requests
