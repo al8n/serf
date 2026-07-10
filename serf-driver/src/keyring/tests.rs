@@ -27,12 +27,21 @@ fn install_adds_secondary_and_rotates() {
 
 #[cfg(feature = "aes-gcm")]
 #[test]
-fn install_existing_key_is_idempotent_success() {
+fn install_existing_key_is_success_without_rotation() {
+  // Re-installing the current primary succeeds but mutates nothing, so no
+  // rotated ring is published and the persistence observer never fires on a
+  // retried install.
   let ring = Keyring::new(aes(1));
   let out = apply_key_request(&ring, KeyRequestOperation::Install, Some(&aes(1)));
   assert!(out.response().result);
-  // The dup insert is dropped, so the rotated ring equals the original.
-  assert_eq!(out.rotated().expect("install reports a mutation"), &ring);
+  assert!(out.rotated().is_none());
+
+  // The same holds for a key already installed as a secondary.
+  let mut ring = Keyring::new(aes(1));
+  ring.insert_secondary(aes(2));
+  let out = apply_key_request(&ring, KeyRequestOperation::Install, Some(&aes(2)));
+  assert!(out.response().result);
+  assert!(out.rotated().is_none());
 }
 
 #[cfg(feature = "aes-gcm")]
