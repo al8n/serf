@@ -648,6 +648,36 @@ where
     self.core.respond_key(&mut self.transport, req, resp, now)
   }
 
+  /// The coordinator's live cross-transport [`memberlist_proto::EncryptionOptions`]
+  /// — the single source of truth for the gossip and reliable-plane AEAD keyring.
+  ///
+  /// A driver applying a key-management op reads this, mutates the keyring, and
+  /// pushes it back via [`set_encryption_options`](Self::set_encryption_options),
+  /// so the reported key state and the bytes on the wire cannot diverge.
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn encryption_options(&self) -> &memberlist_proto::EncryptionOptions {
+    self.transport.encryption_options()
+  }
+
+  /// Replace the coordinator's live encryption options, re-keying the gossip and
+  /// reliable planes in lockstep.
+  ///
+  /// The post-construction counterpart to the construction-time policy: applying a
+  /// completed key rotation here rotates the actual AEAD both planes encrypt
+  /// under, rather than leaving a driver-held shadow to drift from the wire.
+  #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn set_encryption_options(&mut self, encryption: memberlist_proto::EncryptionOptions) {
+    self.transport.set_encryption_options(encryption)
+  }
+
   /// Forwards to [`Endpoint::leave_broadcast_deadline`].
   pub const fn leave_broadcast_deadline(&self) -> Option<Instant> {
     self.core.leave_broadcast_deadline()

@@ -10,6 +10,9 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use memberlist_proto::{SeedableRng, SmallRng};
 use smol_str::SmolStr;
 
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+use memberlist_proto::EncryptionOptions;
+
 /// A fixed-seed gossip RNG for the engine constructors. These are single-node
 /// state tests; a deterministic seed keeps them reproducible.
 fn test_rng() -> SmallRng {
@@ -1718,6 +1721,7 @@ fn key_request(id: u32, deadline: Instant) -> Event<SmolStr, SocketAddr> {
   #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
   let key = SecretKey::ChaCha20Poly1305([0x11u8; 32]);
   Event::KeyRequest(KeyRequest::test_with_deadline(
+    KeyRequestOperation::Install,
     id,
     from,
     Some(key),
@@ -1882,5 +1886,193 @@ fn key_request_at_exact_deadline_survives_prune_and_is_delivered() {
     matches!(engine.poll_event(), Some(Event::KeyRequest(_))),
     "a KeyRequest at exactly its deadline is still answerable, so the prune must \
      retain it and poll_event must deliver it"
+  );
+}
+
+// ── key-management applied to the LIVE wire keyring ───────────────────────────
+
+/// A fixed AEAD key filled with `fill`, in whichever backend is compiled.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn secret_key(fill: u8) -> SecretKey {
+  #[cfg(feature = "aes-gcm")]
+  {
+    SecretKey::Aes256([fill; 32])
+  }
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  {
+    SecretKey::ChaCha20Poly1305([fill; 32])
+  }
+}
+
+/// A `SerfEngine` whose gossip and reliable planes encrypt under `keyring`.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn make_encrypted_engine(id: &str, port: u16, keyring: Keyring) -> SerfEngine<SmolStr, u32> {
+  let cfg = Options::new()
+    .with_port(port)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new(id), node_addr(port));
+  let transform =
+    TransformOptions::default().with_encryption(EncryptionOptions::new().with_keyring(keyring));
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  SerfEngine::try_new_at(cfg, transform, ep_cfg, SerfOptions::new(), now, test_rng())
+    .expect("valid encrypted configuration must construct")
+}
+
+/// A `KeyRequest` carrying `op` and `key` from a synthetic originator, with a
+/// future deadline (the mutation path ignores the deadline; `respond_key` uses it).
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn key_op(op: KeyRequestOperation, key: Option<SecretKey>) -> KeyRequest<SmolStr, SocketAddr> {
+  let from = memberlist_proto::Node::new(SmolStr::new("op"), node_addr(6000));
+  let deadline = Instant::from_origin(Duration::from_secs(86_400)) + Duration::from_secs(30);
+  KeyRequest::test_with_deadline(op, 1, from, key, deadline)
+}
+
+/// `apply_key_request` mutates the engine's LIVE wire keyring (the coordinator's,
+/// not a driver-held shadow): install adds a secondary leaving the primary intact,
+/// use promotes it, remove drops a secondary, removing the current primary is
+/// refused with the ring unchanged, and list snapshots the live post-op state.
+/// Every op's effect is visible through the `keyring()` accessor — the single
+/// source of truth. `handle_key_request` then applies-then-responds, so a valid op
+/// lands on the live keyring even when the response cannot be routed.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_ops_mutate_the_live_keyring() {
+  let k1 = secret_key(0x11);
+  let k2 = secret_key(0x22);
+  let mut engine = make_encrypted_engine("a", 7946, Keyring::new(k1));
+
+  // Baseline: primary K1, no secondaries.
+  assert_eq!(engine.keyring().expect("encrypted").primary_ref(), &k1);
+  assert!(engine.keyring().unwrap().secondaries().is_empty());
+
+  // install K2 -> K2 becomes a secondary; the primary is untouched.
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Install, Some(k2)));
+  assert!(resp.result, "install must succeed");
+  {
+    let kr = engine.keyring().expect("encrypted");
+    assert_eq!(kr.primary_ref(), &k1, "install must not move the primary");
+    assert!(
+      kr.secondaries().contains(&k2),
+      "install must add K2 as a secondary"
+    );
+  }
+
+  // use K2 -> K2 is promoted to primary.
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Use, Some(k2)));
+  assert!(resp.result, "use must succeed");
+  assert_eq!(
+    engine.keyring().unwrap().primary_ref(),
+    &k2,
+    "use must promote K2 to primary"
+  );
+
+  // remove K1 (now a secondary) -> gone from the ring.
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Remove, Some(k1)));
+  assert!(resp.result, "remove of a secondary must succeed");
+  {
+    let kr = engine.keyring().expect("encrypted");
+    assert_eq!(kr.primary_ref(), &k2);
+    assert!(
+      !kr.secondaries().contains(&k1),
+      "remove must drop K1 from the ring"
+    );
+  }
+
+  // remove the CURRENT primary (K2) -> refused; the ring is unchanged.
+  let before_primary = *engine.keyring().unwrap().primary_ref();
+  let before_secondaries = engine.keyring().unwrap().secondaries().to_vec();
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Remove, Some(k2)));
+  assert!(!resp.result, "removing the current primary must be refused");
+  {
+    let kr = engine.keyring().expect("encrypted");
+    assert_eq!(
+      *kr.primary_ref(),
+      before_primary,
+      "a refused remove must not move the primary"
+    );
+    assert_eq!(
+      kr.secondaries(),
+      before_secondaries.as_slice(),
+      "a refused remove must not change the ring"
+    );
+  }
+
+  // list -> reports the live primary and every installed key; no wire change.
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::List, None));
+  assert!(resp.result, "list must succeed");
+  assert_eq!(resp.primary_key, Some(k2), "list reports the live primary");
+  assert!(
+    resp.keys.contains(&k2),
+    "list reports the primary among the keys"
+  );
+
+  // handle_key_request composes apply-then-respond: the op lands on the live
+  // keyring even though the synthetic originator is unroutable (respond is
+  // best-effort, so its Result is not asserted here).
+  let k3 = secret_key(0x33);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let _ = engine.handle_key_request(&key_op(KeyRequestOperation::Install, Some(k3)), now);
+  assert!(
+    engine.keyring().unwrap().secondaries().contains(&k3),
+    "handle_key_request must apply the op to the live keyring regardless of respond routing"
+  );
+}
+
+/// The wire proof: after a rotation applied through the live-keyring path, the
+/// engine's gossip crypto runs under the NEW primary and REJECTS a frame under the
+/// removed key. A rotates to K2 and drops K1; a peer B holding K2 decrypts A's
+/// post-rotation frame (rotated traffic flows), while a frame captured under K1 no
+/// longer decrypts on A (old-key traffic rejected). Driven through the real
+/// `encrypt_gossip` / `decrypt_gossip` paths, not keyring-state asserts alone.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_rotation_reencrypts_gossip_and_rejects_removed_key() {
+  let k1 = secret_key(0x11);
+  let k2 = secret_key(0x22);
+  // A starts {primary K1, secondary K2}; B holds only K2.
+  let mut a = make_encrypted_engine("a", 7946, Keyring::with_secondaries(k1, [k2]));
+  let b = make_encrypted_engine("b", 7947, Keyring::new(k2));
+
+  let plaintext = b"gossip-probe-payload-0123456789";
+
+  // A frame A emits under its CURRENT primary (K1), captured before the rotation.
+  let under_k1 = a
+    .endpoint
+    .encrypt_gossip(plaintext)
+    .expect("encrypt under K1");
+  assert_eq!(
+    a.endpoint
+      .decrypt_gossip(&under_k1)
+      .expect("A decrypts its own K1 frame pre-rotation"),
+    plaintext
+  );
+
+  // Rotate A to K2 and drop K1 through the single live-keyring chokepoint.
+  assert!(
+    a.apply_key_request(&key_op(KeyRequestOperation::Use, Some(k2)))
+      .result
+  );
+  assert!(
+    a.apply_key_request(&key_op(KeyRequestOperation::Remove, Some(k1)))
+      .result
+  );
+
+  // Rotated traffic flows: A now encrypts under K2, and B (holding K2) decrypts it.
+  let under_k2 = a
+    .endpoint
+    .encrypt_gossip(plaintext)
+    .expect("encrypt under K2");
+  assert_eq!(
+    b.endpoint
+      .decrypt_gossip(&under_k2)
+      .expect("a peer holding the new key decrypts A's rotated gossip"),
+    plaintext,
+    "post-rotation gossip must decrypt under the promoted key"
+  );
+
+  // Old-key traffic rejected: A dropped K1, so a frame under K1 no longer decrypts.
+  assert!(
+    a.endpoint.decrypt_gossip(&under_k1).is_err(),
+    "a frame under the removed key K1 must be rejected by the rotated engine"
   );
 }

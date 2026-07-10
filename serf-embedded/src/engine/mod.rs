@@ -53,7 +53,12 @@ use serf_proto::{
 };
 
 #[cfg(encryption)]
-use serf_proto::{SecretKey, event::KeyRequest, event::KeyResponseArgs};
+use memberlist_proto::Keyring;
+#[cfg(encryption)]
+use serf_proto::{
+  SecretKey,
+  event::{KeyRequest, KeyRequestOperation, KeyResponseArgs},
+};
 
 use memberlist_embedded::{
   GossipIo, InitError, Options, StreamIo, TransformOptions,
@@ -1378,6 +1383,152 @@ where
     now: Instant,
   ) -> Result<(), SerfError> {
     self.endpoint.respond_key(req, resp, now)
+  }
+
+  /// Apply one inbound key-management [`KeyRequest`] to the engine's LIVE wire
+  /// keyring and answer the originator in the same call.
+  ///
+  /// The live keyring is the coordinator's cross-transport [`EncryptionOptions`]
+  /// keyring — the single source of truth both the gossip and the reliable plane
+  /// encrypt under. This method reads it, applies the requested op, and pushes the
+  /// result back through the coordinator ([`set_encryption_options`]), so a
+  /// completed rotation actually re-keys the wire instead of updating a driver-held
+  /// shadow the wire never sees. It is the ONLY post-construction keyring mutation
+  /// path, so the reported key state and the on-wire AEAD cannot diverge:
+  ///
+  /// - `install` inserts the key as a secondary (idempotent),
+  /// - `use` promotes the key to primary,
+  /// - `remove` drops a secondary — refusing the current primary,
+  /// - `list` snapshots the keys and primary from the post-op live state.
+  ///
+  /// A node with no keyring configured answers `result = false` and makes no wire
+  /// change. A failed op (unknown key, or removing the primary) answers
+  /// `result = false` with a message and leaves the keyring untouched.
+  ///
+  /// Apply-then-respond: the op is applied to the wire keyring first; the
+  /// [`respond_key`](Self::respond_key) that follows is best-effort. The cluster-wide
+  /// op has already happened on this node even if the response is past its deadline
+  /// or cannot be routed, so an `Err` here means only that the acknowledgement was
+  /// not queued — never that the op was skipped. Returns `Ok(())` when a response
+  /// was queued (a driver re-egresses it within the tick).
+  ///
+  /// [`EncryptionOptions`]: memberlist_proto::EncryptionOptions
+  /// [`set_encryption_options`]: serf_proto::StreamEndpoint::set_encryption_options
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn handle_key_request(
+    &mut self,
+    req: &KeyRequest<I, SocketAddr>,
+    now: Instant,
+  ) -> Result<(), SerfError> {
+    let resp = self.apply_key_request(req);
+    self.respond_key(req, resp, now)
+  }
+
+  /// Read-modify-write the coordinator's live keyring for one [`KeyRequest`],
+  /// returning the answer built from the post-op live state. The single keyring
+  /// mutation chokepoint behind [`handle_key_request`](Self::handle_key_request).
+  #[cfg(encryption)]
+  fn apply_key_request(&mut self, req: &KeyRequest<I, SocketAddr>) -> KeyResponseArgs {
+    let mut encryption = self.endpoint.encryption_options().clone();
+    let Some(current) = encryption.keyring() else {
+      return KeyResponseArgs {
+        result: false,
+        message: "no keyring configured on this node".into(),
+        ..Default::default()
+      };
+    };
+    let mut keyring = current.clone();
+    let (resp, mutated) = match (req.op(), req.key()) {
+      (KeyRequestOperation::Install, Some(key)) => {
+        keyring.insert_secondary(*key);
+        (
+          KeyResponseArgs {
+            result: true,
+            ..Default::default()
+          },
+          true,
+        )
+      }
+      (KeyRequestOperation::Use, Some(key)) => match keyring.promote(key.as_bytes()) {
+        Ok(()) => (
+          KeyResponseArgs {
+            result: true,
+            ..Default::default()
+          },
+          true,
+        ),
+        Err(_) => (
+          KeyResponseArgs {
+            result: false,
+            message: "requested primary key is not installed".into(),
+            ..Default::default()
+          },
+          false,
+        ),
+      },
+      (KeyRequestOperation::Remove, Some(key)) => match keyring.remove_secondary(key.as_bytes()) {
+        Ok(()) => (
+          KeyResponseArgs {
+            result: true,
+            ..Default::default()
+          },
+          true,
+        ),
+        Err(_) => (
+          KeyResponseArgs {
+            result: false,
+            message: "key is not a removable secondary".into(),
+            ..Default::default()
+          },
+          false,
+        ),
+      },
+      (KeyRequestOperation::List, _) => {
+        let mut keys = Vec::with_capacity(1 + keyring.secondaries().len());
+        keys.push(*keyring.primary_ref());
+        keys.extend(keyring.secondaries().iter().copied());
+        (
+          KeyResponseArgs {
+            result: true,
+            primary_key: Some(*keyring.primary_ref()),
+            keys,
+            ..Default::default()
+          },
+          false,
+        )
+      }
+      (_, None) => (
+        KeyResponseArgs {
+          result: false,
+          message: "key-management request missing its required key".into(),
+          ..Default::default()
+        },
+        false,
+      ),
+    };
+    // Push the rotated keyring back to the coordinator so the gossip and reliable
+    // planes re-key in lockstep. A read-only or failed op leaves the wire unchanged.
+    if mutated {
+      encryption.set_keyring(keyring);
+      self.endpoint.set_encryption_options(encryption);
+    }
+    resp
+  }
+
+  /// The engine's LIVE wire keyring — the coordinator's current keyring, the same
+  /// state [`handle_key_request`](Self::handle_key_request) mutates and the gossip
+  /// and reliable planes encrypt under. `None` when the node is unencrypted.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn keyring(&self) -> Option<&Keyring> {
+    self.endpoint.encryption_options().keyring()
   }
 }
 
