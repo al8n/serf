@@ -7,8 +7,9 @@
 //! stack, drives the engine over a [`SmoltcpGossip`] + [`SmoltcpStream`] view of
 //! the just-ticked sockets, then acts on serf's mandatory driver-actioned events
 //! IN the poll cycle (a lost id-conflict [`Event::Shutdown`] flips a stop flag; an
-//! encryption [`Event::KeyRequest`] is applied to the local keyring and answered
-//! via `respond_key`), buffering every drained event for the app's own
+//! encryption [`Event::KeyRequest`] is applied to the engine's live wire keyring and
+//! answered, both through the engine's `handle_key_request`), buffering every drained
+//! event for the app's own
 //! [`poll_event`](Serf::poll_event). All protocol work lives in the shared engine;
 //! this driver supplies only the link layer plus the mandatory-event side effects.
 
@@ -40,8 +41,6 @@ use smoltcp::{
 
 #[cfg(encryption)]
 use serf_embedded::{Keyring, SecretKey};
-#[cfg(encryption)]
-use serf_proto::event::{KeyRequest, KeyRequestOperation, KeyResponseArgs};
 
 use crate::{
   InitError, InterfaceOptions, JoinError, Options, Resolver, TransformOptions,
@@ -169,86 +168,6 @@ fn min_opt(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
   }
 }
 
-/// Apply one inbound [`KeyRequest`] to the driver's local keyring, producing the
-/// [`KeyResponseArgs`] the poll cycle forwards to `respond_key`.
-///
-/// Mirrors serf-reactor's `apply_key_request`: the driver owns its key store and
-/// answers the four key-management operations from it. A node with no keyring
-/// configured reports failure. The op is applied to the driver-local keyring copy;
-/// keeping the live coordinator encryption in lockstep is a deferred refinement
-/// (the same shape as serf-reactor, whose keyring delegate is likewise separate
-/// from the coordinator's construction-time keyring).
-#[cfg(encryption)]
-fn apply_key_request<I, A>(
-  keyring: &mut Option<Keyring>,
-  req: &KeyRequest<I, A>,
-) -> KeyResponseArgs {
-  let Some(kr) = keyring.as_mut() else {
-    return KeyResponseArgs {
-      result: false,
-      message: "no keyring configured on this node".into(),
-      keys: Vec::new(),
-      primary_key: None,
-    };
-  };
-  match (req.op(), req.key()) {
-    (KeyRequestOperation::Install, Some(key)) => {
-      kr.insert_secondary(*key);
-      KeyResponseArgs {
-        result: true,
-        message: "".into(),
-        keys: Vec::new(),
-        primary_key: None,
-      }
-    }
-    (KeyRequestOperation::Use, Some(key)) => match kr.promote(key.as_bytes()) {
-      Ok(()) => KeyResponseArgs {
-        result: true,
-        message: "".into(),
-        keys: Vec::new(),
-        primary_key: None,
-      },
-      Err(_) => KeyResponseArgs {
-        result: false,
-        message: "requested primary key is not installed".into(),
-        keys: Vec::new(),
-        primary_key: None,
-      },
-    },
-    (KeyRequestOperation::Remove, Some(key)) => match kr.remove_secondary(key.as_bytes()) {
-      Ok(()) => KeyResponseArgs {
-        result: true,
-        message: "".into(),
-        keys: Vec::new(),
-        primary_key: None,
-      },
-      Err(_) => KeyResponseArgs {
-        result: false,
-        message: "key is not a removable secondary".into(),
-        keys: Vec::new(),
-        primary_key: None,
-      },
-    },
-    (KeyRequestOperation::List, _) => {
-      let mut keys: Vec<SecretKey> = Vec::with_capacity(1 + kr.secondaries().len());
-      keys.push(*kr.primary_ref());
-      keys.extend(kr.secondaries().iter().copied());
-      KeyResponseArgs {
-        result: true,
-        message: "".into(),
-        keys,
-        primary_key: Some(*kr.primary_ref()),
-      }
-    }
-    (_, None) => KeyResponseArgs {
-      result: false,
-      message: "key-management request missing its required key".into(),
-      keys: Vec::new(),
-      primary_key: None,
-    },
-  }
-}
-
 /// An executor-free serf node that composes serf's super-machine (via
 /// [`SerfEngine`](serf_embedded::SerfEngine)) with a smoltcp TCP/IP stack.
 ///
@@ -299,11 +218,6 @@ where
   /// Set once the driver observed a lost id-conflict [`Event::Shutdown`]; the
   /// caller reads it via [`is_shutdown`](Self::is_shutdown) and stops polling.
   shutdown: bool,
-  /// The driver-local keyring answering inbound [`Event::KeyRequest`]s, seeded from
-  /// the construction `TransformOptions` encryption keyring (or `None` when the node
-  /// is unencrypted).
-  #[cfg(encryption)]
-  keyring: Option<Keyring>,
   // `D` is passed to construction and each `poll`; `PhantomData` makes the struct
   // generic over it without holding it.
   _device: PhantomData<D>,
@@ -525,12 +439,6 @@ where
   where
     D: Device,
   {
-    // Seed the driver-local keyring from the construction encryption policy BEFORE
-    // `transform` is moved into the engine, so inbound `KeyRequest`s can be answered
-    // from the same key material the node was built with.
-    #[cfg(encryption)]
-    let keyring = transform.encryption.keyring().cloned();
-
     let embedded_cfg = embedded_options(&cfg);
 
     // 1. Validate the medium up front: smoltcp's `Interface::new` asserts the
@@ -742,8 +650,6 @@ where
       app_events_dropped: 0,
       loopback: VecDeque::new(),
       shutdown: false,
-      #[cfg(encryption)]
-      keyring,
       _device: PhantomData,
       _a: PhantomData,
     })
@@ -1057,6 +963,20 @@ where
     self.engine.list_keys(now)
   }
 
+  /// The node's LIVE wire keyring — the keyring the gossip and reliable planes
+  /// actually encrypt under, and the state an inbound [`Event::KeyRequest`] rotates
+  /// via the engine. `None` when the node is unencrypted. Unlike
+  /// [`list_keys`](Self::list_keys) (a cluster-wide query), this is a local read of
+  /// this node's own keyring for UI / diagnostics / tests.
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn keyring(&self) -> Option<&Keyring> {
+    self.engine.keyring()
+  }
+
   /// Advance both the smoltcp stack and serf's state machine, act on serf's
   /// mandatory driver-actioned events, and drive to quiescence within the tick.
   /// Returns the next wakeup deadline: the minimum of the smoltcp stack's next
@@ -1070,8 +990,9 @@ where
   ///    a [`SmoltcpGossip`] + [`SmoltcpStream`] view of the just-ticked sockets
   ///    (computing the next deadline and egressing outbound gossip), then the drain
   ///    acts on the driver-actioned events: [`Event::Shutdown`] flips the stop flag;
-  ///    an [`Event::KeyRequest`] is applied to the local keyring and answered via
-  ///    `respond_key`. Every drained event is buffered for the app's own
+  ///    an [`Event::KeyRequest`] is applied to the engine's live wire keyring and
+  ///    answered via the engine's `handle_key_request`. Every drained event is
+  ///    buffered for the app's own
   ///    [`poll_event`](Self::poll_event), so membership / user / query observations
   ///    and the mandatory events alike remain visible AFTER the driver acted.
   ///
@@ -1137,8 +1058,8 @@ where
   /// effect on each mandatory event, and buffer every event for the app.
   ///
   /// Returns whether the drain queued outbound gossip work the current pump's egress
-  /// did not see — a successful `respond_key` — so [`poll`](Self::poll) knows to
-  /// re-pump and egress it within the same tick.
+  /// did not see — a key response the engine's `handle_key_request` just queued — so
+  /// [`poll`](Self::poll) knows to re-pump and egress it within the same tick.
   fn drain_engine_events(&mut self, now: Instant) -> bool {
     // `now` and the queued-outbound signal are consumed only by the encryption
     // `KeyRequest` arm; a build without an AEAD backend reads neither and queues no
@@ -1154,17 +1075,17 @@ where
         // A lost id-conflict vote means the local node MUST stop; flag it. The event
         // still reaches the app via `poll_event`.
         Event::Shutdown => self.shutdown = true,
-        // An inbound key-management request: apply the op to the local keyring and
-        // answer the originator. The response is a directed gossip transmit egressed
-        // on the re-pump [`poll`](Self::poll) runs while `queued` is set.
+        // An inbound key-management request: apply the op to the engine's LIVE wire
+        // keyring and answer the originator in one call. The response is a directed
+        // gossip transmit egressed on the re-pump [`poll`](Self::poll) runs while
+        // `queued` is set.
         #[cfg(encryption)]
         Event::KeyRequest(req) => {
-          let resp = apply_key_request(&mut self.keyring, req);
-          // Ignoring Err: `respond_key` fails only when the response cannot be
-          // routed; the key op has already applied to the driver keyring.
-          if self.engine.respond_key(req, resp, now).is_ok() {
-            queued = true;
-          }
+          // `Ok` means a key response was queued (re-pump to egress it). Ignoring the
+          // Err case: `handle_key_request` has already applied the op to the live
+          // keyring; an Err means only the best-effort response was past-deadline or
+          // could not be routed, which queues no outbound work.
+          queued |= self.engine.handle_key_request(req, now).is_ok();
         }
         _ => {}
       }
