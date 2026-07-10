@@ -1601,9 +1601,9 @@ where
   {
     use buffa::Message as _;
 
-    // Latch the command's instant so that when the coordinator's resulting
-    // `NodeUpdated` is drained (via a later `poll_event`, which does not latch)
-    // the member coalescer arms from live `now`, not a stale `drain_now`.
+    // Latch the command's instant so the coordinator's resulting `NodeUpdated`,
+    // drained synchronously at the end of this call, arms the member coalescer
+    // from live `now` rather than a stale `drain_now`.
     self.drain_now = now;
 
     // Refuse once the machine has shut down (lost id-conflict vote).
@@ -1634,6 +1634,12 @@ where
       let status = ms.status();
       *ms.member_mut() = Member::new(node, tags, status);
     }
+
+    // Emit the resulting NodeUpdated synchronously under the freshly latched
+    // `now`, mirroring how `user_event` processes its event inline. Deferring it
+    // to a later `poll_event` drain would let an intervening ingress or timeout
+    // overwrite `drain_now`, arming the member coalescer from the wrong instant.
+    self.drain_inner(t);
 
     Ok(())
   }

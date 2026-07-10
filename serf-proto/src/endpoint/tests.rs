@@ -8050,3 +8050,34 @@ fn set_tags_after_idle_gap_arms_member_window_from_live_now() {
     "the coalesced Member(Update) flushes when its live-armed window closes"
   );
 }
+
+#[test]
+fn set_tags_emits_its_node_updated_synchronously_under_the_command_latch() {
+  // `set_tags` arms the member coalescer from its OWN command instant by
+  // draining the coordinator's resulting `NodeUpdated` synchronously. A drain
+  // captured at an EARLIER instant that lands afterwards must therefore NOT
+  // re-time the member window: the batch already belongs to the set_tags
+  // instant, so the older drain finds nothing left to arm and cannot pull the
+  // flush deadline backwards (which would flush the batch early).
+  use crate::typed::Tags;
+
+  let mut e = ep_member_coalescing(); // member coalesce 10s, quiescent 2s
+
+  let tags: Tags = [("role", "web")].into_iter().collect();
+  e.set_tags(tags, t_secs(100))
+    .expect("set_tags must succeed");
+
+  // Interpose an ingress drain captured at an EARLIER instant than the command.
+  // With the synchronous drain in `set_tags` the NodeUpdated is already
+  // consumed, so this older drain has nothing to feed the coalescer.
+  e.test_drain_after_ingress(t_secs(50));
+
+  // The window is armed at set_tags's live now (100 + quiescent 2 = 102), NOT the
+  // earlier ingress instant (50 + 2 = 52). Dropping the synchronous drain lets
+  // the older ingress arm the window at 52 and this assertion fails.
+  assert_eq!(
+    e.core_mut().test_member_flush_deadline(),
+    Some(t_secs(102)),
+    "the member window is armed at the set_tags instant, not the later older ingress drain"
+  );
+}

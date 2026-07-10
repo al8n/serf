@@ -1086,6 +1086,14 @@ where
     self.core.test_set_drain_now(now)
   }
 
+  /// Forwards to [`Endpoint::drain_after_ingress`], latching `now` and sieving
+  /// the coordinator's pending inner events — the interposed-ingress seam for a
+  /// test that asserts a command's effect is not re-timed by a later drain.
+  #[cfg(test)]
+  pub(crate) fn test_drain_after_ingress(&mut self, now: Instant) {
+    self.core.drain_after_ingress(&mut self.transport, now)
+  }
+
   /// Forwards to [`Endpoint::test_last_query_id`].
   #[cfg(test)]
   pub(crate) fn test_last_query_id(&self) -> Option<QueryId> {
