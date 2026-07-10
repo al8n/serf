@@ -1819,6 +1819,14 @@ where
   fn emit_member(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>) {
     let now = self.drain_now;
     if let Some(c) = self.member_coalescer.as_mut() {
+      // The window may have elapsed while the driver was busy and has not yet
+      // fired the overdue flush timer. Flush the completed batch before the new
+      // event mutates it — otherwise a feed after the deadline would overwrite a
+      // due observation and extend the window, merging two separate windows and
+      // dropping the earlier one.
+      if c.due(now) {
+        c.flush(&mut self.pending_events);
+      }
       c.feed(kind, members, now);
     } else {
       self
@@ -1838,6 +1846,12 @@ where
     let now = self.drain_now;
     if msg.cc {
       if let Some(c) = self.user_coalescer.as_mut() {
+        // Flush an elapsed-but-not-yet-fired window before the new event mutates
+        // it (see emit_member): a newer generation fed after the deadline would
+        // otherwise supersede and drop a due earlier generation.
+        if c.due(now) {
+          c.flush(&mut self.pending_events);
+        }
         c.feed(msg, now);
         return;
       }

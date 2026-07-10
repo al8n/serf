@@ -7888,6 +7888,82 @@ fn member_coalescing_coalesce_cap_bounds_a_busy_stream() {
 }
 
 #[test]
+fn overdue_member_window_flushes_before_a_late_same_id_event() {
+  // A window can be due (its deadline elapsed) yet not flushed, because the
+  // driver drained ready ingress before firing the overdue timer. A late event
+  // for the same node must NOT overwrite the due observation: the machine flushes
+  // the completed window first, then opens a fresh one.
+  let mut e = ep_member_coalescing(); // coalesce 10s, quiescent 2s
+  e.test_inner_node_joined(2, t_secs(5)); // Join(2): window due at t7
+  assert!(e.poll_event().is_none(), "the join is buffered");
+
+  // Node 2 fails at t8 — PAST the t7 deadline, but before handle_timeout fires.
+  e.test_inner_node_left(2, t_secs(8)); // Alive -> Failed
+
+  // The overdue Join window is flushed by the late feed, before the Failed can
+  // overwrite it.
+  let ev = e
+    .poll_event()
+    .expect("the overdue Join batch is flushed by the late feed");
+  assert!(matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Join));
+  assert_eq!(member_ids(&ev), vec![2]);
+  assert!(
+    e.poll_event().is_none(),
+    "the Failed is buffered in a fresh window, not delivered yet"
+  );
+
+  // The fresh window (t8 + 2s quiescent) delivers the Failed separately.
+  e.handle_timeout(t_secs(10));
+  let ev = e
+    .poll_event()
+    .expect("the fresh window delivers the Failed");
+  assert!(matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Failed));
+  assert_eq!(member_ids(&ev), vec![2]);
+}
+
+#[test]
+fn overdue_user_window_flushes_before_a_late_newer_generation() {
+  // The user coalescer keeps only the newest generation per name. A newer
+  // generation fed after the window is due must not silently supersede a due
+  // earlier generation: the machine flushes the elapsed window first.
+  let mut e = ep_user_coalescing(); // user coalesce 10s, quiescent 2s
+  e.user_event("foo", bytes::Bytes::from_static(b"gen1"), true, t_secs(5))
+    .unwrap(); // window due at t7
+  assert!(e.poll_event().is_none(), "the first generation is buffered");
+
+  // A newer "foo" at t8 — PAST the t7 deadline, before handle_timeout fires.
+  e.user_event("foo", bytes::Bytes::from_static(b"gen2"), true, t_secs(8))
+    .unwrap();
+
+  // The earlier generation is flushed by the late feed, before the newer one
+  // supersedes it.
+  let ev = e
+    .poll_event()
+    .expect("the overdue earlier generation is flushed by the late feed");
+  match ev {
+    Event::User(u) => {
+      assert_eq!(u.name, "foo");
+      assert_eq!(u.payload, bytes::Bytes::from_static(b"gen1"));
+    }
+    other => panic!("expected Event::User, got {other:?}"),
+  }
+  assert!(e.poll_event().is_none(), "the newer generation is buffered");
+
+  // The fresh window delivers the newer generation.
+  e.handle_timeout(t_secs(10));
+  let ev = e
+    .poll_event()
+    .expect("the fresh window delivers the newer generation");
+  match ev {
+    Event::User(u) => {
+      assert_eq!(u.name, "foo");
+      assert_eq!(u.payload, bytes::Bytes::from_static(b"gen2"));
+    }
+    other => panic!("expected Event::User, got {other:?}"),
+  }
+}
+
+#[test]
 fn user_coalescing_batches_cc_events_and_passes_non_cc_through() {
   let mut e = ep_user_coalescing();
 
