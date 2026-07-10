@@ -2214,7 +2214,8 @@ fn far_future() -> memberlist_proto::Instant {
 
 #[test]
 fn conflict_win_does_not_shut_down() {
-  // Majority of responses agree → local node won → no Event::Shutdown.
+  // Majority of responses agree → local node won → no Event::Shutdown, and the
+  // machine stays Alive and fully functional (guards against over-eager gating).
   let mut e = ep();
   let deadline = far_future();
   let qid = e.test_register_conflict_query(deadline);
@@ -2231,11 +2232,22 @@ fn conflict_win_does_not_shut_down() {
     e.poll_event().is_none(),
     "winning conflict must not emit Shutdown"
   );
+  assert!(
+    e.state().is_alive(),
+    "winning conflict must leave the machine Alive"
+  );
+  // A won vote leaves the command surface fully open.
+  assert!(
+    e.user_event("post-win", bytes::Bytes::new(), false).is_ok(),
+    "a won vote must not gate commands"
+  );
 }
 
 #[test]
-fn conflict_loss_emits_shutdown() {
-  // Minority of responses agree → local node lost → Event::Shutdown.
+fn conflict_loss_transitions_to_shutdown_and_still_delivers_event() {
+  // Minority of responses agree → local node lost → the machine performs its
+  // documented forced Alive → Shutdown transition (Go serf's conflict-loss
+  // shutdown()) AND the buffered Event::Shutdown still drains via poll_event.
   let mut e = ep();
   let deadline = far_future();
   let qid = e.test_register_conflict_query(deadline);
@@ -2245,14 +2257,248 @@ fn conflict_loss_emits_shutdown() {
   e.test_fold_conflict_response(qid, 201u32, false);
   e.test_fold_conflict_response(qid, 202u32, false);
 
+  assert!(e.state().is_alive(), "machine is Alive before the close");
+
   let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
   e.test_fire_due_query_closes(past);
 
+  // The transition happened at the close, before any event is drained: reverting
+  // the `self.state = Shutdown` in close_conflict_query leaves this Alive → fail.
+  assert!(
+    e.state().is_shutdown(),
+    "a lost conflict vote must transition the machine to Shutdown"
+  );
+
+  // Event delivery is PRESERVED: the already-buffered Event::Shutdown drains from
+  // the now-dead machine (poll_event stays functional post-Shutdown).
   let ev = e.poll_event().expect("conflict loss must emit an event");
   assert!(
     matches!(ev, Event::Shutdown),
     "conflict loss must emit Event::Shutdown, got {:?}",
     ev
+  );
+  assert!(
+    e.state().is_shutdown(),
+    "the machine stays Shutdown after the event drains"
+  );
+}
+
+// ── post-Shutdown chokepoint contract ────────────────────────────────────────
+//
+// A machine that lost an id-conflict vote transitions to `SerfState::Shutdown`
+// and thereafter refuses commands, goes inert on ingress, and quiets its timers
+// (mirroring the memberlist post-leave contract), while still draining the
+// buffered `Event::Shutdown`.  The tests below drive a REAL lost vote through the
+// conflict-query scaffolding and sweep each chokepoint class.
+
+/// Drive the endpoint through a real lost id-conflict vote and drain the
+/// resulting `Event::Shutdown`, leaving it in the terminal `Shutdown` state.
+fn shut_down_via_lost_conflict(e: &mut StreamEndpoint<u32, core::net::SocketAddr, RawRecords>) {
+  let qid = e.test_register_conflict_query(far_future());
+  // 1 agree, 2 disagree → matching 1 < majority 2 → lost.
+  e.test_fold_conflict_response(qid, 200u32, true);
+  e.test_fold_conflict_response(qid, 201u32, false);
+  e.test_fold_conflict_response(qid, 202u32, false);
+  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(3601);
+  e.test_fire_due_query_closes(past);
+  assert!(
+    matches!(e.poll_event(), Some(Event::Shutdown)),
+    "the buffered Event::Shutdown must drain from the shut-down machine"
+  );
+  assert!(e.state().is_shutdown(), "the machine must be Shutdown");
+}
+
+#[test]
+fn shutdown_refuses_originating_commands() {
+  let mut e = ep();
+  // Register a live received-query token BEFORE shutdown so respond()'s refusal
+  // is proven to precede its received_queries lookup and deadline guard.
+  let token = e.test_register_received_query(
+    QueryId {
+      ltime: LamportTime::new(1),
+      id: 5,
+    },
+    addr(1002),
+    far_future(),
+  );
+
+  shut_down_via_lost_conflict(&mut e);
+
+  let now = memberlist_proto::Instant::ORIGIN;
+  let tags: Tags = [("role", "web")].into_iter().collect();
+
+  // Commands that originate cluster work funnel through ensure_not_shutdown.
+  assert!(
+    matches!(
+      e.user_event("x", bytes::Bytes::new(), false),
+      Err(Error::Shutdown)
+    ),
+    "user_event must be refused after shutdown"
+  );
+  assert!(
+    matches!(
+      e.query("q", bytes::Bytes::new(), QueryParams::default(), now),
+      Err(Error::Shutdown)
+    ),
+    "query must be refused after shutdown"
+  );
+  assert!(
+    matches!(e.set_tags(tags), Err(Error::Shutdown)),
+    "set_tags must be refused after shutdown"
+  );
+  assert!(
+    matches!(
+      e.respond(&token, bytes::Bytes::new(), now),
+      Err(Error::Shutdown)
+    ),
+    "respond must be refused after shutdown, before the token lookup"
+  );
+
+  // The lifecycle commands keep their own pre-existing typed state errors — the
+  // transition alone already makes them refuse Shutdown.
+  assert!(
+    matches!(e.join(), Err(Error::BadJoinState(SerfState::Shutdown))),
+    "join keeps BadJoinState on a Shutdown machine"
+  );
+  assert!(
+    matches!(e.leave(now), Err(Error::BadLeaveState(SerfState::Shutdown))),
+    "leave keeps BadLeaveState on a Shutdown machine"
+  );
+  assert!(
+    matches!(
+      e.force_leave(2u32, false, now),
+      Err(Error::BadLeaveState(SerfState::Shutdown))
+    ),
+    "force_leave keeps BadLeaveState on a Shutdown machine"
+  );
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn shutdown_refuses_key_management() {
+  use crate::event::{KeyRequest, KeyRequestOperation, KeyResponseArgs};
+  use memberlist_proto::SecretKey;
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([2u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([2u8; 32]);
+
+  let mut e = ep();
+  // A KeyRequest token obtained before shutdown, to prove respond_key's refusal
+  // precedes its received_queries lookup.
+  let req = KeyRequest::<u32, core::net::SocketAddr>::test_with_deadline(
+    KeyRequestOperation::List,
+    7,
+    memberlist_proto::Node::new(2u32, addr(2000)),
+    None,
+    far_future(),
+  );
+
+  shut_down_via_lost_conflict(&mut e);
+
+  let now = memberlist_proto::Instant::ORIGIN;
+
+  // Every issuance funnels through internal_query → ensure_not_shutdown.
+  assert!(
+    matches!(e.list_keys(now), Err(Error::Shutdown)),
+    "list_keys must be refused after shutdown"
+  );
+  assert!(
+    matches!(e.install_key(key, now), Err(Error::Shutdown)),
+    "install_key must be refused after shutdown"
+  );
+  assert!(
+    matches!(e.use_key(key, now), Err(Error::Shutdown)),
+    "use_key must be refused after shutdown"
+  );
+  assert!(
+    matches!(e.remove_key(key, now), Err(Error::Shutdown)),
+    "remove_key must be refused after shutdown"
+  );
+
+  // respond_key shares the ensure_not_shutdown gate.
+  let refused = e.respond_key(
+    &req,
+    KeyResponseArgs {
+      result: true,
+      message: smol_str::SmolStr::default(),
+      keys: vec![key],
+      primary_key: Some(key),
+    },
+    now,
+  );
+  assert!(
+    matches!(refused, Err(Error::Shutdown)),
+    "respond_key must be refused after shutdown"
+  );
+}
+
+#[test]
+fn shutdown_ingress_is_inert() {
+  let mut e = ep();
+  shut_down_via_lost_conflict(&mut e);
+
+  let members_before = e.num_members();
+  let event_time_before = e.event_time();
+
+  // A valid inbound user event that would normally advance the event clock and
+  // emit Event::User must mutate nothing and emit nothing on a Shutdown machine.
+  let serf_bytes = AnyMessage::<u32, core::net::SocketAddr>::UserEvent(UserEventMessage {
+    ltime: 5.into(),
+    cc: false,
+    name: "post-shutdown".into(),
+    payload: bytes::Bytes::from_static(b"x"),
+  })
+  .encode()
+  .unwrap();
+  e.test_inject_user_packet(addr(1002), serf_bytes, memberlist_proto::Instant::ORIGIN);
+
+  assert!(
+    e.poll_event().is_none(),
+    "ingress must emit nothing new after shutdown"
+  );
+  assert_eq!(
+    e.event_time(),
+    event_time_before,
+    "ingress must not advance the event clock after shutdown"
+  );
+  assert_eq!(
+    e.num_members(),
+    members_before,
+    "ingress must not change membership after shutdown"
+  );
+}
+
+#[test]
+fn shutdown_timers_are_quiet() {
+  let mut e = ep();
+  // A live endpoint schedules serf deadlines (reap / reconnect / queue-check).
+  assert!(
+    e.core_mut().serf_poll_timeout().is_some(),
+    "a live machine schedules serf deadlines"
+  );
+
+  shut_down_via_lost_conflict(&mut e);
+
+  // A Shutdown machine schedules no serf wakeup (reverting the serf_poll_timeout
+  // gate surfaces the still-armed next_reap → this fails).
+  assert!(
+    e.core_mut().serf_poll_timeout().is_none(),
+    "a Shutdown machine must schedule no serf deadline"
+  );
+
+  // A timer tick far past every deadline fires no serf work: no reap, reconnect,
+  // query-close, or leave-completion, and its ingress drain is inert.
+  let far = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(86_400);
+  e.handle_timeout(far);
+  assert!(
+    e.poll_event().is_none(),
+    "a Shutdown machine must emit no serf event on a timer tick"
+  );
+  assert!(
+    e.state().is_shutdown(),
+    "a Shutdown machine stays Shutdown across a timer tick"
   );
 }
 
