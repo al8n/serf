@@ -7922,6 +7922,28 @@ fn overdue_member_window_flushes_before_a_late_same_id_event() {
 }
 
 #[test]
+fn backward_ingress_after_a_newer_event_does_not_backdate_the_window() {
+  // The coalescer schedules on a monotonic clock, so a delayed reliable-ingress
+  // member event carrying an earlier arrival time — processed after a newer
+  // command — must not move an active window's deadline into the past.
+  let mut e = ep_member_coalescing(); // coalesce 10s, quiescent 2s
+  e.test_inner_node_joined(2, t_secs(100)); // arms the window; deadline 100 + 2 = 102
+  assert_eq!(e.core_mut().test_member_flush_deadline(), Some(t_secs(102)));
+
+  // A join carrying an EARLIER arrival time, processed after the newer join.
+  e.test_inner_node_joined(3, t_secs(50));
+  assert_eq!(
+    e.core_mut().test_member_flush_deadline(),
+    Some(t_secs(102)),
+    "an older interposed ingress event must not backdate the active window"
+  );
+  assert!(
+    e.poll_event().is_none(),
+    "both joins remain buffered — the deadline was not backdated into the past"
+  );
+}
+
+#[test]
 fn overdue_user_window_flushes_before_a_late_newer_generation() {
   // The user coalescer keeps only the newest generation per name. A newer
   // generation fed after the window is due must not silently supersede a due

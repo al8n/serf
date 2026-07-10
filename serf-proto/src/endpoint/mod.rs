@@ -792,6 +792,13 @@ where
   /// Callers that do not have a meaningful `now` (e.g., `poll_event` called
   /// after a prior handle call) use the last latched value.
   drain_now: Instant,
+  /// Monotonically non-decreasing processing clock for coalescer window
+  /// scheduling.  `drain_now` carries protocol arrival time, which is NOT
+  /// monotonic — reliable ingress can be processed after a newer command yet
+  /// carry an earlier `received_at`.  Feeding that raw value to the coalescer
+  /// would move an active window's quiescent deadline backward and flush it
+  /// prematurely, so the coalescer arms from this max-clamped clock instead.
+  coalesce_now: Instant,
   /// Dirty flag for the push-pull local-state snapshot (H6).
   ///
   /// Set whenever any of the three Lamport clocks, member status-ltimes,
@@ -907,6 +914,7 @@ where
       member_coalescer,
       user_coalescer,
       drain_now: Instant::ORIGIN,
+      coalesce_now: Instant::ORIGIN,
       // The snapshot starts dirty so the first push-pull always ships a fresh
       // body even if no explicit API call has been made yet.
       local_state_dirty: true,
@@ -1224,6 +1232,8 @@ where
   /// Flush each enabled coalescer whose window has closed at `now` into
   /// `pending_events`.
   fn flush_due_coalescers(&mut self, now: Instant) {
+    let now = self.coalesce_now.max(now);
+    self.coalesce_now = now;
     if let Some(c) = self.member_coalescer.as_mut() {
       if c.due(now) {
         c.flush(&mut self.pending_events);
@@ -1817,7 +1827,8 @@ where
   /// disabled (the default) performs.  The feed is armed at `self.drain_now`,
   /// the freshest instant the machine has latched.
   fn emit_member(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>) {
-    let now = self.drain_now;
+    let now = self.coalesce_now.max(self.drain_now);
+    self.coalesce_now = now;
     if let Some(c) = self.member_coalescer.as_mut() {
       // The window may have elapsed while the driver was busy and has not yet
       // fired the overdue flush timer. Flush the completed batch before the new
@@ -1843,7 +1854,8 @@ where
   /// coalescer's `handle` predicate (`CrateEvent::User(e) => e.cc()`): only
   /// coalescable user events are buffered.
   fn emit_user(&mut self, msg: UserEventMessage) {
-    let now = self.drain_now;
+    let now = self.coalesce_now.max(self.drain_now);
+    self.coalesce_now = now;
     if msg.cc {
       if let Some(c) = self.user_coalescer.as_mut() {
         // Flush an elapsed-but-not-yet-fired window before the new event mutates
