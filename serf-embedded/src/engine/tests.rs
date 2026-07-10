@@ -2076,3 +2076,155 @@ fn key_rotation_reencrypts_gossip_and_rejects_removed_key() {
     "a frame under the removed key K1 must be rejected by the rotated engine"
   );
 }
+
+// ── Cross-cipher (dual-backend) ambiguity regressions ────────────────────────
+//
+// These need BOTH AEAD backends so an AES-256 key and a ChaCha20-Poly1305 key can
+// share the same 32 raw bytes yet be DISTINCT keys — the twin the byte-keyed
+// coordinator ops (`promote`/`remove_secondary`) cannot tell apart. Gated on both
+// features accordingly.
+
+/// A fixed AES-256-GCM key filled with `fill`.
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn aes256(fill: u8) -> SecretKey {
+  SecretKey::Aes256([fill; 32])
+}
+
+/// A fixed ChaCha20-Poly1305 key filled with `fill` — the cross-cipher byte twin of
+/// `aes256(fill)` (identical bytes, different variant, so `!=` under `SecretKey`'s
+/// variant-inclusive equality).
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn chacha(fill: u8) -> SecretKey {
+  SecretKey::ChaCha20Poly1305([fill; 32])
+}
+
+/// Fallible sibling of [`make_encrypted_engine`] that surfaces the construction
+/// `InitError` instead of panicking, for the construction-preflight assertion.
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+fn try_make_encrypted_engine(
+  id: &str,
+  port: u16,
+  keyring: Keyring,
+) -> Result<SerfEngine<SmolStr, u32>, InitError> {
+  let cfg = Options::new()
+    .with_port(port)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new(id), node_addr(port));
+  let transform =
+    TransformOptions::default().with_encryption(EncryptionOptions::new().with_keyring(keyring));
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  SerfEngine::try_new_at(cfg, transform, ep_cfg, SerfOptions::new(), now, test_rng())
+}
+
+/// The chokepoint is variant-exact: a key op naming one cipher can never touch a
+/// byte-twin of another cipher, and installing a twin is refused — while exact
+/// (variant + bytes) ops still apply. Every wrong-variant assertion fails on the
+/// byte-keyed revert (which would promote/remove/install the wrong cipher's key
+/// and report success).
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn cross_cipher_key_ops_are_variant_exact() {
+  let k1 = aes256(0x11); // primary
+  let x_aes = aes256(0x22); // the AES twin, installed as a secondary
+  let x_chacha = chacha(0x22); // its cross-cipher byte twin (same bytes, ChaCha)
+  let mut engine = make_encrypted_engine("a", 7946, Keyring::with_secondaries(k1, [x_aes]));
+  let before = engine.keyring().unwrap().secondaries().to_vec();
+
+  // use(ChaCha(X)) must NOT promote the byte-twin AES256(X): the exact ChaCha key is
+  // absent. Refused, ring unchanged. (Revert: promotes AES256(X), reports success.)
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Use, Some(x_chacha)));
+  assert!(
+    !resp.result,
+    "use of an absent cross-cipher twin must be refused"
+  );
+  assert_eq!(
+    engine.keyring().unwrap().primary_ref(),
+    &k1,
+    "a refused use must not move the primary"
+  );
+  assert_eq!(
+    engine.keyring().unwrap().secondaries(),
+    before.as_slice(),
+    "a refused use must not change the ring"
+  );
+
+  // remove(ChaCha(X)) must NOT drop the byte-twin AES256(X). (Revert: removes it.)
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Remove, Some(x_chacha)));
+  assert!(
+    !resp.result,
+    "remove of an absent cross-cipher twin must be refused"
+  );
+  assert!(
+    engine.keyring().unwrap().secondaries().contains(&x_aes),
+    "the AES twin must remain installed after a refused cross-cipher remove"
+  );
+
+  // install(ChaCha(X)) while AES256(X) is present is a cross-cipher collision:
+  // refused, ring unchanged. (Revert: inserts ChaCha(X), producing an ambiguous
+  // twin ring and reporting success.)
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::Install, Some(x_chacha)));
+  assert!(
+    !resp.result,
+    "installing a cross-cipher byte twin must be refused"
+  );
+  assert!(
+    !engine.keyring().unwrap().secondaries().contains(&x_chacha),
+    "a refused cross-cipher install must not add the twin"
+  );
+  assert_eq!(
+    engine.keyring().unwrap().secondaries(),
+    before.as_slice(),
+    "a refused cross-cipher install must not change the ring"
+  );
+
+  // Exact-variant ops still apply. Install a genuinely new ChaCha key (no byte twin
+  // present), promote it by its exact variant, and remove the AES twin by ITS true
+  // variant — every one succeeds.
+  let z_chacha = chacha(0x33);
+  assert!(
+    engine
+      .apply_key_request(&key_op(KeyRequestOperation::Install, Some(z_chacha)))
+      .result,
+    "installing a non-colliding ChaCha key must succeed"
+  );
+  assert!(engine.keyring().unwrap().secondaries().contains(&z_chacha));
+  assert!(
+    engine
+      .apply_key_request(&key_op(KeyRequestOperation::Use, Some(z_chacha)))
+      .result,
+    "promoting the exact ChaCha key must succeed"
+  );
+  assert_eq!(
+    engine.keyring().unwrap().primary_ref(),
+    &z_chacha,
+    "the exact ChaCha key must become the primary"
+  );
+  assert!(
+    engine
+      .apply_key_request(&key_op(KeyRequestOperation::Remove, Some(x_aes)))
+      .result,
+    "removing the AES key by its true variant must succeed"
+  );
+  assert!(
+    !engine.keyring().unwrap().secondaries().contains(&x_aes),
+    "the AES key must be gone after an exact-variant remove"
+  );
+}
+
+/// Construction refuses a seed keyring that already carries a cross-cipher byte
+/// twin, so an ambiguous ring can never reach the running chokepoint. Fails on the
+/// revert: without the preflight the ring is individually usable and constructs.
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn construction_rejects_a_keyring_with_cross_cipher_byte_twins() {
+  // AES256(X) primary + ChaCha20-Poly1305(X) secondary: identical bytes, different
+  // ciphers — an ambiguous ring for the byte-keyed rotation ops.
+  let keyring = Keyring::with_secondaries(aes256(0x11), [chacha(0x11)]);
+  match try_make_encrypted_engine("a", 7946, keyring) {
+    Err(InitError::Encryption(_)) => {}
+    Err(other) => {
+      panic!("expected InitError::Encryption for a cross-cipher twin keyring, got {other:?}")
+    }
+    Ok(_) => panic!("construction must reject a keyring carrying cross-cipher byte twins"),
+  }
+}
