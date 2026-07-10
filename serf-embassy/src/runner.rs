@@ -2,7 +2,7 @@
 //! as sibling futures.
 //!
 //! One embassy task owns the [`Runner`] and calls [`Runner::run`]. Inside, two
-//! kinds of future run concurrently under one `join`:
+//! kinds of future race under one `select`:
 //!
 //! - the **pump loop** — re-pump the engine over a fresh
 //!   [`SerfGossip`](crate::SerfGossip) + [`SerfStream`](crate::SerfStream) view,
@@ -11,6 +11,11 @@
 //!   pump-wake, the folded deadline timer} fires first;
 //! - the **N workers** — each [`run_slot`](crate::worker::run_slot) owns one
 //!   `TcpSocket` and its `RefCell<Mailbox>`, looping internally forever.
+//!
+//! Both diverge under normal operation, so the `select` never resolves and the task
+//! runs forever. A lost id-conflict [`Event::Shutdown`](serf_embedded::Event) is the
+//! one terminal exit: the pump loop observes the poisoned shared state and returns,
+//! collapsing the `select` — the worker futures drop and every socket winds down.
 //!
 //! Only the pump loop re-pumps; the workers loop on their own. Because
 //! [`SerfEngine::pump`](serf_embedded::SerfEngine::pump) is synchronous, the
@@ -37,7 +42,7 @@ use core::{cell::RefCell, net::SocketAddr};
 use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 
 use embassy_futures::{
-  join::{join, join_array},
+  join::join_array,
   select::{select, select3},
 };
 use embassy_net::{tcp::TcpSocket, udp::UdpSocket};
@@ -109,11 +114,16 @@ where
   G: Rng,
   SR: Rng + SeedableRng,
 {
-  /// Drive the node forever: pump the engine and run the `N` workers concurrently.
+  /// Drive the node: pump the engine and run the `N` workers concurrently.
   ///
-  /// Never returns under normal operation; spawn it as an embassy task (or drive
-  /// it with `select` against an operation in a test).
-  pub async fn run(self) -> ! {
+  /// Runs forever under normal operation — spawn it as an embassy task (or drive
+  /// it with `select` against an operation in a test). It returns ONLY after a lost
+  /// id-conflict [`Event::Shutdown`](serf_embedded::Event::Shutdown): the pump loop
+  /// observes the poisoned shared state, performs its final drain, and returns,
+  /// which resolves the `select` below and drops the worker futures — so this frame
+  /// unwinds and the owned sockets (the TCP pool and the gossip UDP socket) close,
+  /// taking the losing node off the wire.
+  pub async fn run(self) {
     let Runner {
       shared,
       udp,
@@ -147,16 +157,23 @@ where
       )
     });
 
-    // The pump loop and the workers run as siblings under one join. The pump loop
-    // diverges (loops forever); `join_array` of the diverging workers likewise
-    // never completes, so `join` never resolves — matching the `-> !` contract.
-    join(
+    // The pump loop and the workers race under one `select`. Under normal operation
+    // the pump loop diverges (loops forever) and `join_array` of the diverging
+    // workers likewise never completes, so the `select` never resolves and `run`
+    // never returns. On a lost id-conflict shutdown the pump loop RETURNS after its
+    // final drain; the `select` then completes and DROPS the worker futures,
+    // releasing their `&mut TcpSocket` borrows. `run` then returns and the owned
+    // sockets close as this frame unwinds — the structural teardown that stops the
+    // losing node without any per-worker abort.
+    //
+    // Ignoring the `Either`: only the pump-loop arm can ever resolve (the workers
+    // diverge), and its `()` output carries nothing — reaching here means shutdown,
+    // and `run` simply returns.
+    let _ = select(
       pump_loop(&shared, &udp, &mailboxes, &cmd_wakes, &mut free, &loopback),
       join_array(workers),
     )
     .await;
-
-    core::unreachable!("the run loop and workers never complete")
   }
 }
 
@@ -169,8 +186,7 @@ async fn pump_loop<I, G, SR>(
   cmd_wakes: &[SlotWake],
   free: &mut Vec<SlotId>,
   loopback: &RefCell<VecDeque<Vec<u8>>>,
-) -> !
-where
+) where
   I: memberlist_proto::Id + Clone,
   G: Rng,
   SR: Rng + SeedableRng,
@@ -208,6 +224,17 @@ where
     // deadline so the next wake re-pumps at once rather than sleeping past it.
     if !settled {
       next = min_opt(next, Some(now));
+    }
+
+    // A lost id-conflict `Event::Shutdown` observed by the drain above poisoned the
+    // shared state. The pump+drain that just ran was the FINAL one — every remaining
+    // event is buffered for the app's `poll_event` — so stop pumping now instead of
+    // sleeping. Returning ends this future, which resolves `Runner::run`'s `select`
+    // and collapses the workers so the sockets wind down (an abrupt stop: a lost
+    // node does not gossip a leave for the id it just lost, which would only
+    // confuse the winner).
+    if shared.is_shutdown() {
+      return;
     }
 
     // Wait for the next thing worth re-pumping for: an inbound gossip datagram, a

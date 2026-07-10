@@ -112,6 +112,19 @@ where
     self.shutdown.get()
   }
 
+  /// Poison the shared state on a lost id-conflict [`Event::Shutdown`]: latch the
+  /// one-way shutdown flag, then wake the parked joins (so a join in flight
+  /// resolves with the shutdown error rather than hang) and the pump loop (so it
+  /// observes the latch after its final drain and stops, collapsing the workers so
+  /// every socket winds down). Idempotent — a repeated shutdown re-signals but the
+  /// latch never clears.
+  #[inline]
+  pub(crate) fn begin_shutdown(&self) {
+    self.shutdown.set(true);
+    self.join_wake.signal(());
+    self.pump_wake.signal(());
+  }
+
   /// Buffer one event for [`poll_event`](crate::Serf::poll_event), bounding the
   /// backlog at [`DEFAULT_EVENT_BUFFER_CAP`] with drop-oldest so a never-draining
   /// app cannot grow memory without bound.
@@ -124,6 +137,22 @@ where
         .set(self.app_events_dropped.get() + 1);
     }
     q.push_back(ev);
+  }
+
+  /// Drive the exact effect the post-pump drain takes when it observes a lost
+  /// id-conflict [`Event::Shutdown`]: buffer the terminal event for the app's
+  /// [`poll_event`](crate::Serf::poll_event), then poison the shared state
+  /// ([`begin_shutdown`](Self::begin_shutdown)).
+  ///
+  /// The engine emits `Event::Shutdown` only from its conflict-resolution vote
+  /// tally (`close_conflict_query`), which the paired two-node harness cannot drive
+  /// to a deterministic majority; this stands in for that vote loss so the driver's
+  /// terminal-shutdown enforcement (pump stop, socket teardown, command rejection,
+  /// join poisoning) is testable end-to-end without a fabricated cluster.
+  #[cfg(any(test, feature = "std"))]
+  pub(crate) fn simulate_conflict_shutdown(&self) {
+    self.push_app_event(Event::Shutdown);
+    self.begin_shutdown();
   }
 }
 
@@ -165,9 +194,11 @@ where
       let ev = self.engine.borrow_mut().poll_event();
       let Some(ev) = ev else { break };
       match &ev {
-        // A lost id-conflict vote means the local node MUST stop; flag it. The
-        // event still reaches the app via `poll_event`.
-        Event::Shutdown => self.shutdown.set(true),
+        // A lost id-conflict vote means the local node MUST stop: poison the shared
+        // state so the pump loop halts after this drain and any parked join resolves
+        // with the shutdown error. The event still reaches the app via `poll_event`
+        // (buffered below).
+        Event::Shutdown => self.begin_shutdown(),
         // An inbound key-management request: apply the op to the engine's LIVE wire
         // keyring and answer the originator in one call. The response is a directed
         // gossip transmit egressed on the re-pump the runner performs while `queued`

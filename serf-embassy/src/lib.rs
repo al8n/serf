@@ -38,7 +38,7 @@ mod worker;
 
 pub use bytes::Bytes;
 pub use config::Options;
-pub use error::{InitError, JoinError, SocketTimeoutOutOfRange};
+pub use error::{InitError, JoinError, OpError, SocketTimeoutOutOfRange};
 pub use gossip_io::SerfGossip;
 pub use resolver::{AddressResolver, SocketAddrResolver};
 pub use runner::Runner;
