@@ -43,7 +43,7 @@ impl Resolver for EmptyResolver {
 }
 
 #[cfg(encryption)]
-use crate::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
+use crate::{EncryptionOptions, Keyring, KeyringDelegate, SecretKey, VoidKeyringDelegate};
 
 /// Build and spawn a TCP serf node bound to an ephemeral loopback port.
 async fn spawn_node(id: &str) -> Serf<SmolStr> {
@@ -896,4 +896,252 @@ async fn tcp_concurrent_dispatch_join_and_ignore_old_join_coexist() {
   a.shutdown().await.expect("cdj-a shuts down");
   b.shutdown().await.expect("cdj-b shuts down");
   c.shutdown().await.expect("cdj-c shuts down");
+}
+
+/// A [`KeyringDelegate`] that records, in order, every live keyring the driver
+/// publishes through `keyring_updated`. The driver fires it only after it has
+/// pushed the rotated ring to the endpoint via `set_encryption_options`, so the
+/// recorded ring is exactly the ring the gossip and reliable planes now encrypt
+/// under — the live-wire observable the rotation test asserts on. `!Send` behind an
+/// `Rc`, matching the compio driver's single-threaded keyring delegate.
+#[cfg(encryption)]
+#[derive(Default)]
+struct RecordingKeyring {
+  rings: core::cell::RefCell<Vec<Keyring>>,
+}
+
+#[cfg(encryption)]
+impl RecordingKeyring {
+  /// The keyrings observed so far, oldest first.
+  fn rings(&self) -> Vec<Keyring> {
+    self.rings.borrow().clone()
+  }
+}
+
+#[cfg(encryption)]
+impl KeyringDelegate for RecordingKeyring {
+  fn keyring_updated(&self, keyring: &Keyring) {
+    self.rings.borrow_mut().push(keyring.clone());
+  }
+}
+
+/// Build and spawn a TCP serf node on an ephemeral loopback port with `encryption`
+/// as its keyring policy and `keyring` as its rotation observer.
+#[cfg(encryption)]
+async fn spawn_encrypted_node_with_keyring(
+  id: &str,
+  encryption: EncryptionOptions,
+  keyring: std::rc::Rc<dyn KeyringDelegate>,
+) -> Serf<SmolStr> {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_encryption(encryption);
+  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    gossip_rng().expect("seed gossip rng"),
+    keyring,
+  )
+  .await
+  .expect("spawn serf node")
+}
+
+/// Drive `events` until the originator's next `KeyResponse` surfaces (emitted when
+/// the key query's deadline fires), draining any interleaved membership / gossip
+/// events so a backlog cannot stall the stream.
+#[cfg(encryption)]
+async fn next_key_response<S>(events: &mut S) -> serf_proto::event::KeyResponse<SmolStr>
+where
+  S: futures_util::Stream<Item = Event<SmolStr, SocketAddr>> + Unpin,
+{
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match events.next().await {
+        Some(Event::KeyResponse(kr)) => break kr,
+        Some(_) => {}
+        None => panic!("event stream closed before a KeyResponse"),
+      }
+    }
+  })
+  .await
+  .expect("a KeyResponse within the timeout")
+}
+
+/// Two encrypted nodes share primary K1, then A rotates the cluster to K2 via
+/// `install_key` -> `use_key` -> `remove_key` over the compio single-threaded
+/// stream driver. Each op propagates and every node applies it to its LIVE wire
+/// keyring. The fail-on-revert check reads both nodes' recorded live rings (and
+/// cross-checks cluster-wide via `list_keys`) and requires primary == K2 with K1
+/// gone — unreachable under the pre-fix shadow model; the observer must have fired
+/// exactly once per mutation and not for the read-only `list` or the refused final
+/// remove; finally a user event still propagates A -> B, proving the wire runs
+/// under K2 on both planes.
+#[cfg(encryption)]
+#[compio::test]
+async fn two_node_tcp_key_rotation_rotates_both_live_keyrings() {
+  use std::rc::Rc;
+
+  let k1 = test_secret_key(0x11);
+  let k2 = test_secret_key(0x22);
+
+  let rec_a = Rc::new(RecordingKeyring::default());
+  let rec_b = Rc::new(RecordingKeyring::default());
+  let enc = || EncryptionOptions::new().with_keyring(Keyring::new(k1));
+
+  let b = spawn_encrypted_node_with_keyring("rot-b", enc(), rec_b.clone()).await;
+  let a = spawn_encrypted_node_with_keyring("rot-a", enc(), rec_a.clone()).await;
+  let b_addr = b.advertise_address();
+
+  // Converge on a 2-member view under K1 (a real encrypted push/pull join).
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 2 && b.num_members() == 2 {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("both nodes converge to a 2-member cluster");
+
+  // Subscribe before issuing any key op so no KeyResponse races the subscription.
+  let mut a_events = a.events();
+  let mut b_events = b.events();
+
+  // install K2: both nodes gain it as a secondary in their live ring.
+  a.install_key(k2).await.expect("install_key dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert!(
+    kr.num_resp >= 2,
+    "install_key must collect a response from BOTH nodes (num_resp={})",
+    kr.num_resp
+  );
+  assert_eq!(kr.num_err, 0, "install_key must succeed on every node");
+
+  // use K2: both nodes promote it to primary.
+  a.use_key(k2).await.expect("use_key dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert_eq!(kr.num_err, 0, "use_key must succeed on every node");
+
+  // remove K1: both nodes drop the old key.
+  a.remove_key(k1).await.expect("remove_key dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert_eq!(kr.num_err, 0, "remove_key must succeed on every node");
+
+  // FAIL-ON-REVERT: each node's observer captured exactly the ring the driver
+  // published to its endpoint at each mutation, in order — install adds K2 as a
+  // secondary under K1, use promotes K2, remove drops K1. Under the pre-fix shadow
+  // model the coordinator keyring never rotated, so this sequence is unreachable.
+  for (name, rec) in [("rot-a", &rec_a), ("rot-b", &rec_b)] {
+    let rings = rec.rings();
+    assert_eq!(
+      rings.len(),
+      3,
+      "{name}: the observer fires exactly once per successful mutation"
+    );
+    assert_eq!(
+      rings[0].primary_ref(),
+      &k1,
+      "{name}: install leaves K1 as primary"
+    );
+    assert!(
+      rings[0].secondaries().contains(&k2),
+      "{name}: install adds K2 as a secondary"
+    );
+    assert_eq!(rings[1].primary_ref(), &k2, "{name}: use promotes K2");
+    assert_eq!(
+      rings[2].primary_ref(),
+      &k2,
+      "{name}: K2 stays primary after the remove"
+    );
+    assert!(
+      !rings[2].secondaries().contains(&k1),
+      "{name}: the removed K1 is absent from the live keyring"
+    );
+  }
+
+  // Independent, endpoint-direct cluster cross-check: `list_keys` tallies every
+  // node's LIVE ring — K2 primary on BOTH nodes and K1 installed on none.
+  a.list_keys().await.expect("list_keys dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert_eq!(
+    kr.primary_keys.get(&k2).copied(),
+    Some(2),
+    "both nodes report K2 as their live primary"
+  );
+  assert_eq!(
+    kr.keys.get(&k2).copied(),
+    Some(2),
+    "both nodes still hold K2 in their live ring"
+  );
+  assert_eq!(
+    kr.keys.get(&k1),
+    None,
+    "the removed K1 is installed on no node"
+  );
+
+  // `list_keys` is read-only: it must NOT have fired the observer.
+  assert_eq!(
+    rec_a.rings().len(),
+    3,
+    "list_keys does not fire the keyring observer"
+  );
+  assert_eq!(
+    rec_b.rings().len(),
+    3,
+    "list_keys does not fire the keyring observer"
+  );
+
+  // A refused op must not fire the observer either: removing the already-gone K1 is
+  // refused on every node, leaving both live rings — and the observer — untouched.
+  a.remove_key(k1).await.expect("remove_key dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert!(
+    kr.num_err >= 1,
+    "removing an absent key is refused (num_err={})",
+    kr.num_err
+  );
+  assert_eq!(
+    rec_a.rings().len(),
+    3,
+    "a refused op does not fire the keyring observer"
+  );
+  assert_eq!(
+    rec_b.rings().len(),
+    3,
+    "a refused op does not fire the keyring observer"
+  );
+
+  // Post-rotation traffic proof: a user event still crosses the wire, which now runs
+  // under K2 on both nodes — the reliable and gossip planes rotated with the keyring.
+  a.user_event("after-rotation", Bytes::from_static(b"payload"), false)
+    .await
+    .expect("user_event from a running node");
+  let saw = compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match b_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "after-rotation" => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .expect("B observes the post-rotation user event within the timeout");
+  assert!(
+    saw,
+    "a user event must still propagate A -> B after the rotation (wire under K2)"
+  );
+
+  a.shutdown().await.expect("rot-a shuts down");
+  b.shutdown().await.expect("rot-b shuts down");
 }
