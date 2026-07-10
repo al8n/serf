@@ -1133,6 +1133,16 @@ where
     // Query-close: tally and expire any pending queries whose deadline elapsed.
     self.fire_due_query_closes(now);
 
+    // A lost id-conflict vote in the query-close pass transitions the machine to
+    // Shutdown. Nothing may follow the terminal Event::Shutdown, so skip the rest
+    // of this pass's deadline work (received-query prune, leave-complete/broadcast
+    // clears): it would prune protocol state or transition after the terminal
+    // event. `serf_poll_timeout` returns `None` once Shutdown, so the un-cleared
+    // leave deadlines never respin the driver.
+    if self.state.is_shutdown() {
+      return;
+    }
+
     // Prune expired received-query tokens.  Entries for which respond() succeeded
     // are removed there; this catches those whose deadline elapsed without a
     // respond() call (driver missed the response window).
@@ -4918,6 +4928,13 @@ where
             self.close_key_query(pq);
           }
         }
+        // A lost conflict close transitions the machine to Shutdown mid-loop.
+        // Stop before closing any remaining due query so nothing is emitted
+        // after the terminal Event::Shutdown (e.g. a same-deadline KeyResponse):
+        // the delivery contract is that nothing follows Event::Shutdown.
+        if self.state.is_shutdown() {
+          break;
+        }
         // Do not advance i: swap_remove replaced index i with the last element.
       } else {
         i += 1;
@@ -5306,15 +5323,25 @@ where
   ///
   /// The local state is marked dirty so the next push-pull egress ships the
   /// recovered clock state.
+  ///
+  /// Refuses with [`Error::Shutdown`] on a machine that lost an id-conflict vote,
+  /// before any mutation: replay is a public origination path (it advances the
+  /// Lamport clocks, dirties the snapshot, and dials every recorded peer), so a
+  /// terminated node must not be able to resurrect itself through it.
   pub(crate) fn load_snapshot<T>(
     &mut self,
     t: &mut T,
     replay: crate::snapshot::ReplayResult<I, A>,
     now: Instant,
-  ) where
+  ) -> Result<(), Error>
+  where
     T: Reliable<I, A>,
     A: Clone,
   {
+    // Terminal-state gate: refuse before any mutation so a Shutdown conflict
+    // loser can neither advance its clocks nor originate rejoin dials.
+    self.ensure_not_shutdown()?;
+
     // G5: advance the member clock to at least last_clock.
     // Whole-message drop gate: a corrupt or adversarially-crafted snapshot with
     // an unacceptable ltime must not advance the local clock.
@@ -5362,6 +5389,7 @@ where
       t.start_push_pull(addr, PushPullKind::Join, now);
       self.drain_inner(t);
     }
+    Ok(())
   }
 
   // ── PingCompleted handler (G9 both halves) ───────────────────────────────

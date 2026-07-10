@@ -679,11 +679,13 @@ where
   }
 
   /// Forwards to [`Endpoint::load_snapshot`].
+  ///
+  /// Refuses with [`Error::Shutdown`] on a machine that lost an id-conflict vote.
   pub fn load_snapshot(
     &mut self,
     replay: crate::snapshot::ReplayResult<I, SocketAddr>,
     now: Instant,
-  ) {
+  ) -> Result<(), Error> {
     self.core.load_snapshot(&mut self.transport, replay, now)
   }
 

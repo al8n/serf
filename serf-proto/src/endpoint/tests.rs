@@ -2283,6 +2283,126 @@ fn conflict_loss_transitions_to_shutdown_and_still_delivers_event() {
   );
 }
 
+// ── same-tick conflict-loss ordering (mid-loop / mid-pass transition) ─────────
+//
+// When a due conflict close loses the vote and shuts the machine down partway
+// through the timeout pass, the remaining due-query closes and the rest of the
+// deadline work must not run: nothing may be produced after Event::Shutdown.
+
+#[test]
+fn same_tick_conflict_loss_stops_remaining_due_conflict_query() {
+  // Two conflict queries (both losing) share a deadline; the received-query
+  // prune of this pass would evict an expired token.  The first close transitions
+  // to Shutdown, so the loop must stop before the second close (only ONE
+  // Event::Shutdown) and the prune must not run (token retained).
+  let mut e = ep();
+  let deadline = t_secs(10);
+
+  // First losing conflict query (1 agree, 2 disagree → matching 1 < majority 2).
+  let cq1 = e.test_register_conflict_query(deadline);
+  e.test_fold_conflict_response(cq1, 200u32, true);
+  e.test_fold_conflict_response(cq1, 201u32, false);
+  e.test_fold_conflict_response(cq1, 202u32, false);
+
+  // Bump the query clock so the second conflict query gets a distinct QueryId
+  // (test_register_conflict_query stamps the ltime from the query clock).
+  e.test_set_clocks(0, 0, 1);
+  let cq2 = e.test_register_conflict_query(deadline);
+  e.test_fold_conflict_response(cq2, 210u32, true);
+  e.test_fold_conflict_response(cq2, 211u32, false);
+  e.test_fold_conflict_response(cq2, 212u32, false);
+
+  // An expired received-query token: the prune step, if reached, evicts it.
+  let _token = e.test_register_received_query(
+    QueryId {
+      ltime: LamportTime::new(1),
+      id: 5,
+    },
+    addr(1002),
+    t_secs(1),
+  );
+  assert_eq!(
+    e.test_received_queries_len(),
+    1,
+    "the received-query token is present before the tick"
+  );
+
+  // One tick past the shared deadline drives the whole after_inner_timeout pass.
+  e.handle_timeout(t_secs(20));
+
+  let mut shutdowns = 0;
+  while let Some(ev) = e.poll_event() {
+    if matches!(ev, Event::Shutdown) {
+      shutdowns += 1;
+    }
+  }
+  // Reverting the mid-loop break closes the second losing conflict query too,
+  // emitting a second Event::Shutdown → this fails.
+  assert_eq!(
+    shutdowns, 1,
+    "only one Event::Shutdown: the loop must stop at the first conflict loss"
+  );
+  // Reverting the after_inner_timeout early-return runs the prune → len 0 → fails.
+  assert_eq!(
+    e.test_received_queries_len(),
+    1,
+    "the received-query prune must not run after the same-tick Shutdown"
+  );
+}
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn same_tick_conflict_loss_stops_remaining_due_key_query() {
+  // A conflict query (losing) is registered FIRST and a key query shares its
+  // deadline.  When the conflict close shuts the machine down mid-loop, the loop
+  // must stop before closing the key query, so no KeyResponse is ever enqueued
+  // after Event::Shutdown, and the received-query prune of the pass must not run.
+  let mut e = ep();
+  let deadline = t_secs(10);
+
+  let cq = e.test_register_conflict_query(deadline);
+  e.test_fold_conflict_response(cq, 200u32, true);
+  e.test_fold_conflict_response(cq, 201u32, false);
+  e.test_fold_conflict_response(cq, 202u32, false);
+
+  // Key query at the SAME deadline, registered second (distinct QueryId: id 77).
+  let _kq = e.test_register_key_query(deadline);
+
+  let _token = e.test_register_received_query(
+    QueryId {
+      ltime: LamportTime::new(1),
+      id: 5,
+    },
+    addr(1002),
+    t_secs(1),
+  );
+  assert_eq!(e.test_received_queries_len(), 1);
+
+  e.handle_timeout(t_secs(20));
+
+  let mut events = vec![];
+  while let Some(ev) = e.poll_event() {
+    events.push(ev);
+  }
+  // Event::Shutdown must be the LAST event, and no KeyResponse may appear at all.
+  // Reverting the mid-loop break closes the key query after the Shutdown →
+  // KeyResponse lands after Shutdown → both assertions fail.
+  assert!(
+    matches!(events.last(), Some(Event::Shutdown)),
+    "Event::Shutdown must be the last event delivered, got {events:?}"
+  );
+  assert!(
+    !events.iter().any(|ev| matches!(ev, Event::KeyResponse(_))),
+    "no KeyResponse may follow the conflict-loss Shutdown, got {events:?}"
+  );
+  // Reverting the after_inner_timeout early-return runs the prune → len 0 → fails.
+  assert_eq!(
+    e.test_received_queries_len(),
+    1,
+    "the received-query prune must not run after the same-tick Shutdown"
+  );
+}
+
 // ── post-Shutdown chokepoint contract ────────────────────────────────────────
 //
 // A machine that lost an id-conflict vote transitions to `SerfState::Shutdown`
@@ -2431,6 +2551,68 @@ fn shutdown_refuses_key_management() {
   assert!(
     matches!(refused, Err(Error::Shutdown)),
     "respond_key must be refused after shutdown"
+  );
+}
+
+#[test]
+fn shutdown_refuses_load_snapshot_replay() {
+  // snapshot replay is a public origination path: on an Alive machine it advances
+  // the Lamport clocks, dirties the snapshot, and dials every recorded peer.  A
+  // Shutdown conflict loser must refuse it with Error::Shutdown before any
+  // mutation — otherwise it could resurrect itself and rejoin the cluster.
+  let mut e = ep();
+  shut_down_via_lost_conflict(&mut e);
+
+  // Clear dirty so the no-mutation assertion is unambiguous, then snapshot every
+  // observable the replay would move.
+  e.test_clear_dirty();
+  let member_before = e.member_time();
+  let event_before = e.event_time();
+  let query_before = e.query_time();
+  let event_min_before = e.test_event_min_time();
+  let query_min_before = e.test_query_min_time();
+
+  // A replay that WOULD advance all three clocks and dial peer 2 on an Alive node.
+  let replay = ReplayResult {
+    alive_nodes: vec![snapshot_node(1, 7946), snapshot_node(2, 1002)],
+    last_clock: 40.into(),
+    last_event_clock: 50.into(),
+    last_query_clock: 60.into(),
+  };
+  assert!(
+    matches!(
+      e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN),
+      Err(Error::Shutdown)
+    ),
+    "load_snapshot must refuse on a Shutdown machine"
+  );
+
+  // Reverting the ensure_not_shutdown gate advances these clocks, dirties the
+  // snapshot, and pushes the rejoin dial → each assertion below fails.
+  assert_eq!(e.member_time(), member_before, "member clock unchanged");
+  assert_eq!(e.event_time(), event_before, "event clock unchanged");
+  assert_eq!(e.query_time(), query_before, "query clock unchanged");
+  assert_eq!(
+    e.test_event_min_time(),
+    event_min_before,
+    "event min_time unchanged"
+  );
+  assert_eq!(
+    e.test_query_min_time(),
+    query_min_before,
+    "query min_time unchanged"
+  );
+  assert!(
+    !e.test_is_dirty(),
+    "the refused replay must not dirty the snapshot"
+  );
+  assert!(
+    e.test_rejoin_dials().is_empty(),
+    "a Shutdown machine must originate no rejoin dials"
+  );
+  assert!(
+    e.poll_event().is_none(),
+    "the refused replay must enqueue no event"
   );
 }
 
@@ -2651,7 +2833,8 @@ fn load_snapshot_sets_member_clock_to_last_clock() {
     last_event_clock: 0.into(),
     last_query_clock: 0.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // G5: member clock >= last_clock.
   assert!(
     e.member_time() >= 5,
@@ -2668,7 +2851,8 @@ fn load_snapshot_sets_event_min_time_to_last_event_clock_plus_one() {
     last_event_clock: 7.into(),
     last_query_clock: 0.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // G5: event_buffer.min_time = last_event_clock + 1 = 8.
   assert_eq!(
     e.test_event_min_time(),
@@ -2686,7 +2870,8 @@ fn load_snapshot_sets_query_min_time_to_last_query_clock_plus_one() {
     last_event_clock: 0.into(),
     last_query_clock: 9.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // G5: query_buffer.min_time = last_query_clock + 1 = 10.
   assert_eq!(
     e.test_query_min_time(),
@@ -2709,7 +2894,8 @@ fn load_snapshot_skips_self_on_rejoin() {
     last_event_clock: 7.into(),
     last_query_clock: 9.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // Dials recorded via test_last_dial_addr: the reconnect should have been issued
   // for node 2 only (and none for self).
   let dialled = e.test_rejoin_dials();
@@ -2734,7 +2920,8 @@ fn load_snapshot_empty_alive_nodes_emits_no_dials() {
     last_event_clock: 2.into(),
     last_query_clock: 1.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   let dialled = e.test_rejoin_dials();
   assert!(dialled.is_empty(), "no dials for empty alive_nodes");
 }
@@ -2749,7 +2936,8 @@ fn load_snapshot_all_clocks_combined() {
     last_event_clock: 20.into(),
     last_query_clock: 30.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   assert!(e.member_time() >= 10, "member_time >= last_clock");
   assert_eq!(e.test_event_min_time(), 21, "event min_time = 20 + 1");
   assert_eq!(e.test_query_min_time(), 31, "query min_time = 30 + 1");
@@ -2766,7 +2954,8 @@ fn load_snapshot_marks_local_state_dirty() {
     last_event_clock: 0.into(),
     last_query_clock: 0.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // Dirty flag must be set so the first push-pull egress carries the recovered clocks.
   assert!(
     e.test_is_dirty(),
@@ -3097,7 +3286,8 @@ fn load_snapshot_advances_event_clock() {
     last_event_clock: 10.into(),
     last_query_clock: 0.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   assert!(
     e.event_time() >= 10,
     "event_clock must be advanced to at least last_event_clock after load_snapshot, got {}",
@@ -3116,7 +3306,8 @@ fn load_snapshot_advances_query_clock() {
     last_event_clock: 0.into(),
     last_query_clock: 20.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   assert!(
     e.query_time() >= 20,
     "query_clock must be advanced to at least last_query_clock after load_snapshot, got {}",
@@ -3135,7 +3326,8 @@ fn load_snapshot_event_clock_allows_new_events_above_floor() {
     last_event_clock: 10.into(),
     last_query_clock: 0.into(),
   };
-  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(r, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
   // Drain any pending events from load_snapshot.
   while e.poll_event().is_some() {}
   // Issue a new user event — must succeed and be delivered above the floor.
@@ -4018,7 +4210,8 @@ fn load_snapshot_max_clocks_are_ignored() {
     last_query_clock: LamportTime::new(u64::MAX),
     alive_nodes: vec![],
   };
-  e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN);
+  e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN)
+    .unwrap();
 
   assert_eq!(
     e.member_time(),
@@ -6620,7 +6813,7 @@ fn load_snapshot_near_watermark_no_panic_integrity_floor() {
   };
   let now = memberlist_proto::Instant::ORIGIN;
   // Must not panic.
-  e.load_snapshot(replay, now);
+  e.load_snapshot(replay, now).unwrap();
 
   // Integrity floor: buffer floors are not 0 and not u64::MAX.
   // (They will be LTIME_MAX = saturating_add(1) of LTIME_MAX - 1.)
@@ -6740,7 +6933,8 @@ fn load_snapshot_near_watermark_integrity_floor() {
       last_event_clock: LamportTime::new(LTIME_MAX - 1),
       last_query_clock: LamportTime::new(LTIME_MAX - 1),
     };
-    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN);
+    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN)
+      .unwrap();
 
     // Stored clocks = LTIME_MAX (degraded state); integrity floor: not 0, not u64::MAX.
     assert_ne!(
@@ -6793,7 +6987,8 @@ fn load_snapshot_near_watermark_integrity_floor() {
       last_event_clock: LamportTime::new(LTIME_MAX - 2),
       last_query_clock: LamportTime::new(LTIME_MAX - 2),
     };
-    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN);
+    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN)
+      .unwrap();
 
     // stored clocks: witness(LTIME_MAX - 2) → LTIME_MAX - 1 (saturating_add(1)).
     assert_eq!(
@@ -6838,7 +7033,8 @@ fn load_snapshot_near_watermark_integrity_floor() {
       last_event_clock: LamportTime::new(LTIME_MAX),
       last_query_clock: LamportTime::new(LTIME_MAX),
     };
-    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN);
+    e.load_snapshot(replay, memberlist_proto::Instant::ORIGIN)
+      .unwrap();
 
     // Clocks must not have advanced past their pre-snapshot values.
     assert_eq!(
@@ -6953,7 +7149,7 @@ fn all_clock_derived_values_satisfy_integrity_floor_after_near_watermark_snapsho
     last_query_clock: LamportTime::new(LTIME_MAX - 1),
   };
   let now = memberlist_proto::Instant::ORIGIN;
-  e.load_snapshot(replay, now);
+  e.load_snapshot(replay, now).unwrap();
 
   // After witnessing LTIME_MAX - 1, stored clocks = LTIME_MAX - 1.
   // Integrity floor: no 0, no u64::MAX.
