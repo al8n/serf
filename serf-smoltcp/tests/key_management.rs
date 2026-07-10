@@ -10,18 +10,20 @@
 //! (live keyring frozen at construction K1) cannot satisfy — then a post-rotation
 //! user event still crosses the wire, proving both planes now run under K2.
 
+// The whole suite exercises key rotation, so without an AEAD backend the file
+// compiles to nothing — gating item-by-item would leave the shared harness
+// helpers dead in a plaintext build.
+#![cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+
 mod harness;
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serf_smoltcp::{
-  Bytes, EndpointOptions, Event, Instant, MaybeResolved, Options, Serf, SerfOptions,
-  SocketAddrResolver, TransformOptions,
+  Bytes, EncryptionOptions, EndpointOptions, Event, Instant, Keyring, MaybeResolved, Options,
+  SecretKey, Serf, SerfOptions, SocketAddrResolver, TransformOptions,
 };
 use smol_str::SmolStr;
-
-#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-use serf_smoltcp::{EncryptionOptions, Keyring, SecretKey};
 
 fn addr(ip: u8, port: u16) -> SocketAddr {
   SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, ip)), port)
