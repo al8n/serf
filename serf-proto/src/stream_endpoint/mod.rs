@@ -1289,7 +1289,13 @@ where
   }
 
   /// Forwards to [`Endpoint::load_snapshot`].
-  pub fn load_snapshot(&mut self, replay: crate::snapshot::ReplayResult<I, A>, now: Instant)
+  ///
+  /// Refuses with [`Error::Shutdown`] on a machine that lost an id-conflict vote.
+  pub fn load_snapshot(
+    &mut self,
+    replay: crate::snapshot::ReplayResult<I, A>,
+    now: Instant,
+  ) -> Result<(), Error>
   where
     A: Clone,
   {
