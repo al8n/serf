@@ -1,15 +1,13 @@
-//! The conflict-loss shutdown is TERMINAL: a node that loses an id-conflict vote
-//! stops pumping, closes its sockets, and rejects further commands — so two nodes
-//! can never stay active under one identity.
+//! Shutdown is TERMINAL: a stopped node — whether it called `Serf::shutdown` or lost
+//! an id-conflict vote — stops pumping, closes its sockets, and rejects further
+//! commands, so two nodes can never stay active under one identity.
 //!
-//! serf emits `Event::Shutdown` only from its conflict-resolution vote tally, which
-//! the paired two-node harness cannot drive to a deterministic majority, so these
-//! tests inject the same terminal signal via the driver's `simulate_conflict_shutdown`
-//! seam (buffer the `Event::Shutdown` + poison the shared state, exactly as the run
-//! loop's post-pump drain does on a real vote loss) and assert the ENFORCEMENT the
-//! driver adds on top of that signal.
-
-#![allow(clippy::collapsible_if)]
+//! Both triggers reach the same terminal path (`begin_shutdown`). These end-to-end
+//! tests drive the public `Serf::shutdown` and assert that ENFORCEMENT: the runner
+//! future completes, the sockets wind down, in-flight and subsequent commands fail
+//! with the shutdown error, and a peer is unaffected. The extra `Event::Shutdown` a
+//! real vote loss surfaces on top (the engine emits it and the drain buffers it for
+//! the app) is covered by the driver's own `shared` unit test.
 
 mod support;
 
@@ -20,8 +18,7 @@ use embassy_net::StackResources;
 use embassy_time::{Duration, Timer};
 use futures::executor::block_on;
 use serf_embassy::{
-  Bytes, Event, JoinError, MaybeResolved, OpError, ReachedSet, SocketAddrResolver,
-  TransformOptions, now,
+  Bytes, JoinError, MaybeResolved, OpError, ReachedSet, SocketAddrResolver, TransformOptions, now,
 };
 
 use support::cluster::{
@@ -29,17 +26,16 @@ use support::cluster::{
   join_and_converge,
 };
 
-/// Two converged nodes; A loses an id-conflict vote. A's shutdown must be terminal —
-/// its `Runner::run` future completes (the pump stopped and the sockets wound down),
-/// a subsequent command fails fast with [`OpError::Shutdown`], yet the buffered
-/// terminal `Event::Shutdown` is still drainable via `poll_event` — while the winner
-/// B keeps running and keeps accepting commands.
+/// Two converged nodes; A calls the public `shutdown()`. A's stop must be terminal —
+/// its `Runner::run` future completes (the pump stopped and the sockets wound down)
+/// and every subsequent command fails fast with [`OpError::Shutdown`] — while the
+/// peer B keeps running and keeps accepting commands.
 ///
 /// Reverting the enforcement to flag-only (the pump keeps looping, the handle keeps
 /// accepting commands) makes A's runner never complete and the post-shutdown command
 /// succeed, so both assertions below fail.
 #[test]
-fn conflict_loss_stops_the_loser_and_spares_the_winner() {
+fn shutdown_stops_the_node_and_spares_the_peer() {
   let (dev_a, dev_b) = devices();
   let mut res_a = StackResources::<{ POOL + 2 }>::new();
   let mut res_b = StackResources::<{ POOL + 2 }>::new();
@@ -70,10 +66,10 @@ fn conflict_loss_stops_the_loser_and_spares_the_winner() {
       // Converge: B joins A, both reach a 2-member view.
       join_and_converge(&ml_a, &ml_b).await;
 
-      // A loses the id-conflict vote: the drain observes the terminal Event::Shutdown.
-      ml_a.simulate_conflict_shutdown();
+      // A stops abruptly via the public shutdown command.
+      ml_a.shutdown();
 
-      // The loser's flag flips AND its runner future completes (the pump stopped and
+      // A's flag flips AND its runner future completes (the pump stopped and
       // `Runner::run`'s select collapsed the workers, closing the sockets).
       loop {
         if ml_a.is_shutdown() && a_stopped.get() {
@@ -82,8 +78,7 @@ fn conflict_loss_stops_the_loser_and_spares_the_winner() {
         Timer::after(Duration::from_millis(2)).await;
       }
 
-      // The loser rejects further commands fast — it cannot keep acting under the
-      // duplicate identity.
+      // A rejects further commands fast — a stopped node cannot keep acting.
       let post = ml_a.user_event("post-shutdown", Bytes::from_static(b"x"), false);
       assert!(
         matches!(post, Err(OpError::Shutdown)),
@@ -94,24 +89,11 @@ fn conflict_loss_stops_the_loser_and_spares_the_winner() {
         "leave after shutdown must also be rejected"
       );
 
-      // The app can still drain the buffered terminal Event::Shutdown.
-      let mut saw_shutdown = false;
-      while let Some(ev) = ml_a.poll_event() {
-        if matches!(ev, Event::Shutdown) {
-          saw_shutdown = true;
-          break;
-        }
-      }
-      assert!(
-        saw_shutdown,
-        "the buffered Event::Shutdown must remain observable via poll_event"
-      );
-
-      // The winner keeps running: not shut down, and still accepting commands.
-      assert!(!ml_b.is_shutdown(), "the winner must not be shut down");
+      // The peer keeps running: not shut down, and still accepting commands.
+      assert!(!ml_b.is_shutdown(), "the peer must not be shut down");
       ml_b
-        .user_event("winner-still-live", Bytes::from_static(b"y"), false)
-        .expect("the winner keeps accepting commands");
+        .user_event("peer-still-live", Bytes::from_static(b"y"), false)
+        .expect("the peer keeps accepting commands");
       true
     };
 
@@ -128,13 +110,13 @@ fn conflict_loss_stops_the_loser_and_spares_the_winner() {
   });
 }
 
-/// A join in flight when the conflict-loss lands must resolve with
+/// A join in flight when a `shutdown()` lands must resolve with
 /// [`JoinError::Shutdown`] rather than spin its backstop forever, and the
 /// join's drop-cancel of the orphaned engine-side entry must be clean (no panic).
 #[test]
 fn join_in_flight_resolves_on_shutdown() {
   // A single node is enough: it joins an unreachable seed so the push/pull stays in
-  // flight, then loses the vote before the dial can resolve.
+  // flight, then shuts down before the dial can resolve.
   let (dev_a, _dev_b) = devices();
   let mut res_a = StackResources::<{ POOL + 2 }>::new();
   let (stack_a, mut net_a) = build_stack(dev_a, &mut res_a, 1, 0x1111_2222);
@@ -156,7 +138,7 @@ fn join_in_flight_resolves_on_shutdown() {
       // slice must outlive the held `join_fut`, so bind it.
       let seeds = [MaybeResolved::Resolved(addr(9, 7946))];
       let join_fut = ml_a.join(&SocketAddrResolver, &seeds, false);
-      // Once the join is registered and in flight, lose the vote.
+      // Once the join is registered and in flight, shut the node down.
       let trigger = async {
         loop {
           if ml_a.pending_join_count() > 0 {
@@ -164,7 +146,7 @@ fn join_in_flight_resolves_on_shutdown() {
           }
           Timer::after(Duration::from_millis(2)).await;
         }
-        ml_a.simulate_conflict_shutdown();
+        ml_a.shutdown();
         // The join resolves; this branch just keeps the trigger alive meanwhile.
         core::future::pending::<Result<ReachedSet, JoinError>>().await
       };
