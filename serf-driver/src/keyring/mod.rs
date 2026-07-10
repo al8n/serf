@@ -103,7 +103,8 @@ pub fn keyring_carries_cross_cipher_twin(keyring: &Keyring) -> bool {
 ///
 /// The variant-exact semantics:
 ///
-/// - `install` inserts the key as a secondary (idempotent; a cross-cipher byte
+/// - `install` inserts the key as a secondary (an already-installed key is a
+///   success with no mutation, so nothing is republished; a cross-cipher byte
 ///   twin of an already-present key is refused),
 /// - `use` promotes the exact (variant + bytes) key to primary — a promote of the
 ///   current primary is a trivial success with no wire change,
@@ -121,11 +122,14 @@ pub fn apply_key_request(
   let mut keyring = current.clone();
   let (response, mutated) = match (op, key) {
     (KeyRequestOperation::Install, Some(key)) => {
-      // A same-variant re-install is the idempotent `insert_secondary` no-op,
-      // reported as success. A cross-cipher byte twin of an already-present key
-      // is refused to keep the byte-keyed rotation ops unambiguous.
+      // A cross-cipher byte twin of an already-present key is refused to keep the
+      // byte-keyed rotation ops unambiguous. Installing a key that is already the
+      // primary or an installed secondary is a success WITHOUT mutation, so a
+      // retried install never republishes an unchanged ring to the observer.
       if keyring_has_cross_cipher_twin(&keyring, key) {
         (refused("cross-cipher key collision"), false)
+      } else if keyring.primary_ref() == key || keyring.secondaries().contains(key) {
+        (success(), false)
       } else {
         keyring.insert_secondary(*key);
         (success(), true)
