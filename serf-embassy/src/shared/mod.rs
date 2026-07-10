@@ -138,22 +138,6 @@ where
     }
     q.push_back(ev);
   }
-
-  /// Drive the exact effect the post-pump drain takes when it observes a lost
-  /// id-conflict [`Event::Shutdown`]: buffer the terminal event for the app's
-  /// [`poll_event`](crate::Serf::poll_event), then poison the shared state
-  /// ([`begin_shutdown`](Self::begin_shutdown)).
-  ///
-  /// The engine emits `Event::Shutdown` only from its conflict-resolution vote
-  /// tally (`close_conflict_query`), which the paired two-node harness cannot drive
-  /// to a deterministic majority; this stands in for that vote loss so the driver's
-  /// terminal-shutdown enforcement (pump stop, socket teardown, command rejection,
-  /// join poisoning) is testable end-to-end without a fabricated cluster.
-  #[cfg(any(test, feature = "std"))]
-  pub(crate) fn simulate_conflict_shutdown(&self) {
-    self.push_app_event(Event::Shutdown);
-    self.begin_shutdown();
-  }
 }
 
 impl<I, G, SR> Shared<I, G, SR>
@@ -162,27 +146,50 @@ where
   G: Rng,
   SR: Rng + SeedableRng,
 {
-  /// Drain the engine's event queue (mandatory-first), take the driver-owned side
-  /// effect on each mandatory event, buffer every event for the app, and pulse
-  /// `join_wake` so parked joins re-check `poll_join`.
+  /// Drain the engine's event queue (mandatory-first), routing each event through
+  /// [`route_drained_event`](Self::route_drained_event) — the driver-owned side
+  /// effect, then the app buffering — and pulse `join_wake` so parked joins
+  /// re-check `poll_join`.
   ///
   /// Called by the Runner once per pump, AFTER `pump` (so it sees this tick's
-  /// freshly-emitted events). The mandatory ACTIONS run BEFORE the lossy buffering:
-  /// an [`Event::Shutdown`] sets the shutdown state (the node stops), and an
-  /// [`Event::KeyRequest`] is applied to the engine's LIVE wire keyring and
-  /// answered in one call through `handle_key_request` — the live-keyring
-  /// chokepoint — never a driver-local shadow. A dropped observation is fine; a
-  /// dropped action is not, so the actions are taken here regardless of the app
-  /// ever polling.
-  ///
-  /// Returns whether the drain queued outbound gossip work the current pump's
-  /// egress did not see — a key response `handle_key_request` just queued — so the
-  /// Runner knows to re-pump and egress it (and loop back a self-addressed one)
-  /// within the same tick.
+  /// freshly-emitted events). Returns whether the drain queued outbound gossip work
+  /// the current pump's egress did not see — a key response `handle_key_request`
+  /// just queued — so the Runner knows to re-pump and egress it (and loop back a
+  /// self-addressed one) within the same tick.
   pub(crate) fn drain_events(&self, now: Instant) -> bool {
+    let mut queued = false;
+    loop {
+      let ev = self.engine.borrow_mut().poll_event();
+      let Some(ev) = ev else { break };
+      queued |= self.route_drained_event(ev, now);
+    }
+
+    // Every drain re-checks parked joins: the pump folds each completion into its
+    // await-result join, so a resolved outcome is now visible to `poll_join`.
+    self.join_wake.signal(());
+    queued
+  }
+
+  /// Route one drained machine event: take serf's mandatory driver-owned side
+  /// effect on it, then buffer it for the app's
+  /// [`poll_event`](crate::Serf::poll_event). Returns whether the side effect
+  /// queued outbound gossip work (a key response) the current pump's egress did not
+  /// see.
+  ///
+  /// The mandatory ACTION runs BEFORE the lossy buffering. A lost id-conflict
+  /// [`Event::Shutdown`] poisons the shared state
+  /// ([`begin_shutdown`](Self::begin_shutdown)) — the node stops, the pump loop
+  /// halts after this drain, and any parked join resolves with the shutdown error;
+  /// this is the same terminal path the handle's
+  /// [`Serf::shutdown`](crate::Serf::shutdown) reaches directly. An
+  /// [`Event::KeyRequest`] is applied to the engine's LIVE wire keyring and answered
+  /// in one call through `handle_key_request` — the live-keyring chokepoint, never a
+  /// driver-local shadow. A dropped observation is fine; a dropped action is not, so
+  /// the action is taken regardless of the app ever polling.
+  fn route_drained_event(&self, ev: Event<I, SocketAddr>, now: Instant) -> bool {
     // `now` and the queued-outbound signal are consumed only by the encryption
     // `KeyRequest` arm; a build without an AEAD backend reads neither and queues no
-    // key response, so its drain never re-pumps on this account.
+    // key response.
     #[cfg(not(encryption))]
     let _ = now;
     #[cfg(encryption)]
@@ -190,39 +197,31 @@ where
     #[cfg(not(encryption))]
     let queued = false;
 
-    loop {
-      let ev = self.engine.borrow_mut().poll_event();
-      let Some(ev) = ev else { break };
-      match &ev {
-        // A lost id-conflict vote means the local node MUST stop: poison the shared
-        // state so the pump loop halts after this drain and any parked join resolves
-        // with the shutdown error. The event still reaches the app via `poll_event`
-        // (buffered below).
-        Event::Shutdown => self.begin_shutdown(),
-        // An inbound key-management request: apply the op to the engine's LIVE wire
-        // keyring and answer the originator in one call. The response is a directed
-        // gossip transmit egressed on the re-pump the runner performs while `queued`
-        // is set.
-        #[cfg(encryption)]
-        Event::KeyRequest(req) => {
-          // `Ok` means a key response was queued (re-pump to egress it). Ignoring
-          // the Err case: `handle_key_request` has already applied the op to the
-          // live keyring; an Err means only the best-effort response was
-          // past-deadline or could not be routed, which queues no outbound work.
-          queued |= self
-            .engine
-            .borrow_mut()
-            .handle_key_request(req, now)
-            .is_ok();
-        }
-        _ => {}
+    match &ev {
+      // A lost id-conflict vote means the local node MUST stop: poison the shared
+      // state so the pump loop halts after this drain and any parked join resolves
+      // with the shutdown error. The event still reaches the app via `poll_event`
+      // (buffered below).
+      Event::Shutdown => self.begin_shutdown(),
+      // An inbound key-management request: apply the op to the engine's LIVE wire
+      // keyring and answer the originator in one call. The response is a directed
+      // gossip transmit egressed on the re-pump the runner performs while `queued`
+      // is set.
+      #[cfg(encryption)]
+      Event::KeyRequest(req) => {
+        // `Ok` means a key response was queued (re-pump to egress it). Ignoring
+        // the Err case: `handle_key_request` has already applied the op to the
+        // live keyring; an Err means only the best-effort response was
+        // past-deadline or could not be routed, which queues no outbound work.
+        queued |= self
+          .engine
+          .borrow_mut()
+          .handle_key_request(req, now)
+          .is_ok();
       }
-      self.push_app_event(ev);
+      _ => {}
     }
-
-    // Every drain re-checks parked joins: the pump folds each completion into its
-    // await-result join, so a resolved outcome is now visible to `poll_join`.
-    self.join_wake.signal(());
+    self.push_app_event(ev);
     queued
   }
 
@@ -242,3 +241,6 @@ where
       .saturating_add(self.app_events_dropped.get())
   }
 }
+
+#[cfg(test)]
+mod tests;

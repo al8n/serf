@@ -472,21 +472,25 @@ where
     self.shared.is_shutdown()
   }
 
-  /// Stand in for a lost id-conflict vote in driver tests: buffer the terminal
-  /// [`Event::Shutdown`] for [`poll_event`](Self::poll_event) and poison the shared
-  /// state, exactly as the run loop's post-pump drain does when the engine emits
-  /// `Event::Shutdown` from its conflict-resolution tally.
+  /// Abruptly stop the local node.
   ///
-  /// The engine emits `Event::Shutdown` only from that vote tally, which the paired
-  /// two-node test harness cannot drive to a deterministic majority, so this exposes
-  /// the same terminal input to exercise the driver's shutdown enforcement (pump
-  /// stop, socket teardown, command rejection, join poisoning) end-to-end. Present
-  /// only in the host (`std`) test build.
-  #[cfg(any(test, feature = "std"))]
-  #[doc(hidden)]
+  /// Latches the terminal shutdown state and wakes the run loop: the
+  /// [`Runner`](crate::Runner) returns after its next drain, collapsing its workers
+  /// so the gossip and reliable-plane sockets wind down. Pending [`join`](Self::join)s
+  /// and every subsequent command fail fast with the shutdown error
+  /// ([`JoinError::Shutdown`](crate::JoinError::Shutdown) /
+  /// [`OpError::Shutdown`](crate::OpError::Shutdown)); events already buffered stay
+  /// drainable via [`poll_event`](Self::poll_event).
+  ///
+  /// This does NOT gossip a leave — call [`leave`](Self::leave) for a graceful
+  /// departure that notifies peers. The node initiated the stop, so no
+  /// [`Event::Shutdown`](serf_embedded::Event::Shutdown) is synthesized for it; a
+  /// lost id-conflict vote drives this same terminal path but, being unsolicited,
+  /// DOES surface that event through [`poll_event`](Self::poll_event). Idempotent: a
+  /// second call re-signals the run loop but the shutdown latch never clears.
   #[inline]
-  pub fn simulate_conflict_shutdown(&self) {
-    self.shared.simulate_conflict_shutdown();
+  pub fn shutdown(&self) {
+    self.shared.begin_shutdown();
   }
 
   /// Drain one application-visible serf event the run loop buffered, mandatory
