@@ -515,6 +515,17 @@ pub enum Error {
   /// `bad_join_status` guard in serf-core `api.rs` `join()`.
   #[error("join called from invalid state: {0}")]
   BadJoinState(SerfState),
+  /// A command was issued after the serf machine shut down.
+  ///
+  /// Losing an id-conflict vote forces the machine to [`SerfState::Shutdown`]
+  /// (mirroring Go serf, whose conflict-loss branch calls `shutdown()`, which
+  /// sets the state).  A shut-down machine is no longer a cluster participant,
+  /// so every command that would originate new work — user events, queries, tag
+  /// updates, query responses, and key-management issuance — is refused with
+  /// this error.  The driver owns stopping I/O and delivering the buffered
+  /// [`Event::Shutdown`]; the machine only refuses to originate.
+  #[error("operation attempted after the serf machine shut down")]
+  Shutdown,
   /// The inner memberlist `leave()` returned an error.
   #[error("inner leave error: {0}")]
   InnerLeave(#[from] memberlist_proto::Error),
@@ -901,6 +912,30 @@ where
     self.state
   }
 
+  /// The single post-[`Shutdown`](SerfState::Shutdown) command guard: `Ok(())`
+  /// while the machine is live, `Err(Error::Shutdown)` once it has shut down.
+  ///
+  /// Losing an id-conflict vote forces the machine to `SerfState::Shutdown`
+  /// (mirroring Go serf's conflict-loss `shutdown()`), after which every command
+  /// that originates new cluster work funnels its lifecycle check through here so
+  /// the contract is named in one place — the memberlist post-leave
+  /// `ensure_running` precedent applied to serf's terminal state.  A shut-down
+  /// machine additionally goes inert on ingress and quiet on its timers; only the
+  /// already-buffered [`Event::Shutdown`] still drains via `poll_event`.  The
+  /// driver owns stopping I/O and delivering that event.
+  ///
+  /// Gates only on `Shutdown`, not on every non-`Alive` state: `Leaving` and
+  /// `Left` keep originating (matching Go serf, where the layer keeps running
+  /// until `shutdown()`); a driver that wants a stricter post-leave policy
+  /// enforces it in its own command gate.
+  const fn ensure_not_shutdown(&self) -> Result<(), Error> {
+    if matches!(self.state, SerfState::Shutdown) {
+      Err(Error::Shutdown)
+    } else {
+      Ok(())
+    }
+  }
+
   /// The current member (SWIM membership) Lamport clock value.
   pub const fn member_time(&self) -> u64 {
     self.clock
@@ -964,7 +999,15 @@ where
   /// Returns the minimum of serf's own periodic deadlines (reap, reconnect,
   /// queue-check, leave-broadcast, leave-complete, and pending-query closes).
   /// The composing super-machine folds in the coordinator's own deadline.
+  ///
+  /// A shut-down machine (lost id-conflict vote) schedules no wakeups: its
+  /// deadlines fire no work (`after_inner_timeout` is inert once Shutdown), so
+  /// surfacing them would spin the driver.  Mirrors memberlist's `poll_timeout`
+  /// returning `None` once not Running.
   pub fn serf_poll_timeout(&self) -> Option<Instant> {
+    if self.state.is_shutdown() {
+      return None;
+    }
     let query_min = self.pending_queries.iter().map(|pq| pq.deadline).min();
     [
       self.next_reap,
@@ -1013,6 +1056,11 @@ where
     I: Clone,
     A: Clone,
   {
+    // A shut-down machine (lost id-conflict vote) is quiet on its timers: no
+    // snapshot resync, and `after_inner_timeout` fires no deadlines.
+    if self.state.is_shutdown() {
+      return;
+    }
     self.drain_now = now;
     if self.local_state_dirty {
       self.resync_local_state(t);
@@ -1041,6 +1089,15 @@ where
     I: Clone,
     A: Clone,
   {
+    // A shut-down machine (lost id-conflict vote) fires no serf deadlines: no
+    // reap, reconnect, queue-check, query-close, or leave-completion, and its
+    // ingress drain is inert.  Mirrors the memberlist post-leave `handle_timeout`
+    // early-out.  The transition itself happens inside this method (a lost
+    // conflict close), so the gate quiets every *subsequent* tick, not the one
+    // that shut the machine down.
+    if self.state.is_shutdown() {
+      return;
+    }
     self.drain_now = now;
 
     // Step 1: drain all inner events produced by the tick through the serf sieve.
@@ -1146,6 +1203,15 @@ where
   where
     T: Reliable<I, A>,
   {
+    // Ingress chokepoint: a shut-down machine (lost id-conflict vote) is inert on
+    // ingress — no inbound inner event mutates serf state, rebroadcasts, or emits
+    // any event beyond the already-buffered Event::Shutdown.  Gating the dispatch
+    // itself (before the match, every caller) mirrors the memberlist post-leave
+    // handle_packet gate, which returns early before its own message match once
+    // not Running.
+    if self.state.is_shutdown() {
+      return;
+    }
     use memberlist_proto::Event as IE;
     match ev {
       // ── membership ───────────────────────────────────────────────────────
@@ -1305,6 +1371,15 @@ where
     I: Clone + Data,
     A: Data,
   {
+    // Egress chokepoint: a shut-down machine (lost id-conflict vote) synthesises
+    // no push-pull snapshot.  `fire_reap` can mark the snapshot dirty in the same
+    // tick that a lost conflict close shuts the machine down, so this guard keeps
+    // the deferred resync (in `drain_inner`) from pushing a fresh snapshot to the
+    // coordinator after shutdown; the driver owns tearing the coordinator down.
+    if self.state.is_shutdown() {
+      return;
+    }
+
     // Gather status_ltimes from the membership store.
     // HashMap iteration order is arbitrary, so collect first then sort by the
     // stable encoded id bytes so two machines with identical membership always
@@ -1448,6 +1523,9 @@ where
     A: Clone,
   {
     use buffa::Message as _;
+
+    // Refuse once the machine has shut down (lost id-conflict vote).
+    self.ensure_not_shutdown()?;
 
     let pb_tags = tags_to_pb(&tags);
     let encoded = pb_tags.encode_to_vec();
@@ -2471,6 +2549,9 @@ where
   where
     T: Reliable<I, A>,
   {
+    // Refuse once the machine has shut down (lost id-conflict vote).
+    self.ensure_not_shutdown()?;
+
     let name: smol_str::SmolStr = name.into();
     let max_size = self.opts.max_user_event_size();
 
@@ -2771,6 +2852,10 @@ where
     I: Clone + Data,
     A: Clone + Data,
   {
+    // Refuse once the machine has shut down (lost id-conflict vote), before any
+    // RNG draw, clock read, or state mutation.
+    self.ensure_not_shutdown()?;
+
     // Tag-regex pre-validation: compile-check every Filter::Tag pattern FIRST,
     // before any RNG draw, clock read, or state mutation.  A broken pattern
     // returns Err with zero side effects — no RNG advance, no ltime stamp, no
@@ -3241,6 +3326,10 @@ where
     I: Clone + Data,
     A: Clone + Data,
   {
+    // Refuse once the machine has shut down (lost id-conflict vote): answering an
+    // already-received query after shutdown is dead work.
+    self.ensure_not_shutdown()?;
+
     // Look up the received-query entry for this token.
     let query_id = QueryId {
       ltime: token.ltime(),
@@ -3368,6 +3457,10 @@ where
     I: Clone + Data,
     A: Clone + Data,
   {
+    // Refuse once the machine has shut down (lost id-conflict vote): answering an
+    // already-received key query after shutdown is dead work.
+    self.ensure_not_shutdown()?;
+
     let query_id = QueryId {
       ltime: req.ltime,
       id: req.id,
@@ -4546,6 +4639,11 @@ where
     I: Clone + Data,
     A: Clone + Data,
   {
+    // Refuse once the machine has shut down (lost id-conflict vote): the single
+    // chokepoint behind every key-management issuance (install / use / remove /
+    // list) and the conflict-resolution query itself.
+    self.ensure_not_shutdown()?;
+
     // G8 / H8: stamp from the query clock; queries read the clock but do not
     // increment it.
     let ltime = LamportTime(self.query_clock);
@@ -4851,7 +4949,13 @@ where
       // Won — the local node is the canonical holder.
       return;
     }
-    // We lost — the driver must shut this node down.
+    // We lost the vote.  Perform serf's documented forced Alive/Leaving →
+    // Shutdown transition — Go serf's conflict-loss branch calls `shutdown()`,
+    // which sets the state — BEFORE emitting, so the event is born from an
+    // already-dead machine and the chokepoints (commands / ingress / timers)
+    // observe Shutdown for the rest of this drain.  The driver remains
+    // responsible for stopping I/O and delivering this buffered event.
+    self.state = SerfState::Shutdown;
     self.pending_events.push_back(Event::Shutdown);
   }
 

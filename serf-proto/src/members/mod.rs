@@ -91,6 +91,17 @@ pub enum SerfState {
   /// The endpoint has fully left the cluster.
   Left,
   /// The endpoint has been shut down (abnormal or forced).
+  ///
+  /// The machine performs this forced transition itself when it loses an
+  /// id-conflict vote (mirroring Go serf, whose conflict-loss branch calls
+  /// `shutdown()`).  Once `Shutdown` the machine is terminal: it refuses every
+  /// command that would originate cluster work (with [`Error::Shutdown`]), goes
+  /// inert on ingress, and quiets its timers.  Only the already-buffered
+  /// [`Event::Shutdown`] still drains via `poll_event`; the driver owns stopping
+  /// I/O and delivering that event.
+  ///
+  /// [`Error::Shutdown`]: crate::endpoint::Error::Shutdown
+  /// [`Event::Shutdown`]: crate::event::Event::Shutdown
   Shutdown,
 }
 
