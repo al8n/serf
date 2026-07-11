@@ -104,6 +104,17 @@ impl Options {
   pub const DEFAULT_MAX_COALESCED_USER_EVENTS: core::num::NonZeroUsize =
     core::num::NonZeroUsize::new(1024).unwrap();
 
+  /// Absolute ceiling on the configured
+  /// [`max_user_event_size`](Options::max_user_event_size), enforced at
+  /// construction by [`validate`](Options::validate).
+  ///
+  /// A user event must fit inside a single UDP gossip packet with headroom, so
+  /// the configured per-event limit is itself capped at 9 KiB and any larger
+  /// configuration is rejected up front rather than at send time. Mirrors Go
+  /// serf's 9 KB `UserEventSizeLimit` (the legacy `serf-core/src/serf.rs`
+  /// `USER_EVENT_SIZE_LIMIT` port).
+  pub const USER_EVENT_SIZE_LIMIT: usize = 9 * 1024;
+
   /// Returns a new `Options` with all defaults as specified in Go serf
   /// `options.go` and the legacy `serf-core/src/options.rs` port.
   pub fn new() -> Self {
@@ -494,20 +505,28 @@ impl Options {
     self
   }
 
-  /// Validates the coalescing configuration.
+  /// Validates the configuration.
   ///
-  /// When a coalescing pair is enabled (both periods non-zero) the quiescent
-  /// period must be strictly less than the coalesce period: the quiescent window
-  /// is the "went quiet" fast-flush, and the coalesce period is the
-  /// maximum-delay cap.  If quiescent `>=` coalesce the quiescent window can
-  /// never bind — almost always a misconfiguration.  This mirrors the semantics
-  /// documented on the legacy `serf-core/src/options.rs` period fields.
+  /// Two classes are checked:
   ///
-  /// Returns `Ok(())` when coalescing is disabled or the invariant holds for
-  /// every enabled pair.  The Sans-I/O [`Endpoint`](crate::endpoint::Endpoint)
-  /// construction is infallible and tolerates any configuration (its flush
-  /// deadline is always `min(coalesce, quiescent)`); a driver that wants to
-  /// reject a nonsensical configuration up front calls this.
+  /// - **Coalescing periods.** When a coalescing pair is enabled (both periods
+  ///   non-zero) the quiescent period must be strictly less than the coalesce
+  ///   period: the quiescent window is the "went quiet" fast-flush, and the
+  ///   coalesce period is the maximum-delay cap.  If quiescent `>=` coalesce the
+  ///   quiescent window can never bind — almost always a misconfiguration.  This
+  ///   mirrors the semantics documented on the legacy `serf-core/src/options.rs`
+  ///   period fields.
+  /// - **User-event size ceiling.** `max_user_event_size` must not exceed the
+  ///   absolute [`USER_EVENT_SIZE_LIMIT`](Options::USER_EVENT_SIZE_LIMIT): a user
+  ///   event has to fit a single UDP gossip packet with headroom.  This mirrors
+  ///   the Go serf construction-time check on the configured limit.
+  ///
+  /// Returns `Ok(())` when every check passes.  The Sans-I/O
+  /// [`Endpoint`](crate::endpoint::Endpoint) construction is infallible and
+  /// tolerates any configuration (its coalescer flush deadline is always
+  /// `min(coalesce, quiescent)`, and the per-event size limit is enforced at
+  /// send time); a driver that wants to reject a nonsensical configuration up
+  /// front calls this.
   pub fn validate(&self) -> Result<(), InvalidOptions> {
     if self.member_coalesce_enabled() && self.quiescent_period >= self.coalesce_period {
       return Err(InvalidOptions::MemberCoalesce(CoalesceConfig {
@@ -519,6 +538,12 @@ impl Options {
       return Err(InvalidOptions::UserCoalesce(CoalesceConfig {
         coalesce_period: self.user_coalesce_period,
         quiescent_period: self.user_quiescent_period,
+      }));
+    }
+    if self.max_user_event_size > Self::USER_EVENT_SIZE_LIMIT {
+      return Err(InvalidOptions::UserEventSize(UserEventSizeConfig {
+        max_user_event_size: self.max_user_event_size,
+        limit: Self::USER_EVENT_SIZE_LIMIT,
       }));
     }
     Ok(())
@@ -544,9 +569,28 @@ impl core::fmt::Display for CoalesceConfig {
   }
 }
 
-/// Error returned by [`Options::validate`] for a self-contradictory coalescing
-/// configuration (an enabled quiescent period not strictly less than its
-/// coalesce period).
+/// The user-event size configuration that failed [`Options::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserEventSizeConfig {
+  /// The configured `max_user_event_size`.
+  pub max_user_event_size: usize,
+  /// The absolute ceiling ([`Options::USER_EVENT_SIZE_LIMIT`]).
+  pub limit: usize,
+}
+
+impl core::fmt::Display for UserEventSizeConfig {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "max_user_event_size ({}) must not exceed USER_EVENT_SIZE_LIMIT ({})",
+      self.max_user_event_size, self.limit
+    )
+  }
+}
+
+/// Error returned by [`Options::validate`] for a configuration that cannot be
+/// honored: a coalescing pair whose quiescent period is not strictly less than
+/// its coalesce period, or a `max_user_event_size` above the absolute ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum InvalidOptions {
@@ -558,6 +602,10 @@ pub enum InvalidOptions {
   /// coalesce period while user coalescing is enabled.
   #[error("user-event coalescing: {0}")]
   UserCoalesce(CoalesceConfig),
+  /// The configured `max_user_event_size` exceeds the absolute
+  /// [`USER_EVENT_SIZE_LIMIT`](Options::USER_EVENT_SIZE_LIMIT) ceiling.
+  #[error("user-event size: {0}")]
+  UserEventSize(UserEventSizeConfig),
 }
 
 impl Default for Options {

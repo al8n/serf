@@ -217,3 +217,41 @@ fn validate_rejects_quiescent_not_less_than_coalesce() {
     Err(InvalidOptions::UserCoalesce(_))
   ));
 }
+
+// ── user-event size ceiling ──────────────────────────────────────────────────
+
+#[test]
+fn user_event_size_limit_matches_go_serf() {
+  // The absolute ceiling is 9 KiB, matching the Go serf construction-time check.
+  assert_eq!(Options::USER_EVENT_SIZE_LIMIT, 9 * 1024);
+  assert_eq!(Options::USER_EVENT_SIZE_LIMIT, 9216);
+}
+
+#[test]
+fn validate_rejects_max_user_event_size_over_ceiling() {
+  let over = Options::new().with_max_user_event_size(Options::USER_EVENT_SIZE_LIMIT + 1);
+  assert!(matches!(
+    over.validate(),
+    Err(InvalidOptions::UserEventSize(_))
+  ));
+}
+
+#[test]
+fn validate_accepts_max_user_event_size_at_or_below_ceiling() {
+  // Exactly the ceiling is accepted.
+  assert!(
+    Options::new()
+      .with_max_user_event_size(Options::USER_EVENT_SIZE_LIMIT)
+      .validate()
+      .is_ok()
+  );
+  // Below the ceiling is accepted.
+  assert!(
+    Options::new()
+      .with_max_user_event_size(Options::USER_EVENT_SIZE_LIMIT - 1)
+      .validate()
+      .is_ok()
+  );
+  // The default (512) is well below the ceiling.
+  assert!(Options::new().validate().is_ok());
+}
