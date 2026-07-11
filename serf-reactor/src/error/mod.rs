@@ -140,6 +140,17 @@ pub enum SerfError {
   #[error("leave did not complete within the configured leave timeout")]
   LeaveTimeout,
 
+  /// A graceful [`leave`](crate::Serf::leave) completed locally but the local
+  /// socket failed while sending the departure fan-out, so at least one peer
+  /// was never handed the farewell and will classify the departure as a
+  /// failure. Per-peer network signals (a reset or unreachable reflected for a
+  /// peer that is itself gone) do NOT raise this — only a local send failure
+  /// does.
+  #[error(
+    "the local socket failed while sending the leave fan-out; peers may classify the departure as a failure"
+  )]
+  LeaveFarewellUndelivered,
+
   /// The driver task has shut down and is no longer accepting commands.
   #[error("driver shut down")]
   Shutdown,

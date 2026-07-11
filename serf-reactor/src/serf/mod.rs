@@ -798,8 +798,12 @@ impl<I, A, R> Serf<I, A, R> {
     }
   }
 
-  /// Gracefully leave the cluster. Resolves once peers have been notified or the
-  /// configured leave timeout elapses.
+  /// Gracefully leave the cluster. Resolves `Ok` once the departure fan-out has
+  /// been handed to the transport (peers have been notified), or an error when
+  /// the configured leave timeout elapses
+  /// ([`LeaveTimeout`](SerfError::LeaveTimeout)) or the local socket failed
+  /// while sending the fan-out
+  /// ([`LeaveFarewellUndelivered`](SerfError::LeaveFarewellUndelivered)).
   pub async fn leave(&self) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     self.send(Command::Leave(LeaveCmd { reply: tx }))?;

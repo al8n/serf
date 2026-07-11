@@ -52,6 +52,7 @@ fn every_variant_displays_and_debugs() {
     SerfError::Entropy(io::Error::other("entropy")),
     SerfError::Resolve(io::Error::other("dns")),
     SerfError::LeaveTimeout,
+    SerfError::LeaveFarewellUndelivered,
     SerfError::Shutdown,
     SerfError::NotRunning,
     SerfError::JoinAllFailed(JoinFailed::new(3, 0)),

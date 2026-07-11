@@ -84,7 +84,7 @@ use crate::{
   driver::{
     options::RuntimeOptions,
     shared::{
-      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate,
+      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate, leave_outcome,
       observation_payload_bytes, poll_send_gossip, retain_leave_datagram, retry_retained_leave,
       trace_leave_drain_residue, trace_leave_transform_error,
     },
@@ -322,6 +322,11 @@ where
   left_cluster_seen: bool,
   /// Deadline bounding the teardown park that drains retained farewells.
   leave_drain_deadline: Option<Instant>,
+  /// A leave-farewell send failed on the LOCAL socket (not a per-peer network
+  /// signal): the parked leave resolves
+  /// [`LeaveFarewellUndelivered`](SerfError::LeaveFarewellUndelivered) instead
+  /// of a false `Ok`.
+  leave_send_failed: bool,
   /// Parked `Shutdown` replies — acked only after the UDP socket drops, so a caller
   /// resuming from `shutdown().await` can rebind the same address. A `Vec` because
   /// several callers can race `shutdown()`.
@@ -397,6 +402,7 @@ where
       leave_drain: LeaveDrain::new(),
       left_cluster_seen: false,
       leave_drain_deadline: None,
+      leave_send_failed: false,
       shutdown_reply: Vec::new(),
       recv_buf: vec![0u8; buf_len.max(1)],
       iter_drain_cap: driver_opts.iter_drain_cap().max(1),
@@ -768,14 +774,20 @@ where
     // sends that ride an established QUIC connection are quinn-managed; only the
     // plain-UDP sends below are retained.)
     if self.leave_initiated {
-      retry_retained_leave(&mut self.leave_drain, self.socket.as_ref(), cx);
+      retry_retained_leave(
+        &mut self.leave_drain,
+        self.socket.as_ref(),
+        cx,
+        &mut self.leave_send_failed,
+      );
       // A `LeftCluster` observed while these datagrams were still queued
       // deferred the parked leave; resolve it now that the socket has accepted
       // every retained farewell.
       if self.left_cluster_seen && self.leave_drain.is_empty() {
         self.left_cluster_seen = false;
         if let Some(pl) = self.pending_leave.take() {
-          pl.resolve_all(|| Ok(()));
+          let failed = self.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
         }
       }
     }
@@ -796,6 +808,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
+                self.leave_send_failed = true;
               }
               continue;
             }
@@ -808,6 +821,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
+                self.leave_send_failed = true;
               }
               continue;
             }
@@ -823,6 +837,7 @@ where
           Err(_) => {
             if self.leave_initiated {
               trace_leave_transform_error(peer);
+              self.leave_send_failed = true;
             }
             continue;
           }
@@ -842,6 +857,7 @@ where
             cx,
             peer,
             &on_wire,
+            &mut self.leave_send_failed,
           );
         }
         UnreliableTransport::Datagram => {
@@ -869,6 +885,7 @@ where
                 cx,
                 peer,
                 &on_wire,
+                &mut self.leave_send_failed,
               );
             }
             // TooLarge: the connection is already Established (max_size was Some), so
@@ -881,6 +898,7 @@ where
                 cx,
                 peer,
                 &on_wire,
+                &mut self.leave_send_failed,
               );
             }
           }
@@ -914,7 +932,13 @@ where
           // reliable streams only. A backpressured send here would lose the
           // farewell for good, so it is retained and retried exactly like the
           // plain-UDP leave drain.
-          retain_leave_datagram(&mut self.leave_drain, dest, &bytes, outcome);
+          retain_leave_datagram(
+            &mut self.leave_drain,
+            dest,
+            &bytes,
+            outcome,
+            &mut self.leave_send_failed,
+          );
         } else {
           // Ignoring Poll: outside a leave, a dropped handshake/ACK/stream
           // packet is recovered by quinn's own loss detection, and a dropped
@@ -1039,7 +1063,8 @@ where
       // resolve when the drain empties (bounded by the caller's leave timeout).
       if self.leave_drain.is_empty() {
         if let Some(pl) = self.pending_leave.take() {
-          pl.resolve_all(|| Ok(()));
+          let failed = self.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
         }
       } else {
         self.left_cluster_seen = true;
@@ -1304,7 +1329,12 @@ where
       // instead of being dropped: the `Pending` send has the writable waker
       // registered while the deadline timer keeps a dead socket from hanging
       // shutdown.
-      retry_retained_leave(&mut this.leave_drain, this.socket.as_ref(), cx);
+      retry_retained_leave(
+        &mut this.leave_drain,
+        this.socket.as_ref(),
+        cx,
+        &mut this.leave_send_failed,
+      );
       if !this.leave_drain.is_empty() {
         let now = Instant::now();
         let deadline = *this

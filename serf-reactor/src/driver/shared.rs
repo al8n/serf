@@ -117,16 +117,44 @@ pub(crate) fn trace_leave_transform_error(_peer: SocketAddr) {
   tracing::debug!(peer = %_peer, "serf leave farewell datagram could not be encoded or encrypted");
 }
 
-/// Record the outcome of one readiness-based leave-farewell datagram send into
-/// `retained`:
-/// - `Ready(Ok)` — it left the socket; nothing to retain.
-/// - `Ready(Err)` — attempted; logged and NOT retained (a deterministic error
-///   the next round cannot mask).
-/// - `Pending` — the socket is backpressured; `(peer, datagram)` is retained for
-///   the next writable wake (the datagram is copied only on this path).
+/// The final outcome of one graceful leave: `Ok` when every farewell datagram
+/// reached the socket, [`LeaveFarewellUndelivered`] when a local send or
+/// transform failure lost part of the fan-out.
 ///
-/// Returns `true` when the datagram was retained, so a caller draining fresh
-/// transmits learns the socket is backpressured.
+/// [`LeaveFarewellUndelivered`]: crate::error::SerfError::LeaveFarewellUndelivered
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) fn leave_outcome(send_failed: bool) -> crate::error::Result<()> {
+  if send_failed {
+    Err(crate::error::SerfError::LeaveFarewellUndelivered)
+  } else {
+    Ok(())
+  }
+}
+
+/// Whether a leave-farewell send error is a LOCAL socket failure (the leave
+/// contract is broken — the datagram never left this host) rather than a
+/// per-peer network signal.
+///
+/// Per-peer signals — a reset/refusal reflected for a peer that is itself gone,
+/// or an unreachable route — are the network's answer to a delivered attempt:
+/// the reference implementation logs them and proceeds, and failing the whole
+/// leave because one peer already died would be wrong (and flaky on platforms
+/// that reflect ICMP errors into UDP sends). Everything else — a closed or
+/// invalid socket, a broken pipe, an out-of-memory send path — means the
+/// farewell could not be handed off at all.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) fn farewell_send_failure_is_local(err: &io::Error) -> bool {
+  !matches!(
+    err.kind(),
+    io::ErrorKind::ConnectionReset
+      | io::ErrorKind::ConnectionRefused
+      | io::ErrorKind::ConnectionAborted
+      | io::ErrorKind::HostUnreachable
+      | io::ErrorKind::NetworkUnreachable
+      | io::ErrorKind::AddrNotAvailable
+  )
+}
+
 /// Upper bound on how long a pump's teardown parks waiting for retained
 /// leave-farewell datagrams to drain before releasing the socket anyway. Keeps
 /// shutdown from hanging on a persistently unwritable socket while still giving
@@ -135,17 +163,32 @@ pub(crate) fn trace_leave_transform_error(_peer: SocketAddr) {
 pub(crate) const LEAVE_DRAIN_TEARDOWN_BOUND: core::time::Duration =
   core::time::Duration::from_secs(1);
 
+/// Record the outcome of one readiness-based leave-farewell datagram send into
+/// `retained`:
+/// - `Ready(Ok)` — it left the socket; nothing to retain.
+/// - `Ready(Err)` — attempted; logged and NOT retained (retrying a socket that
+///   errors is futile). A LOCAL failure additionally sets `send_failed`, so the
+///   parked leave resolves with an error instead of a false success.
+/// - `Pending` — the socket is backpressured; `(peer, datagram)` is retained for
+///   the next writable wake (the datagram is copied only on this path).
+///
+/// Returns `true` when the datagram was retained, so a caller draining fresh
+/// transmits learns the socket is backpressured.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) fn retain_leave_datagram(
   retained: &mut LeaveDrain,
   peer: SocketAddr,
   datagram: &[u8],
   outcome: Poll<io::Result<usize>>,
+  send_failed: &mut bool,
 ) -> bool {
   match outcome {
     Poll::Ready(Ok(_)) => false,
     Poll::Ready(Err(err)) => {
       trace_leave_send_error(peer, &err);
+      if farewell_send_failure_is_local(&err) {
+        *send_failed = true;
+      }
       false
     }
     Poll::Pending => {
@@ -168,6 +211,7 @@ pub(crate) fn poll_send_gossip<S>(
   cx: &mut Context<'_>,
   peer: SocketAddr,
   on_wire: &[u8],
+  send_failed: &mut bool,
 ) where
   S: UdpSocket,
 {
@@ -176,13 +220,14 @@ pub(crate) fn poll_send_gossip<S>(
   };
   let outcome = socket.poll_send_to(cx, on_wire, peer);
   if leave_initiated {
-    retain_leave_datagram(retained, peer, on_wire, outcome);
+    retain_leave_datagram(retained, peer, on_wire, outcome, send_failed);
   }
 }
 
 /// Retry the retained leave-farewell datagrams FIRST (oldest to newest), sending
 /// each over `socket` until one is backpressured. A `Ready(Err)` is logged and
-/// counts as attempted; a `Pending` keeps that datagram (and every later one)
+/// counts as attempted — a LOCAL failure sets `send_failed` so the parked leave
+/// resolves with an error; a `Pending` keeps that datagram (and every later one)
 /// retained and stops the pass. Bounded: a single front-to-back sweep with no
 /// re-enqueue of a just-sent datagram, so it cannot loop.
 #[cfg(any(feature = "tcp", feature = "quic"))]
@@ -190,6 +235,7 @@ pub(crate) fn retry_retained_leave<S>(
   retained: &mut LeaveDrain,
   socket: Option<&S>,
   cx: &mut Context<'_>,
+  send_failed: &mut bool,
 ) where
   S: UdpSocket,
 {
@@ -199,7 +245,12 @@ pub(crate) fn retry_retained_leave<S>(
   while let Some((peer, datagram)) = retained.pop_front() {
     match socket.poll_send_to(cx, &datagram, peer) {
       Poll::Ready(Ok(_)) => {}
-      Poll::Ready(Err(err)) => trace_leave_send_error(peer, &err),
+      Poll::Ready(Err(err)) => {
+        trace_leave_send_error(peer, &err);
+        if farewell_send_failure_is_local(&err) {
+          *send_failed = true;
+        }
+      }
       Poll::Pending => {
         retained.push_front((peer, datagram));
         break;
