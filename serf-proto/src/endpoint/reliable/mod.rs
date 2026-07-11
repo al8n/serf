@@ -132,11 +132,18 @@ where
   /// and `poll_transmit` drain remaining output; no new exchanges may be
   /// initiated.
   ///
+  /// `farewell` is an optional already-encoded user frame the coordinator
+  /// reserves into every dead-self farewell compound ahead of its ordinary
+  /// queue drain — serf passes its leave intent here so every farewell
+  /// recipient processes the intent before the death notice from the same
+  /// frame, regardless of what else is queued.
+  ///
   /// # Errors
   ///
   /// Returns [`memberlist_proto::Error`] if the coordinator is already in a
   /// terminal state.
-  fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error>;
+  fn leave(&mut self, now: Instant, farewell: Option<Bytes>)
+  -> Result<(), memberlist_proto::Error>;
 
   /// Attach an application payload to outbound probe Ack messages.
   ///
@@ -216,8 +223,12 @@ where
   }
 
   #[inline]
-  fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
-    self.leave(now)
+  fn leave(
+    &mut self,
+    now: Instant,
+    farewell: Option<Bytes>,
+  ) -> Result<(), memberlist_proto::Error> {
+    self.leave_with(now, farewell)
   }
 
   #[cfg(feature = "coordinates")]
@@ -293,8 +304,12 @@ where
   }
 
   #[inline]
-  fn leave(&mut self, now: Instant) -> Result<(), memberlist_proto::Error> {
-    self.leave(now)
+  fn leave(
+    &mut self,
+    now: Instant,
+    farewell: Option<Bytes>,
+  ) -> Result<(), memberlist_proto::Error> {
+    self.leave_with(now, farewell)
   }
 
   #[cfg(feature = "coordinates")]
