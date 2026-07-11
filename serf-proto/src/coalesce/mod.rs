@@ -96,6 +96,18 @@ impl CoalesceWindow {
 
 // ── MemberEventCoalescer ────────────────────────────────────────────────────────
 
+/// Hard cap on the number of distinct nodes buffered in a single member-coalesce
+/// window.
+///
+/// The `latest` map holds one entry per node id observed while the window is
+/// open; a burst of membership churn across many distinct ids would otherwise
+/// grow it without bound before the window closes.  At the cap a change for a
+/// NEW id is dropped (and counted), while an id already buffered still updates in
+/// place, so the collapse of an in-progress node stays exact.  A normal cluster
+/// never approaches the limit — only an adversarial fan-out of distinct ids is
+/// bounded.  Mirrors the inbound-query overflow cap on the endpoint.
+const MAX_COALESCED_MEMBER_EVENTS: usize = 2048;
+
 /// The latest buffered observation of a node within an open coalesce window.
 struct LatestMember<I, A> {
   kind: MemberEventKind,
@@ -125,6 +137,10 @@ where
   window: CoalesceWindow,
   latest: FxHashMap<I, LatestMember<I, A>>,
   last: FxHashMap<I, (MemberEventKind, A)>,
+  /// Running count of member changes dropped because the `latest` map was at
+  /// [`MAX_COALESCED_MEMBER_EVENTS`] and the change was for a not-yet-buffered
+  /// id.  Cumulative and saturating; never cleared by `reset`/`flush`.
+  dropped: u64,
 }
 
 impl<I, A> MemberEventCoalescer<I, A>
@@ -137,24 +153,41 @@ where
       window: CoalesceWindow::new(coalesce_period, quiescent_period),
       latest: FxHashMap::default(),
       last: FxHashMap::default(),
+      dropped: 0,
     }
   }
 
   /// Buffer a batch of member changes of one `kind`, keyed by node id (latest
   /// wins), and arm the flush window.
   pub(crate) fn feed(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>, now: Instant) {
+    let mut admitted = false;
     for member in members {
       let id = member.node().id_ref().clone();
       // A terminal Reap forgets the node's last-emitted status at feed time: a
       // Reap overwritten by a rejoin Join later in the same window would never
       // reach a flush-time eviction, leaving a stale `last[id]` that suppresses
-      // the genuinely-new Join.
+      // the genuinely-new Join.  This eviction is UNCONDITIONAL and runs before
+      // the cardinality gate below: a Reap dropped by an overflowing window must
+      // still forget the id, or the stale suppression entry outlives it.
       if kind == MemberEventKind::Reap {
         self.last.remove(&id);
       }
+      // Bound the per-window map: a change for a not-yet-buffered id is dropped
+      // once the map is at capacity, while an id already buffered still updates
+      // in place (its collapse must stay exact).  Only genuinely-new ids can grow
+      // the map, so only they are gated.
+      if !self.latest.contains_key(&id) && self.latest.len() >= MAX_COALESCED_MEMBER_EVENTS {
+        self.dropped = self.dropped.saturating_add(1);
+        continue;
+      }
       self.latest.insert(id, LatestMember { kind, member });
+      admitted = true;
     }
-    self.window.arm(now);
+    // Arm only when at least one member was buffered this call: a fully-rejected
+    // batch must not extend the quiescent window.
+    if admitted {
+      self.window.arm(now);
+    }
   }
 
   /// The next flush deadline while the window is open, else `None`.
@@ -178,6 +211,13 @@ where
     self.window.reset();
   }
 
+  /// The cumulative number of member changes dropped because the per-window map
+  /// was saturated (see [`MAX_COALESCED_MEMBER_EVENTS`]).  Saturating; never
+  /// cleared by `reset`/`flush`.
+  pub(crate) fn dropped(&self) -> u64 {
+    self.dropped
+  }
+
   /// The number of ids currently held in the cross-flush suppression map.
   ///
   /// Bounded by live membership because `flush` evicts a node's id on its
@@ -185,6 +225,18 @@ where
   #[cfg(test)]
   pub(crate) fn last_len(&self) -> usize {
     self.last.len()
+  }
+
+  /// The number of distinct ids currently buffered in the open window.
+  #[cfg(test)]
+  pub(crate) fn latest_len(&self) -> usize {
+    self.latest.len()
+  }
+
+  /// Whether the cross-flush suppression map currently holds `id`.
+  #[cfg(test)]
+  pub(crate) fn last_contains(&self, id: &I) -> bool {
+    self.last.contains_key(id)
   }
 }
 
@@ -273,45 +325,97 @@ struct LatestUserEvents {
 pub(crate) struct UserEventCoalescer {
   window: CoalesceWindow,
   events: FxHashMap<SmolStr, LatestUserEvents>,
+  /// Upper bound on `buffered` (the total buffered event volume).  `None`
+  /// disables the bound.
+  cap: Option<core::num::NonZeroUsize>,
+  /// Running sum of every buffered event count across `events`.  A flush emits
+  /// one [`Event::User`] per buffered event, so this equals both the true
+  /// buffered volume and the maximum flush burst — the quantity the `cap`
+  /// bounds (not the per-name key count).
+  buffered: usize,
+  /// Running count of user events dropped because `buffered` was at `cap`.
+  /// Cumulative and saturating; never cleared by `reset`/`flush`.
+  dropped: u64,
 }
 
 impl UserEventCoalescer {
-  /// Construct a user coalescer over the given windows.
-  pub(crate) fn new(coalesce_period: Duration, quiescent_period: Duration) -> Self {
+  /// Construct a user coalescer over the given windows, bounding the total
+  /// buffered event volume to `cap` (`None` disables the bound).
+  pub(crate) fn new(
+    coalesce_period: Duration,
+    quiescent_period: Duration,
+    cap: Option<core::num::NonZeroUsize>,
+  ) -> Self {
     Self {
       window: CoalesceWindow::new(coalesce_period, quiescent_period),
       events: FxHashMap::default(),
+      cap,
+      buffered: 0,
+      dropped: 0,
     }
   }
 
   /// Buffer a coalescing user event (dedup by name, newest ltime wins) and arm
   /// the flush window.
+  ///
+  /// The total buffered event volume is bounded by `cap`: an admission that
+  /// would grow it past the cap is dropped and counted, EXCEPT a newer
+  /// generation for a buffered name, which clears that name's older buffer first
+  /// (net change `<= 0`) and so is always admitted.  An older generation is
+  /// dropped as normal dedup and is NOT counted.  The window is armed only when
+  /// an event is admitted, so a rejected or dropped-older event never extends
+  /// the quiescent timer.
   pub(crate) fn feed(&mut self, event: UserEventMessage, now: Instant) {
+    let cap = self.cap.map_or(usize::MAX, core::num::NonZeroUsize::get);
     let ltime = event.ltime;
-    match self.events.get_mut(&event.name) {
+    let admitted = match self.events.get_mut(&event.name) {
       None => {
-        self.events.insert(
-          event.name.clone(),
-          LatestUserEvents {
-            ltime,
-            events: std::vec![event],
-          },
-        );
+        if self.buffered >= cap {
+          self.dropped = self.dropped.saturating_add(1);
+          false
+        } else {
+          self.events.insert(
+            event.name.clone(),
+            LatestUserEvents {
+              ltime,
+              events: std::vec![event],
+            },
+          );
+          self.buffered += 1;
+          true
+        }
       }
       Some(latest) => {
         if latest.ltime < ltime {
-          // A newer generation supersedes the buffered one.
+          // A newer generation supersedes the buffered one: the old payloads are
+          // cleared first, so the net change is `1 - old_len <= 0` and this is
+          // always admitted regardless of the cap.
+          self.buffered -= latest.events.len();
           latest.ltime = ltime;
           latest.events.clear();
           latest.events.push(event);
+          self.buffered += 1;
+          true
         } else if latest.ltime == ltime {
-          // Same generation: keep both (e.g. distinct payloads at one ltime).
-          latest.events.push(event);
+          // Same generation: keep both (e.g. distinct payloads at one ltime),
+          // subject to the cap.
+          if self.buffered >= cap {
+            self.dropped = self.dropped.saturating_add(1);
+            false
+          } else {
+            latest.events.push(event);
+            self.buffered += 1;
+            true
+          }
+        } else {
+          // Older generation: drop (normal dedup, not counted).
+          false
         }
-        // Older generation: drop.
       }
+    };
+    if admitted {
+      self.window.arm(now);
     }
-    self.window.arm(now);
   }
 
   /// The next flush deadline while the window is open, else `None`.
@@ -331,6 +435,9 @@ impl UserEventCoalescer {
         out.push_back(Event::User(event));
       }
     }
+    // The map is now empty, so the buffered-volume invariant resets to zero
+    // (a live-content reset, not a decrement).
+    self.buffered = 0;
     self.window.reset();
   }
 
@@ -338,7 +445,34 @@ impl UserEventCoalescer {
   /// (see [`MemberEventCoalescer::reset`]).
   pub(crate) fn reset(&mut self) {
     self.events.clear();
+    self.buffered = 0;
     self.window.reset();
+  }
+
+  /// The cumulative number of user events dropped because the buffered volume
+  /// was at `cap` (see [`UserEventCoalescer::new`]).  Saturating; never cleared
+  /// by `reset`/`flush`.
+  pub(crate) fn dropped(&self) -> u64 {
+    self.dropped
+  }
+
+  /// The total buffered event volume (the running sum bounded by `cap`).
+  #[cfg(test)]
+  pub(crate) fn buffered(&self) -> usize {
+    self.buffered
+  }
+
+  /// The number of distinct event names currently buffered.
+  #[cfg(test)]
+  pub(crate) fn distinct_names(&self) -> usize {
+    self.events.len()
+  }
+
+  /// The true sum of buffered payload counts across every name — the invariant
+  /// `buffered` must equal.
+  #[cfg(test)]
+  pub(crate) fn live_payload_count(&self) -> usize {
+    self.events.values().map(|l| l.events.len()).sum()
   }
 }
 

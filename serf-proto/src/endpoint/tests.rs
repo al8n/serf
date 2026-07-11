@@ -8179,3 +8179,102 @@ fn set_tags_emits_its_node_updated_synchronously_under_the_command_latch() {
     "the member window is armed at the set_tags instant, not the later older ingress drain"
   );
 }
+
+/// Build a serf endpoint with USER coalescing enabled and a small buffered-volume
+/// cap, for the overflow-through-the-endpoint tests.
+fn ep_user_coalescing_capped(
+  cap: core::num::NonZeroUsize,
+) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let opts = Options::new()
+    .with_user_coalesce_period(core::time::Duration::from_secs(10))
+    .with_user_quiescent_period(core::time::Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  let _ = e.poll_event();
+  e
+}
+
+#[test]
+fn coalescing_disabled_dropped_accessors_return_zero() {
+  // With coalescing disabled (the default) the coalescers are absent: events pass
+  // straight through and the drop counters read zero, so the observability
+  // accessors never conflate passthrough with a bounded/overflowing coalescer.
+  let mut e = ep();
+  while e.poll_event().is_some() {} // drain any construction events
+  assert_eq!(e.coalesced_user_events_dropped(), 0);
+  assert_eq!(e.coalesced_member_events_dropped(), 0);
+  assert_eq!(e.pending_events_len(), 0);
+
+  e.test_inner_node_joined(2, t_secs(1));
+  e.user_event("d", bytes::Bytes::from_static(b"v"), true, t_secs(1))
+    .unwrap();
+
+  let mut saw_join = false;
+  let mut saw_user = false;
+  while let Some(ev) = e.poll_event() {
+    match ev {
+      Event::Member(me) if me.kind() == MemberEventKind::Join => saw_join = true,
+      Event::User(u) if u.name == "d" => saw_user = true,
+      _ => {}
+    }
+  }
+  assert!(saw_join, "the join passes straight through when disabled");
+  assert!(
+    saw_user,
+    "the cc user event passes straight through when disabled"
+  );
+  assert_eq!(e.coalesced_user_events_dropped(), 0);
+  assert_eq!(e.coalesced_member_events_dropped(), 0);
+  assert_eq!(e.pending_events_len(), 0, "nothing left buffered");
+}
+
+#[test]
+fn user_coalescing_flood_through_endpoint_bounds_burst_and_counts_drops() {
+  // Through the full endpoint: a flood of distinct coalescing user-event names is
+  // bounded by the configured cap. The drop counter surfaces via the public
+  // accessor, and the flush burst never exceeds the cap.
+  let cap = core::num::NonZeroUsize::new(16).unwrap();
+  let mut e = ep_user_coalescing_capped(cap);
+
+  let n: u32 = 200;
+  for i in 0..n {
+    e.user_event(
+      format!("evt-{i}"),
+      bytes::Bytes::from_static(b"p"),
+      true,
+      t_secs(5),
+    )
+    .unwrap();
+  }
+  assert!(
+    e.poll_event().is_none(),
+    "all coalescing user events are buffered, not surfaced immediately"
+  );
+  assert_eq!(
+    e.coalesced_user_events_dropped(),
+    (n as u64) - cap.get() as u64,
+    "every event past the cap is counted via the public accessor"
+  );
+
+  // Firing the window delivers at most `cap` user events.
+  e.handle_timeout(t_secs(7));
+  let mut users = 0usize;
+  while let Some(ev) = e.poll_event() {
+    if matches!(ev, Event::User(_)) {
+      users += 1;
+    }
+  }
+  assert_eq!(users, cap.get(), "the flush burst is bounded by the cap");
+  // The drop counter is cumulative and survives the flush.
+  assert_eq!(
+    e.coalesced_user_events_dropped(),
+    (n as u64) - cap.get() as u64
+  );
+}

@@ -48,6 +48,12 @@ pub struct Options {
   user_coalesce_period: Duration,
   /// Same as `quiescent_period` but for user events only.
   user_quiescent_period: Duration,
+  /// Upper bound on the total buffered user-event volume in the user coalescer;
+  /// `None` disables the bound.  The coalescer keeps only the newest Lamport
+  /// generation per name, so a modest cap covers legitimate traffic while
+  /// bounding an adversarial flood of distinct names (or distinct payloads at a
+  /// single generation) that would otherwise grow the buffer without limit.
+  max_coalesced_user_events: Option<core::num::NonZeroUsize>,
 
   // ── buffers ───────────────────────────────────────────────────────────────
   /// Number of user-event slots in the dedup ring buffer.
@@ -93,6 +99,11 @@ pub struct Options {
 }
 
 impl Options {
+  /// Default upper bound on the total buffered user-event volume in the user
+  /// coalescer (see [`Options::max_coalesced_user_events`]).
+  pub const DEFAULT_MAX_COALESCED_USER_EVENTS: core::num::NonZeroUsize =
+    core::num::NonZeroUsize::new(1024).unwrap();
+
   /// Returns a new `Options` with all defaults as specified in Go serf
   /// `options.go` and the legacy `serf-core/src/options.rs` port.
   pub fn new() -> Self {
@@ -109,6 +120,7 @@ impl Options {
       quiescent_period: Duration::ZERO,
       user_coalesce_period: Duration::ZERO,
       user_quiescent_period: Duration::ZERO,
+      max_coalesced_user_events: Some(Self::DEFAULT_MAX_COALESCED_USER_EVENTS),
       event_buffer_size: 512,
       query_buffer_size: 512,
       max_user_event_size: 512,
@@ -186,6 +198,13 @@ impl Options {
   /// User-event quiescent window.
   pub const fn user_quiescent_period(&self) -> Duration {
     self.user_quiescent_period
+  }
+
+  /// Upper bound on the total buffered user-event volume in the user coalescer
+  /// (`None` = unbounded).  Defaults to
+  /// [`DEFAULT_MAX_COALESCED_USER_EVENTS`](Options::DEFAULT_MAX_COALESCED_USER_EVENTS).
+  pub const fn max_coalesced_user_events(&self) -> Option<core::num::NonZeroUsize> {
+    self.max_coalesced_user_events
   }
 
   /// Whether member-event coalescing is enabled: both the coalesce and quiescent
@@ -374,6 +393,18 @@ impl Options {
   /// Sets `user_quiescent_period` in place.
   pub fn set_user_quiescent_period(&mut self, v: Duration) -> &mut Self {
     self.user_quiescent_period = v;
+    self
+  }
+
+  /// Sets `max_coalesced_user_events` (`None` disables the bound).
+  pub fn with_max_coalesced_user_events(mut self, v: Option<core::num::NonZeroUsize>) -> Self {
+    self.max_coalesced_user_events = v;
+    self
+  }
+
+  /// Sets `max_coalesced_user_events` in place (`None` disables the bound).
+  pub fn set_max_coalesced_user_events(&mut self, v: Option<core::num::NonZeroUsize>) -> &mut Self {
+    self.max_coalesced_user_events = v;
     self
   }
 

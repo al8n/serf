@@ -567,6 +567,21 @@ where
     self.core.num_members()
   }
 
+  /// Forwards to [`Endpoint::coalesced_user_events_dropped`].
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.core.coalesced_user_events_dropped()
+  }
+
+  /// Forwards to [`Endpoint::coalesced_member_events_dropped`].
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.core.coalesced_member_events_dropped()
+  }
+
+  /// Forwards to [`Endpoint::pending_events_len`].
+  pub fn pending_events_len(&self) -> usize {
+    self.core.pending_events_len()
+  }
+
   /// Forwards to [`Endpoint::poll_event`].
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
     self.core.poll_event(&mut self.transport)

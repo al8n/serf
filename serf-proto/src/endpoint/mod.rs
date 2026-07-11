@@ -879,9 +879,13 @@ where
     let member_coalescer = opts
       .member_coalesce_enabled()
       .then(|| MemberEventCoalescer::new(opts.coalesce_period(), opts.quiescent_period()));
-    let user_coalescer = opts
-      .user_coalesce_enabled()
-      .then(|| UserEventCoalescer::new(opts.user_coalesce_period(), opts.user_quiescent_period()));
+    let user_coalescer = opts.user_coalesce_enabled().then(|| {
+      UserEventCoalescer::new(
+        opts.user_coalesce_period(),
+        opts.user_quiescent_period(),
+        opts.max_coalesced_user_events(),
+      )
+    });
 
     #[cfg(feature = "coordinates")]
     let coord_client: Option<crate::coordinate_client::CoordinateClient<I>> =
@@ -992,6 +996,31 @@ where
   /// Number of nodes currently tracked in the membership store.
   pub fn num_members(&self) -> usize {
     self.members.states.len()
+  }
+
+  /// Cumulative count of coalescing user events dropped because the user
+  /// coalescer's buffered volume was at its configured cap
+  /// ([`Options::max_coalesced_user_events`](crate::options::Options::max_coalesced_user_events)).
+  ///
+  /// Lifetime total, saturating, and never cleared — a flush or a `reset` does
+  /// not reset it.  Returns `0` when user coalescing is disabled.
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.user_coalescer.as_ref().map_or(0, |c| c.dropped())
+  }
+
+  /// Cumulative count of member changes dropped because the member coalescer's
+  /// per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared.  Returns `0` when member
+  /// coalescing is disabled.
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.member_coalescer.as_ref().map_or(0, |c| c.dropped())
+  }
+
+  /// Number of coalesced events currently waiting in the flush queue to be
+  /// drained by [`poll_event`](Self::poll_event).
+  pub fn pending_events_len(&self) -> usize {
+    self.pending_events.len()
   }
 
   /// A snapshot of every tracked member (alive, leaving, left, or failed within

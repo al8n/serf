@@ -1,4 +1,4 @@
-use core::{net::SocketAddr, time::Duration};
+use core::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 
 use std::{collections::VecDeque, vec, vec::Vec};
 
@@ -11,7 +11,7 @@ use crate::{
   typed::Tags,
 };
 
-use super::{MemberEventCoalescer, UserEventCoalescer};
+use super::{MAX_COALESCED_MEMBER_EVENTS, MemberEventCoalescer, UserEventCoalescer};
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ fn empty_member_window_has_no_deadline() {
 
 #[test]
 fn empty_user_window_has_no_deadline() {
-  let c = UserEventCoalescer::new(secs(10), secs(2));
+  let c = UserEventCoalescer::new(secs(10), secs(2), None);
   assert_eq!(c.flush_deadline(), None);
   assert!(!c.due(Instant::ORIGIN));
 }
@@ -393,7 +393,7 @@ fn member_reset_drops_buffer_without_emitting() {
 fn user_flush_keeps_newest_generation_per_name() {
   // Ports `test_user_event_coalesce_basic`: foo@1 then foo@2 keeps only foo@2;
   // bar@2(test1) then bar@2(test2) keeps both (same generation).
-  let mut c = UserEventCoalescer::new(secs(10), secs(2));
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), None);
   let t0 = Instant::ORIGIN;
   c.feed(uev("foo", 1, ""), t0);
   c.feed(uev("foo", 2, ""), t0);
@@ -423,7 +423,7 @@ fn user_flush_keeps_newest_generation_per_name() {
 
 #[test]
 fn user_older_generation_is_dropped() {
-  let mut c = UserEventCoalescer::new(secs(10), secs(2));
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), None);
   let t0 = Instant::ORIGIN;
   c.feed(uev("foo", 5, "new"), t0);
   c.feed(uev("foo", 3, "old"), t0);
@@ -438,7 +438,7 @@ fn user_older_generation_is_dropped() {
 
 #[test]
 fn user_reset_drops_buffer_without_emitting() {
-  let mut c = UserEventCoalescer::new(secs(10), secs(2));
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), None);
   c.feed(uev("foo", 1, "x"), Instant::ORIGIN);
   assert!(c.flush_deadline().is_some());
 
@@ -447,4 +447,337 @@ fn user_reset_drops_buffer_without_emitting() {
   let mut out = VecDeque::new();
   c.flush::<u32, SocketAddr>(&mut out);
   assert!(out.is_empty());
+}
+
+// ── user buffered-volume cap (total-sum bound, not per-key) ──────────────────────
+
+#[test]
+fn user_distinct_name_flood_is_capped_and_counted() {
+  // A flood of DISTINCT names at advancing generations pins the buffered volume
+  // at the cap; every event past it is dropped and counted, and a flush emits at
+  // most `cap` user events.
+  const CAP: usize = 1024;
+  const N: usize = 3000;
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(CAP));
+  let t0 = Instant::ORIGIN;
+  for i in 0..N {
+    c.feed(uev(&format!("evt-{i}"), i as u64 + 1, "p"), t0);
+  }
+  assert_eq!(c.buffered(), CAP, "buffered is pinned at the cap");
+  assert_eq!(
+    c.distinct_names(),
+    CAP,
+    "one buffered event per surviving distinct name"
+  );
+  assert_eq!(
+    c.dropped(),
+    (N - CAP) as u64,
+    "every event past the cap is counted as dropped"
+  );
+
+  let mut out = VecDeque::new();
+  c.flush::<u32, SocketAddr>(&mut out);
+  assert!(out.len() <= CAP, "a flush emits at most `cap` events");
+  assert_eq!(out.len(), CAP, "exactly the buffered volume is emitted");
+  assert_eq!(c.buffered(), 0, "flush resets the buffered invariant");
+  assert_eq!(
+    c.dropped(),
+    (N - CAP) as u64,
+    "the drop counter is cumulative and survives the flush"
+  );
+}
+
+#[test]
+fn user_equal_ltime_payload_flood_is_capped_by_total_volume() {
+  // A single name accumulating many DISTINCT payloads at ONE generation must be
+  // bounded by the SAME total-volume cap: the bound is the running sum across the
+  // map, not a per-key constant.
+  const CAP: usize = 1024;
+  const M: usize = 3000;
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(CAP));
+  let t0 = Instant::ORIGIN;
+  for i in 0..M {
+    c.feed(uev("burst", 5, &format!("p{i}")), t0);
+  }
+  assert_eq!(
+    c.distinct_names(),
+    1,
+    "all payloads share the one name/generation"
+  );
+  assert_eq!(
+    c.buffered(),
+    CAP,
+    "the single name's accumulated payloads are bounded by the total-volume cap"
+  );
+  assert_eq!(c.dropped(), (M - CAP) as u64, "the overflow is counted");
+}
+
+#[test]
+fn user_newer_generation_for_existing_key_admitted_at_cap() {
+  // At the cap, a NEWER generation for an already-buffered key must still be
+  // admitted: it clears that key's older payloads first (net change <= 0), so no
+  // drop is counted and the map now carries only the new generation.
+  const CAP: usize = 1024;
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(CAP));
+  let t0 = Instant::ORIGIN;
+  for i in 0..CAP {
+    c.feed(uev(&format!("evt-{i}"), 1, "old"), t0);
+  }
+  assert_eq!(c.buffered(), CAP);
+  assert_eq!(c.dropped(), 0);
+
+  // A newer generation for an existing key, at saturation.
+  c.feed(uev("evt-5", 2, "new"), t0);
+  assert_eq!(
+    c.buffered(),
+    CAP,
+    "superseding an existing key keeps the volume at the cap"
+  );
+  assert_eq!(c.dropped(), 0, "a superseding admit is never a drop");
+
+  let mut out = VecDeque::new();
+  c.flush::<u32, SocketAddr>(&mut out);
+  let events = user_events(out);
+  let five: Vec<_> = events.iter().filter(|e| e.name == "evt-5").collect();
+  assert_eq!(
+    five.len(),
+    1,
+    "only the newest generation of evt-5 survives"
+  );
+  assert_eq!(five[0].ltime, LamportTime::new(2));
+  assert_eq!(five[0].payload.as_ref(), b"new");
+}
+
+#[test]
+fn user_unsaturated_collapse_matches_pre_cap_behavior() {
+  // Well below the cap, the collapse is byte-identical to the pre-cap coalescer:
+  // newest generation per name wins, same-generation payloads accumulate, and
+  // nothing is dropped.  Guards against the cap logic perturbing normal traffic.
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(1024));
+  let t0 = Instant::ORIGIN;
+  c.feed(uev("foo", 1, ""), t0);
+  c.feed(uev("foo", 2, ""), t0);
+  c.feed(uev("bar", 2, "test1"), t0);
+  c.feed(uev("bar", 2, "test2"), t0);
+  assert_eq!(c.dropped(), 0, "an unsaturated workload drops nothing");
+  assert_eq!(c.buffered(), c.live_payload_count());
+
+  let mut out = VecDeque::new();
+  c.flush::<u32, SocketAddr>(&mut out);
+  let events = user_events(out);
+
+  let foo: Vec<_> = events.iter().filter(|e| e.name == "foo").collect();
+  assert_eq!(foo.len(), 1, "only the newest foo generation survives");
+  assert_eq!(foo[0].ltime, LamportTime::new(2));
+
+  let mut bar_payloads: Vec<&[u8]> = events
+    .iter()
+    .filter(|e| e.name == "bar")
+    .map(|e| e.payload.as_ref())
+    .collect();
+  bar_payloads.sort_unstable();
+  assert_eq!(
+    bar_payloads,
+    vec![b"test1".as_slice(), b"test2".as_slice()],
+    "both same-generation bar payloads survive"
+  );
+}
+
+#[test]
+fn user_buffered_invariant_holds_under_randomized_interleave() {
+  // `buffered` must equal the true sum of live payload counts after every feed,
+  // through any interleave of insert / supersede / accumulate / drop-older; a
+  // flush and a reset both zero it.
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(256));
+  // A small deterministic LCG drives a reproducible mix of the four branches.
+  let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+  let mut next = || {
+    state = state
+      .wrapping_mul(6364136223846793005)
+      .wrapping_add(1442695040888963407);
+    state
+  };
+  let t0 = Instant::ORIGIN;
+  for step in 0..5000u64 {
+    let r = next();
+    let name_idx = r % 32;
+    let ltime = (r >> 8) % 8;
+    c.feed(
+      uev(&format!("k{name_idx}"), ltime, "p"),
+      t0 + secs(step % 3),
+    );
+    assert_eq!(
+      c.buffered(),
+      c.live_payload_count(),
+      "buffered must track the live payload sum at step {step}"
+    );
+  }
+  let mut out = VecDeque::new();
+  c.flush::<u32, SocketAddr>(&mut out);
+  assert_eq!(c.buffered(), 0, "flush zeroes buffered");
+  c.feed(uev("k0", 1, "p"), t0);
+  c.reset();
+  assert_eq!(c.buffered(), 0, "reset zeroes buffered");
+}
+
+// ── arm-on-admit-only (a rejected event must not extend the window) ──────────────
+
+#[test]
+fn user_rejected_feed_does_not_arm_the_window() {
+  const CAP: usize = 4;
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(CAP));
+  let t0 = Instant::ORIGIN;
+
+  // An empty map always admits and arms.
+  c.feed(uev("a", 1, "p"), t0);
+  assert_eq!(
+    c.flush_deadline(),
+    Some(t0 + secs(2)),
+    "the first event arms the window"
+  );
+
+  // Saturate the buffered volume.
+  for i in 1..CAP {
+    c.feed(uev(&format!("n{i}"), 1, "p"), t0 + secs(1));
+  }
+  assert_eq!(c.buffered(), CAP);
+  let deadline_before = c.flush_deadline();
+
+  // A rejected feed (a new name at the cap) must NOT re-arm the quiescent window.
+  c.feed(uev("overflow", 9, "p"), t0 + secs(5));
+  assert_eq!(c.dropped(), 1);
+  assert_eq!(
+    c.flush_deadline(),
+    deadline_before,
+    "a rejected event must not extend the quiescent deadline"
+  );
+}
+
+// ── member cardinality cap (MAX_COALESCED_MEMBER_EVENTS) ─────────────────────────
+
+#[test]
+fn member_reap_eviction_runs_before_the_cardinality_gate() {
+  // The unconditional `last.remove` on a Reap must run even when that same Reap is
+  // rejected by the cardinality cap; otherwise a stale suppression entry outlives
+  // the reaped node and wrongly suppresses its later rejoin.
+  const ABSENT_ID: u32 = 9_000_000;
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // Record `last[ABSENT_ID] = (Join, addr)` via a flushed Join, leaving `latest`
+  // empty afterwards.
+  c.feed(MemberEventKind::Join, vec![member(ABSENT_ID)], t0);
+  let mut out = VecDeque::new();
+  c.flush(&mut out);
+  assert!(
+    c.last_contains(&ABSENT_ID),
+    "the Join is recorded in `last`"
+  );
+  assert_eq!(c.latest_len(), 0, "the window drained");
+
+  // Saturate `latest` with distinct OTHER ids.
+  for id in 0..MAX_COALESCED_MEMBER_EVENTS as u32 {
+    c.feed(MemberEventKind::Join, vec![member(id)], t0);
+  }
+  assert_eq!(c.latest_len(), MAX_COALESCED_MEMBER_EVENTS);
+
+  // A Reap for ABSENT_ID: absent from the saturated map, so the insert is rejected
+  // and counted — but the `last.remove` must still run.
+  c.feed(MemberEventKind::Reap, vec![member(ABSENT_ID)], t0);
+  assert_eq!(
+    c.latest_len(),
+    MAX_COALESCED_MEMBER_EVENTS,
+    "the Reap insert was rejected by the cap"
+  );
+  assert_eq!(c.dropped(), 1, "the rejected Reap is counted");
+  assert!(
+    !c.last_contains(&ABSENT_ID),
+    "the unconditional Reap eviction ran before the cap rejected the insert"
+  );
+
+  // Drain the saturated window; ABSENT_ID never entered `latest`, so this flush
+  // leaves `last` still lacking it.
+  let mut drained = VecDeque::new();
+  c.flush(&mut drained);
+  assert_eq!(c.latest_len(), 0);
+  assert!(!c.last_contains(&ABSENT_ID));
+
+  // A later rejoin Join now lands in an empty window and must NOT be suppressed.
+  c.feed(MemberEventKind::Join, vec![member(ABSENT_ID)], t0);
+  let mut out2 = VecDeque::new();
+  c.flush(&mut out2);
+  let groups = member_groups(out2);
+  assert_eq!(
+    find_group(&groups, MemberEventKind::Join).map(|(_, ids)| ids.as_slice()),
+    Some([ABSENT_ID].as_slice()),
+    "the rejoin must re-emit, not be suppressed by a stale last entry: {groups:?}"
+  );
+}
+
+#[test]
+fn member_cardinality_cap_bounds_distinct_ids() {
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // Fill to capacity with distinct new ids.
+  for id in 0..MAX_COALESCED_MEMBER_EVENTS as u32 {
+    c.feed(MemberEventKind::Join, vec![member(id)], t0);
+  }
+  assert_eq!(c.latest_len(), MAX_COALESCED_MEMBER_EVENTS);
+  assert_eq!(c.dropped(), 0);
+
+  // Further DISTINCT ids overflow the cap and are counted.
+  const OVERFLOW: u32 = 100;
+  for i in 0..OVERFLOW {
+    c.feed(
+      MemberEventKind::Join,
+      vec![member(MAX_COALESCED_MEMBER_EVENTS as u32 + i)],
+      t0,
+    );
+  }
+  assert_eq!(
+    c.latest_len(),
+    MAX_COALESCED_MEMBER_EVENTS,
+    "the map stays at the cap"
+  );
+  assert_eq!(c.dropped(), OVERFLOW as u64, "each overflow id is counted");
+
+  // An EXISTING id always updates in place, never rejected.
+  c.feed(MemberEventKind::Leave, vec![member(0)], t0);
+  assert_eq!(
+    c.latest_len(),
+    MAX_COALESCED_MEMBER_EVENTS,
+    "an existing-id update does not grow the map"
+  );
+  assert_eq!(
+    c.dropped(),
+    OVERFLOW as u64,
+    "an existing-id update is not a drop"
+  );
+}
+
+#[test]
+fn member_rejected_feed_does_not_arm_the_window() {
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // An empty map always admits and arms.
+  c.feed(MemberEventKind::Join, vec![member(0)], t0);
+  assert_eq!(c.flush_deadline(), Some(t0 + secs(2)));
+
+  // Saturate `latest` with distinct ids.
+  for id in 1..MAX_COALESCED_MEMBER_EVENTS as u32 {
+    c.feed(MemberEventKind::Join, vec![member(id)], t0 + secs(1));
+  }
+  assert_eq!(c.latest_len(), MAX_COALESCED_MEMBER_EVENTS);
+  let deadline_before = c.flush_deadline();
+
+  // A rejected feed (a new id at the cap) must NOT re-arm the window.
+  c.feed(MemberEventKind::Join, vec![member(9_000_000)], t0 + secs(5));
+  assert_eq!(c.dropped(), 1);
+  assert_eq!(
+    c.flush_deadline(),
+    deadline_before,
+    "a rejected member event must not extend the quiescent deadline"
+  );
 }

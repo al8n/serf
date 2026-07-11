@@ -64,6 +64,12 @@ fn options_all_defaults() {
   assert_eq!(o.quiescent_period(), Duration::ZERO);
   assert_eq!(o.user_coalesce_period(), Duration::ZERO);
   assert_eq!(o.user_quiescent_period(), Duration::ZERO);
+  // The user-coalescer volume cap defaults to 1024 (bounded, not disabled).
+  assert_eq!(
+    o.max_coalesced_user_events(),
+    Some(Options::DEFAULT_MAX_COALESCED_USER_EVENTS)
+  );
+  assert_eq!(Options::DEFAULT_MAX_COALESCED_USER_EVENTS.get(), 1024);
   // Buffers
   assert_eq!(o.event_buffer_size(), 512);
   assert_eq!(o.query_buffer_size(), 512);
@@ -145,6 +151,24 @@ fn coalescing_enabled_only_when_both_periods_are_non_zero() {
     .with_user_coalesce_period(Duration::from_secs(10))
     .with_user_quiescent_period(Duration::from_secs(2));
   assert!(user_both.user_coalesce_enabled());
+}
+
+#[test]
+fn max_coalesced_user_events_builder_and_disable() {
+  use core::num::NonZeroUsize;
+
+  // The `with_` builder overrides the default.
+  let bounded = Options::new().with_max_coalesced_user_events(NonZeroUsize::new(64));
+  assert_eq!(bounded.max_coalesced_user_events(), NonZeroUsize::new(64));
+
+  // `None` disables the bound.
+  let unbounded = Options::new().with_max_coalesced_user_events(None);
+  assert_eq!(unbounded.max_coalesced_user_events(), None);
+
+  // The in-place setter matches the `with_` builder.
+  let mut o = Options::new();
+  o.set_max_coalesced_user_events(NonZeroUsize::new(64));
+  assert_eq!(o.max_coalesced_user_events(), NonZeroUsize::new(64));
 }
 
 #[test]
