@@ -235,8 +235,11 @@ where
   /// reintroduced flush wait). Unlike [`kill_abrupt`](Self::kill_abrupt), the
   /// farewell (leave intent packed with the dead-self notice) reaches peers
   /// before teardown, so peers observe an intentional Leave rather than a
-  /// probe-timeout Failed. The slot's id, addr, and event log are retained for
-  /// later assertions.
+  /// probe-timeout Failed. `shutdown()` follows the resolved `leave()` with no
+  /// intervening delay, deliberately pinning the leave-then-immediate-shutdown
+  /// ordering: a resolved leave means every farewell datagram was accepted by
+  /// the socket, so an immediate teardown cannot discard one. The slot's id,
+  /// addr, and event log are retained for later assertions.
   pub async fn leave_graceful(&mut self, i: usize) -> Duration {
     let serf = self.slots[i].serf.take().expect("node slot is live");
     let start = std::time::Instant::now();

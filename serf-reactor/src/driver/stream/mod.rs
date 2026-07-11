@@ -66,8 +66,9 @@ use crate::{
   driver::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{
-      ExchangeId, LeaveDrain, dispatch_event_delegate, observation_payload_bytes, poll_send_gossip,
-      retry_retained_leave, trace_leave_transform_error,
+      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate,
+      observation_payload_bytes, poll_send_gossip, retry_retained_leave, trace_leave_drain_residue,
+      trace_leave_transform_error,
     },
   },
   drop_counter::ReactorDropCounter,
@@ -357,6 +358,12 @@ where
   /// Leave-farewell datagrams retained after a non-completing UDP send, retried
   /// FIFO ahead of fresh transmits and flushed before the socket drops.
   leave_drain: LeaveDrain,
+  /// `LeftCluster` observed while retained farewells were still queued: the
+  /// parked leave resolves the moment `leave_drain` empties, so `Ok` from
+  /// `leave().await` always means the farewell reached the socket.
+  left_cluster_seen: bool,
+  /// Deadline bounding the teardown park that drains retained farewells.
+  leave_drain_deadline: Option<Instant>,
   /// Parked `Shutdown` replies — acked only after the bind sockets drop, so a
   /// caller resuming from `shutdown().await` can rebind the same address. A `Vec`
   /// because several callers can race `shutdown()`.
@@ -496,6 +503,8 @@ where
       pending_leave: None,
       leave_initiated: false,
       leave_drain: LeaveDrain::new(),
+      left_cluster_seen: false,
+      leave_drain_deadline: None,
       shutdown_reply: Vec::new(),
       bridges: HashMap::new(),
       accepted_rx,
@@ -1106,6 +1115,15 @@ where
     // read the departure as a failure. Periodic gossip stays best-effort.
     if self.leave_initiated {
       retry_retained_leave(&mut self.leave_drain, self.socket.as_ref(), cx);
+      // A `LeftCluster` observed while these datagrams were still queued
+      // deferred the parked leave; resolve it now that the socket has accepted
+      // every retained farewell.
+      if self.left_cluster_seen && self.leave_drain.is_empty() {
+        self.left_cluster_seen = false;
+        if let Some(pl) = self.pending_leave.take() {
+          pl.resolve_all(|| Ok(()));
+        }
+      }
     }
     let encode_opts = EncodeOptions::new(self.label.clone());
     let mut sent = 0;
@@ -1278,10 +1296,19 @@ where
         matches!(c.outcome(), ExchangeStatus::Succeeded),
       );
     }
-    if matches!(ev, Event::LeftCluster)
-      && let Some(pl) = self.pending_leave.take()
-    {
-      pl.resolve_all(|| Ok(()));
+    if matches!(ev, Event::LeftCluster) {
+      // Resolve the parked leave only once every retained farewell datagram has
+      // been accepted by the socket: `Ok` from `leave().await` means the leave
+      // notices reached the transport, not merely that the machine drained its
+      // fan-out. With retained datagrams still queued, remember the fence and
+      // resolve when the drain empties (bounded by the caller's leave timeout).
+      if self.leave_drain.is_empty() {
+        if let Some(pl) = self.pending_leave.take() {
+          pl.resolve_all(|| Ok(()));
+        }
+      } else {
+        self.left_cluster_seen = true;
+      }
     }
     // A lost id-conflict vote means the local node MUST stop, exactly as for a
     // `Command::Shutdown`. Flag shutdown; the pump self-wakes into the teardown
@@ -1533,10 +1560,27 @@ where
         drop(this.accept_shutdown_tx.take());
         // Flush any retained leave-farewell datagrams before releasing the socket.
         // The graceful drain runs across polls (retried as the socket becomes
-        // writable), so a residual queue here is rare; a single bounded sweep
-        // (stops at the first backpressure) exhausts it without an unbounded wait,
-        // since the bind must be released for a caller to rebind the address.
+        // writable), so a residual queue here is rare. A residue parks the
+        // teardown — bounded by a short deadline — instead of being dropped: the
+        // farewell is the peers' only first-hand signal that the departure was
+        // intentional, and the `Pending` send has the writable waker registered
+        // while the deadline timer keeps a dead socket from hanging shutdown.
         retry_retained_leave(&mut this.leave_drain, this.socket.as_ref(), cx);
+        if !this.leave_drain.is_empty() {
+          let now = Instant::now();
+          let deadline = *this
+            .leave_drain_deadline
+            .get_or_insert(now + LEAVE_DRAIN_TEARDOWN_BOUND);
+          if now < deadline {
+            this.arm_timer(deadline, now);
+            if let Some(timer) = this.timer.as_mut()
+              && timer.as_mut().poll(cx).is_pending()
+            {
+              return Poll::Pending;
+            }
+          }
+          trace_leave_drain_residue(this.leave_drain.len());
+        }
         drop(this.socket.take());
       }
 
