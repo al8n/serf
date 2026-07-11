@@ -198,6 +198,7 @@ async fn try_spawn_node_at(
     RuntimeOptions::new(),
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
   )
@@ -224,6 +225,7 @@ async fn assert_quic_new_rejects(runtime: RuntimeOptions) {
       runtime,
       SerfOptions::new(),
       gossip_rng().expect("seed gossip rng"),
+      None,
       #[cfg(encryption)]
       std::rc::Rc::new(VoidKeyringDelegate),
     )
@@ -545,6 +547,7 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<S
     RuntimeOptions::new(),
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
     std::rc::Rc::new(VoidKeyringDelegate),
   )
   .await
@@ -615,6 +618,7 @@ async fn spawn_node_with_runtime(id: &str, runtime: RuntimeOptions) -> Serf<Smol
     runtime,
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
   )

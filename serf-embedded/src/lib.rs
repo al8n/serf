@@ -81,4 +81,4 @@ pub use memberlist_embedded::{EncryptionOptions, Keyring, SecretKey};
 /// serf's own [`Endpoint`](serf_proto::endpoint::Endpoint) configuration, distinct
 /// from the memberlist-layer engine [`Options`].
 pub use serf_proto::options::Options as SerfOptions;
-pub use serf_proto::{endpoint::Error as SerfError, event::Event};
+pub use serf_proto::{ReconnectDelegate, endpoint::Error as SerfError, event::Event};

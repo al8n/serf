@@ -58,6 +58,10 @@ where
   pub(crate) shutdown_flag: Rc<Cell<bool>>,
   pub(crate) driver_options: RuntimeOptions,
   pub(crate) serf_options: SerfOptions,
+  /// Optional per-member reconnect-timeout override (Go serf `ReconnectDelegate`),
+  /// installed into the endpoint by `T::run` before the endpoint moves into the
+  /// detached pump. `None` keeps the flat configured reap timeouts.
+  pub(crate) reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
   /// The driver's keyring delegate, applied to inbound key-management requests.
   /// Present only under an encryption backend.
   #[cfg(encryption)]
@@ -85,6 +89,7 @@ where
     shutdown_flag: Rc<Cell<bool>>,
     driver_options: RuntimeOptions,
     serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
     #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
   ) -> Self {
     Self {
@@ -99,6 +104,7 @@ where
       shutdown_flag,
       driver_options,
       serf_options,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     }

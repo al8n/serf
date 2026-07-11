@@ -158,6 +158,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(VoidKeyringDelegate),
   )
@@ -459,6 +460,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(VoidKeyringDelegate),
   )
@@ -514,6 +516,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     std::sync::Arc::new(VoidKeyringDelegate),
   )
   .await

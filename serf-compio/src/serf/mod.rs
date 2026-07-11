@@ -153,6 +153,7 @@ where
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
     gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
   ) -> core::result::Result<Self, T::Error>
   where
@@ -216,6 +217,7 @@ where
       shutdown_flag.clone(),
       runtime_options,
       serf_options,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     );

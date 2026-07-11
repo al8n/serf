@@ -40,6 +40,10 @@ pub struct TransportRuntime<I, D> {
   pub(crate) user_drop: ReactorDropCounter,
   /// The write half of the member-coalescer shed counter.
   pub(crate) member_drop: ReactorDropCounter,
+  /// Optional per-member reconnect-timeout override (Go serf `ReconnectDelegate`),
+  /// installed into the endpoint by `T::run` before the endpoint moves into the
+  /// detached pump. `None` keeps the flat configured reap timeouts.
+  pub(crate) reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
   /// The driver's keyring delegate, applied to inbound key-management requests.
   /// Present only under an encryption backend.
   #[cfg(encryption)]
@@ -59,6 +63,7 @@ impl<I, D> TransportRuntime<I, D> {
     serf_options: SerfOptions,
     user_drop: ReactorDropCounter,
     member_drop: ReactorDropCounter,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     Self {
@@ -69,6 +74,7 @@ impl<I, D> TransportRuntime<I, D> {
       serf_options,
       user_drop,
       member_drop,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     }

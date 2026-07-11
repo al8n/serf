@@ -59,6 +59,7 @@ async fn try_spawn_node_at(id: &str, bind: SocketAddr) -> Result<Node, SerfError
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(crate::VoidKeyringDelegate),
   )
@@ -86,6 +87,7 @@ async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> No
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     serf_options,
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(crate::VoidKeyringDelegate),
   )
@@ -219,6 +221,7 @@ async fn assert_tcp_new_rejects(runtime: RuntimeOptions) {
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     runtime,
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(crate::VoidKeyringDelegate),
   )

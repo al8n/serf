@@ -401,7 +401,8 @@ where
       self.serf_rng,
       runtime.user_drop,
       runtime.member_drop,
-    );
+    )
+    .with_reconnect_delegate(runtime.reconnect_delegate);
 
     let driver = crate::driver::quic::spawn_quic_driver::<Self::Id, R, G, StdRng, D>(
       endpoint,

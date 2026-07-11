@@ -750,6 +750,20 @@ where
     self.plane.listener = Some(c);
   }
 
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`](serf_proto::ReconnectDelegate) on the serf endpoint.
+  ///
+  /// `None` (the default) keeps the flat configured reap timeouts; a delegate
+  /// lets the driver lengthen or shorten the reaper's per-member window (Go serf
+  /// `ReconnectDelegate`).
+  #[inline]
+  pub fn set_reconnect_delegate(
+    &mut self,
+    delegate: Option<std::boxed::Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+  ) {
+    self.endpoint.set_reconnect_delegate(delegate);
+  }
+
   /// The configured local port (gossip + reliable listener both bind it).
   #[inline]
   pub fn port(&self) -> u16 {

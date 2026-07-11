@@ -755,6 +755,18 @@ where
     self.engine.start(now);
   }
 
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`](crate::ReconnectDelegate) on the serf engine.
+  ///
+  /// `None` (the default) keeps the flat configured reap timeouts.
+  #[inline]
+  pub fn set_reconnect_delegate(
+    &mut self,
+    delegate: Option<std::boxed::Box<dyn serf_embedded::ReconnectDelegate<I, SocketAddr>>>,
+  ) {
+    self.engine.set_reconnect_delegate(delegate);
+  }
+
   /// serf's current lifecycle state.
   #[inline]
   pub fn state(&self) -> SerfState {
