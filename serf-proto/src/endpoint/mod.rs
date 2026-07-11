@@ -509,6 +509,28 @@ pub enum Error {
   /// lifetime (2^63 membership events).
   #[error("leave clock exhausted: member clock reached the LTIME_MAX integrity floor")]
   LeaveClockExhausted,
+  /// `leave()` refused because the encoded leave intent does not fit the
+  /// farewell budget the coordinator can guarantee beside this node's own
+  /// death notice.
+  ///
+  /// serf reserves its leave intent into every dead-self farewell compound so
+  /// each recipient reads the departure as intentional; when the intent would
+  /// not fit — a long (but legal) node id can leave the death notice alone
+  /// filling the gossip MTU — the leave is refused BEFORE any mutation rather
+  /// than silently degrading to a bare `Dead` fan-out that peers would classify
+  /// as a failure.  The endpoint stays a consistent `Alive` member.
+  ///
+  /// Carries `(encoded_intent_size, farewell_capacity)`; the capacity is `0`
+  /// when the death notice alone exhausts the gossip MTU (no farewell can ride).
+  #[error("leave farewell too large: {0} bytes exceeds farewell capacity of {1}")]
+  LeaveFarewellTooLarge(usize, usize),
+  /// `leave()` could not encode its leave intent for the farewell compound.
+  ///
+  /// Encoding the intent is a prerequisite for admitting it against the farewell
+  /// budget, so a codec failure (a degenerate id type) refuses the leave BEFORE
+  /// any mutation instead of degrading to a bare `Dead` fan-out.
+  #[error("leave farewell encode error: {0}")]
+  LeaveFarewellEncode(EncodeError),
   /// `join()` was called while the local endpoint is not `Alive`.
   ///
   /// serf only announces its own join intent from the `Alive` state; a
@@ -2579,27 +2601,33 @@ where
   /// - `Alive` → proceeds with the leave chain below.
   ///
   /// Leave chain (decision 5 / oracle `api.go` leave()):
-  /// 1. Post-increment the member clock to stamp the leave ltime — but only
-  ///    after the [`LTIME_MAX`] integrity-floor gate: if the stamp would land at
-  ///    or above `LTIME_MAX` (a clock driven near the floor), return
-  ///    [`Error::LeaveClockExhausted`] without mutating any state. No invalid
-  ///    intent is emitted and no inner leave starts; the endpoint stays a
-  ///    consistent `Alive` member (degraded-but-safe).
-  /// 2. Set `state = Leaving`, then handle the local leave intent
-  ///    (`handle_node_leave_intent` for the local id), which marks the local
-  ///    node as `Leaving` in the membership store and queues a join-refute
+  /// 1. Compute the prospective leave ltime by post-incrementing the member
+  ///    clock, WITHOUT committing it, and gate it on the [`LTIME_MAX`]
+  ///    integrity floor: if the stamp would land at or above `LTIME_MAX` (a
+  ///    clock driven near the floor), return [`Error::LeaveClockExhausted`]
+  ///    without mutating any state — the endpoint stays a consistent `Alive`
+  ///    member (degraded-but-safe).
+  /// 2. Encode the leave intent from that prospective stamp and admit it against
+  ///    the coordinator's `farewell_capacity` — still BEFORE any mutation. The
+  ///    intent MUST ride the dead-self farewell compound so peers read the
+  ///    departure as intentional; if it cannot fit (a long id can leave the
+  ///    death notice alone filling the gossip MTU) the inner leave would degrade
+  ///    to a bare `Dead` fan-out peers classify as a failure, so refuse with
+  ///    [`Error::LeaveFarewellTooLarge`] (or [`Error::LeaveFarewellEncode`] on a
+  ///    codec failure) and leave the machine untouched. Only past this admission
+  ///    does any mutation occur.
+  /// 3. Commit the stamp, set `state = Leaving`, then handle the local leave
+  ///    intent (`handle_node_leave_intent` for the local id), which marks the
+  ///    local node as `Leaving` in the membership store and queues a join-refute
   ///    suppression.
-  /// 3. Enqueue the leave-intent broadcast on the intent tier (rank 0) so peers
-  ///    learn the local node is leaving.
-  /// 4. Call inner `leave(now)` synchronously. The inner packs the payloads
-  ///    still queued on the user-broadcast tiers — the rank-0 intent just
-  ///    enqueued — into its dead-self fan-out, user parts ahead of the death
-  ///    notice, so every farewell recipient receives the intent ATOMICALLY with
-  ///    the dead-self notice in one datagram and processes the intent first,
-  ///    classifying the departure as intentional rather than a failure. The
-  ///    inner emits `Event::LeftCluster` once all dead-self packets drain via
-  ///    `poll_transmit`. No separate wait for the intent to flush exists: the
-  ///    queued intent departs with the dead-self frame, not on its own schedule.
+  /// 4. Call inner `leave(now, Some(intent))` synchronously, passing the
+  ///    pre-admitted intent as the explicit farewell. The inner RESERVES it into
+  ///    every dead-self farewell compound ahead of its ordinary queue drain,
+  ///    user parts ahead of the death notice, so every farewell recipient
+  ///    receives the intent ATOMICALLY with the dead-self notice in one datagram
+  ///    and processes it first, classifying the departure as intentional rather
+  ///    than a failure. The inner emits `Event::LeftCluster` once all dead-self
+  ///    packets drain via `poll_transmit`.
   ///
   /// The `Leaving → Left` transition happens later in `handle_timeout` when
   /// `leave_complete_deadline` (armed on inner `LeftCluster` + `leave_propagate_delay`)
@@ -2643,10 +2671,32 @@ where
     if !ltime_is_acceptable(stamp) {
       return Err(Error::LeaveClockExhausted);
     }
+    let ltime = LamportTime(stamp);
 
-    // The stamp is acceptable: commit it and transition to Leaving.
+    // Admit the farewell BEFORE any mutation. serf reserves its leave intent
+    // into every dead-self farewell compound so each recipient reads the
+    // departure as intentional; if the intent cannot ride beside the death
+    // notice the inner leave silently degrades to a bare `Dead` fan-out and
+    // peers classify the departure as a failure. Encode the intent from the
+    // prospective (not-yet-committed) stamp and check it against the largest
+    // payload the coordinator can guarantee to carry, refusing up front — clock
+    // unadvanced, still `Alive`, nothing queued — rather than reporting a
+    // success peers read as a failure. An encode failure (a degenerate id type)
+    // refuses here for the same reason: the intent is a prerequisite for the
+    // admission, not an optional extra that may be dropped.
+    let farewell = AnyMessage::<I, A>::Leave(LeaveMessage::new(ltime, local_id.clone(), false))
+      .encode()
+      .map_err(Error::LeaveFarewellEncode)?;
+    match t.farewell_capacity() {
+      Some(capacity) if farewell.len() <= capacity => {}
+      Some(capacity) => return Err(Error::LeaveFarewellTooLarge(farewell.len(), capacity)),
+      // `None`: the death notice alone exhausts the gossip MTU, so no farewell
+      // can ride beside it. Report a zero capacity per the variant's contract.
+      None => return Err(Error::LeaveFarewellTooLarge(farewell.len(), 0)),
+    }
+
+    // Admission passed: commit the stamp and transition to Leaving.
     self.clock = stamp;
-    let ltime = LamportTime(self.clock);
     self.mark_local_state_dirty();
 
     // 1. Transition to Leaving BEFORE applying the local intent so the
@@ -2664,24 +2714,15 @@ where
       return Err(Error::LeaveClockExhausted);
     }
 
-    // 3. Encode the leave intent and call the inner leave synchronously,
-    //    passing the intent as the explicit farewell payload. The coordinator
-    //    RESERVES it into every dead-self farewell compound ahead of its
-    //    ordinary queue drain — user parts before the death notice — so every
-    //    farewell recipient receives the intent atomically with the dead-self
-    //    notice and processes it first, reading the departure as intentional,
-    //    regardless of what else is queued (an older, larger queued payload
-    //    cannot crowd the reservation out). This queues the resulting fan-out
-    //    packets for `poll_transmit`.
-    //
-    //    An encode failure (a degenerate id type — a construction-time concern
-    //    the driver surfaces) degrades to a plain inner leave: peers then read
-    //    the departure as a failure until the late-intent heal cannot help,
-    //    matching the pre-farewell tolerance for the same degenerate case.
-    let farewell = AnyMessage::<I, A>::Leave(LeaveMessage::new(ltime, local_id, false))
-      .encode()
-      .ok();
-    t.leave(now, farewell)?;
+    // 3. Call the inner leave synchronously, passing the pre-admitted intent as
+    //    the explicit farewell payload. The coordinator RESERVES it into every
+    //    dead-self farewell compound ahead of its ordinary queue drain — user
+    //    parts before the death notice — so every farewell recipient receives
+    //    the intent atomically with the dead-self notice and processes it first,
+    //    reading the departure as intentional, regardless of what else is queued
+    //    (an older, larger queued payload cannot crowd the reservation out).
+    //    This queues the resulting fan-out packets for `poll_transmit`.
+    t.leave(now, Some(farewell))?;
 
     Ok(())
   }

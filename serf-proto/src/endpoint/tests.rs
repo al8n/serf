@@ -8,6 +8,7 @@ use crate::{
 #[cfg(feature = "coordinates")]
 use bytes::Bytes;
 use memberlist_proto::{EndpointOptions, RawRecords, SeedableRng, SmallRng, streams::LabelOptions};
+use smol_str::SmolStr;
 
 /// The plain-TCP record layer the unit-test coordinators run over.
 type TestTransport = RawRecords;
@@ -30,9 +31,12 @@ fn default_endpoint_is_send_and_sync() {
 /// the identity and the SNI provider is unused (the plain-TCP record layer
 /// ignores it).  A fixed cluster label keeps the handshake well-formed for the
 /// loopback tests that complete a real exchange.
-fn coord(
-  inner: memberlist_proto::Endpoint<u32, core::net::SocketAddr>,
-) -> memberlist_proto::streams::StreamEndpoint<u32, core::net::SocketAddr, TestTransport> {
+fn coord<I>(
+  inner: memberlist_proto::Endpoint<I, core::net::SocketAddr>,
+) -> memberlist_proto::streams::StreamEndpoint<I, core::net::SocketAddr, TestTransport>
+where
+  I: memberlist_proto::Id,
+{
   memberlist_proto::streams::StreamEndpoint::new(
     inner,
     LabelOptions::new_in(Some(b"serf-test".to_vec()), ()),
@@ -472,6 +476,106 @@ fn leave_one_below_watermark_succeeds() {
     Some(MemberStatus::Leaving),
     "self-membership must transition to Leaving on the boundary leave"
   );
+}
+
+/// Pre-mutation farewell admission: a `leave()` whose encoded intent cannot ride
+/// the dead-self farewell compound is refused with [`Error::LeaveFarewellTooLarge`]
+/// BEFORE any mutation.  The machine stays a consistent `Alive`: the clock does
+/// not advance, self-membership never half-transitions to `Leaving`, no intent
+/// is queued, no dead-self fan-out is emitted, and a normal operation still works.
+///
+/// The reproduction is the finding's own scenario — a long (but legal) node id.
+/// memberlist's identity-aware construction floor sizes the gossip MTU for a
+/// probe `Ping` (the local id in BOTH node slots plus two advertise addresses),
+/// while the farewell budget only has to hold the Dead-self notice (the id
+/// twice, no addresses). At the minimum valid MTU the budget left beside the
+/// death notice is a couple of addresses' worth — far below the id-sized leave
+/// intent — so the intent cannot ride.
+#[test]
+fn leave_over_farewell_budget_refuses_pre_mutation() {
+  let addr: core::net::SocketAddr = "127.0.0.1:7946".parse().unwrap();
+  let big_id = SmolStr::new("n".repeat(900));
+
+  // Read the identity-aware gossip-MTU floor off a deliberately-undersized
+  // construction, so the test tracks the real encoding overhead rather than a
+  // brittle constant, then build at exactly that floor.
+  let required = match memberlist_proto::Endpoint::try_new_at(
+    EndpointOptions::new(big_id.clone(), addr)
+      .with_gossip_mtu(memberlist_proto::DEFAULT_GOSSIP_MTU),
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  ) {
+    Err(memberlist_proto::EndpointInitError::GossipMtuTooSmall(b)) => b.bound(),
+    Err(other) => {
+      panic!("expected a gossip-MTU floor rejection, got a different init error: {other:?}")
+    }
+    Ok(_) => panic!("expected the long-id construction to be rejected by the gossip-MTU floor"),
+  };
+  let inner_opts = EndpointOptions::new(big_id.clone(), addr)
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap())
+    .with_gossip_mtu(required);
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let mut e: StreamEndpoint<SmolStr, core::net::SocketAddr, RawRecords> =
+    StreamEndpoint::new(coord(inner), Options::new());
+  // Drain the construction self-join so the machine starts settled.
+  let _ = e.poll_event();
+
+  // Seed one live peer: a successful leave WOULD fan a dead-self notice out to
+  // it, so the absence of any transmit after the refusal is meaningful. Drain
+  // whatever the seed produced first, and snapshot the clock and queue depth.
+  e.test_seed_member(
+    SmolStr::new("peer"),
+    MemberStatus::Alive,
+    LamportTime::new(1),
+  );
+  while e.poll_memberlist_transmit().is_some() {}
+  let clock_before = e.member_time();
+  let queue_before = e.user_broadcast_queue_len();
+
+  let err = e
+    .leave(memberlist_proto::Instant::ORIGIN)
+    .expect_err("an over-budget farewell must refuse the leave");
+  assert!(
+    matches!(err, Error::LeaveFarewellTooLarge(len, cap) if len > cap),
+    "expected LeaveFarewellTooLarge with intent size exceeding capacity, got {err:?}"
+  );
+
+  // Unmutated machine: still Alive, clock unadvanced, self-membership still
+  // Alive (never a half-Leaving), no intent queued, and no dead-self fan-out.
+  assert!(e.state().is_alive(), "the refused leave must stay Alive");
+  assert_eq!(
+    e.member_time(),
+    clock_before,
+    "the refused leave must not advance the member clock"
+  );
+  assert_eq!(
+    e.test_member_status(big_id.clone()),
+    Some(MemberStatus::Alive),
+    "self-membership must stay Alive, not a half-Leaving"
+  );
+  assert_eq!(
+    e.user_broadcast_queue_len(),
+    queue_before,
+    "the refused leave must queue no leave intent"
+  );
+  assert!(
+    e.poll_memberlist_transmit().is_none(),
+    "the refused leave must emit no dead-self fan-out"
+  );
+
+  // A normal operation still works — the machine is not wedged in a half-state.
+  // force_leave targets the peer id (a small intent, no farewell reservation),
+  // so it proceeds regardless of the local id's farewell budget.
+  e.force_leave(
+    SmolStr::new("peer"),
+    false,
+    memberlist_proto::Instant::ORIGIN,
+  )
+  .expect("a normal membership operation must still work after the refusal");
 }
 
 #[test]

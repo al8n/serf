@@ -22,6 +22,9 @@ where
   let _ = t.endpoint_ref().local_state_snapshot_bytes();
   let _ = t.endpoint_ref().user_broadcast_queue_len();
 
+  // Read-only farewell admission bound (the pre-leave capacity check).
+  let _ = t.farewell_capacity();
+
   // Mutating: queue a broadcast at rank 0 (highest priority).
   let result = t.queue_user_broadcast_ranked(0, Bytes::from_static(b"hello"));
   assert!(
