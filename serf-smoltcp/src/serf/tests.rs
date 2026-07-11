@@ -169,6 +169,33 @@ fn over_ceiling_user_event_size_is_rejected() {
   assert!(matches!(err, crate::InitError::InvalidSerfOptions(_)));
 }
 
+// The explicit-RNG constructor runs the same preflight, so an over-ceiling
+// configuration cannot slip in through the production entropy-seeded path.
+#[test]
+fn over_ceiling_user_event_size_is_rejected_by_with_rng() {
+  use memberlist_proto::{SeedableRng, SmallRng};
+
+  let mut dev = NullDevice;
+  let Err(err) = Serf::<SmolStr, SocketAddr, NullDevice>::with_rng(
+    Options::new(),
+    ip_iface(1),
+    TransformOptions::default(),
+    EndpointOptions::new(
+      SmolStr::new("a"),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946),
+    ),
+    SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1),
+    &SocketAddrResolver,
+    &mut dev,
+    now(),
+    SmallRng::seed_from_u64(1),
+    SmallRng::seed_from_u64(2),
+  ) else {
+    panic!("an over-ceiling max_user_event_size must be rejected by with_rng");
+  };
+  assert!(matches!(err, crate::InitError::InvalidSerfOptions(_)));
+}
+
 /// A [`GossipIo`] that replays a fixed list of pre-encoded datagrams once (one per
 /// `recv`), draining `send`. Feeds a controlled flood of inbound gossip straight to
 /// the engine's pump.

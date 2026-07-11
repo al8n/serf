@@ -168,6 +168,12 @@ impl fmt::Display for InitError {
   }
 }
 
+impl From<serf_embedded::MemberlistInitError> for InitError {
+  fn from(e: serf_embedded::MemberlistInitError) -> Self {
+    InitError::Engine(e.into())
+  }
+}
+
 impl From<serf_embedded::InitError> for InitError {
   fn from(e: serf_embedded::InitError) -> Self {
     InitError::Engine(e)

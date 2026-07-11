@@ -61,12 +61,15 @@ use serf_proto::{
 };
 
 use memberlist_embedded::{
-  GossipIo, InitError, Options, StreamIo, TransformOptions,
+  GossipIo, InitError as MemberlistInitError, Options, StreamIo, TransformOptions,
   reliable::{ConnState, Connection, ReliablePlane},
   socket_addr_is_routable, validate_runtime_config,
 };
 
-use crate::cidr::{CidrFilter, cidr_blocks};
+use crate::{
+  cidr::{CidrFilter, cidr_blocks},
+  error::InitError,
+};
 
 /// The largest the encrypted wrapper can inflate a gossip datagram, or `0` when
 /// no encryption backend is built in. serf's gossip plane carries only the
@@ -545,7 +548,10 @@ where
   /// # Errors
   ///
   /// Returns [`InitError`] instead of panicking when the configuration is
-  /// invalid: a zero/over-ceiling gossip MTU, a zero port or close timeout, a
+  /// invalid: serf options that fail
+  /// [`SerfOptions::validate`](serf_proto::options::Options::validate) (a
+  /// self-contradictory coalescing pair, an over-ceiling `max_user_event_size`),
+  /// a zero/over-ceiling gossip MTU, a zero port or close timeout, a
   /// non-routable or port-mismatched advertise address, a machine-endpoint init
   /// failure, or (with an encryption backend built in) an unusable keyring.
   pub fn try_new_at_with_rng(
@@ -557,6 +563,13 @@ where
     gossip_rng: G,
     serf_rng: SR,
   ) -> Result<Self, InitError> {
+    // Reject an invalid serf configuration up front, in the one funnel every
+    // constructor (and every wrapping driver) passes through, so no engine can
+    // be built past the construction-time checks.
+    serf_opts
+      .validate()
+      .map_err(InitError::InvalidSerfOptions)?;
+
     // Validate every advertise-independent config field (port, gossip-MTU
     // ceiling, close timeout, and the encryption keyring) up front, sharing the
     // reused preflight so the deterministic checks live in ONE place.
@@ -570,13 +583,13 @@ where
     // rotation ops (`promote`/`remove_secondary`) match on bytes alone, so such a
     // ring would make every later byte-keyed op ambiguous and let a rotation
     // promote or remove the wrong cipher's key. Failing fast here — surfaced through
-    // the existing encryption `InitError` channel, the closest typed construction
+    // the memberlist half's encryption channel, the closest typed construction
     // error — beats a latent ambiguous rotation, and establishes the chokepoint
     // invariant that the live keyring is cross-cipher-collision-free at all times.
     #[cfg(encryption)]
     if let Some(keyring) = transform.encryption.keyring() {
       if keyring_carries_cross_cipher_twin(keyring) {
-        return Err(EncryptionError::KeyMismatch.into());
+        return Err(InitError::Memberlist(EncryptionError::KeyMismatch.into()));
       }
     }
 
@@ -587,12 +600,12 @@ where
     // Reject a non-routable advertise address before the endpoint exists: a node
     // must advertise an address its peers can route a reply to.
     if !socket_addr_is_routable(&advertise) {
-      return Err(InitError::NonRoutableAdvertiseAddr(advertise));
+      return Err(MemberlistInitError::NonRoutableAdvertiseAddr(advertise).into());
     }
     // The advertised port must match the single bound port (one port serves both
     // the gossip and reliable planes; a direct embedded interface has no NAT).
     if advertise.port() != cfg.port {
-      return Err(InitError::AdvertisePortMismatch);
+      return Err(MemberlistInitError::AdvertisePortMismatch.into());
     }
 
     // Size the inbound-gossip scratch from the configured gossip MTU, keeping the
@@ -613,8 +626,9 @@ where
 
     // Build the inner memberlist `Endpoint` (the SWIM machine serf sits on) with
     // the injected gossip RNG. `try_new_at` maps a machine init failure to
-    // `InitError::Endpoint` and starts its timers from a consistent origin.
-    let mut ep = Endpoint::try_new_at(ep_cfg, now, gossip_rng).map_err(InitError::Endpoint)?;
+    // `MemberlistInitError::Endpoint` and starts its timers from a consistent origin.
+    let mut ep =
+      Endpoint::try_new_at(ep_cfg, now, gossip_rng).map_err(MemberlistInitError::Endpoint)?;
 
     // Install the routable-address admission filter on the raw `Endpoint` BEFORE
     // it is wrapped: the machine consults it inline for every inbound Alive, so a

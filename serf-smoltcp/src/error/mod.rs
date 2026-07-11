@@ -328,16 +328,29 @@ impl InitError {
   /// Map a [`SerfEngine`](serf_embedded::SerfEngine) construction error into the
   /// driver's [`InitError`].
   ///
-  /// The driver pre-validates the port, gossip MTU, close timeout, and advertise
-  /// address before building the engine, so in practice the engine fails only with
-  /// [`Endpoint`](serf_embedded::InitError::Endpoint) (machine init) or
-  /// [`Encryption`](serf_embedded::InitError::Encryption) (an unusable keyring).
-  /// The remaining variants are mapped to their driver equivalents anyway so the
-  /// conversion is total and stays correct if the driver's pre-checks are ever
-  /// reordered or relaxed.
+  /// The driver pre-validates the port, gossip MTU, close timeout, advertise
+  /// address, and serf options before building the engine, so in practice the
+  /// engine fails only with
+  /// [`Endpoint`](serf_embedded::MemberlistInitError::Endpoint) (machine init) or
+  /// [`Encryption`](serf_embedded::MemberlistInitError::Encryption) (an unusable
+  /// keyring). The remaining variants are mapped to their driver equivalents
+  /// anyway so the conversion is total and stays correct if the driver's
+  /// pre-checks are ever reordered or relaxed.
   pub(crate) fn from_embedded(e: serf_embedded::InitError) -> Self {
-    use serf_embedded::InitError as E;
     match e {
+      serf_embedded::InitError::InvalidSerfOptions(inner) => InitError::InvalidSerfOptions(inner),
+      serf_embedded::InitError::Memberlist(m) => Self::from_memberlist(m),
+      // The engine's own error is `#[non_exhaustive]`; treat an unknown future
+      // arm like the memberlist wildcard in `from_memberlist`.
+      _ => InitError::Endpoint(EndpointInitError::AwarenessMultiplierZero),
+    }
+  }
+
+  /// Map the memberlist half of the engine's construction error — also the type
+  /// the shared advertise-independent preflight returns directly.
+  pub(crate) fn from_memberlist(m: serf_embedded::MemberlistInitError) -> Self {
+    use serf_embedded::MemberlistInitError as E;
+    match m {
       E::NonRoutableAdvertiseAddr(addr) => InitError::NonRoutableAdvertiseAddr(addr),
       E::AdvertisePortMismatch => InitError::AdvertisePortMismatch,
       E::ZeroPort => InitError::ZeroPort,
@@ -349,9 +362,9 @@ impl InitError {
       E::Endpoint(inner) => InitError::Endpoint(inner),
       #[cfg(encryption)]
       E::Encryption(inner) => InitError::Encryption(inner),
-      // `serf_embedded::InitError` is `#[non_exhaustive]`, so a wildcard is
-      // required even though every variant it defines today is handled above and
-      // this arm is unreachable. A future engine-only failure mode reaching here
+      // The memberlist half is `#[non_exhaustive]`, so a wildcard is required
+      // even though every variant it defines today is handled above and this
+      // arm is unreachable. A future engine-only failure mode reaching here
       // surfaces as a generic endpoint-init failure and would warrant its own
       // driver variant when added.
       _ => InitError::Endpoint(EndpointInitError::AwarenessMultiplierZero),
