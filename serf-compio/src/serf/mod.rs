@@ -43,7 +43,7 @@ use crate::{
   delegate::Delegate,
   driver::options::RuntimeOptions,
   drop_counter::DropReader,
-  error::{JoinFailed, Result, SerfError},
+  error::{InvalidOption, JoinFailed, Result, SerfError},
   events::EventStream,
   resolver::{AdvertiseAddrResolver, Resolver},
   snapshot::{SerfSnapshot, SnapshotCell},
@@ -170,6 +170,12 @@ where
     // `event_queue_cap` would make the event-stream channel a rendezvous the
     // non-blocking forward can never deposit into, dropping every event.
     runtime_options.validate()?;
+    // Reject a serf-level configuration a driver cannot honor (an over-ceiling
+    // `max_user_event_size`, or a self-contradictory coalescing pair) at the same
+    // early stage, before any socket is bound or the detached driver is spawned.
+    serf_options
+      .validate()
+      .map_err(|e| SerfError::InvalidOption(InvalidOption::new("serf_options", e.to_string())))?;
 
     // Cache the join deadline on the handle BEFORE `runtime_options` is moved
     // into the driver bundle, so each await-result join can stamp its absolute

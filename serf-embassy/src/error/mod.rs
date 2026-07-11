@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use core::{fmt, time::Duration};
 
-use serf_embedded::{JoinFailed, SerfError};
+use serf_embedded::{InvalidOptions, JoinFailed, SerfError};
 
 /// Why constructing a [`Serf`](crate::Serf) node failed.
 ///
@@ -68,6 +68,12 @@ pub enum InitError {
   /// [`Serf::new_with_rng`](crate::Serf::new_with_rng) to supply your own RNGs
   /// and avoid the platform entropy draw entirely.
   Entropy,
+  /// The serf-level [`SerfOptions`](crate::SerfOptions) failed
+  /// [`validate`](crate::SerfOptions::validate): `max_user_event_size` exceeds
+  /// the absolute `USER_EVENT_SIZE_LIMIT` ceiling, or a coalescing quiescent
+  /// period is not strictly less than its coalesce period. Carries the typed
+  /// cause.
+  InvalidSerfOptions(InvalidOptions),
 }
 
 impl InitError {
@@ -157,6 +163,7 @@ impl fmt::Display for InitError {
       InitError::Resolve(e) => write!(f, "advertise address resolution failed: {e}"),
       InitError::NoAddresses => f.write_str("advertise address resolution returned no addresses"),
       InitError::Entropy => f.write_str("entropy source failed while seeding the RNGs"),
+      InitError::InvalidSerfOptions(e) => write!(f, "invalid serf options: {e}"),
     }
   }
 }

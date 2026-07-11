@@ -39,7 +39,7 @@ pub use memberlist_proto::{EndpointOptions, Instant};
 // is self-contained: the event set, the resolver result + admission predicates, the
 // transform config, the await-result join types, and serf's config / error types.
 pub use serf_embedded::{
-  AliveDelegate, DEFAULT_EVENT_BUFFER_CAP, Event, JoinFailed, JoinId, LabelError,
+  AliveDelegate, DEFAULT_EVENT_BUFFER_CAP, Event, InvalidOptions, JoinFailed, JoinId, LabelError,
   MAX_RESOLVED_ADDRS_PER_SEED, MaybeOwned, MaybeResolved, MergeDelegate, ReachedSet,
   ReconnectDelegate, ResolvedAddrs, SerfError, SerfOptions, TransformOptions,
   socket_addr_is_routable,

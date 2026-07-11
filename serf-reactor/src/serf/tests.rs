@@ -246,6 +246,35 @@ async fn tcp_new_rejects_zero_event_queue_cap() {
   assert_tcp_new_rejects(RuntimeOptions::new().with_event_queue_cap(0)).await;
 }
 
+/// An over-ceiling `max_user_event_size` in the serf options is rejected by
+/// `Serf::tcp` at construction — before binding a socket or spawning the detached
+/// driver — rather than returning `Ok` and later dropping oversize user events.
+#[tokio::test]
+async fn tcp_new_rejects_over_ceiling_user_event_size() {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("bad-serf-opt-node"))
+    .with_advertise_addr(MaybeResolved::Resolved(bind));
+  let serf = SerfOptions::new().with_max_user_event_size(SerfOptions::USER_EVENT_SIZE_LIMIT + 1);
+  let res = Serf::<SmolStr, SocketAddr, TokioRuntime>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(crate::VoidKeyringDelegate),
+  )
+  .await;
+  match res {
+    Err(SerfError::InvalidOption(_)) => {}
+    Err(other) => panic!("expected InvalidOption, got {other:?}"),
+    Ok(_) => panic!("an over-ceiling max_user_event_size must be rejected at construction"),
+  }
+}
+
 /// A `Bounded(0)` observation channel sourced from a serde config is rejected.
 #[cfg(feature = "serde")]
 #[tokio::test]

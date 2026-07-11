@@ -146,6 +146,29 @@ fn zero_port_is_rejected() {
   assert!(matches!(err, crate::InitError::ZeroPort));
 }
 
+#[test]
+fn over_ceiling_user_event_size_is_rejected() {
+  let mut dev = NullDevice;
+  // A `max_user_event_size` above the absolute ceiling is rejected at
+  // construction rather than dropping oversize user events at send time.
+  let Err(err) = Serf::<SmolStr, SocketAddr, NullDevice>::try_new(
+    Options::new(),
+    ip_iface(1),
+    TransformOptions::default(),
+    EndpointOptions::new(
+      SmolStr::new("a"),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946),
+    ),
+    SerfOptions::new().with_max_user_event_size(SerfOptions::USER_EVENT_SIZE_LIMIT + 1),
+    &SocketAddrResolver,
+    &mut dev,
+    now(),
+  ) else {
+    panic!("an over-ceiling max_user_event_size must be rejected");
+  };
+  assert!(matches!(err, crate::InitError::InvalidSerfOptions(_)));
+}
+
 /// A [`GossipIo`] that replays a fixed list of pre-encoded datagrams once (one per
 /// `recv`), draining `send`. Feeds a controlled flood of inbound gossip straight to
 /// the engine's pump.

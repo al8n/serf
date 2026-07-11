@@ -3,6 +3,7 @@
 use core::fmt;
 
 use memberlist_proto::EndpointInitError;
+use serf_embedded::InvalidOptions;
 
 use crate::interface::{HardwareAddress, IpCidr, Medium, Route};
 use core::net::SocketAddr;
@@ -201,6 +202,12 @@ pub enum InitError {
   /// immediately — the drain never runs and an in-flight push/pull response is
   /// truncated. Must be non-zero.
   ZeroCloseTimeout,
+  /// The serf-level [`SerfOptions`](crate::SerfOptions) failed
+  /// [`validate`](crate::SerfOptions::validate): `max_user_event_size` exceeds
+  /// the absolute `USER_EVENT_SIZE_LIMIT` ceiling, or a coalescing quiescent
+  /// period is not strictly less than its coalesce period. Carries the typed
+  /// cause.
+  InvalidSerfOptions(InvalidOptions),
 }
 
 /// The configured gossip MTU exceeds the largest plaintext payload whose on-wire
@@ -312,6 +319,7 @@ impl fmt::Display for InitError {
         f.write_str("udp_rx_packets and udp_tx_packets must be non-zero")
       }
       InitError::ZeroCloseTimeout => f.write_str("close_timeout must be non-zero"),
+      InitError::InvalidSerfOptions(e) => write!(f, "invalid serf options: {e}"),
     }
   }
 }

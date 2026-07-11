@@ -47,7 +47,7 @@ use crate::{
   },
   delegate::Delegate,
   driver::options::RuntimeOptions,
-  error::{JoinFailed, Result, SerfError},
+  error::{InvalidOption, JoinFailed, Result, SerfError},
   events::EventStream,
   resolver::{AdvertiseAddrResolver, Resolver},
   shared::Shared,
@@ -171,6 +171,13 @@ where
     // Reject runtime knobs a zero capacity would deterministically break BEFORE
     // binding any socket or spawning the detached driver.
     runtime_options.validate().map_err(T::Error::from)?;
+    // Reject a serf-level configuration a driver cannot honor (an over-ceiling
+    // `max_user_event_size`, or a self-contradictory coalescing pair) at the same
+    // early stage, before any socket is bound or the detached driver is spawned.
+    serf_options
+      .validate()
+      .map_err(|e| SerfError::InvalidOption(InvalidOption::new("serf_options", e.to_string())))
+      .map_err(T::Error::from)?;
     // Cache the join deadline before `runtime_options` moves into the bundle.
     let join_deadline = runtime_options.join_deadline();
     // Cache `query_timeout_mult` before `serf_options` moves into the bundle, so
