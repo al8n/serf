@@ -218,11 +218,12 @@ where
     self.slots[i].id.clone()
   }
 
-  /// Abruptly kill node `i`: shut its handle down, which discards the teardown's
-  /// best-effort leave (the gossip socket drops before the leave datagram can be
-  /// transmitted), so peers detect a probe-timeout Failed rather than a graceful
-  /// Leave. The slot's id, addr, and event log are retained for a later restart or
-  /// assertion; the freed port is released before `shutdown` resolves.
+  /// Abruptly kill node `i`: shut its handle down without a leave. A shutdown
+  /// sends no farewell (abrupt by design, mirroring the reference
+  /// implementation's Shutdown), so peers detect a probe-timeout Failed rather
+  /// than a graceful Leave. The slot's id, addr, and event log are retained for
+  /// a later restart or assertion; the freed port is released before `shutdown`
+  /// resolves.
   pub async fn kill_abrupt(&mut self, i: usize) {
     let serf = self.slots[i].serf.take().expect("node slot is live");
     serf.shutdown().await.expect("node shuts down");
@@ -247,6 +248,20 @@ where
     let elapsed = start.elapsed();
     serf.shutdown().await.expect("node shuts down");
     elapsed
+  }
+
+  /// Gracefully leave node `i` with a shutdown racing the leave: both commands
+  /// are issued concurrently, so they typically land in the same driver command
+  /// batch and the teardown itself must egress the still-queued farewell before
+  /// releasing the gossip socket. Unlike
+  /// [`leave_graceful`](Self::leave_graceful) there is no resolved-leave fence
+  /// ahead of the shutdown — the leave must still resolve `Ok`, proving the
+  /// farewell reached the transport under the race.
+  pub async fn leave_with_racing_shutdown(&mut self, i: usize) {
+    let serf = self.slots[i].serf.take().expect("node slot is live");
+    let (leave, shutdown) = futures_util::future::join(serf.leave(), serf.shutdown()).await;
+    leave.expect("node leaves gracefully despite the racing shutdown");
+    shutdown.expect("node shuts down");
   }
 
   /// Restart a previously-killed node `i` at the SAME id and advertise address,

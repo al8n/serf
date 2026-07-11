@@ -558,6 +558,42 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Two nodes on loopback: node A joins node B, then B's `leave()` and
+/// `shutdown()` race — issued concurrently, they typically land in the same
+/// driver command batch, so the teardown itself owns egressing the queued
+/// farewell before it releases the gossip socket. Node A must still observe
+/// Join → Leave (never a Failed) and B's leave must still resolve `Ok`,
+/// pinning that an immediate shutdown cannot discard the departure fan-out
+/// while it is still queued inside the endpoint.
+async fn serf_events_leave_with_racing_shutdown<R>()
+where
+  R: Runtime,
+{
+  // Hold B's Left tombstone past the test window, as in `serf_events_leave`.
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["leave-race-a", "leave-race-b"],
+    cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  cluster.leave_with_racing_shutdown(1).await;
+
+  // A observes exactly [Join, Leave] about B — never a Failed.
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[MemberEventKind::Join, MemberEventKind::Leave],
+    )
+    .await;
+
+  // B lands in A's Left tombstone view.
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+
+  cluster.shutdown_all().await;
+}
+
 /// Two nodes on loopback: node A joins node B, B is abruptly killed and detected
 /// Failed, then B is restarted at the same id and advertise address. Node A must
 /// observe the sequence Join → Failed → Join about B — the failed member
@@ -809,6 +845,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_events_leave_with_racing_shutdown() {
+    super::serf_events_leave_with_racing_shutdown::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn serf_reconnect() {
     super::serf_reconnect::<TokioRuntime>().await;
   }
@@ -885,6 +926,11 @@ mod smol_cells {
   #[test]
   fn serf_events_leave_smol() {
     SmolRuntime::block_on(super::serf_events_leave::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_events_leave_with_racing_shutdown_smol() {
+    SmolRuntime::block_on(super::serf_events_leave_with_racing_shutdown::<SmolRuntime>());
   }
 
   #[test]
