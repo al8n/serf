@@ -926,12 +926,15 @@ where
       raw_sent += 1;
       if let Some(socket) = self.socket.as_ref() {
         let outcome = socket.poll_send_to(cx, &bytes, dest);
-        if self.leave_initiated {
-          // The leave fan-out may ride a quinn application DATAGRAM frame,
-          // which quinn does NOT retransmit — its loss recovery covers the
-          // reliable streams only. A backpressured send here would lose the
-          // farewell for good, so it is retained and retried exactly like the
-          // plain-UDP leave drain.
+        if self.leave_initiated && matches!(unreliable, UnreliableTransport::Datagram) {
+          // In `Datagram` mode the leave fan-out rides quinn application
+          // DATAGRAM frames, which quinn does NOT retransmit — its loss
+          // recovery covers the reliable streams only — and quinn-proto gives
+          // no per-packet frame provenance, so every raw packet during the
+          // leave is retained and error-accounted like the plain-UDP leave
+          // drain (a local failure of the shared socket is correlated with
+          // farewell loss; retaining an unrelated handshake/ACK packet merely
+          // delays the drain-empty fence, bounded by the writable wake).
           retain_leave_datagram(
             &mut self.leave_drain,
             dest,
@@ -940,9 +943,11 @@ where
             &mut self.leave_send_failed,
           );
         } else {
-          // Ignoring Poll: outside a leave, a dropped handshake/ACK/stream
-          // packet is recovered by quinn's own loss detection, and a dropped
-          // datagram-mode gossip frame is re-sent by the next periodic round.
+          // Ignoring Poll: in `Udp` mode the farewell rides only the plain-UDP
+          // gossip path above — no raw QUIC packet carries it — and outside a
+          // leave a dropped handshake/ACK/stream packet is recovered by
+          // quinn's own loss detection while a dropped datagram-mode gossip
+          // frame is re-sent by the next periodic round.
           let _ = outcome;
         }
       }
@@ -1277,14 +1282,15 @@ where
       progress = true;
     }
 
-    // Shutdown: best-effort leave, flush to quiescence (the leave's `Dead`-self
-    // notices must reach the wire before the socket drops), fail every parked
-    // waiter and queued command, release the bound port, then ack. The completion
-    // latch promises the bind address is free, not that every QUIC connection has
-    // closed.
+    // Shutdown: flush to quiescence (an explicit leave's `Dead`-self notices
+    // must reach the wire before the socket drops), fail every parked waiter
+    // and queued command, release the bound port, then ack. No implicit leave:
+    // a shutdown without an explicit `leave()` is abrupt by design (mirroring
+    // the reference implementation's Shutdown), so peers detect the departure
+    // as a failure; an explicit leave already queued its fan-out when its
+    // command was dispatched. The completion latch promises the bind address is
+    // free, not that every QUIC connection has closed.
     if this.shared.is_shutdown() {
-      // Ignoring Err: best-effort leave during shutdown.
-      let _ = this.endpoint.leave(Instant::now());
       // Drain endpoint surfaces to quiescence before reaping: a single
       // `drain_surfaces` pass is egress-capped, so a large batch of already-queued
       // `ExchangeCompleted` events would be partially skipped, leaving contacted
@@ -1319,9 +1325,6 @@ where
           )));
         }
       }
-      if let Some(pl) = this.pending_leave.take() {
-        pl.resolve_all(|| Err(SerfError::Shutdown));
-      }
       // Flush any retained leave-farewell datagrams before releasing the socket:
       // the quiescence loop above retains a backpressured graceful-leave fan-out
       // rather than dropping it, and it must reach the wire before the socket
@@ -1335,7 +1338,18 @@ where
         cx,
         &mut this.leave_send_failed,
       );
-      if !this.leave_drain.is_empty() {
+      if this.leave_drain.is_empty() {
+        // A leave racing this shutdown resolves HERE, on delivery: the
+        // machine's `LeftCluster` is propagate-delay-fenced behind a
+        // `handle_timeout` a tearing-down pump never runs, and the fan-out has
+        // verifiably been handed to the transport (surfaces quiescent, nothing
+        // retained). A residue instead resolves `Err(Shutdown)` below — the
+        // farewell did not fully leave this host.
+        if let Some(pl) = this.pending_leave.take() {
+          let failed = this.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
+        }
+      } else {
         let now = Instant::now();
         let deadline = *this
           .leave_drain_deadline
@@ -1349,6 +1363,9 @@ where
           }
         }
         trace_leave_drain_residue(this.leave_drain.len());
+        if let Some(pl) = this.pending_leave.take() {
+          pl.resolve_all(|| Err(SerfError::Shutdown));
+        }
       }
       // Release the bound port BEFORE acking: dropping the agnostic UDP socket
       // closes its FD synchronously, so a caller resuming from `shutdown().await`

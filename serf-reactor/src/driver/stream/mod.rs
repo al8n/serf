@@ -1559,11 +1559,12 @@ where
     // stream FD has closed.
     if this.shared.is_shutdown() {
       if this.accept_shutdown_tx.is_some() {
-        // FREEZE (one-time). Best-effort leave, freeze every live bridge, drop the
-        // template inbound sender so the channel can reach all-senders-gone, and
-        // release the bind sockets.
-        // Ignoring Err: best-effort leave during shutdown.
-        let _ = this.endpoint.leave(Instant::now());
+        // FREEZE (one-time). Freeze every live bridge, drop the template inbound
+        // sender so the channel can reach all-senders-gone, and release the bind
+        // sockets. No implicit leave: a shutdown without an explicit `leave()` is
+        // abrupt by design (mirroring the reference implementation's Shutdown),
+        // so peers detect the departure as a failure; an explicit leave already
+        // queued its fan-out when its command was dispatched.
         for (_, handle) in this.bridges.drain() {
           // Ignoring Err: the bridge may have already exited (cancel receiver
           // gone); the freeze is best-effort.
@@ -1577,8 +1578,12 @@ where
       }
 
       // FAREWELL DRAIN (re-entrant), then release the gossip socket (once —
-      // `socket.is_some()` is the phase guard). Retained leave-farewell
-      // datagrams are retried while the socket is still held; a residue parks
+      // `socket.is_some()` is the phase guard). The endpoint surfaces are first
+      // drained to quiescence WHILE the socket still exists: a leave dispatched
+      // in the same command batch as the shutdown (or the best-effort one in
+      // the freeze) queued its dead-self fan-out inside the endpoint, and a
+      // gossip transmit popped after the socket drops is silently discarded.
+      // Retained leave-farewell datagrams are then retried; a residue parks
       // the teardown — bounded by a short deadline — instead of being dropped,
       // because the farewell is the peers' only first-hand signal that the
       // departure was intentional. The `Pending` send registers the writable
@@ -1586,13 +1591,30 @@ where
       // teardown wake re-enters this phase until the queue empties or the
       // deadline wins. Dropping the socket then closes its UDP FD synchronously.
       if this.socket.is_some() {
+        loop {
+          let (_, drain_more, _) = this.drain_surfaces(cx);
+          if !drain_more {
+            break;
+          }
+        }
         retry_retained_leave(
           &mut this.leave_drain,
           this.socket.as_ref(),
           cx,
           &mut this.leave_send_failed,
         );
-        if !this.leave_drain.is_empty() {
+        if this.leave_drain.is_empty() {
+          // A leave racing this shutdown resolves HERE, on delivery: the
+          // machine's `LeftCluster` is propagate-delay-fenced behind a
+          // `handle_timeout` a tearing-down pump never runs, and the fan-out
+          // has verifiably been handed to the transport (surfaces quiescent,
+          // nothing retained). A residue instead falls through to the reap's
+          // `Err(Shutdown)` — the farewell did not fully leave this host.
+          if let Some(pl) = this.pending_leave.take() {
+            let failed = this.leave_send_failed;
+            pl.resolve_all(|| leave_outcome(failed));
+          }
+        } else {
           let now = Instant::now();
           let deadline = *this
             .leave_drain_deadline
