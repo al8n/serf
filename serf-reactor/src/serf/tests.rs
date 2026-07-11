@@ -188,6 +188,44 @@ async fn coalesced_drops_are_published_on_shutdown_teardown() {
   );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coalesced_drops_are_visible_immediately_after_shutdown_on_a_multi_thread_runtime() {
+  // On a multi-threaded runtime the `shutdown().await` caller can resume on a
+  // different worker than the pump. The final counter publish must therefore
+  // happen-before the shutdown reply is sent, so an accessor read immediately
+  // after `shutdown().await` observes the final total rather than a stale
+  // pre-drain value. Repeat to make the ordering violation reliably observable if
+  // the publish is ever moved back after the reply.
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let n: u32 = 20;
+  for round in 0..24 {
+    let serf_opts = SerfOptions::new()
+      .with_user_coalesce_period(Duration::from_secs(10))
+      .with_user_quiescent_period(Duration::from_secs(2))
+      .with_max_coalesced_user_events(Some(cap));
+    let a = spawn_node_with_serf_options(&format!("coalesce-mt-{round}"), serf_opts).await;
+
+    for i in 0..n {
+      let (tx, _) = oneshot::channel();
+      a.send(Command::UserEvent(UserEventCmd::new(
+        SmolStr::new(format!("evt-{i}")),
+        bytes::Bytes::new(),
+        true,
+        tx,
+      )))
+      .expect("enqueue user event");
+    }
+
+    a.shutdown().await.expect("coalesce-mt shuts down");
+
+    assert_eq!(
+      a.coalesced_user_events_dropped(),
+      u64::from(n) - cap.get() as u64,
+      "the final drop total is visible to a caller resumed after shutdown completes"
+    );
+  }
+}
+
 /// Build VALID TCP transport options paired with a deliberately invalid
 /// `runtime`, and assert `Serf::tcp` rejects it with [`SerfError::InvalidOption`]
 /// — before binding a socket or spawning the detached driver — rather than

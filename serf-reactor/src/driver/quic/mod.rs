@@ -1205,6 +1205,21 @@ where
       if let Some(pl) = this.pending_leave.take() {
         pl.resolve_all(|| Err(SerfError::Shutdown));
       }
+      // The coalescer drop counters are cumulative; publish them a final time as the
+      // driver future completes so the drops shed in the last command drain — an
+      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
+      // from the public total. This MUST precede every shutdown completion signal
+      // below (the stashed replies and the completion latch): a `shutdown().await`
+      // caller released first could resume on another worker and read the stale
+      // pre-drain total before these stores land. The normal per-poll publish below
+      // is skipped once this shutdown branch returns, so this store is the
+      // completeness backstop.
+      this
+        .shared
+        .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
+      this
+        .shared
+        .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
       // Release the bound port BEFORE acking: dropping the agnostic UDP socket
       // closes its FD synchronously, so a caller resuming from `shutdown().await`
       // can immediately rebind the same address.
@@ -1213,17 +1228,6 @@ where
         // Ignoring Err: the caller dropped its reply receiver.
         let _ = reply.send(Ok(()));
       }
-      // The coalescer drop counters are cumulative; publish them a final time as the
-      // driver future completes so the drops shed in the last command drain — an
-      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
-      // from the public total. The normal per-poll publish below is skipped once this
-      // shutdown branch returns, so this store is the completeness backstop.
-      this
-        .shared
-        .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
-      this
-        .shared
-        .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
       this.shared.mark_shutdown_complete();
       return Poll::Ready(());
     }

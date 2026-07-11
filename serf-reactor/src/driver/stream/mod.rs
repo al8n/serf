@@ -1590,23 +1590,36 @@ where
         }
         this.accept_join = None;
       }
-      // The bind address is now free. Ack the stashed replies and release any late
-      // `shutdown()` caller parked on the completion latch, then stop.
-      for reply in this.shutdown_reply.drain(..) {
-        // Ignoring Err: the caller dropped its reply receiver.
-        let _ = reply.send(Ok(()));
-      }
       // The coalescer drop counters are cumulative; publish them a final time as the
       // driver future completes so the drops shed in the last command drain — an
       // overflow immediately followed by a `Shutdown` in the same pass — are not lost
-      // from the public total. The normal per-poll publish below is skipped once this
-      // shutdown branch returns, so this store is the completeness backstop.
+      // from the public total. This MUST precede every shutdown completion signal
+      // below (the stashed replies and the completion latch): a `shutdown().await`
+      // caller released first could resume on another worker and read the stale
+      // pre-drain total before these stores land. The normal per-poll publish below
+      // is skipped once this shutdown branch returns, so this store is the
+      // completeness backstop.
+      // The coalescer drop counters are cumulative; publish them a final time as the
+      // driver future completes so the drops shed in the last command drain — an
+      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
+      // from the public total. This MUST precede every shutdown completion signal
+      // below (the stashed replies and the completion latch): a `shutdown().await`
+      // caller released first could resume on another worker and read the stale
+      // pre-drain total before these stores land. The normal per-poll publish below
+      // is skipped once this shutdown branch returns, so this store is the
+      // completeness backstop.
       this
         .shared
         .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
       this
         .shared
         .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
+      // The bind address is now free. Ack the stashed replies and release any late
+      // `shutdown()` caller parked on the completion latch, then stop.
+      for reply in this.shutdown_reply.drain(..) {
+        // Ignoring Err: the caller dropped its reply receiver.
+        let _ = reply.send(Ok(()));
+      }
       this.shared.mark_shutdown_complete();
       return Poll::Ready(());
     }
