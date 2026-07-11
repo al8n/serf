@@ -610,21 +610,6 @@ fn shutdown_prevents_leaving_to_left_transition() {
 }
 
 #[test]
-fn leave_arms_broadcast_deadline() {
-  let mut e = ep();
-  assert!(e.leave_broadcast_deadline().is_none());
-  e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
-  let dl = e
-    .leave_broadcast_deadline()
-    .expect("broadcast deadline must be armed");
-  // Default broadcast_timeout is 5s; deadline = ORIGIN + 5s.
-  assert_eq!(
-    dl,
-    memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(5)
-  );
-}
-
-#[test]
 fn force_leave_from_shutdown_is_rejected() {
   let mut e = ep();
   e.core_mut().state = SerfState::Shutdown;
@@ -713,25 +698,6 @@ fn leave_witnesses_and_advances_member_clock() {
   assert!(
     e.member_time() > clock_before,
     "leave() must advance the member clock"
-  );
-}
-
-#[test]
-fn poll_timeout_includes_leave_deadlines_when_armed() {
-  let mut e = ep();
-  // Initially no serf deadlines; poll_timeout may be None (inner idle) or
-  // Some from inner's own schedule — just confirm it does not panic.
-  let _ = e.poll_timeout();
-
-  e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
-  // After leave(), leave_broadcast_deadline is armed.
-  let timeout = e
-    .poll_timeout()
-    .expect("must have a deadline after leave()");
-  let expected = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(5);
-  assert!(
-    timeout <= expected,
-    "poll_timeout must be ≤ leave_broadcast_deadline ({expected:?}), got {timeout:?}"
   );
 }
 
@@ -3423,28 +3389,6 @@ fn stale_self_leave_does_not_trigger_refute() {
     e.member_time(),
     4,
     "stale self-leave must not advance the clock beyond witness(0, 3) = 4"
-  );
-}
-
-// Bug 5: Leave-broadcast deadline never retired.
-#[test]
-fn leave_broadcast_deadline_is_cleared_after_expiry() {
-  let mut e = ep();
-  // leave() arms leave_broadcast_deadline = ORIGIN + broadcast_timeout (5s).
-  e.leave(memberlist_proto::Instant::ORIGIN).unwrap();
-  assert!(
-    e.leave_broadcast_deadline().is_some(),
-    "leave_broadcast_deadline must be armed after leave()"
-  );
-
-  // Tick past the deadline.
-  let past = memberlist_proto::Instant::ORIGIN + core::time::Duration::from_secs(6);
-  e.handle_timeout(past);
-
-  // The deadline must be cleared.
-  assert!(
-    e.leave_broadcast_deadline().is_none(),
-    "leave_broadcast_deadline must be cleared after expiry"
   );
 }
 

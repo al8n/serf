@@ -286,11 +286,8 @@ where
     }
   }
 
-  /// Number of unsent items in the coordinator's user broadcast queue.
-  ///
-  /// The driver may poll this during a graceful leave to detect when the
-  /// leave-intent broadcast has been flushed without waiting the full
-  /// `broadcast_timeout`.
+  /// Number of unsent items in the coordinator's user broadcast queue, summed
+  /// across every tier.  Queue-depth introspection for telemetry and tests.
   pub fn user_broadcast_queue_len(&self) -> usize {
     self.transport.endpoint_ref().user_broadcast_queue_len()
   }
@@ -755,11 +752,6 @@ where
     I: Clone + Data,
   {
     self.core.respond_key(&mut self.transport, req, resp, now)
-  }
-
-  /// Forwards to [`Endpoint::leave_broadcast_deadline`].
-  pub const fn leave_broadcast_deadline(&self) -> Option<Instant> {
-    self.core.leave_broadcast_deadline()
   }
 
   /// Forwards to [`Endpoint::leave_complete_deadline`].

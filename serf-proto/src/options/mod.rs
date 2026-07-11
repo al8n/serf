@@ -31,8 +31,6 @@ pub struct Options {
   /// How long recent join/leave intents are buffered to handle out-of-order
   /// delivery before the inner memberlist `NodeJoined`/`NodeLeft` event.
   recent_intent_timeout: Duration,
-  /// How long to wait for a broadcast (leave, force-remove) to propagate.
-  broadcast_timeout: Duration,
   /// Extra delay after calling inner `leave()` before transitioning to `Left`,
   /// giving in-flight probes time to observe the leave intent.
   leave_propagate_delay: Duration,
@@ -122,7 +120,6 @@ impl Options {
       reconnect_timeout: Duration::from_secs(3600 * 24),
       tombstone_timeout: Duration::from_secs(3600 * 24),
       recent_intent_timeout: Duration::from_secs(60 * 5),
-      broadcast_timeout: Duration::from_secs(5),
       leave_propagate_delay: Duration::from_secs(1),
       queue_check_interval: Duration::from_secs(30),
       coalesce_period: Duration::ZERO,
@@ -173,11 +170,6 @@ impl Options {
   /// How long recent intents are buffered to handle out-of-order delivery.
   pub const fn recent_intent_timeout(&self) -> Duration {
     self.recent_intent_timeout
-  }
-
-  /// Broadcast propagation timeout.
-  pub const fn broadcast_timeout(&self) -> Duration {
-    self.broadcast_timeout
   }
 
   /// Extra delay before transitioning to `Left` after calling inner `leave()`.
@@ -360,12 +352,6 @@ impl Options {
   /// Sets `recent_intent_timeout`.
   pub fn with_recent_intent_timeout(mut self, v: Duration) -> Self {
     self.recent_intent_timeout = v;
-    self
-  }
-
-  /// Sets `broadcast_timeout`.
-  pub fn with_broadcast_timeout(mut self, v: Duration) -> Self {
-    self.broadcast_timeout = v;
     self
   }
 

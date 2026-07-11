@@ -707,14 +707,6 @@ where
   next_reconnect: Option<Instant>,
   /// Next deadline at which the broadcast queue depth is checked.
   next_queue_check: Option<Instant>,
-  /// Deadline after which we stop waiting for the leave-intent broadcast to
-  /// propagate and proceed to call the inner `leave()`.
-  ///
-  /// Armed in `leave()` at `now + broadcast_timeout`. The driver may
-  /// short-circuit by polling `user_broadcast_queue_len()` reaching zero;
-  /// the machine itself fires unconditionally when the deadline elapses.
-  /// `None` when not in the middle of a graceful leave.
-  leave_broadcast_deadline: Option<Instant>,
   /// Deadline after which the `Leaving → Left` transition fires.
   ///
   /// Armed in the `LeftCluster` sieve arm at `now + leave_propagate_delay`.
@@ -952,7 +944,6 @@ where
       next_reap: Some(first_reap),
       next_reconnect: Some(first_reconnect),
       next_queue_check: Some(first_queue_check),
-      leave_broadcast_deadline: None,
       leave_complete_deadline: None,
       event_buffer: EventBuffer::new(event_buf_size),
       query_buffer: QueryBuffer::new(query_buf_size),
@@ -1148,7 +1139,7 @@ where
   /// The earliest serf-level deadline requiring a `handle_timeout` call.
   ///
   /// Returns the minimum of serf's own periodic deadlines (reap, reconnect,
-  /// queue-check, leave-broadcast, leave-complete, and pending-query closes).
+  /// queue-check, leave-complete, and pending-query closes).
   /// The composing super-machine folds in the coordinator's own deadline.
   ///
   /// A shut-down machine (lost id-conflict vote) schedules no wakeups: its
@@ -1174,7 +1165,6 @@ where
       self.next_reap,
       self.next_reconnect,
       self.next_queue_check,
-      self.leave_broadcast_deadline,
       self.leave_complete_deadline,
       query_min,
       member_flush,
@@ -1298,10 +1288,10 @@ where
 
     // A lost id-conflict vote in the query-close pass transitions the machine to
     // Shutdown. Nothing may follow the terminal Event::Shutdown, so skip the rest
-    // of this pass's deadline work (received-query prune, leave-complete/broadcast
-    // clears): it would prune protocol state or transition after the terminal
+    // of this pass's deadline work (received-query prune, leave-complete
+    // transition): it would prune protocol state or transition after the terminal
     // event. `serf_poll_timeout` returns `None` once Shutdown, so the un-cleared
-    // leave deadlines never respin the driver.
+    // leave-complete deadline never respins the driver.
     if self.state.is_shutdown() {
       return;
     }
@@ -1320,14 +1310,6 @@ where
           self.pending_events.push_back(Event::LeftCluster);
         }
         // If already Shutdown: the leave chain was interrupted; no transition or event.
-      }
-    }
-
-    // Leave-broadcast: clear the deadline once it has elapsed so poll_timeout
-    // does not keep returning it and causing driver spin.
-    if let Some(dl) = self.leave_broadcast_deadline {
-      if now >= dl {
-        self.leave_broadcast_deadline = None;
       }
     }
 
@@ -2331,8 +2313,8 @@ where
   ///
   /// Go serf's `handle_prune` only removes a `Leaving`/`Left` node from
   /// `left_members` (relying on the invariant that a node is never in both
-  /// lists) and sleeps `broadcast_timeout + leave_propagate_delay` for a
-  /// `Leaving` member before erasing.  The Sans-I/O machine cannot sleep, so
+  /// lists) and sleeps its broadcast timeout plus the leave-propagate delay for
+  /// a `Leaving` member before erasing.  The Sans-I/O machine cannot sleep, so
   /// the prune is immediate; it also scrubs every index list and the
   /// recent-intent entry so no stale reference to the forgotten node survives
   /// in any structure.
@@ -2607,14 +2589,17 @@ where
   ///    (`handle_node_leave_intent` for the local id), which marks the local
   ///    node as `Leaving` in the membership store and queues a join-refute
   ///    suppression.
-  /// 3. Enqueue a leave-intent broadcast on the intent tier (rank 0) so
-  ///    peers learn about the leave.  (`FIX`: no `on_finished` callback —
-  ///    flushing is bounded by `broadcast_timeout` deadline instead.)
-  /// 4. Call inner `leave(now)` to begin the memberlist dead-self fan-out.
-  ///    The inner will eventually emit `Event::LeftCluster` once all dead-self
-  ///    packets are drained via `poll_transmit`.
-  /// 5. Arm `leave_broadcast_deadline = now + broadcast_timeout`.  The
-  ///    driver can short-circuit by watching `user_broadcast_queue_len()`.
+  /// 3. Enqueue the leave-intent broadcast on the intent tier (rank 0) so peers
+  ///    learn the local node is leaving.
+  /// 4. Call inner `leave(now)` synchronously. The inner packs the payloads
+  ///    still queued on the user-broadcast tiers — the rank-0 intent just
+  ///    enqueued — into its dead-self fan-out, user parts ahead of the death
+  ///    notice, so every farewell recipient receives the intent ATOMICALLY with
+  ///    the dead-self notice in one datagram and processes the intent first,
+  ///    classifying the departure as intentional rather than a failure. The
+  ///    inner emits `Event::LeftCluster` once all dead-self packets drain via
+  ///    `poll_transmit`. No separate wait for the intent to flush exists: the
+  ///    queued intent departs with the dead-self frame, not on its own schedule.
   ///
   /// The `Leaving → Left` transition happens later in `handle_timeout` when
   /// `leave_complete_deadline` (armed on inner `LeftCluster` + `leave_propagate_delay`)
@@ -2680,15 +2665,15 @@ where
     }
 
     // 3. Broadcast the leave intent on the intent tier (rank 0) so peers learn
-    //    the local node is leaving without waiting for anti-entropy.  The
-    //    driver bounds the flush via the broadcast deadline below.
+    //    the local node is leaving without waiting for anti-entropy.
     self.broadcast_leave(t, ltime, local_id, false);
 
-    // 4. Arm the broadcast-timeout deadline so the driver always has a finite
-    //    wait; it can short-circuit by watching `user_broadcast_queue_len()`.
-    self.leave_broadcast_deadline = Some(now + self.opts.broadcast_timeout());
-
-    // 5. Call inner leave; this queues the dead-self fan-out packets.
+    // 4. Call inner leave synchronously. It packs the rank-0 intent just queued
+    //    (with any other pending user broadcast) into its dead-self fan-out —
+    //    user parts ahead of the death notice — so every farewell recipient
+    //    receives the intent atomically with the dead-self notice and processes
+    //    it first, reading the departure as intentional. This queues the
+    //    resulting fan-out packets for `poll_transmit`.
     t.leave(now)?;
 
     Ok(())
@@ -2703,6 +2688,11 @@ where
   ///
   /// Does not require the local endpoint to be `Alive` (callers may want to
   /// clean up failed nodes before leaving themselves), but rejects `Shutdown`.
+  ///
+  /// A leave intent queued here shortly before a local [`leave`](Self::leave)
+  /// now rides that leave's dead-self fan-out — the inner `leave()` packs the
+  /// still-pending user broadcasts into its farewell frames — instead of being
+  /// dropped by the pre-fan-out queue reset.
   pub(crate) fn force_leave<T>(
     &mut self,
     t: &mut T,
@@ -2749,9 +2739,6 @@ where
     // Broadcast the leave intent (carrying the prune flag) so peers apply the
     // same forced removal.
     self.broadcast_leave(t, ltime, id, prune);
-
-    // Arm the broadcast deadline so the driver knows how long to wait.
-    self.leave_broadcast_deadline = Some(now + self.opts.broadcast_timeout());
 
     Ok(())
   }
@@ -4113,13 +4100,6 @@ where
           destination: dest_addr,
         }));
     }
-  }
-
-  /// Returns the `leave_broadcast_deadline`, if armed.
-  ///
-  /// `None` when not in the middle of a graceful leave or force-leave.
-  pub const fn leave_broadcast_deadline(&self) -> Option<Instant> {
-    self.leave_broadcast_deadline
   }
 
   /// Returns the `leave_complete_deadline`, if armed.

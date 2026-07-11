@@ -25,7 +25,6 @@ fn options_default_and_new_are_equal() {
   assert_eq!(a.reconnect_timeout(), b.reconnect_timeout());
   assert_eq!(a.tombstone_timeout(), b.tombstone_timeout());
   assert_eq!(a.recent_intent_timeout(), b.recent_intent_timeout());
-  assert_eq!(a.broadcast_timeout(), b.broadcast_timeout());
   assert_eq!(a.leave_propagate_delay(), b.leave_propagate_delay());
   assert_eq!(a.queue_check_interval(), b.queue_check_interval());
   assert_eq!(a.coalesce_period(), b.coalesce_period());
@@ -56,7 +55,6 @@ fn options_all_defaults() {
   assert_eq!(o.reconnect_timeout(), Duration::from_secs(3600 * 24));
   assert_eq!(o.tombstone_timeout(), Duration::from_secs(3600 * 24));
   assert_eq!(o.recent_intent_timeout(), Duration::from_secs(60 * 5));
-  assert_eq!(o.broadcast_timeout(), Duration::from_secs(5));
   assert_eq!(o.leave_propagate_delay(), Duration::from_secs(1));
   assert_eq!(o.queue_check_interval(), Duration::from_secs(30));
   // Coalescing disabled by default
