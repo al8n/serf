@@ -80,7 +80,7 @@ use crate::{
     QueryResponse as QueryResponseEvent,
   },
   framing::{encode_message, peek_frame_header},
-  members::{IntentKind, Member, MemberState, MemberStatus, Members, SerfState},
+  members::{IntentKind, Member, MemberState, MemberStatus, Members, SerfState, remove_old_member},
   options::Options,
   typed::{
     Filter, JoinMessage, LeaveMessage, PushPullMessage, QueryFlag, QueryMessage,
@@ -1798,8 +1798,8 @@ where
 
     // Clear from failed/left lists when re-joining after failure or leave.
     if matches!(old_status, MemberStatus::Failed | MemberStatus::Left) {
-      self.members.failed_members.retain(|i| i != id);
-      self.members.left_members.retain(|i| i != id);
+      remove_old_member(&mut self.members.failed_members, id);
+      remove_old_member(&mut self.members.left_members, id);
     }
 
     // Membership changed — snapshot is stale.
@@ -2065,7 +2065,7 @@ where
         };
         let member = ms.member().clone();
         // Move from failed_members to left_members.
-        self.members.failed_members.retain(|i| i != &id_clone);
+        remove_old_member(&mut self.members.failed_members, &id_clone);
         self.members.left_members.push(id_clone);
         self
           .pending_events
@@ -2098,8 +2098,8 @@ where
   /// recent-intent entry so no stale reference to the forgotten node survives
   /// in any structure.
   fn prune_member(&mut self, id: &I) {
-    self.members.left_members.retain(|i| i != id);
-    self.members.failed_members.retain(|i| i != id);
+    remove_old_member(&mut self.members.left_members, id);
+    remove_old_member(&mut self.members.failed_members, id);
     self.members.recent_intents.remove(id);
 
     #[cfg(feature = "coordinates")]
@@ -3880,6 +3880,12 @@ where
     I: Clone,
   {
     self.members.states.get(&id).map(|ms| ms.status())
+  }
+
+  /// Expose the effective broadcast queue depth cap for assertions.
+  #[cfg(test)]
+  pub(crate) fn test_queue_max(&self) -> usize {
+    self.queue_max()
   }
 
   /// Return the `status_time` of member `id`, or `None` if unknown.
