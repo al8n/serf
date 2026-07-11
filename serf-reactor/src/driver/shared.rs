@@ -140,8 +140,9 @@ pub(crate) fn leave_outcome(send_failed: bool) -> crate::error::Result<()> {
 /// the reference implementation logs them and proceeds, and failing the whole
 /// leave because one peer already died would be wrong (and flaky on platforms
 /// that reflect ICMP errors into UDP sends). Everything else — a closed or
-/// invalid socket, a broken pipe, an out-of-memory send path — means the
-/// farewell could not be handed off at all.
+/// invalid socket, a vanished source address (`EADDRNOTAVAIL`, e.g. the bound
+/// interface disappeared), a broken pipe, an out-of-memory send path — means
+/// the farewell could not be handed off at all.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) fn farewell_send_failure_is_local(err: &io::Error) -> bool {
   !matches!(
@@ -151,7 +152,6 @@ pub(crate) fn farewell_send_failure_is_local(err: &io::Error) -> bool {
       | io::ErrorKind::ConnectionAborted
       | io::ErrorKind::HostUnreachable
       | io::ErrorKind::NetworkUnreachable
-      | io::ErrorKind::AddrNotAvailable
   )
 }
 

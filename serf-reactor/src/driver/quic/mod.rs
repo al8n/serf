@@ -1343,6 +1343,12 @@ where
         cx,
         &mut this.leave_send_failed,
       );
+      // The caller's per-leave deadline governs resolution during teardown
+      // exactly as in the normal poll's reap: a leave that missed its
+      // configured window resolves `LeaveTimeout` even mid-shutdown (a zero
+      // timeout is a loud immediate `LeaveTimeout` by contract). A leave
+      // still parked past this point has a strictly-future deadline.
+      this.reap_pending_leave(Instant::now());
       if this.leave_drain.is_empty() {
         // A leave racing this shutdown resolves HERE, on delivery: the
         // machine's `LeftCluster` is propagate-delay-fenced behind a
@@ -1356,16 +1362,27 @@ where
         }
       } else {
         let now = Instant::now();
-        let deadline = *this
+        let drain_deadline = *this
           .leave_drain_deadline
           .get_or_insert(now + LEAVE_DRAIN_TEARDOWN_BOUND);
-        if now < deadline {
-          this.arm_timer(deadline, now);
+        if now < drain_deadline {
+          // Park until whichever fires first: the drain bound, or a
+          // still-parked leave's deadline — whose firing must resolve
+          // `LeaveTimeout` promptly, while the drain keeps the rest of its
+          // window. A `Ready` timer re-enters the phase so the reap and the
+          // park recompute against the new now.
+          let park_until = this
+            .pending_leave
+            .as_ref()
+            .map_or(drain_deadline, |pl| pl.deadline.min(drain_deadline));
+          this.arm_timer(park_until, now);
           if let Some(timer) = this.timer.as_mut()
             && timer.as_mut().poll(cx).is_pending()
           {
             return Poll::Pending;
           }
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
         }
         trace_leave_drain_residue(this.leave_drain.len());
         if let Some(pl) = this.pending_leave.take() {
