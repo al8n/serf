@@ -65,7 +65,10 @@ use crate::{
   delegate::Delegate,
   driver::{
     options::{RuntimeOptions, StreamTransportOptions},
-    shared::{ExchangeId, dispatch_event_delegate, observation_payload_bytes},
+    shared::{
+      ExchangeId, LeaveDrain, dispatch_event_delegate, observation_payload_bytes, poll_send_gossip,
+      retry_retained_leave, trace_leave_transform_error,
+    },
   },
   drop_counter::ReactorDropCounter,
   error::{JoinFailed, Result, SerfError},
@@ -347,6 +350,13 @@ where
   pending_joins: Vec<PendingJoin>,
   /// The in-flight graceful leave, resolved on `LeftCluster`.
   pending_leave: Option<PendingLeave>,
+  /// Set once `leave()` has been initiated. Switches the gossip egress from
+  /// best-effort (drop on non-completion) to retention for the leave fan-out,
+  /// which has no next gossip round to re-send a dropped farewell.
+  leave_initiated: bool,
+  /// Leave-farewell datagrams retained after a non-completing UDP send, retried
+  /// FIFO ahead of fresh transmits and flushed before the socket drops.
+  leave_drain: LeaveDrain,
   /// Parked `Shutdown` replies — acked only after the bind sockets drop, so a
   /// caller resuming from `shutdown().await` can rebind the same address. A `Vec`
   /// because several callers can race `shutdown()`.
@@ -484,6 +494,8 @@ where
       label,
       pending_joins: Vec::new(),
       pending_leave: None,
+      leave_initiated: false,
+      leave_drain: LeaveDrain::new(),
       shutdown_reply: Vec::new(),
       bridges: HashMap::new(),
       accepted_rx,
@@ -669,6 +681,9 @@ where
           let res: Result<()> = self.endpoint.leave(now).map_err(SerfError::from);
           match res {
             Ok(()) if was_alive => {
+              // The leave mutated and fan-out is queued: switch the gossip egress
+              // to retention so a backpressured farewell is retried, not dropped.
+              self.leave_initiated = true;
               self.pending_leave = Some(PendingLeave {
                 repliers: vec![reply],
                 deadline: now + leave_timeout,
@@ -1083,6 +1098,15 @@ where
     // the last transmit is the endpoint's leave-completion fence (it emits
     // `LeftCluster`), so the leave/shutdown datagrams reach the socket before that
     // fence fires.
+    //
+    // Once `leave()` has been initiated the fan-out is RETAINED on backpressure:
+    // retry the retained datagrams FIRST (they drain as the socket becomes
+    // writable), then pop fresh transmits at the unchanged cadence — a
+    // non-completing send is retained (not dropped) instead of leaving peers to
+    // read the departure as a failure. Periodic gossip stays best-effort.
+    if self.leave_initiated {
+      retry_retained_leave(&mut self.leave_drain, self.socket.as_ref(), cx);
+    }
     let encode_opts = EncodeOptions::new(self.label.clone());
     let mut sent = 0;
     while sent < budget {
@@ -1095,14 +1119,24 @@ where
           let (to, msg) = pkt.into_parts();
           match encode_outgoing(&msg, &encode_opts) {
             Ok(b) => (to, b),
-            Err(_) => continue,
+            Err(_) => {
+              if self.leave_initiated {
+                trace_leave_transform_error(to);
+              }
+              continue;
+            }
           }
         }
         Transmit::Compound(cmp) => {
           let (to, msgs) = cmp.into_parts();
           match encode_outgoing_compound(&msgs, &encode_opts) {
             Ok(b) => (to, b),
-            Err(_) => continue,
+            Err(_) => {
+              if self.leave_initiated {
+                trace_leave_transform_error(to);
+              }
+              continue;
+            }
           }
         }
       };
@@ -1112,14 +1146,24 @@ where
       {
         on_wire = match self.endpoint.encrypt_gossip(&on_wire) {
           Ok(bytes) => bytes,
-          Err(_) => continue,
+          Err(_) => {
+            if self.leave_initiated {
+              trace_leave_transform_error(peer);
+            }
+            continue;
+          }
         };
       }
-      if let Some(socket) = self.socket.as_ref() {
-        // Ignoring Poll: gossip is best-effort — a full or errored UDP send drops
-        // the datagram and SWIM recovers on the next round.
-        let _ = socket.poll_send_to(cx, &on_wire, peer);
-      }
+      // Periodic gossip is best-effort (dropped on non-completion, SWIM re-sends
+      // next round); the leave fan-out is retained for a retry.
+      poll_send_gossip(
+        &mut self.leave_drain,
+        self.leave_initiated,
+        self.socket.as_ref(),
+        cx,
+        peer,
+        &on_wire,
+      );
     }
     worked |= sent > 0;
     more |= sent == budget;
@@ -1487,6 +1531,12 @@ where
         // scheduled (awaited below). Dropping the gossip socket closes its UDP FD
         // synchronously.
         drop(this.accept_shutdown_tx.take());
+        // Flush any retained leave-farewell datagrams before releasing the socket.
+        // The graceful drain runs across polls (retried as the socket becomes
+        // writable), so a residual queue here is rare; a single bounded sweep
+        // (stops at the first backpressure) exhausts it without an unbounded wait,
+        // since the bind must be released for a caller to rebind the address.
+        retry_retained_leave(&mut this.leave_drain, this.socket.as_ref(), cx);
         drop(this.socket.take());
       }
 
