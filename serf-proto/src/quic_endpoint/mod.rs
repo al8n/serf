@@ -140,6 +140,43 @@ where
   }
 }
 
+// ── reconnect delegate (minimal bounds: forwards a plain field setter) ────────
+
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
+where
+  I: Eq + core::hash::Hash,
+  D: DropCounter,
+{
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`](crate::ReconnectDelegate), consuming builder form.
+  ///
+  /// Forwards to
+  /// [`Endpoint::with_reconnect_delegate`](crate::endpoint::Endpoint::with_reconnect_delegate);
+  /// `None` (the default) keeps the flat configured timeouts.
+  #[must_use]
+  pub fn with_reconnect_delegate(
+    mut self,
+    delegate: Option<std::boxed::Box<dyn crate::ReconnectDelegate<I, SocketAddr>>>,
+  ) -> Self {
+    self.core.set_reconnect_delegate(delegate);
+    self
+  }
+
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`](crate::ReconnectDelegate).
+  ///
+  /// Forwards to
+  /// [`Endpoint::set_reconnect_delegate`](crate::endpoint::Endpoint::set_reconnect_delegate).
+  pub fn set_reconnect_delegate(
+    &mut self,
+    delegate: Option<std::boxed::Box<dyn crate::ReconnectDelegate<I, SocketAddr>>>,
+  ) {
+    self.core.set_reconnect_delegate(delegate);
+  }
+}
+
 // ── transport-level driver surface + serf commands ─────────────────────────────
 //
 // The driver-surface methods reach the coordinator (`transport`) directly — the

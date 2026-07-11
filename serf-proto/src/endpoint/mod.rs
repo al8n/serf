@@ -73,7 +73,7 @@ use crate::KeyRequestMessage;
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
 use crate::event::{KeyRequest as KeyRequestEvent, KeyRequestOperation, KeyResponseArgs};
 use crate::{
-  AnyMessage, ConflictResponseMessage, EncodeError, LamportTime, MessageType,
+  AnyMessage, ConflictResponseMessage, EncodeError, LamportTime, MessageType, ReconnectDelegate,
   bridge::{tags_from_pb, tags_to_pb, user_event_to_pb},
   coalesce::{DropCounter, MemberEventCoalescer, UserEventCoalescer},
   event::{
@@ -771,6 +771,14 @@ where
   /// Cumulative member-coalescer shed count, incremented in `emit_member` when
   /// the member coalescer drops a change at its cardinality cap.
   member_drop: D,
+  /// Optional per-member override for the reaper's reconnect / tombstone
+  /// timeout (Go serf `ReconnectDelegate`).
+  ///
+  /// Consulted by `fire_reap` for every failed and left member it considers;
+  /// `None` is the noop (the flat configured timeouts apply unchanged). Boxed
+  /// `dyn` carries `Send + Sync` from the trait's supertraits, so the endpoint
+  /// keeps its auto-traits for the multi-threaded drivers.
+  reconnect_delegate: Option<std::boxed::Box<dyn ReconnectDelegate<I, A>>>,
   /// The most recent directed-send (address, bytes) produced by
   /// `handle_relay` or `relay_response`.
   ///
@@ -955,6 +963,7 @@ where
       user_coalescer,
       user_drop,
       member_drop,
+      reconnect_delegate: None,
       drain_now: Instant::ORIGIN,
       coalesce_now: Instant::ORIGIN,
       // The snapshot starts dirty so the first push-pull always ships a fresh
@@ -1078,6 +1087,39 @@ where
       .values()
       .map(|ms| std::sync::Arc::new(ms.member().clone()))
       .collect()
+  }
+}
+
+// ── reconnect delegate (minimal bounds: a plain injected-field setter) ────────
+
+impl<I, A, R, D> Endpoint<I, A, R, D>
+where
+  I: Eq + core::hash::Hash,
+  D: DropCounter,
+{
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`], consuming builder form.
+  ///
+  /// `None` (the default) is the noop: the flat configured `reconnect_timeout`
+  /// / `tombstone_timeout` apply to every member in the reaper.
+  #[must_use]
+  pub fn with_reconnect_delegate(
+    mut self,
+    delegate: Option<std::boxed::Box<dyn ReconnectDelegate<I, A>>>,
+  ) -> Self {
+    self.reconnect_delegate = delegate;
+    self
+  }
+
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`].
+  ///
+  /// `None` restores the default flat timeouts.
+  pub fn set_reconnect_delegate(
+    &mut self,
+    delegate: Option<std::boxed::Box<dyn ReconnectDelegate<I, A>>>,
+  ) {
+    self.reconnect_delegate = delegate;
   }
 }
 
@@ -2338,16 +2380,25 @@ where
     let tombstone_timeout = self.opts.tombstone_timeout();
     let intent_timeout = self.opts.recent_intent_timeout();
 
-    // Reap failed members whose leave_time > reconnect_timeout.
+    // Reap failed members whose leave_time > reconnect_timeout, honoring the
+    // per-member override: Go serf's `reap!` (base.rs ~521-553) consults the
+    // `ReconnectDelegate` here with `reconnect_timeout` as the base. The
+    // delegate and the membership store are disjoint fields, so their shared
+    // borrows compose.
     let mut i = 0;
     while i < self.members.failed_members.len() {
       let id = self.members.failed_members[i].clone();
-      let expired = self
-        .members
-        .states
-        .get(&id)
-        .and_then(|ms| ms.leave_time())
-        .is_some_and(|lt| now.duration_since(lt) > reconnect_timeout);
+      let expired = match self.members.states.get(&id) {
+        Some(ms) => {
+          let timeout = match &self.reconnect_delegate {
+            Some(d) => d.reconnect_timeout(ms.member(), reconnect_timeout),
+            None => reconnect_timeout,
+          };
+          ms.leave_time()
+            .is_some_and(|lt| now.duration_since(lt) > timeout)
+        }
+        None => false,
+      };
       if expired {
         self.members.failed_members.swap_remove(i);
         if let Some(ms) = self.members.states.remove(&id) {
@@ -2368,16 +2419,24 @@ where
       }
     }
 
-    // Reap left (tombstone) members whose leave_time > tombstone_timeout.
+    // Reap left (tombstone) members whose leave_time > tombstone_timeout,
+    // honoring the same per-member override: Go serf shares one `reap!` pass
+    // for the left list, passing `tombstone_timeout` as the base to the very
+    // same `ReconnectDelegate` (base.rs ~568-569).
     let mut i = 0;
     while i < self.members.left_members.len() {
       let id = self.members.left_members[i].clone();
-      let expired = self
-        .members
-        .states
-        .get(&id)
-        .and_then(|ms| ms.leave_time())
-        .is_some_and(|lt| now.duration_since(lt) > tombstone_timeout);
+      let expired = match self.members.states.get(&id) {
+        Some(ms) => {
+          let timeout = match &self.reconnect_delegate {
+            Some(d) => d.reconnect_timeout(ms.member(), tombstone_timeout),
+            None => tombstone_timeout,
+          };
+          ms.leave_time()
+            .is_some_and(|lt| now.duration_since(lt) > timeout)
+        }
+        None => false,
+      };
       if expired {
         self.members.left_members.swap_remove(i);
         if let Some(ms) = self.members.states.remove(&id) {
