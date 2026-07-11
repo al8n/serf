@@ -157,6 +157,7 @@ where
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
     gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> core::result::Result<Self, T::Error>
   where
@@ -201,6 +202,7 @@ where
       serf_options,
       user_drop_writer,
       member_drop_writer,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     );
@@ -259,6 +261,7 @@ where
     delegate: D,
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -274,6 +277,7 @@ where
       runtime_options,
       serf_options,
       crate::gossip_rng()?,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )
@@ -291,6 +295,7 @@ where
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
     gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -307,6 +312,7 @@ where
       runtime_options,
       serf_options,
       gossip_rng,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )
@@ -357,6 +363,7 @@ where
     delegate: D,
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -372,6 +379,7 @@ where
       runtime_options,
       serf_options,
       crate::gossip_rng()?,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )
@@ -389,6 +397,7 @@ where
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
     gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -405,6 +414,7 @@ where
       runtime_options,
       serf_options,
       gossip_rng,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )
@@ -454,6 +464,7 @@ where
     delegate: D,
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -469,6 +480,7 @@ where
       runtime_options,
       serf_options,
       crate::gossip_rng()?,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )
@@ -486,6 +498,7 @@ where
     runtime_options: RuntimeOptions,
     serf_options: SerfOptions,
     gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -502,6 +515,7 @@ where
       runtime_options,
       serf_options,
       gossip_rng,
+      reconnect_delegate,
       #[cfg(encryption)]
       keyring,
     )

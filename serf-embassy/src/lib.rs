@@ -55,8 +55,9 @@ pub use memberlist_proto::{EndpointOptions, Instant, Node, Rng, SeedableRng, Sma
 // transform config, the await-result join types, and serf's config / error types.
 pub use serf_embedded::{
   AliveDelegate, DEFAULT_EVENT_BUFFER_CAP, Event, JoinFailed, JoinId, LabelError,
-  MAX_RESOLVED_ADDRS_PER_SEED, MaybeOwned, MaybeResolved, MergeDelegate, ReachedSet, ResolvedAddrs,
-  SerfError, SerfOptions, TransformOptions, socket_addr_is_routable,
+  MAX_RESOLVED_ADDRS_PER_SEED, MaybeOwned, MaybeResolved, MergeDelegate, ReachedSet,
+  ReconnectDelegate, ResolvedAddrs, SerfError, SerfOptions, TransformOptions,
+  socket_addr_is_routable,
 };
 // serf's own protocol types named in the command signatures.
 pub use serf_proto::{

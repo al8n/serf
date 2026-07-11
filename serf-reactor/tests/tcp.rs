@@ -37,6 +37,27 @@ use smol_str::SmolStr;
 /// A reactor TCP node handle over the agnostic runtime `R`.
 type Node<R> = Serf<SmolStr, SocketAddr, R>;
 
+/// A [`ReconnectDelegate`](serf_proto::ReconnectDelegate) that forces an immediate
+/// reap (zero timeout) for one target member id and passes every other member
+/// through the configured base timeout unchanged.
+struct ReapImmediately {
+  target: SmolStr,
+}
+
+impl serf_proto::ReconnectDelegate<SmolStr, SocketAddr> for ReapImmediately {
+  fn reconnect_timeout(
+    &self,
+    member: &serf_proto::members::Member<SmolStr, SocketAddr>,
+    base: Duration,
+  ) -> Duration {
+    if member.node().id_ref() == &self.target {
+      Duration::ZERO
+    } else {
+      base
+    }
+  }
+}
+
 /// Build and spawn a reactor TCP node on an ephemeral loopback port through the
 /// ergonomic `Serf::tcp` constructor.
 async fn spawn_node<R>(id: &str) -> Node<R>
@@ -54,6 +75,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
@@ -263,6 +285,70 @@ where
   b.shutdown().await.expect("lv-b shuts down");
 }
 
+/// The construction-time `reconnect_delegate` is installed into the endpoint and
+/// consulted by the reaper: node A carries a delegate that zeroes node B's LEFT
+/// tombstone while A's flat `tombstone_timeout` stays at 24h. After B leaves
+/// gracefully, A drops back to a single member — which can only happen if the
+/// driver installed the delegate AND the reaper consulted it (the flat 24h
+/// timeout would otherwise hold B for the whole test). Proves the reactor
+/// constructor wiring end-to-end.
+async fn reconnect_delegate_reaps_left_member<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("rd-b").await;
+  let b_addr = b.advertise_address();
+
+  // A: a long flat tombstone (so a default reap never fires within the test) with
+  // fast reap ticks, plus a delegate overriding ONLY B's tombstone to zero.
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("rd-a"))
+    .with_advertise_addr(MaybeResolved::Resolved(bind));
+  let serf_opts = SerfOptions::new()
+    .with_reap_interval(Duration::from_millis(100))
+    .with_tombstone_timeout(Duration::from_secs(86_400));
+  let a = Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf_opts,
+    Some(Box::new(ReapImmediately {
+      target: SmolStr::new("rd-b"),
+    })),
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf tcp node A with a reconnect delegate");
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  // B leaves gracefully: A moves B to its LEFT tombstone list. With the delegate
+  // zeroing B's tombstone, A's next reap tick drops B — the 2-member cluster
+  // returns to 1. Without the delegate consult, A would hold B for the flat 24h.
+  b.leave().await.expect("B leaves the cluster");
+
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 1 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A reaps the left member B early via the reconnect-delegate override");
+
+  a.shutdown().await.expect("rd-a shuts down");
+  b.shutdown().await.expect("rd-b shuts down");
+}
+
 /// After a two-node join, the snapshot read-forwarders on the joined node reflect
 /// the two-member cluster: `members` returns both nodes, `local_member` / `local_id`
 /// return this node, `state` is `Alive`, `advertise_node` composes id + advertise,
@@ -415,6 +501,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     std::sync::Arc::new(VoidKeyringDelegate),
   )
   .await
@@ -560,6 +647,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn reconnect_delegate_reaps_left_member() {
+    super::reconnect_delegate_reaps_left_member::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn snapshot_forwarders_reflect_joined_cluster() {
     super::snapshot_forwarders_reflect_joined_cluster::<TokioRuntime>().await;
   }
@@ -614,6 +706,11 @@ mod smol_cells {
   #[test]
   fn leave_emits_left_cluster_smol() {
     SmolRuntime::block_on(super::leave_emits_left_cluster::<SmolRuntime>());
+  }
+
+  #[test]
+  fn reconnect_delegate_reaps_left_member_smol() {
+    SmolRuntime::block_on(super::reconnect_delegate_reaps_left_member::<SmolRuntime>());
   }
 
   #[test]

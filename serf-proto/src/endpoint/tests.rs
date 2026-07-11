@@ -893,6 +893,145 @@ fn reap_deadline_fires_via_handle_timeout() {
   );
 }
 
+// ── ReconnectDelegate: per-member reap-timeout override (Go serf `reap!`) ──────
+
+/// Build a serf `StreamEndpoint` with caller-supplied serf `opts`, so a test can
+/// set the flat reap timeouts. Mirrors [`ep`] otherwise.
+fn ep_with_opts(opts: Options) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  // Drain the construction NodeJoined(self) so tests start from a clean queue.
+  let _ = e.poll_event();
+  e
+}
+
+/// A reconnect delegate that overrides the reap timeout for one target member id
+/// and passes every other member through the configured base timeout unchanged.
+struct OverrideOne {
+  target: u32,
+  override_timeout: core::time::Duration,
+}
+
+impl ReconnectDelegate<u32, core::net::SocketAddr> for OverrideOne {
+  fn reconnect_timeout(
+    &self,
+    member: &Member<u32, core::net::SocketAddr>,
+    timeout: core::time::Duration,
+  ) -> core::time::Duration {
+    if *member.node().id_ref() == self.target {
+      self.override_timeout
+    } else {
+      timeout
+    }
+  }
+}
+
+#[test]
+fn reconnect_delegate_overrides_the_failed_reap_timeout() {
+  // Flat reconnect_timeout is long (30s); the delegate shortens member 2 to 1s.
+  let opts = Options::new().with_reconnect_timeout(core::time::Duration::from_secs(30));
+  let mut e = ep_with_opts(opts);
+  e.set_reconnect_delegate(Some(Box::new(OverrideOne {
+    target: 2,
+    override_timeout: core::time::Duration::from_secs(1),
+  })));
+
+  let t0 = memberlist_proto::Instant::ORIGIN;
+  seed_failed(&mut e, 2, "127.0.0.1:1002".parse().unwrap(), t0);
+  seed_failed(&mut e, 3, "127.0.0.1:1003".parse().unwrap(), t0);
+
+  // Past t0 + 1s (override) + reap_interval (15s): only member 2 has crossed its
+  // shortened window; member 3 is still inside the flat 30s window.
+  e.handle_timeout(t0 + core::time::Duration::from_secs(1 + 15));
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "the overridden member (1s window) must be reaped at the early tick"
+  );
+  assert_eq!(
+    e.test_member_status(3),
+    Some(MemberStatus::Failed),
+    "the passthrough member (flat 30s) must survive the early tick"
+  );
+  let reaped_early = core::iter::from_fn(|| e.poll_event())
+    .any(|ev| matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Reap));
+  assert!(
+    reaped_early,
+    "a Member(Reap) event must fire for the overridden member"
+  );
+
+  // Past the flat 30s window (+ reap_interval): member 3 reaps too.
+  e.handle_timeout(t0 + core::time::Duration::from_secs(30 + 15 + 1));
+  assert_eq!(
+    e.test_member_status(3),
+    None,
+    "the passthrough member must reap once past the flat reconnect_timeout"
+  );
+}
+
+#[test]
+fn reconnect_delegate_overrides_the_left_reap_timeout() {
+  // Same shape on the LEFT list, proving the second reap loop consults the very
+  // same delegate with tombstone_timeout as the base (Go serf's shared reap).
+  let opts = Options::new().with_tombstone_timeout(core::time::Duration::from_secs(30));
+  let mut e = ep_with_opts(opts);
+  e.set_reconnect_delegate(Some(Box::new(OverrideOne {
+    target: 2,
+    override_timeout: core::time::Duration::from_secs(1),
+  })));
+
+  let t0 = memberlist_proto::Instant::ORIGIN;
+  e.test_seed_left_member_by_status(2, LamportTime::new(3), t0);
+  e.test_seed_left_member_by_status(3, LamportTime::new(3), t0);
+
+  e.handle_timeout(t0 + core::time::Duration::from_secs(1 + 15));
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "the overridden left member (1s window) must be reaped at the early tick"
+  );
+  assert_eq!(
+    e.test_member_status(3),
+    Some(MemberStatus::Left),
+    "the passthrough left member (flat 30s) must survive the early tick"
+  );
+
+  e.handle_timeout(t0 + core::time::Duration::from_secs(30 + 15 + 1));
+  assert_eq!(
+    e.test_member_status(3),
+    None,
+    "the passthrough left member must reap once past the flat tombstone_timeout"
+  );
+}
+
+#[test]
+fn no_delegate_keeps_the_flat_timeouts() {
+  // With no delegate (default None) both members obey the flat reconnect_timeout,
+  // proving None is exact passthrough — the reaper is unchanged from today.
+  let opts = Options::new().with_reconnect_timeout(core::time::Duration::from_secs(30));
+  let mut e = ep_with_opts(opts);
+
+  let t0 = memberlist_proto::Instant::ORIGIN;
+  seed_failed(&mut e, 2, "127.0.0.1:1002".parse().unwrap(), t0);
+  seed_failed(&mut e, 3, "127.0.0.1:1003".parse().unwrap(), t0);
+
+  // Early tick (16s): neither member has crossed the flat 30s window.
+  e.handle_timeout(t0 + core::time::Duration::from_secs(1 + 15));
+  assert_eq!(e.test_member_status(2), Some(MemberStatus::Failed));
+  assert_eq!(e.test_member_status(3), Some(MemberStatus::Failed));
+
+  // Past 30s (+ reap_interval): both reap together under the same flat timeout.
+  e.handle_timeout(t0 + core::time::Duration::from_secs(30 + 15 + 1));
+  assert_eq!(e.test_member_status(2), None);
+  assert_eq!(e.test_member_status(3), None);
+}
+
 // ── Task 2.1: event ring-buffer dedup + event-clock + event broadcast tier ────
 
 #[test]

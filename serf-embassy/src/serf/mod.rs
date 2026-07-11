@@ -898,6 +898,21 @@ where
     r.map_err(OpError::from)
   }
 
+  /// Install (or clear) the per-member reconnect-timeout override
+  /// [`ReconnectDelegate`](crate::ReconnectDelegate) on the serf engine.
+  ///
+  /// `None` (the default) keeps the flat configured reap timeouts.
+  pub fn set_reconnect_delegate(
+    &self,
+    delegate: Option<std::boxed::Box<dyn serf_embedded::ReconnectDelegate<I, SocketAddr>>>,
+  ) {
+    self
+      .shared
+      .engine
+      .borrow_mut()
+      .set_reconnect_delegate(delegate);
+  }
+
   /// Issue a cluster-wide `install_key` query to add `key` to every node's keyring.
   #[cfg(encryption)]
   #[cfg_attr(

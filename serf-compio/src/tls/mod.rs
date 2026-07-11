@@ -452,7 +452,8 @@ where
       self.serf_rng,
       runtime.user_drop,
       runtime.member_drop,
-    );
+    )
+    .with_reconnect_delegate(runtime.reconnect_delegate);
 
     crate::driver::stream::stream_driver_loop::<Self::Id, Labeled<TlsRecords>, D, G, StdRng>(
       endpoint,

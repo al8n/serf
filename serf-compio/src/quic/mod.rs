@@ -340,7 +340,8 @@ where
       self.serf_rng,
       runtime.user_drop,
       runtime.member_drop,
-    );
+    )
+    .with_reconnect_delegate(runtime.reconnect_delegate);
 
     crate::driver::quic::quic_driver_loop::<Self::Id, D, G, StdRng>(
       endpoint,

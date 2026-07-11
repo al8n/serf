@@ -132,6 +132,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
