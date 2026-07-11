@@ -594,6 +594,40 @@ where
   cluster.shutdown_all().await;
 }
 
+/// A leave configured with a zero timeout racing a shutdown resolves
+/// `Err(LeaveTimeout)` — never `Ok` — even though the teardown still delivers
+/// the fan-out: the caller's per-leave deadline keeps governing resolution
+/// during teardown, and a zero timeout is a loud immediate `LeaveTimeout` by
+/// contract.
+async fn leave_with_zero_timeout_racing_shutdown_times_out<R>()
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let node = Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("zero-leave"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new().with_leave_timeout(Duration::ZERO),
+    SerfOptions::new(),
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn zero-leave-timeout node");
+
+  let (leave, shutdown) = future::join(node.leave(), node.shutdown()).await;
+  assert!(
+    matches!(leave, Err(serf_reactor::SerfError::LeaveTimeout)),
+    "a zero leave timeout must resolve LeaveTimeout even when a shutdown races it, got {leave:?}"
+  );
+  shutdown.expect("node shuts down");
+}
+
 /// Two nodes on loopback: node A joins node B, B is abruptly killed and detected
 /// Failed, then B is restarted at the same id and advertise address. Node A must
 /// observe the sequence Join → Failed → Join about B — the failed member
@@ -850,6 +884,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn leave_with_zero_timeout_racing_shutdown_times_out() {
+    super::leave_with_zero_timeout_racing_shutdown_times_out::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn serf_reconnect() {
     super::serf_reconnect::<TokioRuntime>().await;
   }
@@ -931,6 +970,13 @@ mod smol_cells {
   #[test]
   fn serf_events_leave_with_racing_shutdown_smol() {
     SmolRuntime::block_on(super::serf_events_leave_with_racing_shutdown::<SmolRuntime>());
+  }
+
+  #[test]
+  fn leave_with_zero_timeout_racing_shutdown_times_out_smol() {
+    SmolRuntime::block_on(super::leave_with_zero_timeout_racing_shutdown_times_out::<
+      SmolRuntime,
+    >());
   }
 
   #[test]

@@ -78,7 +78,6 @@ fn retain_leave_datagram_flags_only_local_failures() {
     io::ErrorKind::ConnectionAborted,
     io::ErrorKind::HostUnreachable,
     io::ErrorKind::NetworkUnreachable,
-    io::ErrorKind::AddrNotAvailable,
   ] {
     let mut send_failed = false;
     assert!(!retain_leave_datagram(
@@ -96,10 +95,13 @@ fn retain_leave_datagram_flags_only_local_failures() {
   }
 
   // Local socket failures: attempted, not retained, and the leave FAILS.
+  // `AddrNotAvailable` is local — the bound source address vanished from this
+  // host — not a peer signal.
   for kind in [
     io::ErrorKind::NotConnected,
     io::ErrorKind::BrokenPipe,
     io::ErrorKind::InvalidInput,
+    io::ErrorKind::AddrNotAvailable,
     io::ErrorKind::Other,
   ] {
     let mut send_failed = false;
