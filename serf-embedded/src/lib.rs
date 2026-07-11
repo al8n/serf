@@ -23,6 +23,9 @@ compile_error!("serf-embedded requires the `std` or `alloc` feature");
 
 mod cidr;
 pub mod engine;
+pub mod error;
+
+pub use error::InitError;
 
 pub use engine::{DEFAULT_EVENT_BUFFER_CAP, JoinFailed, JoinId, ReachedSet, SerfEngine};
 
@@ -39,7 +42,9 @@ pub use memberlist_embedded::{
   // The datagram + pooled-stream I/O seams a driver supplies to `SerfEngine::pump`.
   GossipIo,
   GossipMtuTooLarge,
-  InitError,
+  // The memberlist half of the engine's construction error, carried inside
+  // `InitError::Memberlist`.
+  InitError as MemberlistInitError,
   // Engine sizing (ports / close timeout / CIDR policy).
   Options,
   StreamIo,
@@ -80,5 +85,5 @@ pub use memberlist_embedded::{EncryptionOptions, Keyring, SecretKey};
 
 /// serf's own [`Endpoint`](serf_proto::endpoint::Endpoint) configuration, distinct
 /// from the memberlist-layer engine [`Options`].
-pub use serf_proto::options::Options as SerfOptions;
+pub use serf_proto::options::{InvalidOptions, Options as SerfOptions};
 pub use serf_proto::{ReconnectDelegate, endpoint::Error as SerfError, event::Event};

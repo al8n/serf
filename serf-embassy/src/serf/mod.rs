@@ -384,6 +384,12 @@ where
     let embedded_cfg = embedded_options(&cfg);
     validate_runtime_config(&embedded_cfg, &transform, ep_cfg.gossip_mtu())
       .map_err(InitError::from)?;
+    // Reject a serf-level configuration the engine cannot honor (an over-ceiling
+    // `max_user_event_size`, or a self-contradictory coalescing pair) at the same
+    // deterministic preflight, before resolving the advertise address or binding.
+    serf_opts
+      .validate()
+      .map_err(InitError::InvalidSerfOptions)?;
 
     // Resolve the advertise address into a single wire `SocketAddr`, then re-type
     // `ep_cfg` so the rest of construction — and the engine — only sees the resolved

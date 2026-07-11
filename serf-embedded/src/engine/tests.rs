@@ -167,8 +167,39 @@ fn non_routable_advertise_is_rejected() {
     test_rng(),
   );
   assert!(
-    matches!(result, Err(InitError::NonRoutableAdvertiseAddr(_))),
+    matches!(
+      result,
+      Err(InitError::Memberlist(
+        crate::MemberlistInitError::NonRoutableAdvertiseAddr(_)
+      ))
+    ),
     "a non-routable advertise address must fail construction"
+  );
+}
+
+/// An over-ceiling `max_user_event_size` is rejected in the engine's own
+/// construction funnel, so a driver built directly on the engine cannot bypass
+/// the serf-options validation the wrapping drivers enforce.
+#[test]
+fn over_ceiling_user_event_size_is_rejected_at_engine_construction() {
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new("test"), node_addr(7946));
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let serf_opts =
+    SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1);
+  let result = SerfEngine::<SmolStr, u32>::try_new_at(
+    cfg,
+    TransformOptions::default(),
+    ep_cfg,
+    serf_opts,
+    now,
+    test_rng(),
+  );
+  assert!(
+    matches!(result, Err(InitError::InvalidSerfOptions(_))),
+    "an over-ceiling max_user_event_size must fail engine construction"
   );
 }
 
@@ -2272,7 +2303,7 @@ fn construction_rejects_a_keyring_with_cross_cipher_byte_twins() {
   // ciphers — an ambiguous ring for the byte-keyed rotation ops.
   let keyring = Keyring::with_secondaries(aes256(0x11), [chacha(0x11)]);
   match try_make_encrypted_engine("a", 7946, keyring) {
-    Err(InitError::Encryption(_)) => {}
+    Err(InitError::Memberlist(crate::MemberlistInitError::Encryption(_))) => {}
     Err(other) => {
       panic!("expected InitError::Encryption for a cross-cipher twin keyring, got {other:?}")
     }

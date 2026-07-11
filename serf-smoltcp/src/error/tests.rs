@@ -56,6 +56,12 @@ fn all_variants() -> Vec<InitError> {
     InitError::TcpRxBufferTooLarge,
     InitError::ZeroUdpPackets,
     InitError::ZeroCloseTimeout,
+    InitError::InvalidSerfOptions(
+      crate::SerfOptions::new()
+        .with_max_user_event_size(crate::SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1)
+        .validate()
+        .expect_err("an over-ceiling max_user_event_size is invalid"),
+    ),
   ]
 }
 
@@ -115,36 +121,36 @@ fn from_encryption_error() {
 // and routes any future (non_exhaustive) variant to a generic endpoint error.
 #[test]
 fn from_embedded_maps_each_mode() {
-  use serf_embedded::InitError as E;
+  use serf_embedded::MemberlistInitError as E;
 
   assert!(matches!(
-    InitError::from_embedded(E::ZeroPort),
+    InitError::from_memberlist(E::ZeroPort),
     InitError::ZeroPort
   ));
   assert!(matches!(
-    InitError::from_embedded(E::AdvertisePortMismatch),
+    InitError::from_memberlist(E::AdvertisePortMismatch),
     InitError::AdvertisePortMismatch
   ));
   assert!(matches!(
-    InitError::from_embedded(E::ZeroCloseTimeout),
+    InitError::from_memberlist(E::ZeroCloseTimeout),
     InitError::ZeroCloseTimeout
   ));
   assert!(matches!(
-    InitError::from_embedded(E::NonRoutableAdvertiseAddr(sample_socket_addr())),
+    InitError::from_memberlist(E::NonRoutableAdvertiseAddr(sample_socket_addr())),
     InitError::NonRoutableAdvertiseAddr(_)
   ));
   assert!(matches!(
-    InitError::from_embedded(E::Endpoint(EndpointInitError::AwarenessMultiplierZero)),
+    InitError::from_memberlist(E::Endpoint(EndpointInitError::AwarenessMultiplierZero)),
     InitError::Endpoint(_)
   ));
   #[cfg(encryption)]
   assert!(matches!(
-    InitError::from_embedded(E::Encryption(memberlist_proto::EncryptionError::AuthFailed)),
+    InitError::from_memberlist(E::Encryption(memberlist_proto::EncryptionError::AuthFailed)),
     InitError::Encryption(_)
   ));
 
   // The carried ceiling/value survive the GossipMtuTooLarge remap.
-  let mapped = InitError::from_embedded(E::GossipMtuTooLarge(serf_embedded::GossipMtuTooLarge {
+  let mapped = InitError::from_memberlist(E::GossipMtuTooLarge(serf_embedded::GossipMtuTooLarge {
     gossip_mtu: 99_999,
     ceiling: 65_467,
   }));

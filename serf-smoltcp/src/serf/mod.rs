@@ -295,7 +295,13 @@ where
     // Advertise-independent config preflight before touching the link layer.
     let embedded_cfg = embedded_options(&cfg);
     validate_runtime_config(&embedded_cfg, &transform, ep_cfg.gossip_mtu())
-      .map_err(InitError::from_embedded)?;
+      .map_err(InitError::from_memberlist)?;
+    // Reject a serf-level configuration the engine cannot honor (an over-ceiling
+    // `max_user_event_size`, or a self-contradictory coalescing pair) at the same
+    // deterministic preflight, before drawing entropy or touching the link layer.
+    serf_opts
+      .validate()
+      .map_err(InitError::InvalidSerfOptions)?;
 
     // Resolve the advertise address, then re-type `ep_cfg` so the rest of
     // construction only ever sees the resolved wire `SocketAddr`.
@@ -385,7 +391,13 @@ where
   {
     let embedded_cfg = embedded_options(&cfg);
     validate_runtime_config(&embedded_cfg, &transform, ep_cfg.gossip_mtu())
-      .map_err(InitError::from_embedded)?;
+      .map_err(InitError::from_memberlist)?;
+    // Reject a serf-level configuration the engine cannot honor (an over-ceiling
+    // `max_user_event_size`, or a self-contradictory coalescing pair) at the same
+    // deterministic preflight, before drawing entropy or touching the link layer.
+    serf_opts
+      .validate()
+      .map_err(InitError::InvalidSerfOptions)?;
 
     let resolved_advertise = resolver
       .resolve(ep_cfg.advertise_addr_ref())

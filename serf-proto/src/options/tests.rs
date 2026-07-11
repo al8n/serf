@@ -217,3 +217,104 @@ fn validate_rejects_quiescent_not_less_than_coalesce() {
     Err(InvalidOptions::UserCoalesce(_))
   ));
 }
+
+// ── user-event size ceiling ──────────────────────────────────────────────────
+
+#[test]
+fn default_user_event_size_limit_matches_go_serf() {
+  // The default ceiling is 9 KiB, matching Go serf's fixed construction-time
+  // limit, so a default configuration behaves identically to Go.
+  assert_eq!(Options::DEFAULT_USER_EVENT_SIZE_LIMIT, 9 * 1024);
+  assert_eq!(Options::DEFAULT_USER_EVENT_SIZE_LIMIT, 9216);
+  assert_eq!(
+    Options::new().user_event_size_limit(),
+    Options::DEFAULT_USER_EVENT_SIZE_LIMIT
+  );
+}
+
+#[test]
+fn validate_rejects_max_user_event_size_over_ceiling() {
+  let over = Options::new().with_max_user_event_size(Options::DEFAULT_USER_EVENT_SIZE_LIMIT + 1);
+  assert!(matches!(
+    over.validate(),
+    Err(InvalidOptions::UserEventSize(_))
+  ));
+}
+
+#[test]
+fn validate_accepts_max_user_event_size_at_or_below_ceiling() {
+  // Exactly the ceiling is accepted.
+  assert!(
+    Options::new()
+      .with_max_user_event_size(Options::DEFAULT_USER_EVENT_SIZE_LIMIT)
+      .validate()
+      .is_ok()
+  );
+  // Below the ceiling is accepted.
+  assert!(
+    Options::new()
+      .with_max_user_event_size(Options::DEFAULT_USER_EVENT_SIZE_LIMIT - 1)
+      .validate()
+      .is_ok()
+  );
+  // The default (512) is well below the ceiling.
+  assert!(Options::new().validate().is_ok());
+}
+
+#[test]
+fn raised_ceiling_admits_a_larger_max_user_event_size() {
+  // Raising the ceiling is the deliberate double opt-in: both knobs must move
+  // for a configuration past Go's fixed limit to validate.
+  let raised = Options::new()
+    .with_user_event_size_limit(64 * 1024)
+    .with_max_user_event_size(16 * 1024);
+  assert!(raised.validate().is_ok());
+
+  // Turning only the size knob without the ceiling still rejects.
+  let size_only = Options::new().with_max_user_event_size(16 * 1024);
+  assert!(matches!(
+    size_only.validate(),
+    Err(InvalidOptions::UserEventSize(_))
+  ));
+}
+
+#[test]
+fn lowered_ceiling_rejects_an_unadjusted_max_user_event_size() {
+  // A ceiling below the configured (here: default 512) per-event size makes the
+  // pair incoherent and is rejected.
+  let lowered = Options::new().with_user_event_size_limit(256);
+  assert!(matches!(
+    lowered.validate(),
+    Err(InvalidOptions::UserEventSize(_))
+  ));
+  // Lowering both knobs coherently validates.
+  assert!(
+    Options::new()
+      .with_user_event_size_limit(256)
+      .with_max_user_event_size(256)
+      .validate()
+      .is_ok()
+  );
+}
+
+#[test]
+fn zero_ceiling_is_rejected() {
+  // A zero ceiling can never be satisfied meaningfully; disabling user events
+  // is expressed through max_user_event_size, not the ceiling.
+  let zero = Options::new()
+    .with_user_event_size_limit(0)
+    .with_max_user_event_size(0);
+  assert!(matches!(
+    zero.validate(),
+    Err(InvalidOptions::UserEventSize(_))
+  ));
+}
+
+#[test]
+fn user_event_size_limit_builder_pair_round_trips() {
+  let built = Options::new().with_user_event_size_limit(12 * 1024);
+  assert_eq!(built.user_event_size_limit(), 12 * 1024);
+  let mut set = Options::new();
+  set.set_user_event_size_limit(10 * 1024);
+  assert_eq!(set.user_event_size_limit(), 10 * 1024);
+}
