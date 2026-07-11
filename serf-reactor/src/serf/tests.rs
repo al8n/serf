@@ -11,7 +11,9 @@ use agnostic::tokio::TokioRuntime;
 use crate::{
   Channel, FirstAddrResolver, MaybeResolved, Resolver, RuntimeOptions, Serf, SerfError,
   SocketAddrResolver, TcpTransportOptions, VoidDelegate,
+  command::{Command, UserEventCmd},
 };
+use futures_channel::oneshot;
 use serf_proto::options::Options as SerfOptions;
 use smol_str::SmolStr;
 
@@ -133,6 +135,56 @@ async fn tcp_coalesced_user_events_dropped_observable() {
     dropped,
     u64::from(n) - cap.get() as u64,
     "every distinct-named cc event past the cap is counted on the public handle (got {dropped})"
+  );
+}
+
+/// The pump republishes the cumulative coalescer drop counters at the end of every
+/// poll pass, but the shutdown branch returns `Poll::Ready` before that publish, so
+/// the drops shed in the same command drain as the `Shutdown` would be lost from the
+/// public total. The teardown publish — run as the driver future completes — makes
+/// the total exact even for drops shed on the way out; without it the handle keeps
+/// the stale value the last normal poll left.
+///
+/// The flood is enqueued synchronously — no await between the sends — so on the
+/// single-threaded cooperative runtime the driver cannot run, and cannot publish,
+/// until the test parks on the shutdown reply; the whole flood and the trailing
+/// shutdown then drain in one poll, since `drain_commands` takes the entire queue.
+#[tokio::test]
+async fn coalesced_drops_are_published_on_shutdown_teardown() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let a = spawn_node_with_serf_options("coalesce-teardown", serf_opts).await;
+
+  // Enqueue distinct-named coalescing user events past the cap directly onto the
+  // command queue without awaiting each reply: the reply receivers drop immediately,
+  // so the driver's acks are discarded, but every event is still fed to the coalescer
+  // and the overflow counted. Firing them synchronously guarantees they queue ahead
+  // of the shutdown with no intervening driver publish.
+  let n: u32 = 20;
+  for i in 0..n {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("evt-{i}")),
+      bytes::Bytes::new(),
+      true,
+      tx,
+    )))
+    .expect("enqueue user event");
+  }
+
+  // Shut down with no intervening sleep: the shutdown lands in the same poll's drain
+  // as the flood, so the coalescer sheds `n - cap` events and the driver returns
+  // `Poll::Ready` from the shutdown branch with those drops unpublished by the normal
+  // per-poll store. Awaiting completion runs the teardown publish.
+  a.shutdown().await.expect("coalesce-teardown shuts down");
+
+  assert_eq!(
+    a.coalesced_user_events_dropped(),
+    u64::from(n) - cap.get() as u64,
+    "the cumulative drop total shed in the shutdown drain is published on teardown"
   );
 }
 

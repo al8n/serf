@@ -1596,6 +1596,17 @@ where
         // Ignoring Err: the caller dropped its reply receiver.
         let _ = reply.send(Ok(()));
       }
+      // The coalescer drop counters are cumulative; publish them a final time as the
+      // driver future completes so the drops shed in the last command drain — an
+      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
+      // from the public total. The normal per-poll publish below is skipped once this
+      // shutdown branch returns, so this store is the completeness backstop.
+      this
+        .shared
+        .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
+      this
+        .shared
+        .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
       this.shared.mark_shutdown_complete();
       return Poll::Ready(());
     }

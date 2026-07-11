@@ -18,8 +18,11 @@ use smol_str::SmolStr;
 
 use crate::{
   Channel, FirstAddrResolver, Resolver, RuntimeOptions, Serf, SerfError, SocketAddrResolver,
-  TcpTransport, TcpTransportOptions, VoidDelegate, gossip_rng,
+  TcpTransport, TcpTransportOptions, VoidDelegate,
+  command::{Command, UserEventCmd},
+  gossip_rng,
 };
+use futures_channel::oneshot;
 
 /// A loopback address with a port nothing listens on — `connect()` returns
 /// `ECONNREFUSED` immediately, so its push/pull exchange fails fast. The port is
@@ -539,6 +542,31 @@ async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Se
   .expect("spawn serf node")
 }
 
+/// Build a TCP serf node with a custom `SerfOptions` and a custom `RuntimeOptions`.
+async fn spawn_node_with_serf_and_runtime(
+  id: &str,
+  serf_options: SerfOptions,
+  runtime_options: RuntimeOptions,
+) -> Serf<SmolStr> {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind));
+  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    runtime_options,
+    serf_options,
+    gossip_rng().expect("seed gossip rng"),
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf node")
+}
+
 /// A single node with user coalescing enabled and a small buffered-volume cap sheds
 /// every distinct-named coalescing user event issued past the cap through the public
 /// `user_event` command path, and the cumulative drop count surfaces on the public
@@ -579,6 +607,59 @@ async fn tcp_coalesced_user_events_dropped_observable() {
     dropped,
     u64::from(n) - cap.get() as u64,
     "every distinct-named cc event past the cap is counted on the public handle (got {dropped})"
+  );
+}
+
+/// The pump republishes the cumulative coalescer drop counters at the head of every
+/// iteration, but the drops shed in the FINAL drain — a coalescer overflow followed
+/// by `Shutdown` in the same fairness pass — increment after that iteration's publish
+/// and the loop breaks into teardown before another head publish can run. The
+/// teardown publish makes the public total exact even for drops shed on the way out;
+/// without it the handle keeps the stale lower value the last head publish left.
+///
+/// The flood is enqueued synchronously — no await between the sends — so on the
+/// single-threaded cooperative runtime the pump cannot run, and cannot publish, until
+/// the test finally parks on the shutdown reply; the whole flood and the trailing
+/// shutdown then drain in one iteration. A command-fairness budget above the flood
+/// size keeps that drain a single pass, so the shutdown never lands alone in a fresh
+/// iteration whose head publish would have captured the drops.
+#[compio::test]
+async fn coalesced_drops_are_published_on_shutdown_teardown() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let runtime = RuntimeOptions::new().with_cmd_fairness_budget(64);
+  let a = spawn_node_with_serf_and_runtime("coalesce-teardown", serf_opts, runtime).await;
+
+  // Enqueue distinct-named coalescing user events past the cap directly onto the
+  // command queue without awaiting each reply: the reply receivers drop immediately,
+  // so the pump's acks are discarded, but every event is still fed to the coalescer
+  // and the overflow counted. Firing them synchronously guarantees they queue ahead
+  // of the shutdown with no intervening pump publish.
+  let n: u32 = 20;
+  for i in 0..n {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("evt-{i}")),
+      Bytes::new(),
+      true,
+      tx,
+    )))
+    .expect("enqueue user event");
+  }
+
+  // Shut down with no intervening sleep: the shutdown lands in the same drain as the
+  // flood, so the coalescer sheds `n - cap` events and the pump breaks to teardown
+  // with those drops unpublished by the head-of-loop store. Awaiting completion runs
+  // the teardown publish.
+  a.shutdown().await.expect("coalesce-teardown shuts down");
+
+  assert_eq!(
+    a.coalesced_user_events_dropped(),
+    u64::from(n) - cap.get() as u64,
+    "the cumulative drop total shed in the shutdown drain is published on teardown"
   );
 }
 

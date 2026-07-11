@@ -903,6 +903,15 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
     }
   }
 
+  // The coalescer drop counters are cumulative; publish them once more on teardown
+  // so the drops shed in the final drain — an overflow immediately followed by a
+  // `Shutdown` in the same fairness pass — are not lost from the public total. The
+  // head-of-loop publish keeps the live value fresh each iteration, but the last
+  // drain breaks straight into teardown before another iteration can republish it,
+  // so this final store is the completeness backstop.
+  coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
+  coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
+
   // Cleanup. Order: flip the shutdown flag so a racing clone observes it on
   // entry, drain queued commands with Err(Shutdown), drop the command receiver
   // so a late send fails fast, signal every live bridge to close, close the
