@@ -95,6 +95,19 @@ fn trace_leave_send_error(_peer: SocketAddr, _err: &io::Error) {
   tracing::debug!(peer = %_peer, error = %_err, "serf leave farewell datagram send failed");
 }
 
+/// Surface retained leave-farewell datagrams abandoned when the teardown drain
+/// deadline won — the socket stayed unwritable, so shutdown proceeds and the
+/// affected peers will read the departure as a failure. A no-op without the
+/// `tracing` feature.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) fn trace_leave_drain_residue(_count: usize) {
+  #[cfg(feature = "tracing")]
+  tracing::debug!(
+    residual = _count,
+    "serf leave farewell datagrams abandoned at the teardown drain deadline"
+  );
+}
+
 /// Surface a leave-farewell datagram dropped because it could not be encoded or
 /// encrypted — a deterministic config-class failure, unlike a transient
 /// best-effort gossip drop. A no-op without the `tracing` feature.
@@ -114,6 +127,14 @@ pub(crate) fn trace_leave_transform_error(_peer: SocketAddr) {
 ///
 /// Returns `true` when the datagram was retained, so a caller draining fresh
 /// transmits learns the socket is backpressured.
+/// Upper bound on how long a pump's teardown parks waiting for retained
+/// leave-farewell datagrams to drain before releasing the socket anyway. Keeps
+/// shutdown from hanging on a persistently unwritable socket while still giving
+/// the farewell a real window to reach the wire.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) const LEAVE_DRAIN_TEARDOWN_BOUND: core::time::Duration =
+  core::time::Duration::from_secs(1);
+
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) fn retain_leave_datagram(
   retained: &mut LeaveDrain,
