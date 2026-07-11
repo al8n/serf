@@ -220,6 +220,105 @@ fn handle_node_leave_intent_failed_to_left() {
   assert!(matches!(ev, Some(Event::Member(ref me)) if me.kind() == MemberEventKind::Leave));
 }
 
+// ── graceful-leave ordering + late-intent heal (peer side) ──────────────────
+
+/// Farewell ordering: a leave intent processed before the dead-self notice —
+/// the order the farewell compound delivers, user intent part ahead of the
+/// `Dead` part — yields EXACTLY one `Member(Leave)`. The intent takes the Alive
+/// peer to `Leaving` silently (no event), then the inner `NodeLeft` completes
+/// `Leaving → Left` and emits the single `Member(Leave)`. The absence of a
+/// `Failed` is the discriminator between an intentional departure and a crash.
+#[test]
+fn graceful_leave_intent_then_dead_yields_exactly_leave() {
+  let mut e = ep();
+  // A known Alive peer, seeded silently at a low status_time.
+  e.test_seed_member(2, MemberStatus::Alive, LamportTime::new(3));
+
+  // One drain cycle in wire order: the leave intent first (Alive → Leaving,
+  // silent), then the dead-self notice (Leaving → Left, emits Leave).
+  let rb = e.test_handle_leave_intent(2, LamportTime::new(7), Instant::ORIGIN);
+  assert!(rb, "a fresh leave intent for an Alive peer rebroadcasts");
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Leaving),
+    "the leave intent must move the Alive peer to Leaving silently"
+  );
+  e.test_inner_node_left(2, Instant::ORIGIN);
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Left),
+    "the dead-self notice must complete Leaving → Left"
+  );
+  assert!(
+    e.test_in_left_members(2),
+    "the departed peer lands in left_members"
+  );
+
+  // Exactly one member event, and it is Leave: the Alive → Leaving step emits
+  // nothing, so no Failed and no duplicate Leave appears.
+  let kinds: Vec<MemberEventKind> = core::iter::from_fn(|| e.poll_event())
+    .filter_map(|ev| match ev {
+      Event::Member(me) => Some(me.kind()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    kinds,
+    vec![MemberEventKind::Leave],
+    "peer-side output must be exactly one Member(Leave)"
+  );
+}
+
+/// Reversed order: the dead-self notice arrives before the leave intent, so the
+/// Alive peer first goes `Failed` (emitting `Member(Failed)`), then the late
+/// intent heals `Failed → Left` (emitting `Member(Leave)`) and moves the peer
+/// from failed_members to left_members. Pins the full second-hand sequence that
+/// a farewell whose intent part is processed after a prior suspicion-driven
+/// failure produces.
+#[test]
+fn dead_then_late_intent_heals_to_leave() {
+  let mut e = ep();
+  e.test_seed_member(2, MemberStatus::Alive, LamportTime::new(3));
+
+  // Dead-self notice first: Alive → Failed, emits Member(Failed).
+  e.test_inner_node_left(2, Instant::ORIGIN);
+  assert_eq!(e.test_member_status(2), Some(MemberStatus::Failed));
+  assert!(
+    e.test_in_failed_members(2),
+    "the failed peer lands in failed_members"
+  );
+
+  // Late leave intent heals Failed → Left, emits Member(Leave).
+  let rb = e.test_handle_leave_intent(2, LamportTime::new(7), Instant::ORIGIN);
+  assert!(rb, "a fresh leave intent for a Failed peer rebroadcasts");
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Left),
+    "the late intent must heal Failed → Left"
+  );
+  assert!(
+    !e.test_in_failed_members(2),
+    "the healed peer leaves failed_members"
+  );
+  assert!(
+    e.test_in_left_members(2),
+    "the healed peer joins left_members"
+  );
+
+  // The full second-hand sequence: Failed then Leave, in order.
+  let kinds: Vec<MemberEventKind> = core::iter::from_fn(|| e.poll_event())
+    .filter_map(|ev| match ev {
+      Event::Member(me) => Some(me.kind()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    kinds,
+    vec![MemberEventKind::Failed, MemberEventKind::Leave],
+    "peer-side output must be Failed then Leave"
+  );
+}
+
 // ── merge_remote_state (G2 witness, G3 left-first, G4 eventJoinIgnore) ───────
 
 /// Helper: build a `PushPullMessage` body as encoded `Bytes`.
