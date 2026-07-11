@@ -2664,17 +2664,24 @@ where
       return Err(Error::LeaveClockExhausted);
     }
 
-    // 3. Broadcast the leave intent on the intent tier (rank 0) so peers learn
-    //    the local node is leaving without waiting for anti-entropy.
-    self.broadcast_leave(t, ltime, local_id, false);
-
-    // 4. Call inner leave synchronously. It packs the rank-0 intent just queued
-    //    (with any other pending user broadcast) into its dead-self fan-out —
-    //    user parts ahead of the death notice — so every farewell recipient
-    //    receives the intent atomically with the dead-self notice and processes
-    //    it first, reading the departure as intentional. This queues the
-    //    resulting fan-out packets for `poll_transmit`.
-    t.leave(now)?;
+    // 3. Encode the leave intent and call the inner leave synchronously,
+    //    passing the intent as the explicit farewell payload. The coordinator
+    //    RESERVES it into every dead-self farewell compound ahead of its
+    //    ordinary queue drain — user parts before the death notice — so every
+    //    farewell recipient receives the intent atomically with the dead-self
+    //    notice and processes it first, reading the departure as intentional,
+    //    regardless of what else is queued (an older, larger queued payload
+    //    cannot crowd the reservation out). This queues the resulting fan-out
+    //    packets for `poll_transmit`.
+    //
+    //    An encode failure (a degenerate id type — a construction-time concern
+    //    the driver surfaces) degrades to a plain inner leave: peers then read
+    //    the departure as a failure until the late-intent heal cannot help,
+    //    matching the pre-farewell tolerance for the same degenerate case.
+    let farewell = AnyMessage::<I, A>::Leave(LeaveMessage::new(ltime, local_id, false))
+      .encode()
+      .ok();
+    t.leave(now, farewell)?;
 
     Ok(())
   }
