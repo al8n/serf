@@ -4141,7 +4141,10 @@ where
   }
 
   /// Expose the effective broadcast queue depth cap for assertions.
-  #[cfg(test)]
+  ///
+  /// Gated like the unit suite that calls it (`mod tests` is `tcp`-gated), so a
+  /// quic-only build does not carry an uncalled seam.
+  #[cfg(all(test, feature = "tcp"))]
   pub(crate) fn test_queue_max(&self) -> usize {
     self.queue_max()
   }
