@@ -70,7 +70,7 @@ pub enum InitError {
   Entropy,
   /// The serf-level [`SerfOptions`](crate::SerfOptions) failed
   /// [`validate`](crate::SerfOptions::validate): `max_user_event_size` exceeds
-  /// the absolute `USER_EVENT_SIZE_LIMIT` ceiling, or a coalescing quiescent
+  /// the configured `user_event_size_limit` ceiling, or a coalescing quiescent
   /// period is not strictly less than its coalesce period. Carries the typed
   /// cause.
   InvalidSerfOptions(InvalidOptions),

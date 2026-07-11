@@ -64,6 +64,8 @@ pub struct Options {
   // ── size limits ───────────────────────────────────────────────────────────
   /// Maximum `name + payload` byte size for a user event.
   max_user_event_size: usize,
+  /// Ceiling on the configured `max_user_event_size`, enforced at construction.
+  user_event_size_limit: usize,
   /// Maximum inbound payload size for a query message.
   query_size_limit: usize,
   /// Maximum outbound payload size for a query response.
@@ -104,16 +106,12 @@ impl Options {
   pub const DEFAULT_MAX_COALESCED_USER_EVENTS: core::num::NonZeroUsize =
     core::num::NonZeroUsize::new(1024).unwrap();
 
-  /// Absolute ceiling on the configured
-  /// [`max_user_event_size`](Options::max_user_event_size), enforced at
-  /// construction by [`validate`](Options::validate).
-  ///
-  /// A user event must fit inside a single UDP gossip packet with headroom, so
-  /// the configured per-event limit is itself capped at 9 KiB and any larger
-  /// configuration is rejected up front rather than at send time. Mirrors Go
-  /// serf's 9 KB `UserEventSizeLimit` (the legacy `serf-core/src/serf.rs`
-  /// `USER_EVENT_SIZE_LIMIT` port).
-  pub const USER_EVENT_SIZE_LIMIT: usize = 9 * 1024;
+  /// Default value of [`user_event_size_limit`](Options::user_event_size_limit):
+  /// Go serf's fixed 9 KB `UserEventSizeLimit` (the legacy
+  /// `serf-core/src/serf.rs` `USER_EVENT_SIZE_LIMIT` port), under which a user
+  /// event fits a single UDP gossip packet with pragmatic IP-fragmentation
+  /// headroom.
+  pub const DEFAULT_USER_EVENT_SIZE_LIMIT: usize = 9 * 1024;
 
   /// Returns a new `Options` with all defaults as specified in Go serf
   /// `options.go` and the legacy `serf-core/src/options.rs` port.
@@ -135,6 +133,7 @@ impl Options {
       event_buffer_size: 512,
       query_buffer_size: 512,
       max_user_event_size: 512,
+      user_event_size_limit: Self::DEFAULT_USER_EVENT_SIZE_LIMIT,
       query_size_limit: 1024,
       query_response_size_limit: 1024,
       max_queue_depth: 4096,
@@ -244,6 +243,32 @@ impl Options {
   /// Maximum `name + payload` byte size for a user event.
   pub const fn max_user_event_size(&self) -> usize {
     self.max_user_event_size
+  }
+
+  /// Ceiling on the configured [`max_user_event_size`](Options::max_user_event_size),
+  /// enforced at construction by [`validate`](Options::validate).
+  ///
+  /// Defaults to [`DEFAULT_USER_EVENT_SIZE_LIMIT`](Options::DEFAULT_USER_EVENT_SIZE_LIMIT)
+  /// (9 KiB — Go serf's fixed limit), so a default configuration behaves
+  /// identically to Go.  Raising it is a deliberate double opt-in for larger
+  /// events, with real operational costs the ceiling cannot remove:
+  ///
+  /// - **It is effectively a cluster-wide protocol parameter.**  Every node
+  ///   drops inbound user events larger than its *local* `max_user_event_size`,
+  ///   silently, as a flood bound — a node raised above its peers has its
+  ///   events partially and invisibly lost.  Keep the pair uniform across the
+  ///   cluster.
+  /// - **Transport limits still bind.**  User events ride the unreliable gossip
+  ///   plane: past the MTU a UDP datagram is IP-fragmented and one lost fragment
+  ///   loses the whole event (gossip never retransmits), QUIC datagrams are
+  ///   capped by the negotiated datagram size, and embedded device MTUs bind far
+  ///   lower.  An event the transport cannot frame surfaces as a send error
+  ///   regardless of this ceiling.
+  /// - **Memory amplification.**  Buffered structures (the user coalescer, the
+  ///   event ring, the rebroadcast queue) scale with per-event size × their
+  ///   entry caps.
+  pub const fn user_event_size_limit(&self) -> usize {
+    self.user_event_size_limit
   }
 
   /// Maximum inbound payload size for a query.
@@ -437,6 +462,22 @@ impl Options {
     self
   }
 
+  /// Sets `user_event_size_limit` (see
+  /// [`user_event_size_limit`](Options::user_event_size_limit) for the
+  /// operational caveats of raising it; keep it uniform across the cluster).
+  pub fn with_user_event_size_limit(mut self, v: usize) -> Self {
+    self.user_event_size_limit = v;
+    self
+  }
+
+  /// Sets `user_event_size_limit` in place (see
+  /// [`user_event_size_limit`](Options::user_event_size_limit) for the
+  /// operational caveats of raising it).
+  pub fn set_user_event_size_limit(&mut self, v: usize) -> &mut Self {
+    self.user_event_size_limit = v;
+    self
+  }
+
   /// Sets `query_size_limit`.
   pub fn with_query_size_limit(mut self, v: usize) -> Self {
     self.query_size_limit = v;
@@ -517,9 +558,12 @@ impl Options {
   ///   mirrors the semantics documented on the legacy `serf-core/src/options.rs`
   ///   period fields.
   /// - **User-event size ceiling.** `max_user_event_size` must not exceed the
-  ///   absolute [`USER_EVENT_SIZE_LIMIT`](Options::USER_EVENT_SIZE_LIMIT): a user
-  ///   event has to fit a single UDP gossip packet with headroom.  This mirrors
-  ///   the Go serf construction-time check on the configured limit.
+  ///   configured [`user_event_size_limit`](Options::user_event_size_limit)
+  ///   (default 9 KiB — Go serf's fixed limit, under which a user event fits a
+  ///   single UDP gossip packet with headroom), and the ceiling itself must be
+  ///   nonzero.  This mirrors the Go serf construction-time check on the
+  ///   configured limit while letting a deliberate configuration raise the
+  ///   ceiling for networks that can carry more.
   ///
   /// Returns `Ok(())` when every check passes.  The Sans-I/O
   /// [`Endpoint`](crate::endpoint::Endpoint) construction is infallible and
@@ -540,10 +584,10 @@ impl Options {
         quiescent_period: self.user_quiescent_period,
       }));
     }
-    if self.max_user_event_size > Self::USER_EVENT_SIZE_LIMIT {
+    if self.user_event_size_limit == 0 || self.max_user_event_size > self.user_event_size_limit {
       return Err(InvalidOptions::UserEventSize(UserEventSizeConfig {
         max_user_event_size: self.max_user_event_size,
-        limit: Self::USER_EVENT_SIZE_LIMIT,
+        limit: self.user_event_size_limit,
       }));
     }
     Ok(())
@@ -574,17 +618,21 @@ impl core::fmt::Display for CoalesceConfig {
 pub struct UserEventSizeConfig {
   /// The configured `max_user_event_size`.
   pub max_user_event_size: usize,
-  /// The absolute ceiling ([`Options::USER_EVENT_SIZE_LIMIT`]).
+  /// The configured ceiling ([`Options::user_event_size_limit`]).
   pub limit: usize,
 }
 
 impl core::fmt::Display for UserEventSizeConfig {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(
-      f,
-      "max_user_event_size ({}) must not exceed USER_EVENT_SIZE_LIMIT ({})",
-      self.max_user_event_size, self.limit
-    )
+    if self.limit == 0 {
+      write!(f, "user_event_size_limit must be nonzero")
+    } else {
+      write!(
+        f,
+        "max_user_event_size ({}) must not exceed user_event_size_limit ({})",
+        self.max_user_event_size, self.limit
+      )
+    }
   }
 }
 
@@ -602,8 +650,9 @@ pub enum InvalidOptions {
   /// coalesce period while user coalescing is enabled.
   #[error("user-event coalescing: {0}")]
   UserCoalesce(CoalesceConfig),
-  /// The configured `max_user_event_size` exceeds the absolute
-  /// [`USER_EVENT_SIZE_LIMIT`](Options::USER_EVENT_SIZE_LIMIT) ceiling.
+  /// The configured `max_user_event_size` exceeds the configured
+  /// [`user_event_size_limit`](Options::user_event_size_limit) ceiling, or the
+  /// ceiling itself is zero.
   #[error("user-event size: {0}")]
   UserEventSize(UserEventSizeConfig),
 }

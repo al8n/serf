@@ -218,7 +218,8 @@ async fn tcp_new_rejects_over_ceiling_user_event_size() {
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new("bad-serf-opt-node"))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  let serf = SerfOptions::new().with_max_user_event_size(SerfOptions::USER_EVENT_SIZE_LIMIT + 1);
+  let serf =
+    SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1);
   let res =
     Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
       opts,

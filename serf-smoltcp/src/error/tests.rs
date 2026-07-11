@@ -58,7 +58,7 @@ fn all_variants() -> Vec<InitError> {
     InitError::ZeroCloseTimeout,
     InitError::InvalidSerfOptions(
       crate::SerfOptions::new()
-        .with_max_user_event_size(crate::SerfOptions::USER_EVENT_SIZE_LIMIT + 1)
+        .with_max_user_event_size(crate::SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1)
         .validate()
         .expect_err("an over-ceiling max_user_event_size is invalid"),
     ),

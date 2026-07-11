@@ -159,7 +159,7 @@ fn over_ceiling_user_event_size_is_rejected() {
       SmolStr::new("a"),
       SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946),
     ),
-    SerfOptions::new().with_max_user_event_size(SerfOptions::USER_EVENT_SIZE_LIMIT + 1),
+    SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1),
     &SocketAddrResolver,
     &mut dev,
     now(),
