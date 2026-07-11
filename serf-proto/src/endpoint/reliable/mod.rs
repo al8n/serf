@@ -124,6 +124,20 @@ where
   /// `poll_inner_event`).
   fn start_push_pull(&mut self, peer: A, kind: PushPullKind, now: Instant) -> StreamId;
 
+  /// The largest farewell payload [`leave`](Reliable::leave) can guarantee to
+  /// deliver beside this node's death notice, or `None` when the death notice
+  /// alone exhausts the gossip MTU.
+  ///
+  /// serf checks this BEFORE mutating any leave state: an intent that cannot
+  /// ride the farewell compound would degrade [`leave`](Reliable::leave) to a
+  /// bare `Dead` fan-out that peers classify as a failure, so an over-budget
+  /// farewell is refused up front. Identity-aware — the bound depends on the
+  /// encoded size of this node's own id.
+  ///
+  /// Reaches the inner membership [`Endpoint`] directly, mirroring the other
+  /// read-only accessors.
+  fn farewell_capacity(&self) -> Option<usize>;
+
   /// Signal that the local node intends to leave the cluster gracefully.
   ///
   /// The coordinator disseminates a Leave message, transitions the inner
@@ -223,6 +237,11 @@ where
   }
 
   #[inline]
+  fn farewell_capacity(&self) -> Option<usize> {
+    self.endpoint_ref().farewell_capacity()
+  }
+
+  #[inline]
   fn leave(
     &mut self,
     now: Instant,
@@ -301,6 +320,11 @@ where
     now: Instant,
   ) -> StreamId {
     self.start_push_pull(peer, kind, now)
+  }
+
+  #[inline]
+  fn farewell_capacity(&self) -> Option<usize> {
+    self.endpoint_ref().farewell_capacity()
   }
 
   #[inline]
