@@ -731,6 +731,90 @@ async fn coalesced_drops_are_visible_after_a_live_burst_without_shutdown() {
   );
 }
 
+/// A coalescer overflow shed in the same drain the pump then SUSPENDS in — parked on
+/// the observation-channel backpressure yield INSIDE `drain_outputs`, before it ever
+/// reaches the pre-select store — is already visible on the public handle at that
+/// suspend point. `drain_outputs` republishes the cumulative drop total at its entry
+/// (it is otherwise shed-free), so a handle read that races the interior park sees
+/// every shed event, not the stale pre-burst value.
+///
+/// The burst is issued synchronously (replies dropped) so the whole of it drains in
+/// one pump pass: distinct-named COALESCING events on a full coalescer are every one
+/// shed and counted, and a few trailing NON-coalescing events emit immediately. With
+/// the observation channel at capacity 1 and the default do-nothing delegate, on the
+/// single-threaded runtime the observation task cannot drain mid-pass (it is scheduled
+/// only when the pump yields), so the second emittable event deterministically finds
+/// the slot Full and drives `drain_events` into its `yield_once` park — inside
+/// `drain_outputs`. Only the final event is awaited; its reply is sent from that same
+/// pass, so this test task resumes exactly when the pump yields on that interior park
+/// and reads the handle while the pump is still suspended in the drain.
+#[compio::test]
+async fn coalesced_drops_visible_when_the_pump_parks_inside_drain_outputs() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let runtime = RuntimeOptions::new()
+    .with_observation_channel(Channel::Bounded(1))
+    .with_cmd_fairness_budget(64);
+  let a = spawn_node_with_serf_and_runtime("coalesce-drain-park", serf_opts, runtime).await;
+
+  // Fill the coalescer to capacity with distinct names (kept, not shed); awaiting
+  // these settles the pump so the burst below drains in a single pass.
+  let cap_n = cap.get() as u32;
+  for i in 0..cap_n {
+    a.user_event(format!("keep-{i}"), Bytes::new(), true)
+      .await
+      .expect("keep user event dispatched");
+  }
+
+  // Synchronous burst, replies dropped. `extra` distinct-named coalescing events on a
+  // full coalescer are all shed and counted; the trailing non-coalescing events emit
+  // immediately and, on the cap-1 observation channel, drive the backpressure park
+  // inside `drain_outputs`.
+  let extra: u32 = 8;
+  for i in 0..extra {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("shed-{i}")),
+      Bytes::new(),
+      true,
+      tx,
+    )))
+    .expect("enqueue coalescing user event");
+  }
+  let emit_n: u32 = 4;
+  for i in 0..emit_n - 1 {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("emit-{i}")),
+      Bytes::new(),
+      false,
+      tx,
+    )))
+    .expect("enqueue non-coalescing user event");
+  }
+  // Await ONLY the final non-coalescing event. Its reply is sent from the same drain
+  // pass; on single-threaded compio this test task then resumes exactly when the pump
+  // yields on the observation backpressure park inside `drain_outputs`.
+  a.user_event(format!("emit-{}", emit_n - 1), Bytes::new(), false)
+    .await
+    .expect("final non-coalescing user event dispatched");
+
+  // Read at the suspend point: the drain-entry publish already carries the whole
+  // burst's overflow, though the pump has not yet reached the pre-select store.
+  let dropped = a.coalesced_user_events_dropped();
+  a.shutdown().await.expect("coalesce-drain-park shuts down");
+
+  assert_eq!(
+    dropped,
+    u64::from(extra),
+    "every shed event is published at the drain entry, visible while the pump is parked \
+     inside drain_outputs (got {dropped})"
+  );
+}
+
 /// `join_many` over two seeds — one reachable (node B), one a blackhole port —
 /// returns only the reached seed's address. The reachable exchange succeeds and
 /// the blackhole exchange fails fast; once both terminate the call resolves

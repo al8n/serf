@@ -15,6 +15,20 @@
 //! handles communicate exclusively via the command channel and read state through
 //! the lock-free snapshot. The socket drops when the loop exits so the bound port
 //! is released before shutdown returns.
+//!
+//! ## Coalescer drop-counter publishing
+//!
+//! The pump owns the endpoint, so a `Serf` handle observes the cumulative
+//! coalescer drop counts only through the two cells this pump republishes.
+//! `drain_outputs` is the funnel for every genuinely-yielding await in the
+//! mutating region — a `send_to`, a `yield_once`, a leave `resolve_all`. Its
+//! `drain_ingress` decode (which feeds `handle_message`, the one place a drain can
+//! coalesce a member change away) is the sole interior shed, so it republishes both
+//! counters each pass right after `drain_ingress` and before the pass's first await.
+//! The pre-select store covers the main select park. `fire_quic_timeout` has no
+//! genuinely-yielding await (its `drain_past_due_udp` poll never returns `Pending`),
+//! so its sheds surface at the following `drain_outputs`; giving it one would
+//! require threading the publisher through it too.
 
 #![cfg(feature = "quic")]
 
@@ -276,6 +290,27 @@ fn recv_buf_len_for(gossip_mtu: usize, quic_max_udp_payload: u64) -> usize {
   gossip_path.max(quic_path)
 }
 
+/// Copies the endpoint's cumulative coalescer drop counters into the handle-shared
+/// cells. The publish is an idempotent whole-value SET of a monotone source, so
+/// calling it at any number of sites never double-counts or regresses.
+struct CoalesceDropPublisher {
+  user: Rc<Cell<u64>>,
+  member: Rc<Cell<u64>>,
+}
+
+impl CoalesceDropPublisher {
+  #[inline]
+  fn publish<I, G, R>(&self, endpoint: &QuicEndpoint<I, G, R>)
+  where
+    I: memberlist_proto::Id + Clone,
+    G: Rng,
+    R: Rng + SeedableRng,
+  {
+    self.user.set(endpoint.coalesced_user_events_dropped());
+    self.member.set(endpoint.coalesced_member_events_dropped());
+  }
+}
+
 /// Single-owner pump task.
 ///
 /// Drives the serf `QuicEndpoint` until the command channel closes (all handles
@@ -367,18 +402,17 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   endpoint.start_scheduling(Instant::now());
   refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
 
+  // Bundle the two handle-shared coalescer drop cells so `drain_outputs` can
+  // republish them each pass right after its `drain_ingress` decode — the sole
+  // interior shed — dominating every subsequent genuinely-yielding await.
+  let coalesce_publisher = CoalesceDropPublisher {
+    user: coalesced_user_events_dropped.clone(),
+    member: coalesced_member_events_dropped.clone(),
+  };
+
   loop {
     let mut dirty = false;
     let mut exit = false;
-
-    // Republish the endpoint's coalescer drop counters for the handle. These are
-    // monotonic cumulative reads and this pump is their sole writer. This head store
-    // captures the drops shed between the pump's wake and the pre-select drains; it
-    // does NOT by itself cover a burst drained later in this same iteration, because
-    // the main select park below is entered without looping back through here — the
-    // pre-select store guarding that park is what keeps the handle current across it.
-    coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
-    coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
 
     // Iter-top command fairness drain so a network flood does not starve user
     // commands (the `cmd` select arm sits below the network arms).
@@ -433,6 +467,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
+        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -493,6 +528,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
+        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -523,6 +559,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
+        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -555,6 +592,15 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       // this store the drops would stay invisible until then.
       coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
       coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
+
+      // The pre-select store above is the last write before this park, so the cell
+      // must equal the live counter here; a future edit that lets a shed slip in
+      // between the store and the park trips this in debug builds.
+      debug_assert_eq!(
+        coalesced_user_events_dropped.get(),
+        endpoint.coalesced_user_events_dropped(),
+        "pre-select coalescer publish must match the endpoint before the pump parks"
+      );
 
       // Arm priority (top → bottom):
       //   1. recv  — kernel-buffered UDP (QUIC handshake/stream data + gossip). An
@@ -638,6 +684,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       &observation_dropped,
       &obs_payload_bytes,
       obs_payload_budget,
+      &coalesce_publisher,
       &mut pending,
       #[cfg(encryption)]
       &*keyring,
@@ -1325,6 +1372,7 @@ async fn drain_outputs<I, G, R>(
   observation_dropped: &Cell<u64>,
   obs_payload_bytes: &Cell<u64>,
   obs_payload_budget: Option<u64>,
+  coalesce_publisher: &CoalesceDropPublisher,
   pending: &mut PendingCommands,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
 ) -> bool
@@ -1336,6 +1384,11 @@ where
   let mut terminal = false;
   loop {
     let did_ingress = drain_ingress::<I, G, R>(endpoint, label);
+    // Republish the coalescer drop counters right after `drain_ingress` — the pass's
+    // only interior shed — and before its first genuinely-yielding await, so the SET
+    // dominates every send/yield below and each loop pass refreshes the total a
+    // parked handle reads.
+    coalesce_publisher.publish(endpoint);
     let did_transmits = drain_transmits::<I, G, R>(endpoint, gossip_socket, label.clone()).await;
     let did_quic = drain_quic_transmits::<I, G, R>(endpoint, gossip_socket).await;
     let did_events = drain_events::<I, G, R>(

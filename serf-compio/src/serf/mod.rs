@@ -410,7 +410,7 @@ where
   }
 
   /// Send `cmd` to the driver, failing fast if the node has shut down.
-  fn send(&self, cmd: Command<I, SocketAddr>) -> Result<()> {
+  pub(crate) fn send(&self, cmd: Command<I, SocketAddr>) -> Result<()> {
     if self.shared.shutdown_flag.get() {
       return Err(SerfError::Shutdown);
     }
