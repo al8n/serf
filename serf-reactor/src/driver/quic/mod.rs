@@ -85,8 +85,8 @@ use crate::{
     options::RuntimeOptions,
     shared::{
       ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate, leave_outcome,
-      observation_payload_bytes, poll_send_gossip, retain_leave_datagram, retry_retained_leave,
-      trace_leave_drain_residue, trace_leave_transform_error,
+      observation_payload_bytes, poll_send_gossip, retry_retained_leave, trace_leave_drain_residue,
+      trace_leave_transform_error,
     },
   },
   drop_counter::ReactorDropCounter,
@@ -311,7 +311,10 @@ where
   pending_leave: Option<PendingLeave>,
   /// Set once `leave()` has been initiated. Switches the gossip egress from
   /// best-effort (drop on non-completion) to retention for the leave fan-out,
-  /// which has no next gossip round to re-send a dropped farewell.
+  /// which has no next gossip round to re-send a dropped farewell — and, in
+  /// `Datagram` mode, reroutes it onto the plain-UDP path, since a frame
+  /// queued into quinn is emitted only when congestion control allows and so
+  /// carries no socket-handoff signal.
   leave_initiated: bool,
   /// Leave-farewell datagrams retained after a non-completing plain-UDP send,
   /// retried FIFO ahead of fresh transmits and flushed before the socket drops.
@@ -766,13 +769,13 @@ where
     // shared UDP socket in `Udp` mode. Popping the last transmit is the endpoint's
     // leave-completion fence (it emits `LeftCluster`), so the leave/shutdown
     // datagrams reach the wire before that fence fires.
-    // Once `leave()` has been initiated the fan-out is RETAINED on plain-UDP
-    // backpressure: retry the retained datagrams FIRST (they drain as the socket
-    // becomes writable), then pop fresh transmits at the unchanged cadence — a
-    // non-completing send is retained (not dropped) so peers do not read the
-    // departure as a failure. Periodic gossip stays best-effort. (Datagram-mode
-    // sends that ride an established QUIC connection are quinn-managed; only the
-    // plain-UDP sends below are retained.)
+    // Once `leave()` has been initiated the fan-out rides plain UDP in BOTH
+    // unreliable modes (the Datagram arm reroutes it — see the match below) and
+    // is RETAINED on backpressure: retry the retained datagrams FIRST (they
+    // drain as the socket becomes writable), then pop fresh transmits at the
+    // unchanged cadence — a non-completing send is retained (not dropped) so
+    // peers do not read the departure as a failure. Periodic gossip stays
+    // best-effort.
     if self.leave_initiated {
       retry_retained_leave(
         &mut self.leave_drain,
@@ -860,6 +863,26 @@ where
             &mut self.leave_send_failed,
           );
         }
+        // Once `leave()` has been initiated the fan-out takes the plain-UDP
+        // path even in `Datagram` mode: a frame queued into quinn is emitted
+        // only when congestion control and pacing allow, so an empty retention
+        // queue would not prove the farewell reached the socket — and the
+        // fan-out has no retry round to absorb that loss. The plain-UDP send
+        // gives exact socket-handoff semantics (completed, retained, or
+        // error-classified), and peers demux plain gossip datagrams in every
+        // mode — the `NotReady`/`TooLarge` fallbacks below rely on exactly
+        // that.
+        UnreliableTransport::Datagram if self.leave_initiated => {
+          poll_send_gossip(
+            &mut self.leave_drain,
+            true,
+            self.socket.as_ref(),
+            cx,
+            peer,
+            &on_wire,
+            &mut self.leave_send_failed,
+          );
+        }
         UnreliableTransport::Datagram => {
           match self
             .endpoint
@@ -925,31 +948,13 @@ where
       };
       raw_sent += 1;
       if let Some(socket) = self.socket.as_ref() {
-        let outcome = socket.poll_send_to(cx, &bytes, dest);
-        if self.leave_initiated && matches!(unreliable, UnreliableTransport::Datagram) {
-          // In `Datagram` mode the leave fan-out rides quinn application
-          // DATAGRAM frames, which quinn does NOT retransmit — its loss
-          // recovery covers the reliable streams only — and quinn-proto gives
-          // no per-packet frame provenance, so every raw packet during the
-          // leave is retained and error-accounted like the plain-UDP leave
-          // drain (a local failure of the shared socket is correlated with
-          // farewell loss; retaining an unrelated handshake/ACK packet merely
-          // delays the drain-empty fence, bounded by the writable wake).
-          retain_leave_datagram(
-            &mut self.leave_drain,
-            dest,
-            &bytes,
-            outcome,
-            &mut self.leave_send_failed,
-          );
-        } else {
-          // Ignoring Poll: in `Udp` mode the farewell rides only the plain-UDP
-          // gossip path above — no raw QUIC packet carries it — and outside a
-          // leave a dropped handshake/ACK/stream packet is recovered by
-          // quinn's own loss detection while a dropped datagram-mode gossip
-          // frame is re-sent by the next periodic round.
-          let _ = outcome;
-        }
+        // Ignoring Poll: no raw QUIC packet ever carries the leave fan-out —
+        // once `leave()` is initiated the gossip egress above routes it over
+        // plain UDP with socket-handoff retention — so raw egress stays
+        // best-effort: a dropped handshake/ACK/stream packet is recovered by
+        // quinn's own loss detection, and a dropped datagram-mode gossip frame
+        // is re-sent by the next periodic round.
+        let _ = socket.poll_send_to(cx, &bytes, dest);
       }
     }
     worked |= raw_sent > 0;
