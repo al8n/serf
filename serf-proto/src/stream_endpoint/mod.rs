@@ -310,8 +310,16 @@ where
   /// The driver calls this once at loop entry; without it the coordinator's
   /// `next_probe` / `next_gossip` / `next_pushpull` stay unset and failure
   /// detection, dissemination, and anti-entropy never run.
+  ///
+  /// Also folds the inner events the coordinator queued during construction —
+  /// the local self-join in particular — into serf state under the driver's
+  /// live `now`. Deferring that drain to a later un-latched `poll_event` would
+  /// process the self-join at the machine's origin instant, so a coalescing
+  /// window it opens would be armed already-overdue and flush immediately
+  /// instead of batching the startup membership changes.
   pub fn start_scheduling(&mut self, now: Instant) {
     self.transport.start_scheduling(now);
+    self.core.drain_after_ingress(&mut self.transport, now);
   }
 
   /// Initiate an outbound push-pull dial to `peer`, then sieve the resulting

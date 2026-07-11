@@ -7955,6 +7955,55 @@ fn backward_ingress_after_a_newer_event_does_not_backdate_the_window() {
 }
 
 #[test]
+fn startup_self_join_coalesces_from_the_scheduling_instant() {
+  // The coordinator queues the local self-join during construction, before any
+  // live-time entry point has run. `start_scheduling` — the driver's first call,
+  // made with its live clock — must fold that queued join under that instant:
+  // deferring it to a later un-latched `poll_event` would arm the coalescing
+  // window at the machine's origin, already overdue, flushing the self join
+  // immediately instead of batching it with the startup membership changes.
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let opts = Options::new()
+    .with_coalesce_period(core::time::Duration::from_secs(10))
+    .with_quiescent_period(core::time::Duration::from_secs(2));
+  let mut e: StreamEndpoint<u32, core::net::SocketAddr, RawRecords> =
+    StreamEndpoint::new(coord(inner), opts);
+
+  // The driver arms the schedulers at its live clock; the queued self-join is
+  // folded here, opening the member window at t100.
+  e.start_scheduling(t_secs(100));
+  assert!(
+    e.poll_event().is_none(),
+    "the startup self join is buffered in the window, not delivered immediately"
+  );
+  assert_eq!(
+    e.core_mut().test_member_flush_deadline(),
+    Some(t_secs(102)),
+    "the startup window arms from the scheduling instant, not the origin"
+  );
+
+  // A node joining within the startup window batches with the self join.
+  e.test_inner_node_joined(2, t_secs(101));
+  e.handle_timeout(t_secs(103));
+  let ev = e
+    .poll_event()
+    .expect("one coalesced batch for the startup window");
+  assert!(matches!(ev, Event::Member(ref me) if me.kind() == MemberEventKind::Join));
+  assert_eq!(
+    member_ids(&ev),
+    vec![1, 2],
+    "the self join batches with the startup-window join"
+  );
+  assert!(e.poll_event().is_none());
+}
+
+#[test]
 fn overdue_user_window_flushes_before_a_late_newer_generation() {
   // The user coalescer keeps only the newest generation per name. A newer
   // generation fed after the window is due must not silently supersede a due
