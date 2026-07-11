@@ -80,6 +80,21 @@ pub struct QuicTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   /// coordinator default; `Some(Duration::ZERO)` disables periodic push/pull
   /// entirely. See [`with_push_pull_interval`](Self::with_push_pull_interval).
   push_pull_interval: Option<Duration>,
+  /// SWIM probe interval override. `None` keeps the coordinator default. See
+  /// [`with_probe_interval`](Self::with_probe_interval).
+  probe_interval: Option<Duration>,
+  /// SWIM direct-ping timeout override. `None` keeps the coordinator default. See
+  /// [`with_probe_timeout`](Self::with_probe_timeout).
+  probe_timeout: Option<Duration>,
+  /// Gossip interval override. `None` keeps the coordinator default. See
+  /// [`with_gossip_interval`](Self::with_gossip_interval).
+  gossip_interval: Option<Duration>,
+  /// SWIM suspicion multiplier override. `None` keeps the coordinator default. See
+  /// [`with_suspicion_mult`](Self::with_suspicion_mult).
+  suspicion_mult: Option<u32>,
+  /// SWIM suspicion max-timeout multiplier override. `None` keeps the coordinator
+  /// default. See [`with_suspicion_max_timeout_mult`](Self::with_suspicion_max_timeout_mult).
+  suspicion_max_timeout_mult: Option<u32>,
   /// Gossip-encryption policy. The default (no keyring) leaves the gossip datagrams
   /// plaintext; attaching a keyring via [`with_encryption`](Self::with_encryption)
   /// makes the coordinator's `encrypt_gossip`/`decrypt_gossip` AEAD-protect them.
@@ -102,6 +117,11 @@ impl<I, A> QuicTransportOptions<I, A> {
       advertise_addr: None,
       quic_config: None,
       push_pull_interval: None,
+      probe_interval: None,
+      probe_timeout: None,
+      gossip_interval: None,
+      suspicion_mult: None,
+      suspicion_max_timeout_mult: None,
       #[cfg(encryption)]
       encryption: EncryptionOptions::new(),
     }
@@ -144,6 +164,66 @@ impl<I, A> QuicTransportOptions<I, A> {
   #[inline]
   pub const fn with_push_pull_interval(mut self, interval: Duration) -> Self {
     self.push_pull_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM probe interval — how often the
+  /// coordinator probes a random peer for liveness.
+  ///
+  /// `None` (the default) keeps the coordinator default (~1s). A shorter interval
+  /// speeds failure detection at the cost of more probe traffic; it also shortens
+  /// the suspicion timeout, which scales with the probe interval.
+  #[must_use]
+  #[inline]
+  pub const fn with_probe_interval(mut self, interval: Duration) -> Self {
+    self.probe_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM direct-ping timeout — how long the
+  /// coordinator waits for a probe ack before escalating to indirect probes.
+  ///
+  /// `None` (the default) keeps the coordinator default (~500ms). It must
+  /// comfortably exceed the real network round-trip, or a live peer whose ack is
+  /// merely slow is falsely suspected.
+  #[must_use]
+  #[inline]
+  pub const fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+    self.probe_timeout = Some(timeout);
+    self
+  }
+
+  /// Builder: override the memberlist gossip interval — how often the coordinator
+  /// flushes queued gossip to a random subset of peers.
+  ///
+  /// `None` (the default) keeps the coordinator default (~200ms).
+  #[must_use]
+  #[inline]
+  pub const fn with_gossip_interval(mut self, interval: Duration) -> Self {
+    self.gossip_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM suspicion multiplier — how long a
+  /// suspected peer is held in the Suspect state before being declared Failed.
+  ///
+  /// The minimum suspicion timeout is `suspicion_mult * log10(N+1) * probe_interval`.
+  /// `None` (the default) keeps the coordinator default.
+  #[must_use]
+  #[inline]
+  pub const fn with_suspicion_mult(mut self, mult: u32) -> Self {
+    self.suspicion_mult = Some(mult);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM suspicion max-timeout multiplier — the
+  /// upper bound on the suspicion timeout as a multiple of the minimum.
+  ///
+  /// `None` (the default) keeps the coordinator default.
+  #[must_use]
+  #[inline]
+  pub const fn with_suspicion_max_timeout_mult(mut self, mult: u32) -> Self {
+    self.suspicion_max_timeout_mult = Some(mult);
     self
   }
 
@@ -191,6 +271,36 @@ impl<I, A> QuicTransportOptions<I, A> {
     self.push_pull_interval
   }
 
+  /// The SWIM probe-interval override, if set.
+  #[inline]
+  pub const fn probe_interval(&self) -> Option<Duration> {
+    self.probe_interval
+  }
+
+  /// The SWIM probe-timeout override, if set.
+  #[inline]
+  pub const fn probe_timeout(&self) -> Option<Duration> {
+    self.probe_timeout
+  }
+
+  /// The gossip-interval override, if set.
+  #[inline]
+  pub const fn gossip_interval(&self) -> Option<Duration> {
+    self.gossip_interval
+  }
+
+  /// The SWIM suspicion-multiplier override, if set.
+  #[inline]
+  pub const fn suspicion_mult(&self) -> Option<u32> {
+    self.suspicion_mult
+  }
+
+  /// The SWIM suspicion max-timeout-multiplier override, if set.
+  #[inline]
+  pub const fn suspicion_max_timeout_mult(&self) -> Option<u32> {
+    self.suspicion_max_timeout_mult
+  }
+
   /// Gossip-encryption policy.
   #[cfg(encryption)]
   #[cfg_attr(
@@ -230,6 +340,14 @@ where
   /// [`Transport::run`]. `None` keeps the default; `Some(Duration::ZERO)` disables
   /// periodic anti-entropy.
   push_pull_interval: Option<Duration>,
+  /// SWIM failure-detection overrides applied to the coordinator's
+  /// `EndpointOptions` in [`Transport::run`]. Each `None` keeps the coordinator
+  /// default.
+  probe_interval: Option<Duration>,
+  probe_timeout: Option<Duration>,
+  gossip_interval: Option<Duration>,
+  suspicion_mult: Option<u32>,
+  suspicion_max_timeout_mult: Option<u32>,
   /// Independent OS-seeded seed for the serf core's RNG, drawn once per node in
   /// [`Transport::new`] and consumed when [`Transport::run`] builds the endpoint via
   /// `new_with_rng`. Distinct from the coordinator's gossip RNG so serf's query IDs
@@ -331,6 +449,11 @@ where
       gossip_socket,
       quic_config,
       push_pull_interval: options.push_pull_interval,
+      probe_interval: options.probe_interval,
+      probe_timeout: options.probe_timeout,
+      gossip_interval: options.gossip_interval,
+      suspicion_mult: options.suspicion_mult,
+      suspicion_max_timeout_mult: options.suspicion_max_timeout_mult,
       serf_rng,
       #[cfg(encryption)]
       encryption: options.encryption,
@@ -369,6 +492,25 @@ where
     // coordinator keeps its own default.
     if let Some(interval) = self.push_pull_interval {
       inner_opts = inner_opts.with_push_pull_interval(interval);
+    }
+    // Caller-supplied SWIM failure-detection overrides: each left unset keeps the
+    // coordinator's own default. Lowering these speeds up failure detection (probe
+    // cadence, ack timeout, gossip cadence, and the suspicion timeout that scales
+    // with the probe interval).
+    if let Some(v) = self.probe_interval {
+      inner_opts = inner_opts.with_probe_interval(v);
+    }
+    if let Some(v) = self.probe_timeout {
+      inner_opts = inner_opts.with_probe_timeout(v);
+    }
+    if let Some(v) = self.gossip_interval {
+      inner_opts = inner_opts.with_gossip_interval(v);
+    }
+    if let Some(v) = self.suspicion_mult {
+      inner_opts = inner_opts.with_suspicion_mult(v);
+    }
+    if let Some(v) = self.suspicion_max_timeout_mult {
+      inner_opts = inner_opts.with_suspicion_max_timeout_mult(v);
     }
     // The shared UDP socket also carries raw QUIC packets, whose size is governed by
     // the quinn `EndpointConfig`'s accepted max UDP payload — which a caller can set
