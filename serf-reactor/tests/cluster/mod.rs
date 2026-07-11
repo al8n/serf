@@ -71,12 +71,19 @@ impl ClusterTiming {
   /// relative to a loopback round-trip so a live peer is not falsely suspected
   /// under CI scheduling jitter, while the suspicion timeout (fixed at the minimum
   /// for a small cluster: `suspicion_mult * probe_interval`) stays short.
+  ///
+  /// The probe timeout sits BELOW the probe interval so an unanswered probe still
+  /// has an indirect/fallback window inside its own cycle, and the suspicion
+  /// multiplier keeps the small-cluster suspicion floor at ~300 ms — a live peer
+  /// survives a couple hundred milliseconds of executor starvation on an
+  /// oversubscribed CI runner without being falsely declared Failed, while
+  /// detection of a real kill stays comfortably sub-second.
   pub fn fast() -> Self {
     Self {
       probe_interval: Duration::from_millis(100),
-      probe_timeout: Duration::from_millis(100),
+      probe_timeout: Duration::from_millis(50),
       gossip_interval: Duration::from_millis(20),
-      suspicion_mult: 1,
+      suspicion_mult: 3,
       reap_interval: Duration::from_millis(100),
       reconnect_interval: Duration::from_millis(100),
       reconnect_timeout: Duration::from_millis(1),
