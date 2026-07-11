@@ -387,13 +387,17 @@ impl UserEventCoalescer {
       }
       Some(latest) => {
         if latest.ltime < ltime {
-          // A newer generation supersedes the buffered one: the old payloads are
-          // cleared first, so the net change is `1 - old_len <= 0` and this is
-          // always admitted regardless of the cap.
+          // A newer generation supersedes the buffered one, so the net change is
+          // `1 - old_len <= 0` and this is always admitted regardless of the cap.
+          // Replace the buffer with a fresh single-element vector rather than
+          // clearing it in place: `Vec::clear` retains the old capacity, so a name
+          // repeatedly filled toward the cap and then superseded would keep a
+          // large allocation while `buffered` reads low — retained memory the
+          // count-based cap cannot see (a per-name `Theta(cap)` leak). Assigning a
+          // new vector frees the old allocation.
           self.buffered -= latest.events.len();
           latest.ltime = ltime;
-          latest.events.clear();
-          latest.events.push(event);
+          latest.events = std::vec![event];
           self.buffered += 1;
           true
         } else if latest.ltime == ltime {
@@ -473,6 +477,14 @@ impl UserEventCoalescer {
   #[cfg(test)]
   pub(crate) fn live_payload_count(&self) -> usize {
     self.events.values().map(|l| l.events.len()).sum()
+  }
+
+  /// The total ALLOCATED capacity retained across every name's buffer — bounded
+  /// alongside `buffered`, since a superseded buffer must free its allocation
+  /// rather than retain it.
+  #[cfg(test)]
+  pub(crate) fn retained_capacity(&self) -> usize {
+    self.events.values().map(|l| l.events.capacity()).sum()
   }
 }
 

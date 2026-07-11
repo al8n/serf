@@ -513,6 +513,42 @@ fn user_equal_ltime_payload_flood_is_capped_by_total_volume() {
 }
 
 #[test]
+fn superseding_a_name_frees_its_old_buffer_allocation() {
+  // The memory cap counts live events, but a superseded buffer must also FREE
+  // its allocation: `Vec::clear` retains capacity, so a name filled toward the
+  // cap and then superseded would keep a large allocation the count-based cap
+  // cannot see. Repeatedly filling and superseding distinct names would then
+  // retain quadratic memory while `buffered` and the drop counter stay low.
+  const CAP: usize = 1024;
+  const FILL: usize = 512;
+  let mut c = UserEventCoalescer::new(secs(10), secs(2), NonZeroUsize::new(CAP));
+  let t0 = Instant::ORIGIN;
+
+  // Accumulate many payloads at generation 1 for one name, then supersede to a
+  // single event at generation 2.
+  for i in 0..FILL {
+    c.feed(uev("burst", 1, &format!("p{i}")), t0);
+  }
+  assert_eq!(c.buffered(), FILL);
+  assert!(
+    c.retained_capacity() >= FILL,
+    "the buffer grew to hold the flood"
+  );
+
+  c.feed(uev("burst", 2, "new"), t0);
+  assert_eq!(
+    c.buffered(),
+    1,
+    "supersession collapses the buffered volume to one"
+  );
+  assert!(
+    c.retained_capacity() <= 8,
+    "superseding must release the old buffer's allocation; retained {} slots",
+    c.retained_capacity()
+  );
+}
+
+#[test]
 fn user_newer_generation_for_existing_key_admitted_at_cap() {
   // At the cap, a NEWER generation for an already-buffered key must still be
   // admitted: it clears that key's older payloads first (net change <= 0), so no
