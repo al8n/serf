@@ -66,7 +66,7 @@ use crate::{
   driver::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{
-      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate,
+      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate, leave_outcome,
       observation_payload_bytes, poll_send_gossip, retry_retained_leave, trace_leave_drain_residue,
       trace_leave_transform_error,
     },
@@ -364,6 +364,11 @@ where
   left_cluster_seen: bool,
   /// Deadline bounding the teardown park that drains retained farewells.
   leave_drain_deadline: Option<Instant>,
+  /// A leave-farewell send failed on the LOCAL socket (not a per-peer network
+  /// signal): the parked leave resolves
+  /// [`LeaveFarewellUndelivered`](SerfError::LeaveFarewellUndelivered) instead
+  /// of a false `Ok`.
+  leave_send_failed: bool,
   /// Parked `Shutdown` replies — acked only after the bind sockets drop, so a
   /// caller resuming from `shutdown().await` can rebind the same address. A `Vec`
   /// because several callers can race `shutdown()`.
@@ -505,6 +510,7 @@ where
       leave_drain: LeaveDrain::new(),
       left_cluster_seen: false,
       leave_drain_deadline: None,
+      leave_send_failed: false,
       shutdown_reply: Vec::new(),
       bridges: HashMap::new(),
       accepted_rx,
@@ -1114,14 +1120,20 @@ where
     // non-completing send is retained (not dropped) instead of leaving peers to
     // read the departure as a failure. Periodic gossip stays best-effort.
     if self.leave_initiated {
-      retry_retained_leave(&mut self.leave_drain, self.socket.as_ref(), cx);
+      retry_retained_leave(
+        &mut self.leave_drain,
+        self.socket.as_ref(),
+        cx,
+        &mut self.leave_send_failed,
+      );
       // A `LeftCluster` observed while these datagrams were still queued
       // deferred the parked leave; resolve it now that the socket has accepted
       // every retained farewell.
       if self.left_cluster_seen && self.leave_drain.is_empty() {
         self.left_cluster_seen = false;
         if let Some(pl) = self.pending_leave.take() {
-          pl.resolve_all(|| Ok(()));
+          let failed = self.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
         }
       }
     }
@@ -1140,6 +1152,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
+                self.leave_send_failed = true;
               }
               continue;
             }
@@ -1152,6 +1165,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
+                self.leave_send_failed = true;
               }
               continue;
             }
@@ -1167,6 +1181,7 @@ where
           Err(_) => {
             if self.leave_initiated {
               trace_leave_transform_error(peer);
+              self.leave_send_failed = true;
             }
             continue;
           }
@@ -1181,6 +1196,7 @@ where
         cx,
         peer,
         &on_wire,
+        &mut self.leave_send_failed,
       );
     }
     worked |= sent > 0;
@@ -1304,7 +1320,8 @@ where
       // resolve when the drain empties (bounded by the caller's leave timeout).
       if self.leave_drain.is_empty() {
         if let Some(pl) = self.pending_leave.take() {
-          pl.resolve_all(|| Ok(()));
+          let failed = self.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
         }
       } else {
         self.left_cluster_seen = true;
@@ -1555,17 +1572,26 @@ where
         this.inbound_tx = None;
         // Dropping `accept_shutdown_tx` cancels the accept task's pending
         // `accept()`; its `listener` local is released when the task is next
-        // scheduled (awaited below). Dropping the gossip socket closes its UDP FD
-        // synchronously.
+        // scheduled (awaited below).
         drop(this.accept_shutdown_tx.take());
-        // Flush any retained leave-farewell datagrams before releasing the socket.
-        // The graceful drain runs across polls (retried as the socket becomes
-        // writable), so a residual queue here is rare. A residue parks the
-        // teardown — bounded by a short deadline — instead of being dropped: the
-        // farewell is the peers' only first-hand signal that the departure was
-        // intentional, and the `Pending` send has the writable waker registered
-        // while the deadline timer keeps a dead socket from hanging shutdown.
-        retry_retained_leave(&mut this.leave_drain, this.socket.as_ref(), cx);
+      }
+
+      // FAREWELL DRAIN (re-entrant), then release the gossip socket (once —
+      // `socket.is_some()` is the phase guard). Retained leave-farewell
+      // datagrams are retried while the socket is still held; a residue parks
+      // the teardown — bounded by a short deadline — instead of being dropped,
+      // because the farewell is the peers' only first-hand signal that the
+      // departure was intentional. The `Pending` send registers the writable
+      // waker and the deadline timer bounds a persistently dead socket; ANY
+      // teardown wake re-enters this phase until the queue empties or the
+      // deadline wins. Dropping the socket then closes its UDP FD synchronously.
+      if this.socket.is_some() {
+        retry_retained_leave(
+          &mut this.leave_drain,
+          this.socket.as_ref(),
+          cx,
+          &mut this.leave_send_failed,
+        );
         if !this.leave_drain.is_empty() {
           let now = Instant::now();
           let deadline = *this
