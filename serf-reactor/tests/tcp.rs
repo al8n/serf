@@ -23,9 +23,11 @@ use std::net::SocketAddr;
 use agnostic::Runtime;
 use bytes::Bytes;
 use futures_util::{StreamExt, future};
-#[cfg(encryption)]
-use serf_proto::event::MemberEventKind;
-use serf_proto::{event::Event, members::SerfState, options::Options as SerfOptions};
+use serf_proto::{
+  event::{Event, MemberEventKind},
+  members::SerfState,
+  options::Options as SerfOptions,
+};
 #[cfg(encryption)]
 use serf_reactor::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
 use serf_reactor::{
@@ -33,6 +35,10 @@ use serf_reactor::{
   VoidDelegate,
 };
 use smol_str::SmolStr;
+
+/// The reusable multi-node fault-injection fixture, shared by the tokio and smol
+/// cells below.
+mod cluster;
 
 /// A reactor TCP node handle over the agnostic runtime `R`.
 type Node<R> = Serf<SmolStr, SocketAddr, R>;
@@ -471,6 +477,89 @@ where
   b.shutdown().await.expect("rfn-b shuts down");
 }
 
+/// Two nodes on loopback: node A joins node B, then B is abruptly killed. Node A
+/// must observe the member-event sequence Join → Failed → Reap about B: a Failed
+/// (not a Leave), proving the kill discards the graceful-leave datagram, followed
+/// by the reaper removing the failed member under the shortened reconnect timeout.
+///
+/// Mirrors Go serf `serf_events_failed`
+/// (`legacy/serf-core/src/serf/base/tests/serf/event.rs`), whose `test_events`
+/// asserts the exact ordered member-event sequence about the shut-down node.
+async fn serf_events_failed<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["events-failed-a", "events-failed-b"],
+    cluster::ClusterTiming::fast(),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  cluster.kill_abrupt(1).await;
+  // A drops back to a single member once B is detected Failed and then reaped.
+  cluster.await_num_members(0, 1).await;
+
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Failed,
+        MemberEventKind::Reap,
+      ],
+    )
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Two nodes on loopback: node A joins node B, B is abruptly killed and detected
+/// Failed, then B is restarted at the same id and advertise address. Node A must
+/// observe the sequence Join → Failed → Join about B — the failed member
+/// reconnects rather than being reaped, because the reconnect timeout is raised
+/// past the kill-to-restart window while the reconnect loop re-dials B.
+///
+/// Mirrors Go serf `serf_reconnect`
+/// (`legacy/serf-core/src/serf/base/tests/serf/reconnect.rs`).
+async fn serf_reconnect<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["reconnect-a", "reconnect-b"],
+    cluster::ClusterTiming::fast().with_reconnect_timeout(Duration::from_secs(30)),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  cluster.kill_abrupt(1).await;
+  // Wait for A to detect B's failure before B returns, so the Failed event is
+  // recorded distinctly from the later rejoin.
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+
+  cluster.restart(1).await;
+  // The serf reconnect loop re-dials the restarted B, which rejoins the cluster.
+  cluster.await_num_members(0, 2).await;
+
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Failed,
+        MemberEventKind::Join,
+      ],
+    )
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -666,6 +755,16 @@ mod tokio_cells {
     super::remove_failed_node_alias_succeeds::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_events_failed() {
+    super::serf_events_failed::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_reconnect() {
+    super::serf_reconnect::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -728,6 +827,16 @@ mod smol_cells {
   #[test]
   fn remove_failed_node_alias_succeeds_smol() {
     SmolRuntime::block_on(super::remove_failed_node_alias_succeeds::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_events_failed_smol() {
+    SmolRuntime::block_on(super::serf_events_failed::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_reconnect_smol() {
+    SmolRuntime::block_on(super::serf_reconnect::<SmolRuntime>());
   }
 
   #[cfg(encryption)]
