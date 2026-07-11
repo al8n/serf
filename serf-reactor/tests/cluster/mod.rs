@@ -25,6 +25,7 @@ use agnostic::Runtime;
 use futures_util::StreamExt;
 use serf_proto::{
   event::{Event, MemberEventKind},
+  members::MemberStatus,
   options::Options as SerfOptions,
 };
 use serf_reactor::{
@@ -63,6 +64,7 @@ pub struct ClusterTiming {
   reconnect_interval: Duration,
   reconnect_timeout: Duration,
   tombstone_timeout: Duration,
+  leave_propagate_delay: Duration,
 }
 
 impl ClusterTiming {
@@ -88,6 +90,9 @@ impl ClusterTiming {
       reconnect_interval: Duration::from_millis(100),
       reconnect_timeout: Duration::from_millis(1),
       tombstone_timeout: Duration::from_millis(1),
+      // Short enough to keep a graceful leave sub-second, long enough to give
+      // in-flight probes a gossip cycle to observe the leave intent.
+      leave_propagate_delay: Duration::from_millis(100),
     }
   }
 
@@ -97,6 +102,16 @@ impl ClusterTiming {
   #[must_use]
   pub fn with_reconnect_timeout(mut self, v: Duration) -> Self {
     self.reconnect_timeout = v;
+    self
+  }
+
+  /// Override the tombstone timeout — the age at which the reaper removes a
+  /// gracefully-Left member. Raise it beyond the test window to HOLD a left peer
+  /// in the tombstone view instead of reaping it, so a graceful-leave assertion
+  /// observes `[Join, Leave]` without a trailing `Reap`.
+  #[must_use]
+  pub fn with_tombstone_timeout(mut self, v: Duration) -> Self {
+    self.tombstone_timeout = v;
     self
   }
 
@@ -123,6 +138,7 @@ impl ClusterTiming {
       .with_reconnect_interval(self.reconnect_interval)
       .with_reconnect_timeout(self.reconnect_timeout)
       .with_tombstone_timeout(self.tombstone_timeout)
+      .with_leave_propagate_delay(self.leave_propagate_delay)
   }
 }
 
@@ -212,6 +228,24 @@ where
     serf.shutdown().await.expect("node shuts down");
   }
 
+  /// Gracefully leave node `i`, then release its slot. Calls `leave()` — which
+  /// the reactor resolves only once the machine's `LeftCluster` fires, so a
+  /// successful return proves the graceful-leave chain completed — and returns
+  /// the wall-clock the `leave().await` took (a latency canary against any
+  /// reintroduced flush wait). Unlike [`kill_abrupt`](Self::kill_abrupt), the
+  /// farewell (leave intent packed with the dead-self notice) reaches peers
+  /// before teardown, so peers observe an intentional Leave rather than a
+  /// probe-timeout Failed. The slot's id, addr, and event log are retained for
+  /// later assertions.
+  pub async fn leave_graceful(&mut self, i: usize) -> Duration {
+    let serf = self.slots[i].serf.take().expect("node slot is live");
+    let start = std::time::Instant::now();
+    serf.leave().await.expect("node leaves gracefully");
+    let elapsed = start.elapsed();
+    serf.shutdown().await.expect("node shuts down");
+    elapsed
+  }
+
   /// Restart a previously-killed node `i` at the SAME id and advertise address,
   /// re-attaching a collector to the slot's existing log. The freed port is
   /// rebound with a bounded retry to absorb a transient rebind race.
@@ -272,6 +306,26 @@ where
     })
     .await
     .expect("observer reaches the expected member count");
+  }
+
+  /// Poll until `observer`'s membership view holds `subject` as a `Left`
+  /// tombstone — the graceful-leave end state — or fail on the poll timeout.
+  pub async fn await_left_tombstone(&self, observer: usize, subject: &str) {
+    R::timeout(POLL_TIMEOUT, async {
+      loop {
+        if self
+          .node(observer)
+          .members()
+          .iter()
+          .any(|m| m.node().id_ref().as_str() == subject && m.status() == MemberStatus::Left)
+        {
+          break;
+        }
+        R::sleep(POLL_STEP).await;
+      }
+    })
+    .await
+    .expect("observer holds the subject as a Left tombstone");
   }
 
   /// Poll until `observer`'s log records a member event of `kind` naming

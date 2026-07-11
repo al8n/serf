@@ -515,6 +515,49 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Two nodes on loopback: node A joins node B, then B leaves gracefully. Node A
+/// must observe the member-event sequence Join → Leave about B: a Leave (not a
+/// Failed), proving the farewell — the leave intent packed with the dead-self
+/// notice — reached A before B tore down, and B lands in A's Left tombstone
+/// view. The absence of a Failed is the discriminator against the abrupt-kill
+/// path (`serf_events_failed`), which the two tests together pin.
+async fn serf_events_leave<R>()
+where
+  R: Runtime,
+{
+  // Raise A's tombstone timeout past the test window so the reaper holds B's
+  // Left tombstone rather than appending a trailing Reap to the observed
+  // sequence (the fast profile otherwise reaps a left member sub-second).
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["events-leave-a", "events-leave-b"],
+    cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  // The graceful leave().await must complete well inside the driver's 5s leave
+  // timeout — a canary against anyone reintroducing a broadcast-flush wait.
+  let elapsed = cluster.leave_graceful(1).await;
+  assert!(
+    elapsed < Duration::from_secs(3),
+    "graceful leave().await took {elapsed:?}, expected well under the 5s driver leave timeout"
+  );
+
+  // A observes exactly [Join, Leave] about B — never a Failed.
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[MemberEventKind::Join, MemberEventKind::Leave],
+    )
+    .await;
+
+  // B lands in A's Left tombstone view.
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+
+  cluster.shutdown_all().await;
+}
+
 /// Two nodes on loopback: node A joins node B, B is abruptly killed and detected
 /// Failed, then B is restarted at the same id and advertise address. Node A must
 /// observe the sequence Join → Failed → Join about B — the failed member
@@ -761,6 +804,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_events_leave() {
+    super::serf_events_leave::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn serf_reconnect() {
     super::serf_reconnect::<TokioRuntime>().await;
   }
@@ -832,6 +880,11 @@ mod smol_cells {
   #[test]
   fn serf_events_failed_smol() {
     SmolRuntime::block_on(super::serf_events_failed::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_events_leave_smol() {
+    SmolRuntime::block_on(super::serf_events_leave::<SmolRuntime>());
   }
 
   #[test]
