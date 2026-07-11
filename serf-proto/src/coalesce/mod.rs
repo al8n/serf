@@ -28,9 +28,9 @@ use memberlist_proto::Instant;
 use smol_str::SmolStr;
 
 use crate::{
-  FxHashMap, LamportTime, UserEventMessage,
+  FxHashMap, LamportTime, Tags, UserEventMessage,
   event::{Event, MemberEvent, MemberEventKind},
-  members::Member,
+  members::{Member, MemberStatus},
 };
 
 pub(crate) mod drop_counter;
@@ -118,6 +118,20 @@ struct LatestMember<I, A> {
   member: Member<I, A>,
 }
 
+/// The full observable state last EMITTED for a node, kept across flushes so a
+/// repeat that changed nothing is suppressed while ANY observable change — a new
+/// address, new tags, or a new status — re-emits.  A node can fail and rejoin at
+/// the same address within one window with different tags (its `Member` is
+/// rebuilt from freshly decoded metadata); comparing the whole observed state
+/// rather than just the kind and address means that changed metadata is
+/// delivered instead of collapsed away.
+struct LastEmitted<A> {
+  kind: MemberEventKind,
+  addr: A,
+  tags: Tags,
+  status: MemberStatus,
+}
+
 /// Coalesces membership changes over a time window, collapsing rapid transitions
 /// of a node to its latest observed status.
 ///
@@ -125,12 +139,12 @@ struct LatestMember<I, A> {
 /// * `latest` holds the LATEST `(kind, member)` per node id within the open
 ///   window, so a rapid join → leave → join for one node collapses to its final
 ///   observation.
-/// * `last` remembers the last EMITTED `(kind, address)` per node id ACROSS
+/// * `last` remembers the last EMITTED observable state per node id ACROSS
 ///   flushes, so a repeated identical observation is suppressed — except
-///   [`MemberEventKind::Update`], which always re-emits because a node's tags may
-///   have changed.  Pairing the address alongside the kind lets a rejoin at a NEW
-///   address (same id, same kind) re-emit, so consumers learn the node moved
-///   rather than retaining the stale address.
+///   [`MemberEventKind::Update`], which always re-emits.  The stored state is the
+///   full `(kind, address, tags, status)`, so a rejoin at a new address OR a
+///   same-address rejoin whose tags or status changed re-emits, and consumers
+///   never retain stale member metadata.
 ///
 /// A flush groups the surviving observations by kind and emits one
 /// [`Event::Member`] batch per kind.
@@ -140,7 +154,7 @@ where
 {
   window: CoalesceWindow,
   latest: FxHashMap<I, LatestMember<I, A>>,
-  last: FxHashMap<I, (MemberEventKind, A)>,
+  last: FxHashMap<I, LastEmitted<A>>,
 }
 
 impl<I, A> MemberEventCoalescer<I, A>
@@ -251,10 +265,11 @@ where
 {
   /// Emit the coalesced member events into `out` and disarm the window.
   ///
-  /// Groups the surviving observations by kind, suppressing a node whose kind AND
-  /// address are both unchanged since the last flush (except `Update`), and emits
-  /// one [`Event::Member`] batch per surviving kind.  The `last` map persists
-  /// across flushes so the suppression is stateful.
+  /// Groups the surviving observations by kind, suppressing a node whose full
+  /// observable state (kind, address, tags, and status) is unchanged since the
+  /// last flush (except `Update`, which always re-emits), and emits one
+  /// [`Event::Member`] batch per surviving kind.  The `last` map persists across
+  /// flushes so the suppression is stateful.
   ///
   /// **Eviction rule (bounds `last` to live membership):** a node's id is
   /// forgotten from `last` at FEED time the instant a [`MemberEventKind::Reap`]
@@ -277,12 +292,19 @@ where
     let mut grouped: Vec<(MemberEventKind, Vec<Member<I, A>>)> = Vec::new();
     for (id, latest) in self.latest.drain() {
       let addr = latest.member.node().addr_ref().clone();
-      if let Some((prev_kind, prev_addr)) = self.last.get(&id) {
-        // Suppress only a genuinely unchanged observation — same kind AND same
-        // address. A rejoin at a new address (same id, same kind) must still emit
-        // so consumers learn the node moved. An Update always re-emits: its tags
-        // may differ even at an unchanged kind and address.
-        if *prev_kind == latest.kind && *prev_addr == addr && latest.kind != MemberEventKind::Update
+      let tags = latest.member.tags().clone();
+      let status = latest.member.status();
+      if let Some(prev) = self.last.get(&id) {
+        // Suppress only a genuinely unchanged observation — same kind AND the
+        // same full observable state (address, tags, status). A rejoin at a new
+        // address, or a same-address rejoin whose tags or status changed, must
+        // still emit so consumers never retain stale member metadata. An Update
+        // always re-emits.
+        if prev.kind == latest.kind
+          && prev.addr == addr
+          && prev.tags == tags
+          && prev.status == status
+          && latest.kind != MemberEventKind::Update
         {
           continue;
         }
@@ -293,7 +315,15 @@ where
       // (Join differs from the absent entry). Every non-Reap kind is retained to
       // suppress a repeated identical observation.
       if latest.kind != MemberEventKind::Reap {
-        self.last.insert(id, (latest.kind, addr));
+        self.last.insert(
+          id,
+          LastEmitted {
+            kind: latest.kind,
+            addr,
+            tags,
+            status,
+          },
+        );
       }
       match grouped.iter_mut().find(|(k, _)| *k == latest.kind) {
         Some((_, members)) => members.push(latest.member),

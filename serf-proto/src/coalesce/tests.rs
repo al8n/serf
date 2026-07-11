@@ -3,6 +3,7 @@ use core::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 use std::{collections::VecDeque, vec, vec::Vec};
 
 use memberlist_proto::{Instant, Node};
+use smol_str::SmolStr;
 
 use crate::{
   LamportTime, UserEventMessage,
@@ -420,6 +421,71 @@ fn address_change_rejoin_is_not_suppressed() {
   assert!(
     out3.is_empty(),
     "a repeat Join at the unchanged address is still suppressed"
+  );
+}
+
+#[test]
+fn same_address_rejoin_with_changed_tags_is_not_suppressed() {
+  let mut drops = 0u64;
+  // A node joins with one set of tags, then fails and rejoins at the SAME address
+  // within a later window carrying DIFFERENT tags (its member is rebuilt from
+  // freshly decoded metadata). The window collapses Failed → Join, and the last
+  // emitted kind and address are both unchanged — but the tags changed, so the
+  // Join must still emit or consumers retain the stale tags. Suppression compares
+  // the full observable state, not just kind and address.
+  let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+  let tagged = |role: &str| {
+    Member::new(
+      Node::new(7u32, addr),
+      Tags::from_iter([("role", role)]),
+      MemberStatus::None,
+    )
+  };
+
+  let mut c = MemberEventCoalescer::<u32, SocketAddr>::new(secs(10), secs(2));
+  let t0 = Instant::ORIGIN;
+
+  // Window 1: Join with role=web records the last emitted state.
+  c.feed(MemberEventKind::Join, vec![tagged("web")], t0, &mut drops);
+  let mut out = VecDeque::new();
+  c.flush(&mut out);
+  assert_eq!(member_groups(out), vec![(MemberEventKind::Join, vec![7])]);
+
+  // Window 2: Failed then a same-address rejoin Join with role=db, collapsing to
+  // Join(role=db).
+  let t1 = t0 + secs(5);
+  c.feed(MemberEventKind::Failed, vec![tagged("web")], t1, &mut drops);
+  c.feed(MemberEventKind::Join, vec![tagged("db")], t1, &mut drops);
+  let mut out2 = VecDeque::new();
+  c.flush(&mut out2);
+
+  let joined_tags: Vec<(u32, Option<SmolStr>)> = out2
+    .iter()
+    .filter_map(|ev| match ev {
+      Event::Member(me) if me.kind() == MemberEventKind::Join => Some(
+        me.members()
+          .iter()
+          .map(|m| (*m.node().id_ref(), m.tags().0.get("role").cloned())),
+      ),
+      _ => None,
+    })
+    .flatten()
+    .collect();
+  assert_eq!(
+    joined_tags,
+    vec![(7u32, Some(SmolStr::new("db")))],
+    "the same-address rejoin with changed tags must re-emit, carrying the new tags"
+  );
+
+  // Window 3: a genuinely identical repeat (same kind, address, AND tags) is still
+  // suppressed — the dedup is intact and only an observable change defeats it.
+  let t2 = t1 + secs(5);
+  c.feed(MemberEventKind::Join, vec![tagged("db")], t2, &mut drops);
+  let mut out3 = VecDeque::new();
+  c.flush(&mut out3);
+  assert!(
+    out3.is_empty(),
+    "a repeat Join at the unchanged address AND tags is still suppressed"
   );
 }
 
