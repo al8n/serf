@@ -1549,6 +1549,17 @@ where
           break hit_disconnect;
         };
         if !drained_to_disconnect {
+          // The command drain and the shutdown drain loop above both drive the
+          // endpoint, so a coalescer drop may have been counted this poll. Publish
+          // before parking on the frozen bridges' exit so a `Serf` clone reading the
+          // handle from another worker sees the current total, not a stale pre-drain
+          // value held until the last bridge re-polls us.
+          this
+            .shared
+            .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
+          this
+            .shared
+            .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
           return Poll::Pending;
         }
         drop(this.inbound_rx.take());
@@ -1586,19 +1597,20 @@ where
         // Ignoring Ok/Err: only readiness matters — the listener is released once
         // the task has exited, regardless of how.
         if join.poll_unpin(cx).is_pending() {
+          // The endpoint was driven earlier this poll (command drain + shutdown drain
+          // loop), so publish before parking on the accept task's exit: the wait can be
+          // arbitrarily long, and a `Serf` clone reading the handle from another worker
+          // must not see a stale pre-drain total until the task finally re-polls us.
+          this
+            .shared
+            .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
+          this
+            .shared
+            .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
           return Poll::Pending;
         }
         this.accept_join = None;
       }
-      // The coalescer drop counters are cumulative; publish them a final time as the
-      // driver future completes so the drops shed in the last command drain — an
-      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
-      // from the public total. This MUST precede every shutdown completion signal
-      // below (the stashed replies and the completion latch): a `shutdown().await`
-      // caller released first could resume on another worker and read the stale
-      // pre-drain total before these stores land. The normal per-poll publish below
-      // is skipped once this shutdown branch returns, so this store is the
-      // completeness backstop.
       // The coalescer drop counters are cumulative; publish them a final time as the
       // driver future completes so the drops shed in the last command drain — an
       // overflow immediately followed by a `Shutdown` in the same pass — are not lost

@@ -226,6 +226,55 @@ async fn coalesced_drops_are_visible_immediately_after_shutdown_on_a_multi_threa
   }
 }
 
+/// A coalescer overflow shed while the node stays LIVE (no shutdown) surfaces on the
+/// public handle as soon as the burst's replies complete: the pump republishes the
+/// cumulative total at the end of the poll that drained the burst, before it parks, so
+/// a caller resuming from the reply reads the fresh value without an extra wake.
+///
+/// The burst is enqueued synchronously (replies dropped) so on the current-thread
+/// runtime it queues ahead of any pump publish; `drain_commands` takes the whole queue
+/// in one poll. Only the final event is awaited — its reply is sent from that same
+/// poll, whose end-of-poll publish runs before the pump parks, so the await returns
+/// with the handle already current.
+#[tokio::test]
+async fn coalesced_drops_are_visible_after_a_live_burst_without_shutdown() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let a = spawn_node_with_serf_options("coalesce-live-burst", serf_opts).await;
+
+  let n: u32 = 20;
+  for i in 0..n - 1 {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("evt-{i}")),
+      bytes::Bytes::new(),
+      true,
+      tx,
+    )))
+    .expect("enqueue user event");
+  }
+  // Await ONLY the final event's completion; the whole burst drains and replies in the
+  // same poll, whose end-of-poll publish runs before the pump parks.
+  a.user_event(format!("evt-{}", n - 1), bytes::Bytes::new(), true)
+    .await
+    .expect("final user event dispatched");
+
+  // Still live (no shutdown) and no intervening sleep: the public handle already
+  // reflects the whole burst's overflow.
+  let dropped = a.coalesced_user_events_dropped();
+  a.shutdown().await.expect("coalesce-live-burst shuts down");
+
+  assert_eq!(
+    dropped,
+    u64::from(n) - cap.get() as u64,
+    "the live handle reflects the burst overflow right after its replies, no extra wake \
+     (got {dropped})"
+  );
+}
+
 /// Build VALID TCP transport options paired with a deliberately invalid
 /// `runtime`, and assert `Serf::tcp` rejects it with [`SerfError::InvalidOption`]
 /// — before binding a socket or spawning the detached driver — rather than

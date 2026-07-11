@@ -504,10 +504,11 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
     let mut exit = false;
 
     // Republish the endpoint's coalescer drop counters for the handle. These are
-    // monotonic cumulative reads and this pump is their sole writer, so storing the
-    // latest value once at the head of every iteration — which every select arm,
-    // `continue`, and pre-select drain funnels back through — keeps the handle
-    // current before the pump next parks.
+    // monotonic cumulative reads and this pump is their sole writer. This head store
+    // captures the drops shed between the pump's wake and the pre-select drains; it
+    // does NOT by itself cover a burst drained later in this same iteration, because
+    // the main select park below is entered without looping back through here — the
+    // pre-select store guarding that park is what keeps the handle current across it.
     coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
     coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
 
@@ -756,6 +757,16 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       let ready_fut = bridge_ready_rx.recv_async().fuse();
       let timer_fut = compio::time::sleep_until(timeout_deadline.into_std()).fuse();
       pin_mut!(recv_fut, cmd_fut, ready_fut, timer_fut);
+
+      // Republish the coalescer drop counters immediately before the pump parks on the
+      // select. A command burst drained earlier this iteration can shed events and
+      // complete its reply, so a caller resuming from that reply must observe the fresh
+      // cumulative total rather than the stale value the head-of-loop store left before
+      // the drain. This park is not reached by looping through the head store, and for
+      // a live (non-shutdown) node the next wake may be arbitrarily far off, so without
+      // this store the drops would stay invisible until then.
+      coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
+      coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
 
       // Arm priority (top → bottom):
       //   1. recv     — kernel-buffered UDP gossip (an Ack resolves a probe

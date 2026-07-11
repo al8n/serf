@@ -663,6 +663,74 @@ async fn coalesced_drops_are_published_on_shutdown_teardown() {
   );
 }
 
+/// A coalescer overflow shed while the node stays LIVE (no shutdown) surfaces on the
+/// public handle as soon as the burst's replies complete — the pump republishes the
+/// cumulative total immediately before it parks, so a caller resuming from the reply
+/// reads the fresh value without an extra wake. Without that pre-park store the drops
+/// would sit unpublished until the pump's next wake, which for a live node may be
+/// arbitrarily far off.
+///
+/// The coalescer is first filled to capacity with distinct names: those events are KEPT
+/// and queued for broadcast, whose immediate gossip drains before the awaited replies
+/// return, leaving the next wake deadline at the periodic gossip tick. The over-cap
+/// burst that follows carries only NEW names, so on a full coalescer every one is shed —
+/// and a shed event queues no broadcast, so the draining iteration is not made past-due
+/// and parks directly on the select rather than looping back through the head store. The
+/// pre-park store is then the ONLY thing that carries these drops to the handle before
+/// the pump sleeps. The burst is enqueued synchronously (replies dropped) so on the
+/// single-threaded cooperative runtime it queues ahead of any pump publish, and a
+/// command-fairness budget above the burst size drains it in one pass; only the final
+/// event is awaited, and its reply is sent from that same drain.
+#[compio::test]
+async fn coalesced_drops_are_visible_after_a_live_burst_without_shutdown() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let runtime = RuntimeOptions::new().with_cmd_fairness_budget(64);
+  let a = spawn_node_with_serf_and_runtime("coalesce-live-burst", serf_opts, runtime).await;
+
+  // Fill the coalescer to capacity (kept + broadcast); awaiting these settles the pump
+  // so the burst below no longer rides an immediate-broadcast wake.
+  let cap_n = cap.get() as u32;
+  for i in 0..cap_n {
+    a.user_event(format!("keep-{i}"), Bytes::new(), true)
+      .await
+      .expect("keep user event dispatched");
+  }
+
+  // Over-cap burst of NEW names: every one is shed (no broadcast) on the full coalescer.
+  let extra: u32 = 16;
+  for i in 0..extra - 1 {
+    let (tx, _) = oneshot::channel();
+    a.send(Command::UserEvent(UserEventCmd::new(
+      SmolStr::new(format!("shed-{i}")),
+      Bytes::new(),
+      true,
+      tx,
+    )))
+    .expect("enqueue user event");
+  }
+  // Await ONLY the final event's completion; the whole burst drains and replies in the
+  // same pass, and the pump republishes the drop total before parking.
+  a.user_event(format!("shed-{}", extra - 1), Bytes::new(), true)
+    .await
+    .expect("final user event dispatched");
+
+  // Still live (no shutdown) and no intervening sleep: the public handle already
+  // reflects the whole burst's overflow.
+  let dropped = a.coalesced_user_events_dropped();
+  a.shutdown().await.expect("coalesce-live-burst shuts down");
+
+  assert_eq!(
+    dropped,
+    u64::from(extra),
+    "the live handle reflects the burst overflow right after its replies, no extra wake \
+     (got {dropped})"
+  );
+}
+
 /// `join_many` over two seeds — one reachable (node B), one a blackhole port —
 /// returns only the reached seed's address. The reachable exchange succeeds and
 /// the blackhole exchange fails fast; once both terminate the call resolves
