@@ -975,6 +975,27 @@ where
     self.events_dropped
   }
 
+  /// Cumulative count of coalescing user events the endpoint's user coalescer
+  /// shed because its buffered volume was at the configured cap.
+  ///
+  /// Lifetime total, saturating, and never cleared by a flush or reset. Reads `0`
+  /// when user coalescing is disabled. Forwards the endpoint counter unchanged —
+  /// the engine adds no coalescer of its own.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.endpoint.coalesced_user_events_dropped()
+  }
+
+  /// Cumulative count of member changes the endpoint's member coalescer shed
+  /// because its per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared. Reads `0` when member
+  /// coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.endpoint.coalesced_member_events_dropped()
+  }
+
   /// Fold one machine event into the await-result join it terminates, if any.
   ///
   /// A push/pull `ExchangeCompleted` whose `eid` was bound to a join at its
@@ -1337,8 +1358,9 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), SerfError> {
-    self.endpoint.user_event(name, payload, coalesce)
+    self.endpoint.user_event(name, payload, coalesce, now)
   }
 
   /// Issue a cluster-wide query, returning its [`QueryId`].
@@ -1369,8 +1391,8 @@ where
 
   /// Replace the local node's tags, re-advertising them via the coordinator and
   /// refreshing the local member in the membership store.
-  pub fn set_tags(&mut self, tags: Tags) -> Result<(), SerfError> {
-    self.endpoint.set_tags(tags)
+  pub fn set_tags(&mut self, tags: Tags, now: Instant) -> Result<(), SerfError> {
+    self.endpoint.set_tags(tags, now)
   }
 
   /// Issue a cluster-wide `install_key` query to add `key` to every node's

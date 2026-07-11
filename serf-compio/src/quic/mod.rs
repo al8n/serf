@@ -329,10 +329,17 @@ where
     // Serf's core RNG is seeded from its own OS-drawn entropy (`self.serf_rng`),
     // independent of the coordinator's gossip RNG, so two nodes never share the
     // query-ID / relay-selection stream.
-    let endpoint = serf_proto::QuicEndpoint::<Self::Id, G, StdRng>::new_with_rng(
+    let endpoint = serf_proto::QuicEndpoint::<
+      Self::Id,
+      G,
+      StdRng,
+      crate::drop_counter::CompioDropCounter,
+    >::new_with_rng_in(
       coord,
       runtime.serf_options,
       self.serf_rng,
+      runtime.user_drop,
+      runtime.member_drop,
     );
 
     crate::driver::quic::quic_driver_loop::<Self::Id, D, G, StdRng>(

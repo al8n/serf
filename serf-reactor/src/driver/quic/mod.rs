@@ -85,6 +85,7 @@ use crate::{
     options::RuntimeOptions,
     shared::{ExchangeId, dispatch_event_delegate, observation_payload_bytes},
   },
+  drop_counter::ReactorDropCounter,
   error::{JoinFailed, Result, SerfError},
   shared::Shared,
 };
@@ -277,12 +278,12 @@ impl PendingLeave {
 /// a lost id-conflict `Event::Shutdown`, or the last handle dropped).
 pub(crate) struct QuicDriver<I, R, G, SR>
 where
-  // Structurally required: `endpoint` names `QuicEndpoint<I, G, SR>`, whose struct
+  // Structurally required: `endpoint` names `QuicEndpoint<I, G, SR, ReactorDropCounter>`, whose struct
   // declares `I: Eq + Hash`.
   I: core::hash::Hash + Eq,
   R: Runtime,
 {
-  endpoint: QuicEndpoint<I, G, SR>,
+  endpoint: QuicEndpoint<I, G, SR, ReactorDropCounter>,
   /// The shared UDP socket carrying QUIC packets AND plain-UDP gossip. `Option` so
   /// the shutdown branch can drop it (releasing the bound port) BEFORE acking;
   /// `Some` for the running lifetime, taken only during teardown.
@@ -352,7 +353,7 @@ where
   /// the observation hand-off, and the recv-buffer inputs.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
-    endpoint: QuicEndpoint<I, G, SR>,
+    endpoint: QuicEndpoint<I, G, SR, ReactorDropCounter>,
     socket: <R::Net as Net>::UdpSocket,
     quic_max_udp_payload: u64,
     shared: Arc<Shared<I>>,
@@ -543,7 +544,7 @@ where
           let payload = cmd.payload().clone();
           self
             .endpoint
-            .user_event(name, payload, cmd.coalesce)
+            .user_event(name, payload, cmd.coalesce, now)
             .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
@@ -583,7 +584,7 @@ where
       }
       Command::SetTags(SetTagsCmd { tags, reply }) => {
         let res = if running {
-          self.endpoint.set_tags(tags).map_err(SerfError::from)
+          self.endpoint.set_tags(tags, now).map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };
@@ -1144,7 +1145,7 @@ where
   R: Runtime,
   G: rand::Rng + Unpin,
   SR: rand::Rng + SeedableRng + Unpin,
-  QuicEndpoint<I, G, SR>: Unpin,
+  QuicEndpoint<I, G, SR, ReactorDropCounter>: Unpin,
 {
   type Output = ();
 
@@ -1389,7 +1390,7 @@ where
 /// a slow delegate cannot delay it), and once fully done clear the still-recorded
 /// ignore-join streams and reap the waiter.
 fn complete_join_exchange<I, G, SR>(
-  endpoint: &mut QuicEndpoint<I, G, SR>,
+  endpoint: &mut QuicEndpoint<I, G, SR, ReactorDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -1465,7 +1466,7 @@ async fn observation_task<I, D>(
 /// then build the [`QuicDriver`] future. The caller (`Transport::run`) awaits it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_quic_driver<I, R, G, SR, D>(
-  mut endpoint: QuicEndpoint<I, G, SR>,
+  mut endpoint: QuicEndpoint<I, G, SR, ReactorDropCounter>,
   socket: <R::Net as Net>::UdpSocket,
   quic_max_udp_payload: u64,
   shared: Arc<Shared<I>>,

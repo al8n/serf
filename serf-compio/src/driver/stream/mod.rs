@@ -13,6 +13,11 @@
 //! channel and read state through the lock-free snapshot. The listener and
 //! gossip socket are explicitly closed (awaited) when the loop exits so the
 //! bound ports are released before shutdown returns.
+//!
+//! The endpoint holds a write-capable [`CompioDropCounter`] over the same
+//! `Rc<Cell<u64>>` a `Serf` handle reads through its read-only counterpart, so
+//! the cumulative coalescer drop counts are observed directly with no publish
+//! step — a shed on the pump is visible on the next handle read.
 
 use std::{
   cell::Cell,
@@ -66,6 +71,7 @@ use crate::{
       observation_payload_bytes, yield_once,
     },
   },
+  drop_counter::CompioDropCounter,
   error::{JoinFailed, Result, SerfError},
   snapshot::{SerfSnapshot, SnapshotCell},
 };
@@ -164,7 +170,7 @@ impl PendingJoin {
 /// `(eid, peer, succeeded)` rather than the `Event` so it is callable without
 /// constructing a coordinator-internal `ExchangeCompleted`.
 fn complete_join_exchange<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -386,7 +392,9 @@ const ENCRYPTED_WRAPPER_OVERHEAD: usize = 0;
 /// clamped at [`GOSSIP_RECV_BUF_MAX`]. Sizing to the inflated value keeps a
 /// configured `gossip_mtu` close to the historical default from being truncated
 /// once the encryption tag/nonce are added on the wire.
-fn gossip_recv_buf_len<I, RT, G, R>(endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R>) -> usize
+fn gossip_recv_buf_len<I, RT, G, R>(
+  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
+) -> usize
 where
   I: memberlist_proto::Id + Clone,
   RT: StreamTransport,
@@ -406,7 +414,7 @@ where
 /// endpoint happen here; reads happen via the published [`SerfSnapshot`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
-  mut endpoint: StreamEndpoint<I, SocketAddr, RT, G, R>,
+  mut endpoint: StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   gossip_socket: UdpSocket,
   listener: TcpListener,
   commands: Receiver<Command<I, SocketAddr>>,
@@ -993,7 +1001,7 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
 /// the post-loop cleanup.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_command<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1154,7 +1162,7 @@ async fn dispatch_command<I, RT, G, R>(
         let name = cmd.name().clone();
         let payload = cmd.payload().clone();
         endpoint
-          .user_event(name, payload, cmd.coalesce)
+          .user_event(name, payload, cmd.coalesce, now)
           .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
@@ -1192,7 +1200,7 @@ async fn dispatch_command<I, RT, G, R>(
     }
     Command::SetTags(SetTagsCmd { tags, reply }) => {
       let res = if running {
-        endpoint.set_tags(tags).map_err(SerfError::from)
+        endpoint.set_tags(tags, now).map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };
@@ -1266,7 +1274,7 @@ async fn dispatch_command<I, RT, G, R>(
 
 /// Route one bridge inbound message into the coordinator.
 fn dispatch_bridge_inbound<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   inbound: BridgeInbound,
 ) where
   I: memberlist_proto::Id + Clone,
@@ -1312,7 +1320,7 @@ fn dispatch_bridge_inbound<I, RT, G, R>(
 /// compound datagram is split into its ordered messages by `parse_messages`,
 /// each fed as a typed message.
 fn dispatch_gossip<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   src: SocketAddr,
   datagram: &[u8],
   now: Instant,
@@ -1455,7 +1463,7 @@ fn process_one_action(
 /// Drain every [`StreamAction`] the coordinator has queued. Returns `true` iff
 /// any action was processed.
 fn drain_actions<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1479,7 +1487,7 @@ where
 /// past a pending `Shutdown` / `Close` — the coordinator withholds the teardown
 /// for an exchange until its `poll_transport_transmit` queue is empty.
 fn drain_transport_transmits<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &HashMap<ExchangeId, BridgeHandle>,
 ) -> bool
 where
@@ -1508,7 +1516,7 @@ where
 /// `encode_outgoing_compound`), then — with an encryption backend built in —
 /// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
 async fn drain_transmits<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: Option<Bytes>,
 ) -> bool
@@ -1574,7 +1582,7 @@ where
 /// read-only `list` or a refused op leaves the wire untouched.
 #[cfg(encryption)]
 fn apply_key_request_live<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   delegate: &dyn KeyringDelegate,
   req: &KeyRequest<I, SocketAddr>,
 ) -> KeyResponseArgs
@@ -1611,7 +1619,7 @@ where
 /// event is still delivered to subscribers before the main loop breaks.
 #[allow(clippy::too_many_arguments)]
 async fn drain_events<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
   observation_dropped: &Cell<u64>,
   obs_payload_bytes: &Cell<u64>,
@@ -1720,7 +1728,7 @@ where
 /// break into teardown.
 #[allow(clippy::too_many_arguments)]
 async fn drain_outputs<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1821,7 +1829,7 @@ async fn observation_task<I, D>(
 /// consumed is absent, so the clear removes only the streams whose exchange did
 /// not merge. `swap_remove` is sound because `joins` has no ordering.
 async fn reap_pending_joins<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   now: Instant,
 ) where
@@ -1897,7 +1905,7 @@ fn min_pending_leave_deadline(pending_leave: &Option<PendingLeave>) -> Option<In
 /// is the sole builder of recv SQEs here.
 #[allow(clippy::too_many_arguments)]
 async fn fire_timeout_with_drain<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   bridge_inbound_rx: &mut mpsc::Receiver<BridgeInbound>,
@@ -1987,7 +1995,7 @@ where
 /// snapshot — seeded at construction — stays current, and `SerfSnapshot::new`
 /// (which requires the local node) is never called with it absent.
 fn refresh_snapshot<I, RT, G, R>(
-  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   snapshot: &SnapshotCell<I>,
 ) where
   I: memberlist_proto::Id + Clone,
@@ -2014,7 +2022,7 @@ fn refresh_snapshot<I, RT, G, R>(
 /// Route one [`BridgeReady`] — an outbound-dial result — into the coordinator,
 /// spawning a per-bridge byte-mover on success.
 fn handle_bridge_ready<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   ready: BridgeReady,
@@ -2067,7 +2075,7 @@ fn handle_bridge_ready<I, RT, G, R>(
 /// processed (a state-affecting event the caller treats as dirty).
 fn handle_accepted<I, RT, G, R>(
   accepted: io::Result<(TcpStream, SocketAddr)>,
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   stream_opts: StreamTransportOptions,

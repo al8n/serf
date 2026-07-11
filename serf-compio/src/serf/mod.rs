@@ -42,6 +42,7 @@ use crate::{
   },
   delegate::Delegate,
   driver::options::RuntimeOptions,
+  drop_counter::DropReader,
   error::{JoinFailed, Result, SerfError},
   events::EventStream,
   resolver::{AdvertiseAddrResolver, Resolver},
@@ -67,6 +68,12 @@ struct Shared<I> {
   /// at the bounded internal observation channel when the delegate dispatch
   /// loop falls behind. Monotonically increasing.
   observation_dropped: Rc<Cell<u64>>,
+  /// Read-only view of the endpoint's cumulative user-coalescer drop count, over
+  /// the SAME cell the endpoint's writer increments. The driver owns the
+  /// endpoint, so a handle reads the shed count here with no publish step.
+  coalesced_user_events_dropped: DropReader,
+  /// Read-only view of the endpoint's cumulative member-coalescer drop count.
+  coalesced_member_events_dropped: DropReader,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   local_id: I,
@@ -177,6 +184,11 @@ where
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
     let events_dropped = Rc::new(Cell::new(0u64));
     let observation_dropped = Rc::new(Cell::new(0u64));
+    // Mint the two shed counters as (writer, reader) pairs: the driver injects the
+    // writers into the endpoint, the handle keeps the readers, both over the same
+    // backing cell so no publish step exists.
+    let (user_drop_writer, user_drop_reader) = crate::drop_counter::drop_channel();
+    let (member_drop_writer, member_drop_reader) = crate::drop_counter::drop_channel();
     let shutdown_flag = Rc::new(Cell::new(false));
     let snapshot: SnapshotCell<I> = Rc::new(RefCell::new(Rc::new(initial_snapshot(
       &local_id, advertise,
@@ -198,6 +210,8 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      user_drop_writer,
+      member_drop_writer,
       snapshot.clone(),
       shutdown_flag.clone(),
       runtime_options,
@@ -216,6 +230,8 @@ where
         events_rx,
         events_dropped: events_dropped_handle,
         observation_dropped: observation_dropped_handle,
+        coalesced_user_events_dropped: user_drop_reader,
+        coalesced_member_events_dropped: member_drop_reader,
         snapshot,
         shutdown_flag,
         local_id,
@@ -363,6 +379,30 @@ where
     self.shared.observation_dropped.get()
   }
 
+  /// Cumulative number of coalescing user events the driver's endpoint shed
+  /// because its user coalescer was at the configured buffered-volume cap
+  /// (`Options::max_coalesced_user_events`) since this node started.
+  ///
+  /// Republished by the driver pump each iteration. Lifetime total, saturating,
+  /// and never cleared by a flush; always `0` when user coalescing is disabled. A
+  /// non-zero value indicates the coalescer is shedding load: raise
+  /// `Options::max_coalesced_user_events` or slow the user-event source.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.shared.coalesced_user_events_dropped.get()
+  }
+
+  /// Cumulative number of member changes the driver's endpoint shed because its
+  /// member coalescer was at its per-window cardinality cap since this node
+  /// started.
+  ///
+  /// Republished by the driver pump each iteration. Lifetime total, saturating;
+  /// always `0` when member coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.shared.coalesced_member_events_dropped.get()
+  }
+
   /// Subscribe to the serf [`Event`] stream. Multiple subscribers round-robin
   /// (the channel is MPMC, not broadcast).
   #[inline]
@@ -371,7 +411,7 @@ where
   }
 
   /// Send `cmd` to the driver, failing fast if the node has shut down.
-  fn send(&self, cmd: Command<I, SocketAddr>) -> Result<()> {
+  pub(crate) fn send(&self, cmd: Command<I, SocketAddr>) -> Result<()> {
     if self.shared.shutdown_flag.get() {
       return Err(SerfError::Shutdown);
     }

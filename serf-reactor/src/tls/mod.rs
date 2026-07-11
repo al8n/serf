@@ -507,7 +507,14 @@ where
       Labeled<TlsRecords>,
       G,
       StdRng,
-    >::new_with_rng(coord, runtime.serf_options, self.serf_rng);
+      crate::drop_counter::ReactorDropCounter,
+    >::new_with_rng_in(
+      coord,
+      runtime.serf_options,
+      self.serf_rng,
+      runtime.user_drop,
+      runtime.member_drop,
+    );
 
     let driver =
       crate::driver::stream::spawn_stream_driver::<Self::Id, R, Labeled<TlsRecords>, D, G, StdRng>(

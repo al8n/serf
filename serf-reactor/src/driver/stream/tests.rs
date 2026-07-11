@@ -31,6 +31,11 @@ const DRIVER_ADDR: &str = "127.0.0.1:7946";
 
 type TestDriver = StreamDriver<SmolStr, TokioRuntime, RawRecords, SmallRng, SmallRng>;
 
+/// The driver's serf endpoint, pinning the reactor's shared drop-counter storage
+/// the [`StreamDriver`] requires.
+type DrvEndpoint =
+  StreamEndpoint<SmolStr, SocketAddr, RawRecords, SmallRng, SmallRng, ReactorDropCounter>;
+
 fn sa(s: &str) -> SocketAddr {
   s.parse().expect("loopback addr")
 }
@@ -51,10 +56,7 @@ const DEFAULT_TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 /// `advertise`, mirroring the production construction (memberlist inner endpoint →
 /// reliable coordinator → serf super-machine). Seeded deterministically; the
 /// initial local `NodeJoined` self-event is drained so a caller starts clean.
-fn build_endpoint(
-  id: &str,
-  advertise: SocketAddr,
-) -> StreamEndpoint<SmolStr, SocketAddr, RawRecords> {
+fn build_endpoint(id: &str, advertise: SocketAddr) -> DrvEndpoint {
   build_endpoint_with_stream_timeout(id, advertise, DEFAULT_TEST_STREAM_TIMEOUT)
 }
 
@@ -64,7 +66,7 @@ fn build_endpoint_with_stream_timeout(
   id: &str,
   advertise: SocketAddr,
   stream_timeout: Duration,
-) -> StreamEndpoint<SmolStr, SocketAddr, RawRecords> {
+) -> DrvEndpoint {
   let inner_opts = EndpointOptions::new(SmolStr::new(id), advertise)
     .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"))
     .with_stream_timeout(stream_timeout);
@@ -75,7 +77,17 @@ fn build_endpoint_with_stream_timeout(
     Box::new(|_addr: &SocketAddr| None),
     Box::new(|addr: &SocketAddr| *addr),
   );
-  let mut e = StreamEndpoint::new(coord, SerfOptions::new());
+  // These pump-ordering tests do not assert coalescer shed counts, so the write
+  // halves suffice; the read halves are unused here.
+  let (user_drop, _) = crate::drop_counter::drop_channel();
+  let (member_drop, _) = crate::drop_counter::drop_channel();
+  let mut e = StreamEndpoint::new_with_rng_in(
+    coord,
+    SerfOptions::new(),
+    SmallRng::seed_from_u64(0),
+    user_drop,
+    member_drop,
+  );
   while e.poll_event().is_some() {}
   e
 }
@@ -136,7 +148,13 @@ async fn build_driver_with_stream_timeout(
     .await
     .expect("bind gossip socket");
   let endpoint = build_endpoint_with_stream_timeout("drv", sa(DRIVER_ADDR), stream_timeout);
-  let shared = Arc::new(Shared::new(initial_snapshot("drv", sa(DRIVER_ADDR))));
+  let (_, user_drop_reader) = crate::drop_counter::drop_channel();
+  let (_, member_drop_reader) = crate::drop_counter::drop_channel();
+  let shared = Arc::new(Shared::new(
+    initial_snapshot("drv", sa(DRIVER_ADDR)),
+    user_drop_reader,
+    member_drop_reader,
+  ));
   let obs_payload_bytes = Arc::new(AtomicU64::new(0));
   let (obs_tx, obs_rx) = flume::unbounded();
   let (accepted_tx, accepted_rx) = flume::bounded(ACCEPT_CAP);

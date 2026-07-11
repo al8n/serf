@@ -14,7 +14,7 @@ use std::{net::SocketAddr, sync::Arc};
 use flume::Sender;
 use serf_proto::{event::Event, options::Options as SerfOptions};
 
-use crate::{driver::options::RuntimeOptions, shared::Shared};
+use crate::{driver::options::RuntimeOptions, drop_counter::ReactorDropCounter, shared::Shared};
 
 #[cfg(encryption)]
 use crate::delegate::KeyringDelegate;
@@ -35,6 +35,11 @@ pub struct TransportRuntime<I, D> {
   pub(crate) events_tx: Sender<Event<I, SocketAddr>>,
   pub(crate) driver_options: RuntimeOptions,
   pub(crate) serf_options: SerfOptions,
+  /// The write half of the user-coalescer shed counter, injected into the
+  /// endpoint by `T::run` so its increments land in the atomic the handle reads.
+  pub(crate) user_drop: ReactorDropCounter,
+  /// The write half of the member-coalescer shed counter.
+  pub(crate) member_drop: ReactorDropCounter,
   /// The driver's keyring delegate, applied to inbound key-management requests.
   /// Present only under an encryption backend.
   #[cfg(encryption)]
@@ -52,6 +57,8 @@ impl<I, D> TransportRuntime<I, D> {
     events_tx: Sender<Event<I, SocketAddr>>,
     driver_options: RuntimeOptions,
     serf_options: SerfOptions,
+    user_drop: ReactorDropCounter,
+    member_drop: ReactorDropCounter,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     Self {
@@ -60,6 +67,8 @@ impl<I, D> TransportRuntime<I, D> {
       events_tx,
       driver_options,
       serf_options,
+      user_drop,
+      member_drop,
       #[cfg(encryption)]
       keyring,
     }

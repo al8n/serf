@@ -27,7 +27,12 @@ use rustls::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::{QuicEndpoint, members::MemberStatus, options::Options};
+use crate::{
+  QuicEndpoint,
+  event::{Event, MemberEventKind},
+  members::MemberStatus,
+  options::Options,
+};
 
 fn sa(port: u16) -> SocketAddr {
   format!("127.0.0.1:{port}").parse().unwrap()
@@ -163,7 +168,7 @@ fn constructs_alive_with_zero_clocks() {
 fn user_event_marks_local_state_dirty() {
   let mut e = ep(1, 7946);
   e.test_clear_dirty();
-  e.user_event("deploy", Bytes::from_static(b"v2"), false)
+  e.user_event("deploy", Bytes::from_static(b"v2"), false, Instant::ORIGIN)
     .expect("user_event on an alive endpoint");
   assert!(
     e.test_is_dirty(),
@@ -179,6 +184,61 @@ fn handle_packet_with_garbage_bytes_is_a_noop() {
     e.poll_event().is_none(),
     "an undecodable frame yields no serf event"
   );
+}
+
+#[test]
+fn startup_self_join_coalesces_from_the_scheduling_instant() {
+  // The coordinator queues the local self-join during construction, before any
+  // live-time entry point has run. `start_scheduling` — the driver's first call,
+  // made with its live clock — must fold that queued join under that instant:
+  // deferring it to a later un-latched `poll_event` would arm the coalescing
+  // window at the machine's origin, already overdue, flushing the self join
+  // immediately instead of holding it for the configured window.
+  let inner_opts = EndpointOptions::new(1u32, sa(7946))
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner =
+    memberlist_proto::Endpoint::new_at(inner_opts, Instant::ORIGIN, SmallRng::seed_from_u64(0));
+  let coord = memberlist_proto::QuicEndpoint::<u32>::with_quinn_rng_seed(
+    inner,
+    test_quic_options(),
+    Some([0x5au8; 32]),
+  );
+  let opts = Options::new()
+    .with_coalesce_period(Duration::from_secs(10))
+    .with_quiescent_period(Duration::from_secs(2));
+  let mut e: QuicEndpoint<u32> = QuicEndpoint::new(coord, opts);
+
+  // The driver arms the schedulers at its live clock; the queued self-join is
+  // folded here, opening the member window at t100 with its quiescent deadline
+  // at t102.
+  let t = |s: u64| Instant::ORIGIN + Duration::from_secs(s);
+  e.start_scheduling(t(100));
+  assert!(
+    e.poll_event().is_none(),
+    "the startup self join is buffered in the window, not delivered immediately"
+  );
+
+  // Before the window's own deadline nothing flushes — a window armed at the
+  // origin would be long overdue here and would flush the join early.
+  e.handle_timeout(t(101));
+  assert!(
+    e.poll_event().is_none(),
+    "the startup window holds until the deadline armed from the scheduling instant"
+  );
+
+  // At the deadline the self join is delivered.
+  e.handle_timeout(t(102));
+  let ev = e
+    .poll_event()
+    .expect("the startup window flushes at its own deadline");
+  match ev {
+    Event::Member(me) => {
+      assert_eq!(me.kind(), MemberEventKind::Join);
+      let ids: Vec<u32> = me.members().iter().map(|m| *m.node().id_ref()).collect();
+      assert_eq!(ids, vec![1], "the self join is delivered from the window");
+    }
+    other => panic!("expected the coalesced self join, got {other:?}"),
+  }
 }
 
 /// A reconnect dial against a failed member targets the failed peer's address.

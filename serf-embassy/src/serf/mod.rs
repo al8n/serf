@@ -634,6 +634,30 @@ where
     self.shared.events_dropped()
   }
 
+  /// Cumulative count of coalescing user events the engine's user coalescer shed
+  /// because its buffered volume was at the configured cap.
+  ///
+  /// Lifetime total, saturating, and never cleared by a flush or reset. Reads `0`
+  /// when user coalescing is disabled.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.shared.engine.borrow().coalesced_user_events_dropped()
+  }
+
+  /// Cumulative count of member changes the engine's member coalescer shed
+  /// because its per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared. Reads `0` when member
+  /// coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self
+      .shared
+      .engine
+      .borrow()
+      .coalesced_member_events_dropped()
+  }
+
   /// Announce the local node's join intent and await the result: resolve each seed,
   /// dispatch an await-result join on the engine, and await its outcome.
   ///
@@ -800,11 +824,12 @@ where
     if self.shared.is_shutdown() {
       return Err(OpError::Shutdown);
     }
+    let now = time::now();
     let r = self
       .shared
       .engine
       .borrow_mut()
-      .user_event(name, payload, coalesce);
+      .user_event(name, payload, coalesce, now);
     self.shared.wake_pump();
     r.map_err(OpError::from)
   }
@@ -867,7 +892,8 @@ where
     if self.shared.is_shutdown() {
       return Err(OpError::Shutdown);
     }
-    let r = self.shared.engine.borrow_mut().set_tags(tags);
+    let now = time::now();
+    let r = self.shared.engine.borrow_mut().set_tags(tags, now);
     self.shared.wake_pump();
     r.map_err(OpError::from)
   }

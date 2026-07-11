@@ -518,6 +518,97 @@ async fn tcp_events_dropped_counter_observable_under_backpressure() {
   );
 }
 
+/// Build a TCP serf node with a custom `SerfOptions` (runtime options at defaults).
+async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Serf<SmolStr> {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind));
+  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf_options,
+    gossip_rng().expect("seed gossip rng"),
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf node")
+}
+
+/// A single node with user coalescing enabled and a small buffered-volume cap sheds
+/// every distinct-named coalescing user event issued past the cap through the public
+/// `user_event` command path, and the cumulative drop count surfaces on the public
+/// `coalesced_user_events_dropped` accessor — the endpoint counter is otherwise
+/// unreachable once the driver moves the endpoint into the detached pump.
+#[compio::test]
+async fn tcp_coalesced_user_events_dropped_observable() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let a = spawn_node_with_serf_options("coalesce-a", serf_opts).await;
+
+  assert_eq!(
+    a.coalesced_user_events_dropped(),
+    0,
+    "no drops before any user event is issued"
+  );
+
+  // Issue distinct-named coalescing user events past the cap. Each is buffered by
+  // name in the open window; every name past the cap is shed and counted.
+  let n: u32 = 20;
+  for i in 0..n {
+    a.user_event(format!("evt-{i}"), Bytes::new(), true)
+      .await
+      .expect("user event dispatched");
+  }
+
+  // Each `user_event().await` returned only after the pump processed that command
+  // and incremented the shared shed cell, so the handle read is already current on
+  // the same executor thread with no publish step.
+  let dropped = a.coalesced_user_events_dropped();
+  a.shutdown().await.expect("coalesce-a shuts down");
+
+  assert_eq!(
+    dropped,
+    u64::from(n) - cap.get() as u64,
+    "every distinct-named cc event past the cap is counted on the public handle (got {dropped})"
+  );
+}
+
+/// After exactly one shed through the public `user_event` path the handle getter
+/// returns at least one. A construction typo that wired the handle's reader to a
+/// different cell than the endpoint's writer would leave this a permanent zero, so
+/// the aliasing bug fails loudly here rather than silently reporting no drops.
+#[compio::test]
+async fn coalesced_drop_aliasing_guard() {
+  // A cap of one: the second distinct-named coalescing event is shed.
+  let cap = core::num::NonZeroUsize::new(1).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let a = spawn_node_with_serf_options("coalesce-alias", serf_opts).await;
+
+  a.user_event("first".to_string(), Bytes::new(), true)
+    .await
+    .expect("first user event dispatched");
+  a.user_event("second".to_string(), Bytes::new(), true)
+    .await
+    .expect("second user event dispatched");
+
+  assert!(
+    a.coalesced_user_events_dropped() >= 1,
+    "the handle observes the endpoint's shed; a mis-wired reader would read a permanent 0"
+  );
+  a.shutdown().await.expect("coalesce-alias shuts down");
+}
+
 /// `join_many` over two seeds — one reachable (node B), one a blackhole port —
 /// returns only the reached seed's address. The reachable exchange succeeds and
 /// the blackhole exchange fails fast; once both terminate the call resolves

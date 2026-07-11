@@ -223,8 +223,13 @@ fn key_rotation_across_two_nodes_rotates_both_live_keyrings() {
 
   // Post-rotation traffic proof: a user event still crosses the wire, which now runs
   // under K2 on both nodes — the reliable and gossip planes rotated with the keyring.
-  a.user_event("after-rotation", Bytes::from_static(b"payload"), false)
-    .expect("user_event from a running node");
+  a.user_event(
+    "after-rotation",
+    Bytes::from_static(b"payload"),
+    false,
+    clk.now(),
+  )
+  .expect("user_event from a running node");
   let mut b_saw_user = false;
   for _ in 0..BUDGET {
     let na = a.poll(clk.now(), &mut da);

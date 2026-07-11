@@ -182,7 +182,16 @@ where
 
     let (events_tx, events_rx) =
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
-    let shared = Arc::new(Shared::new(initial_snapshot(&local_id, advertise)));
+    // Mint the two shed counters as (writer, reader) pairs: the driver injects the
+    // writers into the endpoint, the handle reads the readers, both over the same
+    // backing atomic so no publish step exists.
+    let (user_drop_writer, user_drop_reader) = crate::drop_counter::drop_channel();
+    let (member_drop_writer, member_drop_reader) = crate::drop_counter::drop_channel();
+    let shared = Arc::new(Shared::new(
+      initial_snapshot(&local_id, advertise),
+      user_drop_reader,
+      member_drop_reader,
+    ));
 
     let runtime = TransportRuntime::<I, D>::new(
       delegate,
@@ -190,6 +199,8 @@ where
       events_tx,
       runtime_options,
       serf_options,
+      user_drop_writer,
+      member_drop_writer,
       #[cfg(encryption)]
       keyring,
     );
@@ -616,6 +627,23 @@ impl<I, A, R> Serf<I, A, R> {
   #[must_use]
   pub fn observation_dropped(&self) -> u64 {
     self.shared.observation_dropped()
+  }
+
+  /// The cumulative count of coalescing user events the driver's endpoint shed
+  /// because its user coalescer was at the configured buffered-volume cap
+  /// (`Options::max_coalesced_user_events`). Lifetime total, saturating; always
+  /// `0` when user coalescing is disabled.
+  #[must_use]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.shared.coalesced_user_events_dropped()
+  }
+
+  /// The cumulative count of member changes the driver's endpoint shed because
+  /// its member coalescer was at its per-window cardinality cap. Lifetime total,
+  /// saturating; always `0` when member coalescing is disabled.
+  #[must_use]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.shared.coalesced_member_events_dropped()
   }
 
   /// The cumulative count of gossip payloads sent over the QUIC datagram plane

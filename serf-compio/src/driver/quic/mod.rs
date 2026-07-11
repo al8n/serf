@@ -15,6 +15,11 @@
 //! handles communicate exclusively via the command channel and read state through
 //! the lock-free snapshot. The socket drops when the loop exits so the bound port
 //! is released before shutdown returns.
+//!
+//! The endpoint holds a write-capable [`CompioDropCounter`] over the same
+//! `Rc<Cell<u64>>` a `Serf` handle reads through its read-only counterpart, so
+//! the cumulative coalescer drop counts are observed directly with no publish
+//! step — a shed on the pump is visible on the next handle read.
 
 #![cfg(feature = "quic")]
 
@@ -58,6 +63,7 @@ use crate::{
       observation_payload_bytes, yield_once,
     },
   },
+  drop_counter::CompioDropCounter,
   error::{JoinFailed, Result, SerfError},
   snapshot::{SerfSnapshot, SnapshotCell},
 };
@@ -154,7 +160,7 @@ impl PendingJoin {
 /// `(eid, peer, succeeded)` rather than the `Event` so it is callable without
 /// constructing a coordinator-internal `ExchangeCompleted`.
 fn complete_join_exchange<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -283,7 +289,7 @@ fn recv_buf_len_for(gossip_mtu: usize, quic_max_udp_payload: u64) -> usize {
 /// happen here; reads happen via the published [`SerfSnapshot`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn quic_driver_loop<I, D, G, R>(
-  mut endpoint: QuicEndpoint<I, G, R>,
+  mut endpoint: QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: UdpSocket,
   // The quinn `EndpointConfig`'s accepted max UDP payload, read off the
   // `QuicOptions` in `QuicTransport::run` (the driver cannot reach the quinn
@@ -720,7 +726,7 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
 /// `shutdown_reply` so the pump acks the caller only AFTER the socket drops in
 /// the post-loop cleanup.
 async fn dispatch_command<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   shutdown_reply: &mut Option<oneshot::Sender<Result<()>>>,
   pending: &mut PendingCommands,
   leave_timeout: Duration,
@@ -855,7 +861,7 @@ async fn dispatch_command<I, G, R>(
         let name = cmd.name().clone();
         let payload = cmd.payload().clone();
         endpoint
-          .user_event(name, payload, cmd.coalesce)
+          .user_event(name, payload, cmd.coalesce, now)
           .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
@@ -893,7 +899,7 @@ async fn dispatch_command<I, G, R>(
     }
     Command::SetTags(SetTagsCmd { tags, reply }) => {
       let res = if running {
-        endpoint.set_tags(tags).map_err(SerfError::from)
+        endpoint.set_tags(tags, now).map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };
@@ -977,7 +983,7 @@ async fn dispatch_command<I, G, R>(
 /// (the main loop drops its `recv_fut` before invoking this), so the bounded drain
 /// is the sole builder of recv SQEs here.
 async fn fire_quic_timeout<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   recv_buf_len: usize,
   driver_opts: RuntimeOptions,
@@ -1044,7 +1050,10 @@ where
 /// cluster label is verified; with none built in the serf gossip plane carries no
 /// wire transforms, so the raw bytes ARE the label frame. A compound datagram is
 /// split into its ordered messages by `parse_messages`, each fed as a typed message.
-fn drain_ingress<I, G, R>(endpoint: &mut QuicEndpoint<I, G, R>, label: &Option<Bytes>) -> bool
+fn drain_ingress<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  label: &Option<Bytes>,
+) -> bool
 where
   I: memberlist_proto::Id + Clone,
   G: Rng,
@@ -1092,7 +1101,7 @@ where
 /// `encode_outgoing_compound`), then — with an encryption backend built in —
 /// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
 async fn drain_transmits<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: Option<Bytes>,
 ) -> bool
@@ -1149,7 +1158,7 @@ where
 /// the coordinator queued, and send it on the shared UDP socket. These are
 /// already framed by quinn-proto, so no codec wrap is applied.
 async fn drain_quic_transmits<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
 ) -> bool
 where
@@ -1178,7 +1187,7 @@ where
 /// is still delivered to subscribers before the main loop breaks.
 #[allow(clippy::too_many_arguments)]
 async fn drain_events<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
   observation_dropped: &Cell<u64>,
   obs_payload_bytes: &Cell<u64>,
@@ -1286,7 +1295,7 @@ where
 /// teardown.
 #[allow(clippy::too_many_arguments)]
 async fn drain_outputs<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: &Option<Bytes>,
   obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
@@ -1338,7 +1347,7 @@ where
 /// leaves the wire untouched.
 #[cfg(encryption)]
 fn apply_key_request_live<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   delegate: &dyn KeyringDelegate,
   req: &KeyRequest<I, SocketAddr>,
 ) -> KeyResponseArgs
@@ -1422,7 +1431,7 @@ async fn observation_task<I, D>(
 /// not merge. Mirrors the stream driver's `reap_pending_joins`; `swap_remove` is
 /// sound because `joins` has no ordering.
 async fn reap_pending_joins<I, G, R>(
-  endpoint: &mut QuicEndpoint<I, G, R>,
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   now: Instant,
 ) where
@@ -1485,8 +1494,10 @@ fn min_pending_leave_deadline(pending_leave: &Option<PendingLeave>) -> Option<In
 /// membership store (the local `NodeJoined` sieve has not fired): the prior
 /// snapshot — seeded at construction — stays current, and `SerfSnapshot::new`
 /// (which requires the local node) is never called with it absent.
-fn refresh_snapshot<I, G, R>(endpoint: &QuicEndpoint<I, G, R>, snapshot: &SnapshotCell<I>)
-where
+fn refresh_snapshot<I, G, R>(
+  endpoint: &QuicEndpoint<I, G, R, CompioDropCounter>,
+  snapshot: &SnapshotCell<I>,
+) where
   I: memberlist_proto::Id + Clone,
   G: Rng,
   R: Rng + SeedableRng,

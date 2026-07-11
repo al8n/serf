@@ -445,7 +445,14 @@ where
       Labeled<TlsRecords>,
       G,
       StdRng,
-    >::new_with_rng(coord, runtime.serf_options, self.serf_rng);
+      crate::drop_counter::CompioDropCounter,
+    >::new_with_rng_in(
+      coord,
+      runtime.serf_options,
+      self.serf_rng,
+      runtime.user_drop,
+      runtime.member_drop,
+    );
 
     crate::driver::stream::stream_driver_loop::<Self::Id, Labeled<TlsRecords>, D, G, StdRng>(
       endpoint,

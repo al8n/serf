@@ -73,3 +73,50 @@ fn drained_shutdown_event_poisons_and_buffers() {
     "the terminal Event::Shutdown must be buffered for poll_event"
   );
 }
+
+/// With user coalescing enabled and a small buffered-volume cap, distinct-named
+/// coalescing user events fed past the cap are shed by the engine's user coalescer,
+/// and the running total surfaces through the same engine borrow the public
+/// `coalesced_user_events_dropped` handle accessor reads.
+#[test]
+fn coalesced_user_events_dropped_surfaces_overflow() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let advertise = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946);
+  let engine = SerfEngine::<SmolStr, SlotId>::try_new_at(
+    Options::new()
+      .with_port(7946)
+      .with_close_timeout(Duration::from_secs(10)),
+    TransformOptions::default(),
+    EndpointOptions::new(SmolStr::new("test"), advertise),
+    SerfOptions::new()
+      .with_user_coalesce_period(Duration::from_secs(10))
+      .with_user_quiescent_period(Duration::from_secs(2))
+      .with_max_coalesced_user_events(Some(cap)),
+    at(),
+    SmallRng::seed_from_u64(42),
+  )
+  .expect("a routable single-node configuration constructs");
+  let shared = Shared::new(engine, advertise);
+  assert_eq!(shared.engine.borrow().coalesced_user_events_dropped(), 0);
+
+  let n: u32 = 20;
+  for i in 0..n {
+    shared
+      .engine
+      .borrow_mut()
+      .user_event(
+        SmolStr::from(alloc::format!("evt-{i}")),
+        bytes::Bytes::from_static(b"p"),
+        true,
+        at(),
+      )
+      .expect("a coalescing user event is accepted while running");
+  }
+
+  assert_eq!(
+    shared.engine.borrow().coalesced_user_events_dropped(),
+    u64::from(n) - cap.get() as u64,
+    "every distinct-named coalescing event past the cap is shed and counted"
+  );
+  assert_eq!(shared.engine.borrow().coalesced_member_events_dropped(), 0);
+}

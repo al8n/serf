@@ -75,6 +75,7 @@ use crate::event::{KeyRequest as KeyRequestEvent, KeyRequestOperation, KeyRespon
 use crate::{
   AnyMessage, ConflictResponseMessage, EncodeError, LamportTime, MessageType,
   bridge::{tags_from_pb, tags_to_pb, user_event_to_pb},
+  coalesce::{DropCounter, MemberEventCoalescer, UserEventCoalescer},
   event::{
     DialPassthrough, Event, MemberEvent, MemberEventKind, QueryAck, QueryEvent,
     QueryResponse as QueryResponseEvent,
@@ -672,9 +673,16 @@ fn next_ltime(clock: &mut u64) -> u64 {
 /// serf's own selection draws (relay picks, reconnect probabilistic gate,
 /// coordinate jitter, query id generation) use `self.rng`; the inner
 /// memberlist `Endpoint`'s gossip uses its own independently-seeded `R`.
-pub struct Endpoint<I, A, R = SmallRng>
+///
+/// `D` is the [`DropCounter`] storage for the two coalescer shed counts
+/// (default: a plain `u64`, keeping the machine atomics-free and `Send + Sync`).
+/// An async driver injects its own shared, read-observable backing via
+/// [`new_with_rng_in`](Self::new_with_rng_in) so its detached handle reads the
+/// shed count without the endpoint publishing a copy.
+pub struct Endpoint<I, A, R = SmallRng, D = u64>
 where
   I: Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// serf configuration knobs.
   opts: Options,
@@ -739,6 +747,30 @@ where
   received_queries: crate::FxHashMap<QueryId, ReceivedQuery<A>>,
   /// serf-level events queued for the driver to drain via `poll_event`.
   pending_events: VecDeque<Event<I, A>>,
+  /// Member-event coalescer, or `None` when member coalescing is disabled
+  /// (either period is zero — the default).
+  ///
+  /// When `Some`, membership events are fed here at their emission sites instead
+  /// of pushed straight to `pending_events`; the batch is flushed into
+  /// `pending_events` once the coalescer's window closes (`after_inner_timeout`).
+  /// When `None`, every membership event passes straight through unchanged —
+  /// the exact behaviour of a machine built with the default (disabled) options.
+  member_coalescer: Option<MemberEventCoalescer<I, A>>,
+  /// User-event coalescer, or `None` when user coalescing is disabled (either
+  /// user period is zero — the default).
+  ///
+  /// Only user events that opted in (`UserEventMessage::cc == true`) are fed
+  /// here; a non-coalescing user event passes straight through even when the
+  /// coalescer is enabled (mirrors the legacy coalescer's `handle` predicate).
+  user_coalescer: Option<UserEventCoalescer>,
+  /// Cumulative user-coalescer shed count, incremented in `emit_user` when the
+  /// user coalescer drops an event at its volume cap.  Held always-present (out
+  /// of the `Option` coalescer) so the count survives `reset`/`flush` and a
+  /// driver-injected backing stays wired for the endpoint's whole lifetime.
+  user_drop: D,
+  /// Cumulative member-coalescer shed count, incremented in `emit_member` when
+  /// the member coalescer drops a change at its cardinality cap.
+  member_drop: D,
   /// The most recent directed-send (address, bytes) produced by
   /// `handle_relay` or `relay_response`.
   ///
@@ -775,6 +807,13 @@ where
   /// Callers that do not have a meaningful `now` (e.g., `poll_event` called
   /// after a prior handle call) use the last latched value.
   drain_now: Instant,
+  /// Monotonically non-decreasing processing clock for coalescer window
+  /// scheduling.  `drain_now` carries protocol arrival time, which is NOT
+  /// monotonic — reliable ingress can be processed after a newer command yet
+  /// carry an earlier `received_at`.  Feeding that raw value to the coalescer
+  /// would move an active window's quiescent deadline backward and flush it
+  /// prematurely, so the coalescer arms from this max-clamped clock instead.
+  coalesce_now: Instant,
   /// Dirty flag for the push-pull local-state snapshot (H6).
   ///
   /// Set whenever any of the three Lamport clocks, member status-ltimes,
@@ -824,10 +863,11 @@ where
 
 // ── construction + cheap accessors ────────────────────────────────────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
   R: SeedableRng,
+  D: DropCounter,
 {
   /// Construct a serf `Endpoint` core using `opts` for serf-level knobs and
   /// `rng` as serf's own injected selection entropy.
@@ -839,7 +879,27 @@ where
   ///
   /// `rng` is **separate** from the coordinator's `R`.  Seed it from the
   /// driver's own entropy source; do not share the same `R` instance.
-  pub fn new_with_rng(opts: Options, rng: R) -> Self {
+  ///
+  /// The two coalescer shed counters start at `D::default()` (`0` for the
+  /// default `u64`).  A driver that must observe the counts from a detached
+  /// handle injects a shared backing via
+  /// [`new_with_rng_in`](Self::new_with_rng_in) instead.
+  pub fn new_with_rng(opts: Options, rng: R) -> Self
+  where
+    D: Default,
+  {
+    Self::new_with_rng_in(opts, rng, D::default(), D::default())
+  }
+
+  /// Construct a serf `Endpoint` core injecting the two coalescer shed counters
+  /// `user_drop` / `member_drop`.
+  ///
+  /// An async driver mints a shared, read-observable backing (an atomic or a
+  /// `Cell`), keeps a read-only clone on its handle, and passes the write-capable
+  /// clones here so the handle observes every coalescer shed WITHOUT the endpoint
+  /// publishing a copy each pump iteration.  The single-owner drivers use the
+  /// `u64` default via [`new_with_rng`](Self::new_with_rng).
+  pub fn new_with_rng_in(opts: Options, rng: R, user_drop: D, member_drop: D) -> Self {
     // Arm the first reap/reconnect/queue-check deadlines relative to the ORIGIN instant.
     // The driver calls handle_timeout(now) and the deadlines fire when now >= deadline.
     let first_reap = Instant::ORIGIN + opts.reap_interval();
@@ -847,6 +907,21 @@ where
     let first_queue_check = Instant::ORIGIN + opts.queue_check_interval();
     let event_buf_size = opts.event_buffer_size();
     let query_buf_size = opts.query_buffer_size();
+
+    // Enable each coalescer iff its (period > 0 && quiescent > 0), else None
+    // (disabled) — the default, which yields exact passthrough at the emission
+    // sites so a machine built with default options behaves identically to one
+    // with no coalescer at all.
+    let member_coalescer = opts
+      .member_coalesce_enabled()
+      .then(|| MemberEventCoalescer::new(opts.coalesce_period(), opts.quiescent_period()));
+    let user_coalescer = opts.user_coalesce_enabled().then(|| {
+      UserEventCoalescer::new(
+        opts.user_coalesce_period(),
+        opts.user_quiescent_period(),
+        opts.max_coalesced_user_events(),
+      )
+    });
 
     #[cfg(feature = "coordinates")]
     let coord_client: Option<crate::coordinate_client::CoordinateClient<I>> =
@@ -876,7 +951,12 @@ where
       pending_queries: Vec::new(),
       received_queries: crate::FxHashMap::default(),
       pending_events: VecDeque::new(),
+      member_coalescer,
+      user_coalescer,
+      user_drop,
+      member_drop,
       drain_now: Instant::ORIGIN,
+      coalesce_now: Instant::ORIGIN,
       // The snapshot starts dirty so the first push-pull always ships a fresh
       // body even if no explicit API call has been made yet.
       local_state_dirty: true,
@@ -901,7 +981,10 @@ where
   /// Suitable for tests and environments where determinism or an explicit seed
   /// is acceptable.  Production drivers should use `new_with_rng` and seed from
   /// a cryptographically-secure source.
-  pub fn new(opts: Options) -> Self {
+  pub fn new(opts: Options) -> Self
+  where
+    D: Default,
+  {
     Self::new_with_rng(opts, R::seed_from_u64(0))
   }
 
@@ -956,6 +1039,31 @@ where
     self.members.states.len()
   }
 
+  /// Cumulative count of coalescing user events dropped because the user
+  /// coalescer's buffered volume was at its configured cap
+  /// ([`Options::max_coalesced_user_events`](crate::options::Options::max_coalesced_user_events)).
+  ///
+  /// Lifetime total, saturating, and never cleared — a flush or a `reset` does
+  /// not reset it.  Returns `0` when user coalescing is disabled.
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.user_drop.get()
+  }
+
+  /// Cumulative count of member changes dropped because the member coalescer's
+  /// per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared.  Returns `0` when member
+  /// coalescing is disabled.
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.member_drop.get()
+  }
+
+  /// Number of coalesced events currently waiting in the flush queue to be
+  /// drained by [`poll_event`](Self::poll_event).
+  pub fn pending_events_len(&self) -> usize {
+    self.pending_events.len()
+  }
+
   /// A snapshot of every tracked member (alive, leaving, left, or failed within
   /// the reap window) as owned [`Member`](crate::members::Member) values, for a
   /// driver's observable membership view published after each membership change.
@@ -975,11 +1083,12 @@ where
 
 // ── poll API (requires full Id + Data bounds for inner delegation) ─────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Id + Clone,
   A: CheapClone + Data + PartialEq + Clone + 'static,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Drain one serf event.
   ///
@@ -1009,6 +1118,16 @@ where
       return None;
     }
     let query_min = self.pending_queries.iter().map(|pq| pq.deadline).min();
+    // Fold in each enabled coalescer's flush deadline so the driver wakes to
+    // flush a buffered member/user batch on time.
+    let member_flush = self
+      .member_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline());
+    let user_flush = self
+      .user_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline());
     [
       self.next_reap,
       self.next_reconnect,
@@ -1016,6 +1135,8 @@ where
       self.leave_broadcast_deadline,
       self.leave_complete_deadline,
       query_min,
+      member_flush,
+      user_flush,
     ]
     .into_iter()
     .flatten()
@@ -1165,6 +1286,33 @@ where
     if let Some(dl) = self.leave_broadcast_deadline {
       if now >= dl {
         self.leave_broadcast_deadline = None;
+      }
+    }
+
+    // Flush any coalescer whose window has closed, delivering the coalesced batch
+    // via `pending_events`.  A member/user event fed earlier this tick (during
+    // `drain_inner` / `fire_reap`) arms a future deadline, so it is NOT flushed
+    // now — only a window armed on a PRIOR tick that has since elapsed flushes
+    // here.  Placed after the Shutdown gate above: a machine that lost its
+    // conflict vote this tick has already dropped its buffered batch (in
+    // `close_conflict_query`) and returned early, so nothing is flushed after the
+    // terminal Event::Shutdown.
+    self.flush_due_coalescers(now);
+  }
+
+  /// Flush each enabled coalescer whose window has closed at `now` into
+  /// `pending_events`.
+  fn flush_due_coalescers(&mut self, now: Instant) {
+    let now = self.coalesce_now.max(now);
+    self.coalesce_now = now;
+    if let Some(c) = self.member_coalescer.as_mut() {
+      if c.due(now) {
+        c.flush(&mut self.pending_events);
+      }
+    }
+    if let Some(c) = self.user_coalescer.as_mut() {
+      if c.due(now) {
+        c.flush(&mut self.pending_events);
       }
     }
   }
@@ -1526,13 +1674,18 @@ where
   ///
   /// Returns [`Error::SetTagsMeta`] if the encoded tag map exceeds
   /// `Meta::MAX_SIZE` or the coordinator's configured `meta_max_size`.
-  pub(crate) fn set_tags<T>(&mut self, t: &mut T, tags: Tags) -> Result<(), Error>
+  pub(crate) fn set_tags<T>(&mut self, t: &mut T, tags: Tags, now: Instant) -> Result<(), Error>
   where
     T: Reliable<I, A>,
     I: Clone,
     A: Clone,
   {
     use buffa::Message as _;
+
+    // Latch the command's instant so the coordinator's resulting `NodeUpdated`,
+    // drained synchronously at the end of this call, arms the member coalescer
+    // from live `now` rather than a stale `drain_now`.
+    self.drain_now = now;
 
     // Refuse once the machine has shut down (lost id-conflict vote).
     self.ensure_not_shutdown()?;
@@ -1562,6 +1715,12 @@ where
       let status = ms.status();
       *ms.member_mut() = Member::new(node, tags, status);
     }
+
+    // Emit the resulting NodeUpdated synchronously under the freshly latched
+    // `now`, mirroring how `user_event` processes its event inline. Deferring it
+    // to a later `poll_event` drain would let an intervening ingress or timeout
+    // overwrite `drain_now`, arming the member coalescer from the wrong instant.
+    self.drain_inner(t);
 
     Ok(())
   }
@@ -1728,6 +1887,61 @@ where
     }
   }
 
+  // ── event emission (coalesce-or-passthrough) ──────────────────────────────
+
+  /// Emit a batch of membership changes of one `kind`.
+  ///
+  /// When the member coalescer is enabled the batch is fed into it (buffered,
+  /// deduped to the latest status per node, and flushed later once its window
+  /// closes in `after_inner_timeout`); otherwise it is pushed straight to
+  /// `pending_events` — the exact passthrough a machine with member coalescing
+  /// disabled (the default) performs.  The feed is armed at `self.drain_now`,
+  /// the freshest instant the machine has latched.
+  fn emit_member(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>) {
+    let now = self.coalesce_now.max(self.drain_now);
+    self.coalesce_now = now;
+    if let Some(c) = self.member_coalescer.as_mut() {
+      // The window may have elapsed while the driver was busy and has not yet
+      // fired the overdue flush timer. Flush the completed batch before the new
+      // event mutates it — otherwise a feed after the deadline would overwrite a
+      // due observation and extend the window, merging two separate windows and
+      // dropping the earlier one.
+      if c.due(now) {
+        c.flush(&mut self.pending_events);
+      }
+      c.feed(kind, members, now, &mut self.member_drop);
+    } else {
+      self
+        .pending_events
+        .push_back(Event::Member(MemberEvent::new(kind, members)));
+    }
+  }
+
+  /// Emit a user event.
+  ///
+  /// A coalescing user event (`cc == true`) is fed to the user coalescer when it
+  /// is enabled; every other case (a non-coalescing event, or the coalescer
+  /// disabled) passes straight through to `pending_events`.  Mirrors the legacy
+  /// coalescer's `handle` predicate (`CrateEvent::User(e) => e.cc()`): only
+  /// coalescable user events are buffered.
+  fn emit_user(&mut self, msg: UserEventMessage) {
+    let now = self.coalesce_now.max(self.drain_now);
+    self.coalesce_now = now;
+    if msg.cc {
+      if let Some(c) = self.user_coalescer.as_mut() {
+        // Flush an elapsed-but-not-yet-fired window before the new event mutates
+        // it (see emit_member): a newer generation fed after the deadline would
+        // otherwise supersede and drop a due earlier generation.
+        if c.due(now) {
+          c.flush(&mut self.pending_events);
+        }
+        c.feed(msg, now, &mut self.user_drop);
+        return;
+      }
+    }
+    self.pending_events.push_back(Event::User(msg));
+  }
+
   // ── member-status FSM handlers ───────────────────────────────────────────
 
   /// Handle an inner `NodeJoined` event.
@@ -1807,12 +2021,7 @@ where
 
     // Always emit Member(Join).
     let member = self.members.states[id].member().clone();
-    self
-      .pending_events
-      .push_back(Event::Member(MemberEvent::new(
-        MemberEventKind::Join,
-        vec![member],
-      )));
+    self.emit_member(MemberEventKind::Join, vec![member]);
   }
 
   /// Handle an inner `NodeLeft` event.
@@ -1854,9 +2063,7 @@ where
     // Membership changed — snapshot is stale.
     self.mark_local_state_dirty();
 
-    self
-      .pending_events
-      .push_back(Event::Member(MemberEvent::new(event_kind, vec![member])));
+    self.emit_member(event_kind, vec![member]);
   }
 
   /// Handle an inner `NodeUpdated` event.
@@ -1894,12 +2101,7 @@ where
     // unaffected and a resync would be wasted work — and `set_tags` queues
     // exactly this event via `update_meta` on every local tag change.
 
-    self
-      .pending_events
-      .push_back(Event::Member(MemberEvent::new(
-        MemberEventKind::Update,
-        vec![member],
-      )));
+    self.emit_member(MemberEventKind::Update, vec![member]);
   }
 
   /// Handle a gossiped join intent (`JoinMessage`).
@@ -2067,12 +2269,7 @@ where
         // Move from failed_members to left_members.
         remove_old_member(&mut self.members.failed_members, &id_clone);
         self.members.left_members.push(id_clone);
-        self
-          .pending_events
-          .push_back(Event::Member(MemberEvent::new(
-            MemberEventKind::Leave,
-            vec![member],
-          )));
+        self.emit_member(MemberEventKind::Leave, vec![member]);
         self.mark_local_state_dirty();
         if prune {
           self.prune_member(id);
@@ -2111,12 +2308,7 @@ where
     }
 
     if let Some(ms) = self.members.states.remove(id) {
-      self
-        .pending_events
-        .push_back(Event::Member(MemberEvent::new(
-          MemberEventKind::Reap,
-          vec![ms.member().clone()],
-        )));
+      self.emit_member(MemberEventKind::Reap, vec![ms.member().clone()]);
     }
     self.mark_local_state_dirty();
   }
@@ -2168,12 +2360,7 @@ where
             }
             self.coord_cache.remove(&id);
           }
-          self
-            .pending_events
-            .push_back(Event::Member(MemberEvent::new(
-              MemberEventKind::Reap,
-              vec![ms.member().clone()],
-            )));
+          self.emit_member(MemberEventKind::Reap, vec![ms.member().clone()]);
         }
         // Do not increment i — swap_remove moved the last element here.
       } else {
@@ -2203,12 +2390,7 @@ where
             }
             self.coord_cache.remove(&id);
           }
-          self
-            .pending_events
-            .push_back(Event::Member(MemberEvent::new(
-              MemberEventKind::Reap,
-              vec![ms.member().clone()],
-            )));
+          self.emit_member(MemberEventKind::Reap, vec![ms.member().clone()]);
         }
       } else {
         i += 1;
@@ -2384,6 +2566,11 @@ where
     I: Clone,
     A: Clone,
   {
+    // Latch the command's instant so any coalesced member event this leave
+    // reaches arms its window from live `now`, consistent with the ingress and
+    // timeout paths and with `force_leave`.
+    self.drain_now = now;
+
     match self.state {
       SerfState::Left => return Ok(()), // idempotent
       SerfState::Leaving | SerfState::Shutdown => {
@@ -2469,6 +2656,10 @@ where
     I: Clone,
     A: Clone,
   {
+    // Latch the command's instant so the coalesced Leave/Reap this force-leave
+    // reaches arms its window from live `now`, not a stale `drain_now`.
+    self.drain_now = now;
+
     if self.state == SerfState::Shutdown {
       return Err(Error::BadLeaveState(self.state));
     }
@@ -2555,10 +2746,17 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), Error>
   where
     T: Reliable<I, A>,
   {
+    // Latch the command's instant so the coalescer arms from live `now` when
+    // this event feeds it (mirrors the ingress/timeout paths). Without this a
+    // coalescing event issued after an idle gap would arm from a stale
+    // `drain_now` and flush immediately, defeating the batching window.
+    self.drain_now = now;
+
     // Refuse once the machine has shut down (lost id-conflict vote).
     self.ensure_not_shutdown()?;
 
@@ -2660,8 +2858,9 @@ where
     }
 
     self.mark_local_state_dirty();
-    // First sight — emit to the driver.
-    self.pending_events.push_back(Event::User(msg));
+    // First sight — emit to the driver (coalesced when enabled and the event
+    // opted into coalescing).
+    self.emit_user(msg);
     true
   }
 
@@ -4433,6 +4632,25 @@ where
     self.drain_now = now;
   }
 
+  /// The member coalescer's current flush deadline (test adapter), unpolluted by
+  /// the periodic serf deadlines that `serf_poll_timeout` folds in.
+  #[cfg(all(test, feature = "tcp"))]
+  pub(crate) fn test_member_flush_deadline(&self) -> Option<Instant> {
+    self
+      .member_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline())
+  }
+
+  /// The user coalescer's current flush deadline (test adapter).
+  #[cfg(all(test, feature = "tcp"))]
+  pub(crate) fn test_user_flush_deadline(&self) -> Option<Instant> {
+    self
+      .user_coalescer
+      .as_ref()
+      .and_then(|c| c.flush_deadline())
+  }
+
   /// Return the `QueryId` of the last pending query entry (test adapter).
   #[cfg(test)]
   pub(crate) fn test_last_query_id(&self) -> Option<QueryId> {
@@ -4978,6 +5196,18 @@ where
     // already-dead machine and the chokepoints (commands / ingress / timers)
     // observe Shutdown for the rest of this drain.  The driver remains
     // responsible for stopping I/O and delivering this buffered event.
+    //
+    // Drop each coalescer's not-yet-flushed batch here, before the terminal
+    // Event::Shutdown: Go serf's `shutdown()` tears down the coalescer goroutine,
+    // abandoning its buffered events rather than delivering them, and the
+    // delivery contract forbids emitting anything after Event::Shutdown.  Ingress
+    // is already inert post-Shutdown, so nothing can refill them.
+    if let Some(c) = self.member_coalescer.as_mut() {
+      c.reset();
+    }
+    if let Some(c) = self.user_coalescer.as_mut() {
+      c.reset();
+    }
     self.state = SerfState::Shutdown;
     self.pending_events.push_back(Event::Shutdown);
   }
@@ -5547,9 +5777,10 @@ pub(crate) fn coord_ack_payload(coord: crate::typed::Coordinate) -> Bytes {
 
 // ── Coordinate public accessors ───────────────────────────────────────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// Return the local node's current Vivaldi coordinate.
   ///

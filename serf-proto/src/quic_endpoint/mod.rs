@@ -41,6 +41,7 @@ use memberlist_proto::{
 use smol_str::SmolStr;
 
 use crate::{
+  DropCounter,
   endpoint::{Endpoint, Error, QueryId, QueryParams},
   event::{Event, QueryEvent},
   members::{Member, SerfState},
@@ -74,12 +75,13 @@ use crate::event::KeyResponseArgs;
 /// type to `SocketAddr` too.
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-pub struct QuicEndpoint<I, G = SmallRng, R = SmallRng>
+pub struct QuicEndpoint<I, G = SmallRng, R = SmallRng, D = u64>
 where
   I: Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// The serf-logic core, holding all serf state and no transport reference.
-  core: Endpoint<I, SocketAddr, R>,
+  core: Endpoint<I, SocketAddr, R, D>,
   /// The memberlist QUIC coordinator serf drives through the `Reliable` seam.
   /// Holds the single membership `Endpoint` and the quinn endpoint.
   transport: Coordinator<I, G>,
@@ -87,19 +89,41 @@ where
 
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
   R: SeedableRng,
+  D: DropCounter,
 {
   /// Construct a `QuicEndpoint` from a memberlist QUIC coordinator `transport`,
   /// serf `opts`, and serf's own injected `rng`.
   ///
   /// `rng` is **separate** from the coordinator's RNG `G`; seed it from the
   /// driver's own entropy source.
-  pub fn new_with_rng(transport: Coordinator<I, G>, opts: Options, rng: R) -> Self {
+  pub fn new_with_rng(transport: Coordinator<I, G>, opts: Options, rng: R) -> Self
+  where
+    D: Default,
+  {
     Self {
       core: Endpoint::new_with_rng(opts, rng),
+      transport,
+    }
+  }
+
+  /// Construct a `QuicEndpoint` injecting the two coalescer shed counters, for a
+  /// driver that shares them with a detached handle.
+  ///
+  /// Forwards `user_drop` / `member_drop` into
+  /// [`Endpoint::new_with_rng_in`](crate::endpoint::Endpoint::new_with_rng_in).
+  pub fn new_with_rng_in(
+    transport: Coordinator<I, G>,
+    opts: Options,
+    rng: R,
+    user_drop: D,
+    member_drop: D,
+  ) -> Self {
+    Self {
+      core: Endpoint::new_with_rng_in(opts, rng, user_drop, member_drop),
       transport,
     }
   }
@@ -108,7 +132,10 @@ where
   ///
   /// Suitable for tests and deterministic environments.  Production drivers
   /// should use `new_with_rng` and seed from a cryptographically-secure source.
-  pub fn new(transport: Coordinator<I, G>, opts: Options) -> Self {
+  pub fn new(transport: Coordinator<I, G>, opts: Options) -> Self
+  where
+    D: Default,
+  {
     Self::new_with_rng(transport, opts, R::seed_from_u64(0))
   }
 }
@@ -123,11 +150,12 @@ where
 
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Id + Clone,
   G: Rng,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Feed one inbound UDP datagram from `from` into the coordinator.
   ///
@@ -242,8 +270,16 @@ where
   /// The driver calls this once at loop entry; without it the coordinator's
   /// `next_probe` / `next_gossip` / `next_pushpull` stay unset and failure
   /// detection, dissemination, and anti-entropy never run.
+  ///
+  /// Also folds the inner events the coordinator queued during construction —
+  /// the local self-join in particular — into serf state under the driver's
+  /// live `now`. Deferring that drain to a later un-latched `poll_event` would
+  /// process the self-join at the machine's origin instant, so a coalescing
+  /// window it opens would be armed already-overdue and flush immediately
+  /// instead of batching the startup membership changes.
   pub fn start_scheduling(&mut self, now: Instant) {
     self.transport.start_scheduling(now);
+    self.core.drain_after_ingress(&mut self.transport, now);
   }
 
   /// Initiate an outbound push-pull dial to `peer`, then sieve the resulting
@@ -567,6 +603,21 @@ where
     self.core.num_members()
   }
 
+  /// Forwards to [`Endpoint::coalesced_user_events_dropped`].
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.core.coalesced_user_events_dropped()
+  }
+
+  /// Forwards to [`Endpoint::coalesced_member_events_dropped`].
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.core.coalesced_member_events_dropped()
+  }
+
+  /// Forwards to [`Endpoint::pending_events_len`].
+  pub fn pending_events_len(&self) -> usize {
+    self.core.pending_events_len()
+  }
+
   /// Forwards to [`Endpoint::poll_event`].
   pub fn poll_event(&mut self) -> Option<Event<I, SocketAddr>> {
     self.core.poll_event(&mut self.transport)
@@ -586,11 +637,11 @@ where
   /// # Errors
   ///
   /// Returns [`Error::SetTagsMeta`] if the encoded tags exceed the metadata cap.
-  pub fn set_tags(&mut self, tags: Tags) -> Result<(), Error>
+  pub fn set_tags(&mut self, tags: Tags, now: Instant) -> Result<(), Error>
   where
     I: Clone,
   {
-    self.core.set_tags(&mut self.transport, tags)
+    self.core.set_tags(&mut self.transport, tags, now)
   }
 
   /// Forwards to [`Endpoint::leave`].
@@ -615,10 +666,11 @@ where
     name: impl Into<smol_str::SmolStr>,
     payload: bytes::Bytes,
     coalesce: bool,
+    now: Instant,
   ) -> Result<(), Error> {
     self
       .core
-      .user_event(&mut self.transport, name, payload, coalesce)
+      .user_event(&mut self.transport, name, payload, coalesce, now)
   }
 
   /// Forwards to [`Endpoint::query`].
@@ -713,11 +765,12 @@ where
 
 #[cfg(all(test, feature = "quic"))]
 #[allow(dead_code)]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Id + Clone,
   G: Rng,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Forwards to [`Endpoint::handle_node_join_intent`].
   pub(crate) fn handle_node_join_intent(&mut self, ltime: LamportTime, id: &I, now: Instant) -> bool
@@ -1274,7 +1327,7 @@ where
 
   /// Mutable access to the serf-logic core, for tests that manipulate its
   /// private state directly.
-  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, SocketAddr, R> {
+  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, SocketAddr, R, D> {
     &mut self.core
   }
 

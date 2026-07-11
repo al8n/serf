@@ -41,6 +41,8 @@ mod command;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod delegate;
 mod driver;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod drop_counter;
 mod error;
 mod events;
 mod resolver;

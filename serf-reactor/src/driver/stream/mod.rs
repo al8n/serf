@@ -67,6 +67,7 @@ use crate::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{ExchangeId, dispatch_event_delegate, observation_payload_bytes},
   },
+  drop_counter::ReactorDropCounter,
   error::{JoinFailed, Result, SerfError},
   shared::Shared,
 };
@@ -324,7 +325,7 @@ where
   R: Runtime,
   T: StreamTransport,
 {
-  endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+  endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   /// Unreliable gossip datagrams. `Option` so the shutdown branch can drop it
   /// (releasing the bound UDP port) BEFORE acking; `Some` for the running
   /// lifetime, taken only during teardown.
@@ -451,7 +452,7 @@ where
   /// state, the observation hand-off, and the accept task's channels/handle.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
-    endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+    endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
     socket: <R::Net as Net>::UdpSocket,
     shared: Arc<Shared<I>>,
     obs_tx: Sender<Event<I, SocketAddr>>,
@@ -703,7 +704,7 @@ where
           let payload = cmd.payload().clone();
           self
             .endpoint
-            .user_event(name, payload, cmd.coalesce)
+            .user_event(name, payload, cmd.coalesce, now)
             .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
@@ -743,7 +744,7 @@ where
       }
       Command::SetTags(SetTagsCmd { tags, reply }) => {
         let res = if running {
-          self.endpoint.set_tags(tags).map_err(SerfError::from)
+          self.endpoint.set_tags(tags, now).map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };
@@ -1444,7 +1445,7 @@ where
   T::Options: Unpin,
   G: rand::Rng + Unpin,
   SR: rand::Rng + SeedableRng + Unpin,
-  StreamEndpoint<I, SocketAddr, T, G, SR>: Unpin,
+  StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>: Unpin,
 {
   type Output = ();
 
@@ -1826,7 +1827,7 @@ where
 /// hand-off, so a slow delegate cannot delay it), and once fully done clear the
 /// still-recorded ignore-join streams and reap the waiter.
 fn complete_join_exchange<I, T, G, SR>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, T, G, SR>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -1974,7 +1975,7 @@ async fn observation_task<I, D>(
 /// caller (`Transport::run`) awaits the returned future.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_stream_driver<I, R, T, D, G, SR>(
-  mut endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+  mut endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   gossip_socket: <R::Net as Net>::UdpSocket,
   listener: <R::Net as Net>::TcpListener,
   shared: Arc<Shared<I>>,
