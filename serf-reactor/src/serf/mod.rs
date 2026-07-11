@@ -618,6 +618,23 @@ impl<I, A, R> Serf<I, A, R> {
     self.shared.observation_dropped()
   }
 
+  /// The cumulative count of coalescing user events the driver's endpoint shed
+  /// because its user coalescer was at the configured buffered-volume cap
+  /// (`Options::max_coalesced_user_events`). Lifetime total, saturating; always
+  /// `0` when user coalescing is disabled.
+  #[must_use]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.shared.coalesced_user_events_dropped()
+  }
+
+  /// The cumulative count of member changes the driver's endpoint shed because
+  /// its member coalescer was at its per-window cardinality cap. Lifetime total,
+  /// saturating; always `0` when member coalescing is disabled.
+  #[must_use]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.shared.coalesced_member_events_dropped()
+  }
+
   /// The cumulative count of gossip payloads sent over the QUIC datagram plane
   /// (a datagram queued onto the peer's pooled, TLS-protected connection) rather
   /// than the plain-UDP fallback. Always `0` on the stream transports and on a

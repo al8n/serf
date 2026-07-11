@@ -368,6 +368,8 @@ where
       runtime.events_tx,
       runtime.events_dropped,
       runtime.observation_dropped,
+      runtime.coalesced_user_events_dropped,
+      runtime.coalesced_member_events_dropped,
       runtime.snapshot,
       runtime.shutdown_flag,
       runtime.driver_options,

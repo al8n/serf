@@ -1375,6 +1375,17 @@ where
       this.refresh_snapshot();
     }
 
+    // Republish the endpoint's coalescer drop counters for the handle: the driver
+    // owns the endpoint, so these cumulative reads are unreachable from a `Serf`
+    // clone otherwise. Monotonic, single writer, so storing the latest value once
+    // per poll is exact.
+    this
+      .shared
+      .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
+    this
+      .shared
+      .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
+
     // Yield to other tasks, but re-poll promptly while work remains.
     if more {
       cx.waker().wake_by_ref();

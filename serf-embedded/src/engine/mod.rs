@@ -975,6 +975,27 @@ where
     self.events_dropped
   }
 
+  /// Cumulative count of coalescing user events the endpoint's user coalescer
+  /// shed because its buffered volume was at the configured cap.
+  ///
+  /// Lifetime total, saturating, and never cleared by a flush or reset. Reads `0`
+  /// when user coalescing is disabled. Forwards the endpoint counter unchanged —
+  /// the engine adds no coalescer of its own.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.endpoint.coalesced_user_events_dropped()
+  }
+
+  /// Cumulative count of member changes the endpoint's member coalescer shed
+  /// because its per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared. Reads `0` when member
+  /// coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.endpoint.coalesced_member_events_dropped()
+  }
+
   /// Fold one machine event into the await-result join it terminates, if any.
   ///
   /// A push/pull `ExchangeCompleted` whose `eid` was bound to a join at its

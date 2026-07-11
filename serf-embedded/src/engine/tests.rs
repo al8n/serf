@@ -253,6 +253,57 @@ fn user_event_accepted_while_running() {
     .expect("a user event is accepted while the node is running");
 }
 
+/// With user coalescing enabled and a small buffered-volume cap, a flood of
+/// distinct-named coalescing user events fed past the cap is shed and counted, and
+/// the running total surfaces through the engine's `coalesced_user_events_dropped`
+/// forward (the endpoint counter reachable through the engine handle).
+#[test]
+fn coalesced_user_events_dropped_surfaces_overflow() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new("test"), node_addr(7946));
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let mut engine: SerfEngine<SmolStr, u32> = SerfEngine::try_new_at(
+    cfg,
+    TransformOptions::default(),
+    ep_cfg,
+    serf_opts,
+    now,
+    test_rng(),
+  )
+  .expect("valid configuration must construct without error");
+  engine.start(now);
+  assert_eq!(
+    engine.coalesced_user_events_dropped(),
+    0,
+    "no drops before any user event is fed"
+  );
+
+  let n: u32 = 20;
+  for i in 0..n {
+    engine
+      .user_event(format!("evt-{i}"), Bytes::from_static(b"p"), true, now)
+      .expect("a coalescing user event is accepted while running");
+  }
+
+  assert_eq!(
+    engine.coalesced_user_events_dropped(),
+    u64::from(n) - cap.get() as u64,
+    "every distinct-named coalescing event past the cap is shed and counted"
+  );
+  assert_eq!(
+    engine.coalesced_member_events_dropped(),
+    0,
+    "member coalescing is disabled, so its drop counter stays zero"
+  );
+}
+
 /// `leave` transitions the endpoint out of `Alive`, and a subsequent `join` is
 /// rejected (serf announces its own join intent only from `Alive`).
 #[test]

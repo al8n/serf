@@ -72,6 +72,70 @@ async fn spawn_node(id: &str) -> Node {
     .expect("spawn serf node")
 }
 
+/// Build and spawn a reactor TCP node with a custom `SerfOptions` (runtime options
+/// at defaults).
+async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Node {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind));
+  Serf::<SmolStr, SocketAddr, TokioRuntime>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf_options,
+    #[cfg(encryption)]
+    std::sync::Arc::new(crate::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf node")
+}
+
+/// A single node with user coalescing enabled and a small buffered-volume cap sheds
+/// every distinct-named coalescing user event issued past the cap through the public
+/// `user_event` command path, and the cumulative drop count surfaces on the public
+/// `coalesced_user_events_dropped` accessor — the endpoint counter is otherwise
+/// unreachable once the driver moves the endpoint into the detached pump.
+#[tokio::test]
+async fn tcp_coalesced_user_events_dropped_observable() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(Duration::from_secs(10))
+    .with_user_quiescent_period(Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let a = spawn_node_with_serf_options("coalesce-a", serf_opts).await;
+
+  assert_eq!(
+    a.coalesced_user_events_dropped(),
+    0,
+    "no drops before any user event is issued"
+  );
+
+  // Issue distinct-named coalescing user events past the cap. Each is buffered by
+  // name in the open window; every name past the cap is shed and counted.
+  let n: u32 = 20;
+  for i in 0..n {
+    a.user_event(format!("evt-{i}"), bytes::Bytes::new(), true)
+      .await
+      .expect("user event dispatched");
+  }
+
+  // The pump republishes the endpoint's cumulative counter each poll; give it a beat
+  // to run one past the final feed before reading.
+  tokio::time::sleep(Duration::from_millis(200)).await;
+
+  let dropped = a.coalesced_user_events_dropped();
+  a.shutdown().await.expect("coalesce-a shuts down");
+
+  assert_eq!(
+    dropped,
+    u64::from(n) - cap.get() as u64,
+    "every distinct-named cc event past the cap is counted on the public handle (got {dropped})"
+  );
+}
+
 /// Build VALID TCP transport options paired with a deliberately invalid
 /// `runtime`, and assert `Serf::tcp` rejects it with [`SerfError::InvalidOption`]
 /// — before binding a socket or spawning the detached driver — rather than

@@ -49,6 +49,11 @@ where
   /// Counter for events dropped at the delegate observation channel when the
   /// delegate fell behind — may include unrecoverable app-data.
   pub(crate) observation_dropped: Rc<Cell<u64>>,
+  /// The endpoint's cumulative user-coalescer drop count, republished by the pump
+  /// so the handle can read it while the endpoint stays owned by the driver.
+  pub(crate) coalesced_user_events_dropped: Rc<Cell<u64>>,
+  /// The endpoint's cumulative member-coalescer drop count, republished by the pump.
+  pub(crate) coalesced_member_events_dropped: Rc<Cell<u64>>,
   pub(crate) snapshot: SnapshotCell<T::Id>,
   pub(crate) shutdown_flag: Rc<Cell<bool>>,
   pub(crate) driver_options: RuntimeOptions,
@@ -74,6 +79,8 @@ where
     events_tx: Sender<Event<T::Id, SocketAddr>>,
     events_dropped: Rc<Cell<u64>>,
     observation_dropped: Rc<Cell<u64>>,
+    coalesced_user_events_dropped: Rc<Cell<u64>>,
+    coalesced_member_events_dropped: Rc<Cell<u64>>,
     snapshot: SnapshotCell<T::Id>,
     shutdown_flag: Rc<Cell<bool>>,
     driver_options: RuntimeOptions,
@@ -86,6 +93,8 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      coalesced_user_events_dropped,
+      coalesced_member_events_dropped,
       snapshot,
       shutdown_flag,
       driver_options,

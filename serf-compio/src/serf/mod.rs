@@ -67,6 +67,13 @@ struct Shared<I> {
   /// at the bounded internal observation channel when the delegate dispatch
   /// loop falls behind. Monotonically increasing.
   observation_dropped: Rc<Cell<u64>>,
+  /// Shares the same `Rc` the driver pump republishes each iteration with the
+  /// endpoint's cumulative user-coalescer drop count. The driver owns the
+  /// endpoint, so a handle reads the shed count here. Monotonically increasing.
+  coalesced_user_events_dropped: Rc<Cell<u64>>,
+  /// Shares the same `Rc` the driver pump republishes with the endpoint's
+  /// cumulative member-coalescer drop count. Monotonically increasing.
+  coalesced_member_events_dropped: Rc<Cell<u64>>,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   local_id: I,
@@ -177,6 +184,8 @@ where
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
     let events_dropped = Rc::new(Cell::new(0u64));
     let observation_dropped = Rc::new(Cell::new(0u64));
+    let coalesced_user_events_dropped = Rc::new(Cell::new(0u64));
+    let coalesced_member_events_dropped = Rc::new(Cell::new(0u64));
     let shutdown_flag = Rc::new(Cell::new(false));
     let snapshot: SnapshotCell<I> = Rc::new(RefCell::new(Rc::new(initial_snapshot(
       &local_id, advertise,
@@ -187,6 +196,8 @@ where
     // always reflect the driver's live count.
     let events_dropped_handle = events_dropped.clone();
     let observation_dropped_handle = observation_dropped.clone();
+    let coalesced_user_events_dropped_handle = coalesced_user_events_dropped.clone();
+    let coalesced_member_events_dropped_handle = coalesced_member_events_dropped.clone();
     // Clone the serf options before they are moved into the driver so the
     // handle can compute `default_query_timeout` / `default_query_param`
     // without a driver round-trip.
@@ -198,6 +209,8 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      coalesced_user_events_dropped,
+      coalesced_member_events_dropped,
       snapshot.clone(),
       shutdown_flag.clone(),
       runtime_options,
@@ -216,6 +229,8 @@ where
         events_rx,
         events_dropped: events_dropped_handle,
         observation_dropped: observation_dropped_handle,
+        coalesced_user_events_dropped: coalesced_user_events_dropped_handle,
+        coalesced_member_events_dropped: coalesced_member_events_dropped_handle,
         snapshot,
         shutdown_flag,
         local_id,
@@ -361,6 +376,30 @@ where
   #[inline]
   pub fn observation_dropped(&self) -> u64 {
     self.shared.observation_dropped.get()
+  }
+
+  /// Cumulative number of coalescing user events the driver's endpoint shed
+  /// because its user coalescer was at the configured buffered-volume cap
+  /// (`Options::max_coalesced_user_events`) since this node started.
+  ///
+  /// Republished by the driver pump each iteration. Lifetime total, saturating,
+  /// and never cleared by a flush; always `0` when user coalescing is disabled. A
+  /// non-zero value indicates the coalescer is shedding load: raise
+  /// `Options::max_coalesced_user_events` or slow the user-event source.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.shared.coalesced_user_events_dropped.get()
+  }
+
+  /// Cumulative number of member changes the driver's endpoint shed because its
+  /// member coalescer was at its per-window cardinality cap since this node
+  /// started.
+  ///
+  /// Republished by the driver pump each iteration. Lifetime total, saturating;
+  /// always `0` when member coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.shared.coalesced_member_events_dropped.get()
   }
 
   /// Subscribe to the serf [`Event`] stream. Multiple subscribers round-robin

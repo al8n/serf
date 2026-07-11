@@ -239,6 +239,55 @@ fn single_pump_over_cap_drop_is_counted() {
   );
 }
 
+/// With user coalescing enabled and a small buffered-volume cap, distinct-named
+/// coalescing user events fed through the public command path past the cap are shed
+/// by the engine's user coalescer, and the running total surfaces through the
+/// public `coalesced_user_events_dropped` forward.
+#[test]
+fn coalesced_user_events_dropped_surfaces_overflow() {
+  let cap = core::num::NonZeroUsize::new(4).unwrap();
+  let mut dev = NullDevice;
+  let serf_opts = SerfOptions::new()
+    .with_user_coalesce_period(core::time::Duration::from_secs(10))
+    .with_user_quiescent_period(core::time::Duration::from_secs(2))
+    .with_max_coalesced_user_events(Some(cap));
+  let mut node = Serf::<SmolStr, SocketAddr, NullDevice>::try_new(
+    Options::new(),
+    ip_iface(1),
+    TransformOptions::default(),
+    EndpointOptions::new(
+      SmolStr::new("a"),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946),
+    ),
+    serf_opts,
+    &SocketAddrResolver,
+    &mut dev,
+    now(),
+  )
+  .expect("a valid configuration constructs");
+  node.start(now());
+  assert_eq!(node.coalesced_user_events_dropped(), 0);
+
+  let n: u32 = 20;
+  for i in 0..n {
+    node
+      .user_event(
+        SmolStr::from(std::format!("evt-{i}")),
+        bytes::Bytes::from_static(b"p"),
+        true,
+        now(),
+      )
+      .expect("a coalescing user event is accepted while running");
+  }
+
+  assert_eq!(
+    node.coalesced_user_events_dropped(),
+    u64::from(n) - cap.get() as u64,
+    "every distinct-named coalescing event past the cap is shed and counted"
+  );
+  assert_eq!(node.coalesced_member_events_dropped(), 0);
+}
+
 #[test]
 fn advertise_not_local_is_rejected() {
   let mut dev = NullDevice;

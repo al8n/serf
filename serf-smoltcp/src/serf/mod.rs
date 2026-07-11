@@ -783,6 +783,26 @@ where
       .saturating_add(self.app_events_dropped)
   }
 
+  /// Cumulative count of coalescing user events the engine's user coalescer shed
+  /// because its buffered volume was at the configured cap.
+  ///
+  /// Lifetime total, saturating, and never cleared by a flush or reset. Reads `0`
+  /// when user coalescing is disabled.
+  #[inline]
+  pub fn coalesced_user_events_dropped(&self) -> u64 {
+    self.engine.coalesced_user_events_dropped()
+  }
+
+  /// Cumulative count of member changes the engine's member coalescer shed
+  /// because its per-window map was at its cardinality cap.
+  ///
+  /// Lifetime total, saturating, and never cleared. Reads `0` when member
+  /// coalescing is disabled.
+  #[inline]
+  pub fn coalesced_member_events_dropped(&self) -> u64 {
+    self.engine.coalesced_member_events_dropped()
+  }
+
   /// The local node's id.
   #[inline]
   pub fn local_id(&self) -> I {

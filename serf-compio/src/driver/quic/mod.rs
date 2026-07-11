@@ -293,6 +293,10 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   events_tx: Sender<Event<I, SocketAddr>>,
   events_dropped: Rc<Cell<u64>>,
   observation_dropped: Rc<Cell<u64>>,
+  // Republished each loop iteration with the endpoint's cumulative coalescer drop
+  // counts so a `Serf` handle can observe them while the endpoint stays owned here.
+  coalesced_user_events_dropped: Rc<Cell<u64>>,
+  coalesced_member_events_dropped: Rc<Cell<u64>>,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   driver_opts: RuntimeOptions,
@@ -366,6 +370,14 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   loop {
     let mut dirty = false;
     let mut exit = false;
+
+    // Republish the endpoint's coalescer drop counters for the handle. These are
+    // monotonic cumulative reads and this pump is their sole writer, so storing the
+    // latest value once at the head of every iteration — which every select arm,
+    // `continue`, and pre-select drain funnels back through — keeps the handle
+    // current before the pump next parks.
+    coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
+    coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
 
     // Iter-top command fairness drain so a network flood does not starve user
     // commands (the `cmd` select arm sits below the network arms).
