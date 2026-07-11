@@ -75,7 +75,7 @@ use crate::event::{KeyRequest as KeyRequestEvent, KeyRequestOperation, KeyRespon
 use crate::{
   AnyMessage, ConflictResponseMessage, EncodeError, LamportTime, MessageType,
   bridge::{tags_from_pb, tags_to_pb, user_event_to_pb},
-  coalesce::{MemberEventCoalescer, UserEventCoalescer},
+  coalesce::{DropCounter, MemberEventCoalescer, UserEventCoalescer},
   event::{
     DialPassthrough, Event, MemberEvent, MemberEventKind, QueryAck, QueryEvent,
     QueryResponse as QueryResponseEvent,
@@ -673,9 +673,16 @@ fn next_ltime(clock: &mut u64) -> u64 {
 /// serf's own selection draws (relay picks, reconnect probabilistic gate,
 /// coordinate jitter, query id generation) use `self.rng`; the inner
 /// memberlist `Endpoint`'s gossip uses its own independently-seeded `R`.
-pub struct Endpoint<I, A, R = SmallRng>
+///
+/// `D` is the [`DropCounter`] storage for the two coalescer shed counts
+/// (default: a plain `u64`, keeping the machine atomics-free and `Send + Sync`).
+/// An async driver injects its own shared, read-observable backing via
+/// [`new_with_rng_in`](Self::new_with_rng_in) so its detached handle reads the
+/// shed count without the endpoint publishing a copy.
+pub struct Endpoint<I, A, R = SmallRng, D = u64>
 where
   I: Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// serf configuration knobs.
   opts: Options,
@@ -756,6 +763,14 @@ where
   /// here; a non-coalescing user event passes straight through even when the
   /// coalescer is enabled (mirrors the legacy coalescer's `handle` predicate).
   user_coalescer: Option<UserEventCoalescer>,
+  /// Cumulative user-coalescer shed count, incremented in `emit_user` when the
+  /// user coalescer drops an event at its volume cap.  Held always-present (out
+  /// of the `Option` coalescer) so the count survives `reset`/`flush` and a
+  /// driver-injected backing stays wired for the endpoint's whole lifetime.
+  user_drop: D,
+  /// Cumulative member-coalescer shed count, incremented in `emit_member` when
+  /// the member coalescer drops a change at its cardinality cap.
+  member_drop: D,
   /// The most recent directed-send (address, bytes) produced by
   /// `handle_relay` or `relay_response`.
   ///
@@ -848,10 +863,11 @@ where
 
 // ── construction + cheap accessors ────────────────────────────────────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
   R: SeedableRng,
+  D: DropCounter,
 {
   /// Construct a serf `Endpoint` core using `opts` for serf-level knobs and
   /// `rng` as serf's own injected selection entropy.
@@ -863,7 +879,27 @@ where
   ///
   /// `rng` is **separate** from the coordinator's `R`.  Seed it from the
   /// driver's own entropy source; do not share the same `R` instance.
-  pub fn new_with_rng(opts: Options, rng: R) -> Self {
+  ///
+  /// The two coalescer shed counters start at `D::default()` (`0` for the
+  /// default `u64`).  A driver that must observe the counts from a detached
+  /// handle injects a shared backing via
+  /// [`new_with_rng_in`](Self::new_with_rng_in) instead.
+  pub fn new_with_rng(opts: Options, rng: R) -> Self
+  where
+    D: Default,
+  {
+    Self::new_with_rng_in(opts, rng, D::default(), D::default())
+  }
+
+  /// Construct a serf `Endpoint` core injecting the two coalescer shed counters
+  /// `user_drop` / `member_drop`.
+  ///
+  /// An async driver mints a shared, read-observable backing (an atomic or a
+  /// `Cell`), keeps a read-only clone on its handle, and passes the write-capable
+  /// clones here so the handle observes every coalescer shed WITHOUT the endpoint
+  /// publishing a copy each pump iteration.  The single-owner drivers use the
+  /// `u64` default via [`new_with_rng`](Self::new_with_rng).
+  pub fn new_with_rng_in(opts: Options, rng: R, user_drop: D, member_drop: D) -> Self {
     // Arm the first reap/reconnect/queue-check deadlines relative to the ORIGIN instant.
     // The driver calls handle_timeout(now) and the deadlines fire when now >= deadline.
     let first_reap = Instant::ORIGIN + opts.reap_interval();
@@ -917,6 +953,8 @@ where
       pending_events: VecDeque::new(),
       member_coalescer,
       user_coalescer,
+      user_drop,
+      member_drop,
       drain_now: Instant::ORIGIN,
       coalesce_now: Instant::ORIGIN,
       // The snapshot starts dirty so the first push-pull always ships a fresh
@@ -943,7 +981,10 @@ where
   /// Suitable for tests and environments where determinism or an explicit seed
   /// is acceptable.  Production drivers should use `new_with_rng` and seed from
   /// a cryptographically-secure source.
-  pub fn new(opts: Options) -> Self {
+  pub fn new(opts: Options) -> Self
+  where
+    D: Default,
+  {
     Self::new_with_rng(opts, R::seed_from_u64(0))
   }
 
@@ -1005,7 +1046,7 @@ where
   /// Lifetime total, saturating, and never cleared — a flush or a `reset` does
   /// not reset it.  Returns `0` when user coalescing is disabled.
   pub fn coalesced_user_events_dropped(&self) -> u64 {
-    self.user_coalescer.as_ref().map_or(0, |c| c.dropped())
+    self.user_drop.get()
   }
 
   /// Cumulative count of member changes dropped because the member coalescer's
@@ -1014,7 +1055,7 @@ where
   /// Lifetime total, saturating, and never cleared.  Returns `0` when member
   /// coalescing is disabled.
   pub fn coalesced_member_events_dropped(&self) -> u64 {
-    self.member_coalescer.as_ref().map_or(0, |c| c.dropped())
+    self.member_drop.get()
   }
 
   /// Number of coalesced events currently waiting in the flush queue to be
@@ -1042,11 +1083,12 @@ where
 
 // ── poll API (requires full Id + Data bounds for inner delegation) ─────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Id + Clone,
   A: CheapClone + Data + PartialEq + Clone + 'static,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Drain one serf event.
   ///
@@ -1867,7 +1909,7 @@ where
       if c.due(now) {
         c.flush(&mut self.pending_events);
       }
-      c.feed(kind, members, now);
+      c.feed(kind, members, now, &mut self.member_drop);
     } else {
       self
         .pending_events
@@ -1893,7 +1935,7 @@ where
         if c.due(now) {
           c.flush(&mut self.pending_events);
         }
-        c.feed(msg, now);
+        c.feed(msg, now, &mut self.user_drop);
         return;
       }
     }
@@ -5729,9 +5771,10 @@ pub(crate) fn coord_ack_payload(coord: crate::typed::Coordinate) -> Bytes {
 
 // ── Coordinate public accessors ───────────────────────────────────────────────
 
-impl<I, A, R> Endpoint<I, A, R>
+impl<I, A, R, D> Endpoint<I, A, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// Return the local node's current Vivaldi coordinate.
   ///

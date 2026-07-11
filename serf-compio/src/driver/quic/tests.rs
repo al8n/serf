@@ -106,16 +106,29 @@ fn test_quic_options() -> QuicOptions {
   )
 }
 
+/// The driver endpoint, pinning the compio driver's shared drop-counter storage.
+type DrvEndpoint = QuicEndpoint<SmolStr, StdRng, StdRng, CompioDropCounter>;
+
 /// Build a standalone serf `QuicEndpoint` over a memberlist QUIC coordinator —
 /// no bound socket, no driver loop; just the composed machine, for driving the
 /// ingress surface directly.
-fn build_endpoint() -> QuicEndpoint<SmolStr, StdRng, StdRng> {
+fn build_endpoint() -> DrvEndpoint {
   let local: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let inner_opts = memberlist_proto::EndpointOptions::new(SmolStr::new("node"), local)
     .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
   let inner = memberlist_proto::Endpoint::new(inner_opts, StdRng::seed_from_u64(1));
   let coord = memberlist_proto::QuicEndpoint::new(inner, test_quic_options());
-  QuicEndpoint::new_with_rng(coord, SerfOptions::new(), StdRng::seed_from_u64(2))
+  // These pump tests do not assert coalescer shed counts, so the write halves
+  // suffice; the read halves are unused here.
+  let (user_drop, _) = crate::drop_counter::drop_channel();
+  let (member_drop, _) = crate::drop_counter::drop_channel();
+  QuicEndpoint::new_with_rng_in(
+    coord,
+    SerfOptions::new(),
+    StdRng::seed_from_u64(2),
+    user_drop,
+    member_drop,
+  )
 }
 
 /// The QUIC past-due drain must DECODE every drained gossip datagram before
@@ -271,7 +284,7 @@ async fn fire_quic_timeout_drains_socket_before_handle_timeout() {
 /// `deadline` already in the past. Returns the join's `(StreamId, ExchangeId)`
 /// and the oneshot receiver the caller awaits.
 fn park_ignore_old_join(
-  endpoint: &mut QuicEndpoint<SmolStr, StdRng, StdRng>,
+  endpoint: &mut DrvEndpoint,
   pending_joins: &mut Vec<PendingJoin>,
   deadline: Instant,
 ) -> (StreamId, ExchangeId, oneshot::Receiver<JoinReply>) {

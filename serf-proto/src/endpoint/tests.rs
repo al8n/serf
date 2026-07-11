@@ -12,6 +12,17 @@ use memberlist_proto::{EndpointOptions, RawRecords, SeedableRng, SmallRng, strea
 /// The plain-TCP record layer the unit-test coordinators run over.
 type TestTransport = RawRecords;
 
+/// The default `u64` drop-counter storage keeps the endpoint free of interior
+/// mutability, so the machine stays `Send + Sync` exactly as before the counter
+/// became a generic parameter. A future reintroduction of an interior-mutable
+/// default would break this and fail the build here.
+#[test]
+fn default_endpoint_is_send_and_sync() {
+  fn assert_send_sync<T: Send + Sync>() {}
+  assert_send_sync::<Endpoint<u32, core::net::SocketAddr, SmallRng>>();
+  assert_send_sync::<StreamEndpoint<u32, core::net::SocketAddr, RawRecords>>();
+}
+
 /// Wrap a raw membership [`memberlist_proto::Endpoint`] into the plain-TCP
 /// reliable coordinator the serf `StreamEndpoint` composes with.
 ///
@@ -1620,7 +1631,7 @@ fn query_emits_on_query_tier_broadcast_queue() {
 fn invalid_tag_regex_does_not_advance_rng() {
   // Helper that builds a serf Endpoint with a specified u64 seed so both
   // endpoints start with exactly the same RNG state.
-  let make_ep = |seed: u64| {
+  let make_ep = |seed: u64| -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
     let inner_opts = EndpointOptions::new(
       1u32,
       "127.0.0.1:7946".parse::<core::net::SocketAddr>().unwrap(),

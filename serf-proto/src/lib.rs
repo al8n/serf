@@ -101,6 +101,9 @@ pub use coordinate_client::{
 pub(crate) mod coalesce;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub use coalesce::DropCounter;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub mod endpoint;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]

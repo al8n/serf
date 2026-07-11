@@ -11,9 +11,7 @@ use agnostic::tokio::TokioRuntime;
 use crate::{
   Channel, FirstAddrResolver, MaybeResolved, Resolver, RuntimeOptions, Serf, SerfError,
   SocketAddrResolver, TcpTransportOptions, VoidDelegate,
-  command::{Command, UserEventCmd},
 };
-use futures_channel::oneshot;
 use serf_proto::options::Options as SerfOptions;
 use smol_str::SmolStr;
 
@@ -124,10 +122,9 @@ async fn tcp_coalesced_user_events_dropped_observable() {
       .expect("user event dispatched");
   }
 
-  // The pump republishes the endpoint's cumulative counter each poll; give it a beat
-  // to run one past the final feed before reading.
-  tokio::time::sleep(Duration::from_millis(200)).await;
-
+  // Each `user_event().await` returned only after the pump processed that command
+  // and incremented the shared shed counter, so the handle read is already current
+  // with no publish step or extra wake.
   let dropped = a.coalesced_user_events_dropped();
   a.shutdown().await.expect("coalesce-a shuts down");
 
@@ -138,141 +135,72 @@ async fn tcp_coalesced_user_events_dropped_observable() {
   );
 }
 
-/// The pump republishes the cumulative coalescer drop counters at the end of every
-/// poll pass, but the shutdown branch returns `Poll::Ready` before that publish, so
-/// the drops shed in the same command drain as the `Shutdown` would be lost from the
-/// public total. The teardown publish — run as the driver future completes — makes
-/// the total exact even for drops shed on the way out; without it the handle keeps
-/// the stale value the last normal poll left.
-///
-/// The flood is enqueued synchronously — no await between the sends — so on the
-/// single-threaded cooperative runtime the driver cannot run, and cannot publish,
-/// until the test parks on the shutdown reply; the whole flood and the trailing
-/// shutdown then drain in one poll, since `drain_commands` takes the entire queue.
-#[tokio::test]
-async fn coalesced_drops_are_published_on_shutdown_teardown() {
-  let cap = core::num::NonZeroUsize::new(4).unwrap();
-  let serf_opts = SerfOptions::new()
-    .with_user_coalesce_period(Duration::from_secs(10))
-    .with_user_quiescent_period(Duration::from_secs(2))
-    .with_max_coalesced_user_events(Some(cap));
-  let a = spawn_node_with_serf_options("coalesce-teardown", serf_opts).await;
-
-  // Enqueue distinct-named coalescing user events past the cap directly onto the
-  // command queue without awaiting each reply: the reply receivers drop immediately,
-  // so the driver's acks are discarded, but every event is still fed to the coalescer
-  // and the overflow counted. Firing them synchronously guarantees they queue ahead
-  // of the shutdown with no intervening driver publish.
-  let n: u32 = 20;
-  for i in 0..n {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("evt-{i}")),
-      bytes::Bytes::new(),
-      true,
-      tx,
-    )))
-    .expect("enqueue user event");
-  }
-
-  // Shut down with no intervening sleep: the shutdown lands in the same poll's drain
-  // as the flood, so the coalescer sheds `n - cap` events and the driver returns
-  // `Poll::Ready` from the shutdown branch with those drops unpublished by the normal
-  // per-poll store. Awaiting completion runs the teardown publish.
-  a.shutdown().await.expect("coalesce-teardown shuts down");
-
-  assert_eq!(
-    a.coalesced_user_events_dropped(),
-    u64::from(n) - cap.get() as u64,
-    "the cumulative drop total shed in the shutdown drain is published on teardown"
-  );
-}
-
+/// On a multi-threaded runtime a `Serf` clone read on a DIFFERENT worker than the
+/// pump observes a coalescer shed the instant the `user_event` reply resolves: the
+/// handle's reader and the endpoint's writer share one atomic, so there is no
+/// publish step for the read to lag behind. Repeated so a regression that
+/// reintroduced a copied-out mirror would be reliably caught.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coalesced_drops_are_visible_immediately_after_shutdown_on_a_multi_thread_runtime() {
-  // On a multi-threaded runtime the `shutdown().await` caller can resume on a
-  // different worker than the pump. The final counter publish must therefore
-  // happen-before the shutdown reply is sent, so an accessor read immediately
-  // after `shutdown().await` observes the final total rather than a stale
-  // pre-drain value. Repeat to make the ordering violation reliably observable if
-  // the publish is ever moved back after the reply.
+async fn coalesced_drop_visible_cross_thread_after_reply() {
   let cap = core::num::NonZeroUsize::new(4).unwrap();
   let n: u32 = 20;
-  for round in 0..24 {
+  for trial in 0..24 {
     let serf_opts = SerfOptions::new()
       .with_user_coalesce_period(Duration::from_secs(10))
       .with_user_quiescent_period(Duration::from_secs(2))
       .with_max_coalesced_user_events(Some(cap));
-    let a = spawn_node_with_serf_options(&format!("coalesce-mt-{round}"), serf_opts).await;
+    let a = spawn_node_with_serf_options(&format!("coalesce-xthread-{trial}"), serf_opts).await;
 
+    // Issue distinct-named coalescing events past the cap; await each reply so the
+    // pump has processed and shed it.
     for i in 0..n {
-      let (tx, _) = oneshot::channel();
-      a.send(Command::UserEvent(UserEventCmd::new(
-        SmolStr::new(format!("evt-{i}")),
-        bytes::Bytes::new(),
-        true,
-        tx,
-      )))
-      .expect("enqueue user event");
+      a.user_event(format!("evt-{i}"), bytes::Bytes::new(), true)
+        .await
+        .expect("user event dispatched");
     }
 
-    a.shutdown().await.expect("coalesce-mt shuts down");
+    // Read the shed count from a CLONE on a spawned task — a different worker than
+    // the pump — immediately after the replies, with no sleep and no publish.
+    let b = a.clone();
+    let observed = tokio::spawn(async move { b.coalesced_user_events_dropped() })
+      .await
+      .expect("read task joins");
 
+    a.shutdown().await.expect("coalesce-xthread shuts down");
     assert_eq!(
-      a.coalesced_user_events_dropped(),
+      observed,
       u64::from(n) - cap.get() as u64,
-      "the final drop total is visible to a caller resumed after shutdown completes"
+      "a clone on another worker observes the shed count with no publish step"
     );
   }
 }
 
-/// A coalescer overflow shed while the node stays LIVE (no shutdown) surfaces on the
-/// public handle as soon as the burst's replies complete: the pump republishes the
-/// cumulative total at the end of the poll that drained the burst, before it parks, so
-/// a caller resuming from the reply reads the fresh value without an extra wake.
-///
-/// The burst is enqueued synchronously (replies dropped) so on the current-thread
-/// runtime it queues ahead of any pump publish; `drain_commands` takes the whole queue
-/// in one poll. Only the final event is awaited — its reply is sent from that same
-/// poll, whose end-of-poll publish runs before the pump parks, so the await returns
-/// with the handle already current.
+/// After exactly one shed through the public `user_event` path the handle getter
+/// returns at least one. A construction typo that wired the handle's reader to a
+/// different atomic than the endpoint's writer would leave this a permanent zero,
+/// so the aliasing bug fails loudly here rather than silently reporting no drops.
 #[tokio::test]
-async fn coalesced_drops_are_visible_after_a_live_burst_without_shutdown() {
-  let cap = core::num::NonZeroUsize::new(4).unwrap();
+async fn coalesced_drop_aliasing_guard() {
+  // A cap of one: the second distinct-named coalescing event is shed.
+  let cap = core::num::NonZeroUsize::new(1).unwrap();
   let serf_opts = SerfOptions::new()
     .with_user_coalesce_period(Duration::from_secs(10))
     .with_user_quiescent_period(Duration::from_secs(2))
     .with_max_coalesced_user_events(Some(cap));
-  let a = spawn_node_with_serf_options("coalesce-live-burst", serf_opts).await;
+  let a = spawn_node_with_serf_options("coalesce-alias", serf_opts).await;
 
-  let n: u32 = 20;
-  for i in 0..n - 1 {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("evt-{i}")),
-      bytes::Bytes::new(),
-      true,
-      tx,
-    )))
-    .expect("enqueue user event");
-  }
-  // Await ONLY the final event's completion; the whole burst drains and replies in the
-  // same poll, whose end-of-poll publish runs before the pump parks.
-  a.user_event(format!("evt-{}", n - 1), bytes::Bytes::new(), true)
+  a.user_event("first".to_string(), bytes::Bytes::new(), true)
     .await
-    .expect("final user event dispatched");
+    .expect("first user event dispatched");
+  a.user_event("second".to_string(), bytes::Bytes::new(), true)
+    .await
+    .expect("second user event dispatched");
 
-  // Still live (no shutdown) and no intervening sleep: the public handle already
-  // reflects the whole burst's overflow.
-  let dropped = a.coalesced_user_events_dropped();
-  a.shutdown().await.expect("coalesce-live-burst shuts down");
-
-  assert_eq!(
-    dropped,
-    u64::from(n) - cap.get() as u64,
-    "the live handle reflects the burst overflow right after its replies, no extra wake \
-     (got {dropped})"
+  assert!(
+    a.coalesced_user_events_dropped() >= 1,
+    "the handle observes the endpoint's shed; a mis-wired reader would read a permanent 0"
   );
+  a.shutdown().await.expect("coalesce-alias shuts down");
 }
 
 /// Build VALID TCP transport options paired with a deliberately invalid

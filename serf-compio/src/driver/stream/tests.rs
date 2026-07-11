@@ -20,11 +20,15 @@ use rand::rngs::StdRng;
 use serf_proto::options::Options as SerfOptions;
 use smol_str::SmolStr;
 
+/// The driver endpoint, pinning the compio driver's shared drop-counter storage.
+type DrvEndpoint =
+  StreamEndpoint<SmolStr, SocketAddr, RawRecords, StdRng, StdRng, CompioDropCounter>;
+
 /// Build a standalone plain-TCP serf `StreamEndpoint` over a memberlist stream
 /// coordinator — no bound socket, no driver loop; just the composed machine, for
 /// driving the gossip ingress surface directly. Mirrors the coordinator the TCP
 /// transport's `run` builds.
-fn build_endpoint() -> StreamEndpoint<SmolStr, SocketAddr, RawRecords, StdRng, StdRng> {
+fn build_endpoint() -> DrvEndpoint {
   let local: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let inner_opts = EndpointOptions::new(SmolStr::new("node"), local)
     .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
@@ -35,10 +39,16 @@ fn build_endpoint() -> StreamEndpoint<SmolStr, SocketAddr, RawRecords, StdRng, S
     Box::new(|_: &SocketAddr| None),
     Box::new(|addr: &SocketAddr| *addr),
   );
-  StreamEndpoint::<SmolStr, SocketAddr, RawRecords, StdRng, StdRng>::new_with_rng(
+  // These pump tests do not assert coalescer shed counts, so the write halves
+  // suffice; the read halves are unused here.
+  let (user_drop, _) = crate::drop_counter::drop_channel();
+  let (member_drop, _) = crate::drop_counter::drop_channel();
+  StreamEndpoint::<SmolStr, SocketAddr, RawRecords, StdRng, StdRng, CompioDropCounter>::new_with_rng_in(
     coord,
     SerfOptions::new(),
     StdRng::seed_from_u64(2),
+    user_drop,
+    member_drop,
   )
 }
 
@@ -151,7 +161,7 @@ async fn fire_timeout_with_drain_drains_socket_before_handle_timeout() {
 /// `deadline` already in the past. Returns the join's `(StreamId, ExchangeId)`
 /// and the oneshot receiver the caller awaits.
 fn park_ignore_old_join(
-  endpoint: &mut StreamEndpoint<SmolStr, SocketAddr, RawRecords, StdRng, StdRng>,
+  endpoint: &mut DrvEndpoint,
   pending_joins: &mut Vec<PendingJoin>,
   deadline: Instant,
 ) -> (

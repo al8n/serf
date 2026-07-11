@@ -353,12 +353,20 @@ where
     // Serf's core RNG is seeded from its own OS-drawn entropy (`self.serf_rng`),
     // independent of the coordinator's gossip RNG, so two nodes never share the
     // query-ID / relay-selection stream.
-    let endpoint =
-      serf_proto::StreamEndpoint::<Self::Id, SocketAddr, RawRecords, G, StdRng>::new_with_rng(
-        coord,
-        runtime.serf_options,
-        self.serf_rng,
-      );
+    let endpoint = serf_proto::StreamEndpoint::<
+      Self::Id,
+      SocketAddr,
+      RawRecords,
+      G,
+      StdRng,
+      crate::drop_counter::CompioDropCounter,
+    >::new_with_rng_in(
+      coord,
+      runtime.serf_options,
+      self.serf_rng,
+      runtime.user_drop,
+      runtime.member_drop,
+    );
 
     crate::driver::stream::stream_driver_loop::<Self::Id, RawRecords, D, G, StdRng>(
       endpoint,
@@ -368,8 +376,6 @@ where
       runtime.events_tx,
       runtime.events_dropped,
       runtime.observation_dropped,
-      runtime.coalesced_user_events_dropped,
-      runtime.coalesced_member_events_dropped,
       runtime.snapshot,
       runtime.shutdown_flag,
       runtime.driver_options,

@@ -33,6 +33,10 @@ use crate::{
   members::Member,
 };
 
+pub(crate) mod drop_counter;
+
+pub use drop_counter::DropCounter;
+
 // ── CoalesceWindow ────────────────────────────────────────────────────────────
 
 /// The two-deadline flush timing shared by the member and user coalescers.
@@ -137,10 +141,6 @@ where
   window: CoalesceWindow,
   latest: FxHashMap<I, LatestMember<I, A>>,
   last: FxHashMap<I, (MemberEventKind, A)>,
-  /// Running count of member changes dropped because the `latest` map was at
-  /// [`MAX_COALESCED_MEMBER_EVENTS`] and the change was for a not-yet-buffered
-  /// id.  Cumulative and saturating; never cleared by `reset`/`flush`.
-  dropped: u64,
 }
 
 impl<I, A> MemberEventCoalescer<I, A>
@@ -153,13 +153,24 @@ where
       window: CoalesceWindow::new(coalesce_period, quiescent_period),
       latest: FxHashMap::default(),
       last: FxHashMap::default(),
-      dropped: 0,
     }
   }
 
   /// Buffer a batch of member changes of one `kind`, keyed by node id (latest
   /// wins), and arm the flush window.
-  pub(crate) fn feed(&mut self, kind: MemberEventKind, members: Vec<Member<I, A>>, now: Instant) {
+  ///
+  /// A change for a not-yet-buffered id dropped by the cardinality cap increments
+  /// `drops` (the endpoint-owned member shed counter); the counter is never read
+  /// back by any protocol path.
+  pub(crate) fn feed<D>(
+    &mut self,
+    kind: MemberEventKind,
+    members: Vec<Member<I, A>>,
+    now: Instant,
+    drops: &mut D,
+  ) where
+    D: DropCounter,
+  {
     let mut admitted = false;
     for member in members {
       let id = member.node().id_ref().clone();
@@ -177,7 +188,7 @@ where
       // in place (its collapse must stay exact).  Only genuinely-new ids can grow
       // the map, so only they are gated.
       if !self.latest.contains_key(&id) && self.latest.len() >= MAX_COALESCED_MEMBER_EVENTS {
-        self.dropped = self.dropped.saturating_add(1);
+        drops.incr_saturating();
         continue;
       }
       self.latest.insert(id, LatestMember { kind, member });
@@ -209,13 +220,6 @@ where
   pub(crate) fn reset(&mut self) {
     self.latest.clear();
     self.window.reset();
-  }
-
-  /// The cumulative number of member changes dropped because the per-window map
-  /// was saturated (see [`MAX_COALESCED_MEMBER_EVENTS`]).  Saturating; never
-  /// cleared by `reset`/`flush`.
-  pub(crate) fn dropped(&self) -> u64 {
-    self.dropped
   }
 
   /// The number of ids currently held in the cross-flush suppression map.
@@ -333,9 +337,6 @@ pub(crate) struct UserEventCoalescer {
   /// buffered volume and the maximum flush burst — the quantity the `cap`
   /// bounds (not the per-name key count).
   buffered: usize,
-  /// Running count of user events dropped because `buffered` was at `cap`.
-  /// Cumulative and saturating; never cleared by `reset`/`flush`.
-  dropped: u64,
 }
 
 impl UserEventCoalescer {
@@ -351,7 +352,6 @@ impl UserEventCoalescer {
       events: FxHashMap::default(),
       cap,
       buffered: 0,
-      dropped: 0,
     }
   }
 
@@ -365,13 +365,20 @@ impl UserEventCoalescer {
   /// dropped as normal dedup and is NOT counted.  The window is armed only when
   /// an event is admitted, so a rejected or dropped-older event never extends
   /// the quiescent timer.
-  pub(crate) fn feed(&mut self, event: UserEventMessage, now: Instant) {
+  ///
+  /// A volume-cap drop increments `drops` (the endpoint-owned user shed counter);
+  /// an older-generation dedup drop does not.  The counter is never read back by
+  /// any protocol path.
+  pub(crate) fn feed<D>(&mut self, event: UserEventMessage, now: Instant, drops: &mut D)
+  where
+    D: DropCounter,
+  {
     let cap = self.cap.map_or(usize::MAX, core::num::NonZeroUsize::get);
     let ltime = event.ltime;
     let admitted = match self.events.get_mut(&event.name) {
       None => {
         if self.buffered >= cap {
-          self.dropped = self.dropped.saturating_add(1);
+          drops.incr_saturating();
           false
         } else {
           self.events.insert(
@@ -404,7 +411,7 @@ impl UserEventCoalescer {
           // Same generation: keep both (e.g. distinct payloads at one ltime),
           // subject to the cap.
           if self.buffered >= cap {
-            self.dropped = self.dropped.saturating_add(1);
+            drops.incr_saturating();
             false
           } else {
             latest.events.push(event);
@@ -451,13 +458,6 @@ impl UserEventCoalescer {
     self.events.clear();
     self.buffered = 0;
     self.window.reset();
-  }
-
-  /// The cumulative number of user events dropped because the buffered volume
-  /// was at `cap` (see [`UserEventCoalescer::new`]).  Saturating; never cleared
-  /// by `reset`/`flush`.
-  pub(crate) fn dropped(&self) -> u64 {
-    self.dropped
   }
 
   /// The total buffered event volume (the running sum bounded by `cap`).

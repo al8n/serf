@@ -37,6 +37,7 @@ use memberlist_proto::{
 use smol_str::SmolStr;
 
 use crate::{
+  DropCounter,
   endpoint::{Endpoint, Error, QueryId, QueryParams},
   event::{Event, QueryEvent},
   members::{Member, SerfState},
@@ -71,13 +72,14 @@ use crate::event::KeyResponseArgs;
 /// `Labeled<TlsRecords>` for TLS.
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
-pub struct StreamEndpoint<I, A, RT, G = SmallRng, R = SmallRng>
+pub struct StreamEndpoint<I, A, RT, G = SmallRng, R = SmallRng, D = u64>
 where
   I: Eq + core::hash::Hash,
   RT: StreamTransport,
+  D: DropCounter,
 {
   /// The serf-logic core, holding all serf state and no transport reference.
-  core: Endpoint<I, A, R>,
+  core: Endpoint<I, A, R, D>,
   /// The memberlist reliable coordinator serf drives through the `Reliable`
   /// seam.  Holds the single membership `Endpoint`.
   transport: Coordinator<I, A, RT, G>,
@@ -85,20 +87,42 @@ where
 
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
-impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
+impl<I, A, RT, G, R, D> StreamEndpoint<I, A, RT, G, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
   RT: StreamTransport,
   R: SeedableRng,
+  D: DropCounter,
 {
   /// Construct a `StreamEndpoint` from a memberlist reliable coordinator
   /// `transport`, serf `opts`, and serf's own injected `rng`.
   ///
   /// `rng` is **separate** from the coordinator's RNG `G`; seed it from the
   /// driver's own entropy source.
-  pub fn new_with_rng(transport: Coordinator<I, A, RT, G>, opts: Options, rng: R) -> Self {
+  pub fn new_with_rng(transport: Coordinator<I, A, RT, G>, opts: Options, rng: R) -> Self
+  where
+    D: Default,
+  {
     Self {
       core: Endpoint::new_with_rng(opts, rng),
+      transport,
+    }
+  }
+
+  /// Construct a `StreamEndpoint` injecting the two coalescer shed counters, for
+  /// a driver that shares them with a detached handle.
+  ///
+  /// Forwards `user_drop` / `member_drop` into
+  /// [`Endpoint::new_with_rng_in`](crate::endpoint::Endpoint::new_with_rng_in).
+  pub fn new_with_rng_in(
+    transport: Coordinator<I, A, RT, G>,
+    opts: Options,
+    rng: R,
+    user_drop: D,
+    member_drop: D,
+  ) -> Self {
+    Self {
+      core: Endpoint::new_with_rng_in(opts, rng, user_drop, member_drop),
       transport,
     }
   }
@@ -107,7 +131,10 @@ where
   ///
   /// Suitable for tests and deterministic environments.  Production drivers
   /// should use `new_with_rng` and seed from a cryptographically-secure source.
-  pub fn new(transport: Coordinator<I, A, RT, G>, opts: Options) -> Self {
+  pub fn new(transport: Coordinator<I, A, RT, G>, opts: Options) -> Self
+  where
+    D: Default,
+  {
     Self::new_with_rng(transport, opts, R::seed_from_u64(0))
   }
 }
@@ -120,13 +147,14 @@ where
 
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
-impl<I, A, RT, G, R> StreamEndpoint<I, A, RT, G, R>
+impl<I, A, RT, G, R, D> StreamEndpoint<I, A, RT, G, R, D>
 where
   I: Id + Clone,
   A: CheapClone + Data + PartialEq + Clone + 'static,
   RT: StreamTransport,
   G: Rng,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Feed one decoded unreliable memberlist `Message<I, A>` into the
   /// coordinator, then sieve the resulting inner events into serf.
@@ -1398,7 +1426,7 @@ where
   /// Mutable access to the serf-logic core, for tests that manipulate its
   /// private state directly.
   #[cfg(test)]
-  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, A, R> {
+  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, A, R, D> {
     &mut self.core
   }
 

@@ -18,11 +18,8 @@ use smol_str::SmolStr;
 
 use crate::{
   Channel, FirstAddrResolver, Resolver, RuntimeOptions, Serf, SerfError, SocketAddrResolver,
-  TcpTransport, TcpTransportOptions, VoidDelegate,
-  command::{Command, UserEventCmd},
-  gossip_rng,
+  TcpTransport, TcpTransportOptions, VoidDelegate, gossip_rng,
 };
-use futures_channel::oneshot;
 
 /// A loopback address with a port nothing listens on — `connect()` returns
 /// `ECONNREFUSED` immediately, so its push/pull exchange fails fast. The port is
@@ -542,31 +539,6 @@ async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Se
   .expect("spawn serf node")
 }
 
-/// Build a TCP serf node with a custom `SerfOptions` and a custom `RuntimeOptions`.
-async fn spawn_node_with_serf_and_runtime(
-  id: &str,
-  serf_options: SerfOptions,
-  runtime_options: RuntimeOptions,
-) -> Serf<SmolStr> {
-  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
-  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
-    .with_local_id(SmolStr::new(id))
-    .with_advertise_addr(MaybeResolved::Resolved(bind));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-    opts,
-    &SocketAddrResolver,
-    &FirstAddrResolver,
-    VoidDelegate::<SmolStr, SocketAddr>::new(),
-    runtime_options,
-    serf_options,
-    gossip_rng().expect("seed gossip rng"),
-    #[cfg(encryption)]
-    std::rc::Rc::new(VoidKeyringDelegate),
-  )
-  .await
-  .expect("spawn serf node")
-}
-
 /// A single node with user coalescing enabled and a small buffered-volume cap sheds
 /// every distinct-named coalescing user event issued past the cap through the public
 /// `user_event` command path, and the cumulative drop count surfaces on the public
@@ -596,10 +568,9 @@ async fn tcp_coalesced_user_events_dropped_observable() {
       .expect("user event dispatched");
   }
 
-  // The pump republishes the endpoint's cumulative counter at the head of every
-  // iteration; give it a beat to run one past the final feed before reading.
-  compio::time::sleep(Duration::from_millis(200)).await;
-
+  // Each `user_event().await` returned only after the pump processed that command
+  // and incremented the shared shed cell, so the handle read is already current on
+  // the same executor thread with no publish step.
   let dropped = a.coalesced_user_events_dropped();
   a.shutdown().await.expect("coalesce-a shuts down");
 
@@ -610,209 +581,32 @@ async fn tcp_coalesced_user_events_dropped_observable() {
   );
 }
 
-/// The pump republishes the cumulative coalescer drop counters at the head of every
-/// iteration, but the drops shed in the FINAL drain — a coalescer overflow followed
-/// by `Shutdown` in the same fairness pass — increment after that iteration's publish
-/// and the loop breaks into teardown before another head publish can run. The
-/// teardown publish makes the public total exact even for drops shed on the way out;
-/// without it the handle keeps the stale lower value the last head publish left.
-///
-/// The flood is enqueued synchronously — no await between the sends — so on the
-/// single-threaded cooperative runtime the pump cannot run, and cannot publish, until
-/// the test finally parks on the shutdown reply; the whole flood and the trailing
-/// shutdown then drain in one iteration. A command-fairness budget above the flood
-/// size keeps that drain a single pass, so the shutdown never lands alone in a fresh
-/// iteration whose head publish would have captured the drops.
+/// After exactly one shed through the public `user_event` path the handle getter
+/// returns at least one. A construction typo that wired the handle's reader to a
+/// different cell than the endpoint's writer would leave this a permanent zero, so
+/// the aliasing bug fails loudly here rather than silently reporting no drops.
 #[compio::test]
-async fn coalesced_drops_are_published_on_shutdown_teardown() {
-  let cap = core::num::NonZeroUsize::new(4).unwrap();
+async fn coalesced_drop_aliasing_guard() {
+  // A cap of one: the second distinct-named coalescing event is shed.
+  let cap = core::num::NonZeroUsize::new(1).unwrap();
   let serf_opts = SerfOptions::new()
     .with_user_coalesce_period(Duration::from_secs(10))
     .with_user_quiescent_period(Duration::from_secs(2))
     .with_max_coalesced_user_events(Some(cap));
-  let runtime = RuntimeOptions::new().with_cmd_fairness_budget(64);
-  let a = spawn_node_with_serf_and_runtime("coalesce-teardown", serf_opts, runtime).await;
+  let a = spawn_node_with_serf_options("coalesce-alias", serf_opts).await;
 
-  // Enqueue distinct-named coalescing user events past the cap directly onto the
-  // command queue without awaiting each reply: the reply receivers drop immediately,
-  // so the pump's acks are discarded, but every event is still fed to the coalescer
-  // and the overflow counted. Firing them synchronously guarantees they queue ahead
-  // of the shutdown with no intervening pump publish.
-  let n: u32 = 20;
-  for i in 0..n {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("evt-{i}")),
-      Bytes::new(),
-      true,
-      tx,
-    )))
-    .expect("enqueue user event");
-  }
-
-  // Shut down with no intervening sleep: the shutdown lands in the same drain as the
-  // flood, so the coalescer sheds `n - cap` events and the pump breaks to teardown
-  // with those drops unpublished by the head-of-loop store. Awaiting completion runs
-  // the teardown publish.
-  a.shutdown().await.expect("coalesce-teardown shuts down");
-
-  assert_eq!(
-    a.coalesced_user_events_dropped(),
-    u64::from(n) - cap.get() as u64,
-    "the cumulative drop total shed in the shutdown drain is published on teardown"
-  );
-}
-
-/// A coalescer overflow shed while the node stays LIVE (no shutdown) surfaces on the
-/// public handle as soon as the burst's replies complete — the pump republishes the
-/// cumulative total immediately before it parks, so a caller resuming from the reply
-/// reads the fresh value without an extra wake. Without that pre-park store the drops
-/// would sit unpublished until the pump's next wake, which for a live node may be
-/// arbitrarily far off.
-///
-/// The coalescer is first filled to capacity with distinct names: those events are KEPT
-/// and queued for broadcast, whose immediate gossip drains before the awaited replies
-/// return, leaving the next wake deadline at the periodic gossip tick. The over-cap
-/// burst that follows carries only NEW names, so on a full coalescer every one is shed —
-/// and a shed event queues no broadcast, so the draining iteration is not made past-due
-/// and parks directly on the select rather than looping back through the head store. The
-/// pre-park store is then the ONLY thing that carries these drops to the handle before
-/// the pump sleeps. The burst is enqueued synchronously (replies dropped) so on the
-/// single-threaded cooperative runtime it queues ahead of any pump publish, and a
-/// command-fairness budget above the burst size drains it in one pass; only the final
-/// event is awaited, and its reply is sent from that same drain.
-#[compio::test]
-async fn coalesced_drops_are_visible_after_a_live_burst_without_shutdown() {
-  let cap = core::num::NonZeroUsize::new(4).unwrap();
-  let serf_opts = SerfOptions::new()
-    .with_user_coalesce_period(Duration::from_secs(10))
-    .with_user_quiescent_period(Duration::from_secs(2))
-    .with_max_coalesced_user_events(Some(cap));
-  let runtime = RuntimeOptions::new().with_cmd_fairness_budget(64);
-  let a = spawn_node_with_serf_and_runtime("coalesce-live-burst", serf_opts, runtime).await;
-
-  // Fill the coalescer to capacity (kept + broadcast); awaiting these settles the pump
-  // so the burst below no longer rides an immediate-broadcast wake.
-  let cap_n = cap.get() as u32;
-  for i in 0..cap_n {
-    a.user_event(format!("keep-{i}"), Bytes::new(), true)
-      .await
-      .expect("keep user event dispatched");
-  }
-
-  // Over-cap burst of NEW names: every one is shed (no broadcast) on the full coalescer.
-  let extra: u32 = 16;
-  for i in 0..extra - 1 {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("shed-{i}")),
-      Bytes::new(),
-      true,
-      tx,
-    )))
-    .expect("enqueue user event");
-  }
-  // Await ONLY the final event's completion; the whole burst drains and replies in the
-  // same pass, and the pump republishes the drop total before parking.
-  a.user_event(format!("shed-{}", extra - 1), Bytes::new(), true)
+  a.user_event("first".to_string(), Bytes::new(), true)
     .await
-    .expect("final user event dispatched");
-
-  // Still live (no shutdown) and no intervening sleep: the public handle already
-  // reflects the whole burst's overflow.
-  let dropped = a.coalesced_user_events_dropped();
-  a.shutdown().await.expect("coalesce-live-burst shuts down");
-
-  assert_eq!(
-    dropped,
-    u64::from(extra),
-    "the live handle reflects the burst overflow right after its replies, no extra wake \
-     (got {dropped})"
-  );
-}
-
-/// A coalescer overflow shed in the same drain the pump then SUSPENDS in — parked on
-/// the observation-channel backpressure yield INSIDE `drain_outputs`, before it ever
-/// reaches the pre-select store — is already visible on the public handle at that
-/// suspend point. `drain_outputs` republishes the cumulative drop total at its entry
-/// (it is otherwise shed-free), so a handle read that races the interior park sees
-/// every shed event, not the stale pre-burst value.
-///
-/// The burst is issued synchronously (replies dropped) so the whole of it drains in
-/// one pump pass: distinct-named COALESCING events on a full coalescer are every one
-/// shed and counted, and a few trailing NON-coalescing events emit immediately. With
-/// the observation channel at capacity 1 and the default do-nothing delegate, on the
-/// single-threaded runtime the observation task cannot drain mid-pass (it is scheduled
-/// only when the pump yields), so the second emittable event deterministically finds
-/// the slot Full and drives `drain_events` into its `yield_once` park — inside
-/// `drain_outputs`. Only the final event is awaited; its reply is sent from that same
-/// pass, so this test task resumes exactly when the pump yields on that interior park
-/// and reads the handle while the pump is still suspended in the drain.
-#[compio::test]
-async fn coalesced_drops_visible_when_the_pump_parks_inside_drain_outputs() {
-  let cap = core::num::NonZeroUsize::new(4).unwrap();
-  let serf_opts = SerfOptions::new()
-    .with_user_coalesce_period(Duration::from_secs(10))
-    .with_user_quiescent_period(Duration::from_secs(2))
-    .with_max_coalesced_user_events(Some(cap));
-  let runtime = RuntimeOptions::new()
-    .with_observation_channel(Channel::Bounded(1))
-    .with_cmd_fairness_budget(64);
-  let a = spawn_node_with_serf_and_runtime("coalesce-drain-park", serf_opts, runtime).await;
-
-  // Fill the coalescer to capacity with distinct names (kept, not shed); awaiting
-  // these settles the pump so the burst below drains in a single pass.
-  let cap_n = cap.get() as u32;
-  for i in 0..cap_n {
-    a.user_event(format!("keep-{i}"), Bytes::new(), true)
-      .await
-      .expect("keep user event dispatched");
-  }
-
-  // Synchronous burst, replies dropped. `extra` distinct-named coalescing events on a
-  // full coalescer are all shed and counted; the trailing non-coalescing events emit
-  // immediately and, on the cap-1 observation channel, drive the backpressure park
-  // inside `drain_outputs`.
-  let extra: u32 = 8;
-  for i in 0..extra {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("shed-{i}")),
-      Bytes::new(),
-      true,
-      tx,
-    )))
-    .expect("enqueue coalescing user event");
-  }
-  let emit_n: u32 = 4;
-  for i in 0..emit_n - 1 {
-    let (tx, _) = oneshot::channel();
-    a.send(Command::UserEvent(UserEventCmd::new(
-      SmolStr::new(format!("emit-{i}")),
-      Bytes::new(),
-      false,
-      tx,
-    )))
-    .expect("enqueue non-coalescing user event");
-  }
-  // Await ONLY the final non-coalescing event. Its reply is sent from the same drain
-  // pass; on single-threaded compio this test task then resumes exactly when the pump
-  // yields on the observation backpressure park inside `drain_outputs`.
-  a.user_event(format!("emit-{}", emit_n - 1), Bytes::new(), false)
+    .expect("first user event dispatched");
+  a.user_event("second".to_string(), Bytes::new(), true)
     .await
-    .expect("final non-coalescing user event dispatched");
+    .expect("second user event dispatched");
 
-  // Read at the suspend point: the drain-entry publish already carries the whole
-  // burst's overflow, though the pump has not yet reached the pre-select store.
-  let dropped = a.coalesced_user_events_dropped();
-  a.shutdown().await.expect("coalesce-drain-park shuts down");
-
-  assert_eq!(
-    dropped,
-    u64::from(extra),
-    "every shed event is published at the drain entry, visible while the pump is parked \
-     inside drain_outputs (got {dropped})"
+  assert!(
+    a.coalesced_user_events_dropped() >= 1,
+    "the handle observes the endpoint's shed; a mis-wired reader would read a permanent 0"
   );
+  a.shutdown().await.expect("coalesce-alias shuts down");
 }
 
 /// `join_many` over two seeds — one reachable (node B), one a blackhole port —

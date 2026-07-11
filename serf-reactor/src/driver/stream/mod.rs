@@ -67,6 +67,7 @@ use crate::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{ExchangeId, dispatch_event_delegate, observation_payload_bytes},
   },
+  drop_counter::ReactorDropCounter,
   error::{JoinFailed, Result, SerfError},
   shared::Shared,
 };
@@ -324,7 +325,7 @@ where
   R: Runtime,
   T: StreamTransport,
 {
-  endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+  endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   /// Unreliable gossip datagrams. `Option` so the shutdown branch can drop it
   /// (releasing the bound UDP port) BEFORE acking; `Some` for the running
   /// lifetime, taken only during teardown.
@@ -451,7 +452,7 @@ where
   /// state, the observation hand-off, and the accept task's channels/handle.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
-    endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+    endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
     socket: <R::Net as Net>::UdpSocket,
     shared: Arc<Shared<I>>,
     obs_tx: Sender<Event<I, SocketAddr>>,
@@ -1444,7 +1445,7 @@ where
   T::Options: Unpin,
   G: rand::Rng + Unpin,
   SR: rand::Rng + SeedableRng + Unpin,
-  StreamEndpoint<I, SocketAddr, T, G, SR>: Unpin,
+  StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>: Unpin,
 {
   type Output = ();
 
@@ -1549,17 +1550,6 @@ where
           break hit_disconnect;
         };
         if !drained_to_disconnect {
-          // The command drain and the shutdown drain loop above both drive the
-          // endpoint, so a coalescer drop may have been counted this poll. Publish
-          // before parking on the frozen bridges' exit so a `Serf` clone reading the
-          // handle from another worker sees the current total, not a stale pre-drain
-          // value held until the last bridge re-polls us.
-          this
-            .shared
-            .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
-          this
-            .shared
-            .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
           return Poll::Pending;
         }
         drop(this.inbound_rx.take());
@@ -1597,35 +1587,10 @@ where
         // Ignoring Ok/Err: only readiness matters — the listener is released once
         // the task has exited, regardless of how.
         if join.poll_unpin(cx).is_pending() {
-          // The endpoint was driven earlier this poll (command drain + shutdown drain
-          // loop), so publish before parking on the accept task's exit: the wait can be
-          // arbitrarily long, and a `Serf` clone reading the handle from another worker
-          // must not see a stale pre-drain total until the task finally re-polls us.
-          this
-            .shared
-            .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
-          this
-            .shared
-            .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
           return Poll::Pending;
         }
         this.accept_join = None;
       }
-      // The coalescer drop counters are cumulative; publish them a final time as the
-      // driver future completes so the drops shed in the last command drain — an
-      // overflow immediately followed by a `Shutdown` in the same pass — are not lost
-      // from the public total. This MUST precede every shutdown completion signal
-      // below (the stashed replies and the completion latch): a `shutdown().await`
-      // caller released first could resume on another worker and read the stale
-      // pre-drain total before these stores land. The normal per-poll publish below
-      // is skipped once this shutdown branch returns, so this store is the
-      // completeness backstop.
-      this
-        .shared
-        .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
-      this
-        .shared
-        .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
       // The bind address is now free. Ack the stashed replies and release any late
       // `shutdown()` caller parked on the completion latch, then stop.
       for reply in this.shutdown_reply.drain(..) {
@@ -1848,17 +1813,6 @@ where
       this.refresh_snapshot();
     }
 
-    // Republish the endpoint's coalescer drop counters for the handle: the driver
-    // owns the endpoint, so these cumulative reads are unreachable from a `Serf`
-    // clone otherwise. Monotonic, single writer, so storing the latest value once
-    // per poll is exact.
-    this
-      .shared
-      .set_coalesced_user_events_dropped(this.endpoint.coalesced_user_events_dropped());
-    this
-      .shared
-      .set_coalesced_member_events_dropped(this.endpoint.coalesced_member_events_dropped());
-
     // Yield to other tasks, but re-poll promptly while work remains.
     if more {
       cx.waker().wake_by_ref();
@@ -1873,7 +1827,7 @@ where
 /// hand-off, so a slow delegate cannot delay it), and once fully done clear the
 /// still-recorded ignore-join streams and reap the waiter.
 fn complete_join_exchange<I, T, G, SR>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, T, G, SR>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -2021,7 +1975,7 @@ async fn observation_task<I, D>(
 /// caller (`Transport::run`) awaits the returned future.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_stream_driver<I, R, T, D, G, SR>(
-  mut endpoint: StreamEndpoint<I, SocketAddr, T, G, SR>,
+  mut endpoint: StreamEndpoint<I, SocketAddr, T, G, SR, ReactorDropCounter>,
   gossip_socket: <R::Net as Net>::UdpSocket,
   listener: <R::Net as Net>::TcpListener,
   shared: Arc<Shared<I>>,

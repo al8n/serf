@@ -42,6 +42,7 @@ use crate::{
   },
   delegate::Delegate,
   driver::options::RuntimeOptions,
+  drop_counter::DropReader,
   error::{JoinFailed, Result, SerfError},
   events::EventStream,
   resolver::{AdvertiseAddrResolver, Resolver},
@@ -67,13 +68,12 @@ struct Shared<I> {
   /// at the bounded internal observation channel when the delegate dispatch
   /// loop falls behind. Monotonically increasing.
   observation_dropped: Rc<Cell<u64>>,
-  /// Shares the same `Rc` the driver pump republishes each iteration with the
-  /// endpoint's cumulative user-coalescer drop count. The driver owns the
-  /// endpoint, so a handle reads the shed count here. Monotonically increasing.
-  coalesced_user_events_dropped: Rc<Cell<u64>>,
-  /// Shares the same `Rc` the driver pump republishes with the endpoint's
-  /// cumulative member-coalescer drop count. Monotonically increasing.
-  coalesced_member_events_dropped: Rc<Cell<u64>>,
+  /// Read-only view of the endpoint's cumulative user-coalescer drop count, over
+  /// the SAME cell the endpoint's writer increments. The driver owns the
+  /// endpoint, so a handle reads the shed count here with no publish step.
+  coalesced_user_events_dropped: DropReader,
+  /// Read-only view of the endpoint's cumulative member-coalescer drop count.
+  coalesced_member_events_dropped: DropReader,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   local_id: I,
@@ -184,8 +184,11 @@ where
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
     let events_dropped = Rc::new(Cell::new(0u64));
     let observation_dropped = Rc::new(Cell::new(0u64));
-    let coalesced_user_events_dropped = Rc::new(Cell::new(0u64));
-    let coalesced_member_events_dropped = Rc::new(Cell::new(0u64));
+    // Mint the two shed counters as (writer, reader) pairs: the driver injects the
+    // writers into the endpoint, the handle keeps the readers, both over the same
+    // backing cell so no publish step exists.
+    let (user_drop_writer, user_drop_reader) = crate::drop_counter::drop_channel();
+    let (member_drop_writer, member_drop_reader) = crate::drop_counter::drop_channel();
     let shutdown_flag = Rc::new(Cell::new(false));
     let snapshot: SnapshotCell<I> = Rc::new(RefCell::new(Rc::new(initial_snapshot(
       &local_id, advertise,
@@ -196,8 +199,6 @@ where
     // always reflect the driver's live count.
     let events_dropped_handle = events_dropped.clone();
     let observation_dropped_handle = observation_dropped.clone();
-    let coalesced_user_events_dropped_handle = coalesced_user_events_dropped.clone();
-    let coalesced_member_events_dropped_handle = coalesced_member_events_dropped.clone();
     // Clone the serf options before they are moved into the driver so the
     // handle can compute `default_query_timeout` / `default_query_param`
     // without a driver round-trip.
@@ -209,8 +210,8 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
-      coalesced_user_events_dropped,
-      coalesced_member_events_dropped,
+      user_drop_writer,
+      member_drop_writer,
       snapshot.clone(),
       shutdown_flag.clone(),
       runtime_options,
@@ -229,8 +230,8 @@ where
         events_rx,
         events_dropped: events_dropped_handle,
         observation_dropped: observation_dropped_handle,
-        coalesced_user_events_dropped: coalesced_user_events_dropped_handle,
-        coalesced_member_events_dropped: coalesced_member_events_dropped_handle,
+        coalesced_user_events_dropped: user_drop_reader,
+        coalesced_member_events_dropped: member_drop_reader,
         snapshot,
         shutdown_flag,
         local_id,

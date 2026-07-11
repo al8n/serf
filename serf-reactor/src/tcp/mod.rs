@@ -378,12 +378,20 @@ where
     coord.set_encryption_options(self.encryption);
     // Serf's core RNG is seeded from its own OS-drawn entropy (`self.serf_rng`),
     // independent of the coordinator's gossip RNG.
-    let endpoint =
-      serf_proto::StreamEndpoint::<Self::Id, SocketAddr, RawRecords, G, StdRng>::new_with_rng(
-        coord,
-        runtime.serf_options,
-        self.serf_rng,
-      );
+    let endpoint = serf_proto::StreamEndpoint::<
+      Self::Id,
+      SocketAddr,
+      RawRecords,
+      G,
+      StdRng,
+      crate::drop_counter::ReactorDropCounter,
+    >::new_with_rng_in(
+      coord,
+      runtime.serf_options,
+      self.serf_rng,
+      runtime.user_drop,
+      runtime.member_drop,
+    );
 
     let driver = crate::driver::stream::spawn_stream_driver::<Self::Id, R, RawRecords, D, G, StdRng>(
       endpoint,

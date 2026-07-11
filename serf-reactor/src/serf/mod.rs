@@ -182,7 +182,16 @@ where
 
     let (events_tx, events_rx) =
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
-    let shared = Arc::new(Shared::new(initial_snapshot(&local_id, advertise)));
+    // Mint the two shed counters as (writer, reader) pairs: the driver injects the
+    // writers into the endpoint, the handle reads the readers, both over the same
+    // backing atomic so no publish step exists.
+    let (user_drop_writer, user_drop_reader) = crate::drop_counter::drop_channel();
+    let (member_drop_writer, member_drop_reader) = crate::drop_counter::drop_channel();
+    let shared = Arc::new(Shared::new(
+      initial_snapshot(&local_id, advertise),
+      user_drop_reader,
+      member_drop_reader,
+    ));
 
     let runtime = TransportRuntime::<I, D>::new(
       delegate,
@@ -190,6 +199,8 @@ where
       events_tx,
       runtime_options,
       serf_options,
+      user_drop_writer,
+      member_drop_writer,
       #[cfg(encryption)]
       keyring,
     );

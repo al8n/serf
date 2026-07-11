@@ -14,20 +14,10 @@
 //! gossip socket are explicitly closed (awaited) when the loop exits so the
 //! bound ports are released before shutdown returns.
 //!
-//! ## Coalescer drop-counter publishing
-//!
-//! The pump owns the endpoint, so a `Serf` handle observes the cumulative
-//! coalescer drop counts only through the two cells this pump republishes.
-//! `drain_outputs` is the funnel for every genuinely-yielding await in the
-//! mutating region — a `send_to`, a `yield_once`, a leave `resolve_all` — so it
-//! republishes both counters at entry. It MUST stay shed-free: a coalescer drop is
-//! shed on the input side (a command or a timeout), never inside a drain, so the
-//! entry publish holds across every interior await. Any shedding call added inside
-//! it must republish after that shed and before the next await. The pre-select
-//! store covers the main select park. `fire_timeout_with_drain` has no genuinely-
-//! yielding await (its `drain_past_due_udp` poll never returns `Pending`), so its
-//! sheds surface at the following `drain_outputs`; giving it one would require
-//! threading the publisher through it too.
+//! The endpoint holds a write-capable [`CompioDropCounter`] over the same
+//! `Rc<Cell<u64>>` a `Serf` handle reads through its read-only counterpart, so
+//! the cumulative coalescer drop counts are observed directly with no publish
+//! step — a shed on the pump is visible on the next handle read.
 
 use std::{
   cell::Cell,
@@ -81,6 +71,7 @@ use crate::{
       observation_payload_bytes, yield_once,
     },
   },
+  drop_counter::CompioDropCounter,
   error::{JoinFailed, Result, SerfError},
   snapshot::{SerfSnapshot, SnapshotCell},
 };
@@ -179,7 +170,7 @@ impl PendingJoin {
 /// `(eid, peer, succeeded)` rather than the `Event` so it is callable without
 /// constructing a coordinator-internal `ExchangeCompleted`.
 fn complete_join_exchange<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   eid: ExchangeId,
   peer: SocketAddr,
@@ -401,7 +392,9 @@ const ENCRYPTED_WRAPPER_OVERHEAD: usize = 0;
 /// clamped at [`GOSSIP_RECV_BUF_MAX`]. Sizing to the inflated value keeps a
 /// configured `gossip_mtu` close to the historical default from being truncated
 /// once the encryption tag/nonce are added on the wire.
-fn gossip_recv_buf_len<I, RT, G, R>(endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R>) -> usize
+fn gossip_recv_buf_len<I, RT, G, R>(
+  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
+) -> usize
 where
   I: memberlist_proto::Id + Clone,
   RT: StreamTransport,
@@ -414,28 +407,6 @@ where
     .min(GOSSIP_RECV_BUF_MAX)
 }
 
-/// Copies the endpoint's cumulative coalescer drop counters into the handle-shared
-/// cells. The publish is an idempotent whole-value SET of a monotone source, so
-/// calling it at any number of sites never double-counts or regresses.
-struct CoalesceDropPublisher {
-  user: Rc<Cell<u64>>,
-  member: Rc<Cell<u64>>,
-}
-
-impl CoalesceDropPublisher {
-  #[inline]
-  fn publish<I, RT, G, R>(&self, endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R>)
-  where
-    I: memberlist_proto::Id + Clone,
-    RT: StreamTransport,
-    G: rand::Rng,
-    R: rand::Rng + SeedableRng,
-  {
-    self.user.set(endpoint.coalesced_user_events_dropped());
-    self.member.set(endpoint.coalesced_member_events_dropped());
-  }
-}
-
 /// Single-owner pump task.
 ///
 /// Drives the serf `StreamEndpoint` until the command channel closes (all
@@ -443,17 +414,13 @@ impl CoalesceDropPublisher {
 /// endpoint happen here; reads happen via the published [`SerfSnapshot`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
-  mut endpoint: StreamEndpoint<I, SocketAddr, RT, G, R>,
+  mut endpoint: StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   gossip_socket: UdpSocket,
   listener: TcpListener,
   commands: Receiver<Command<I, SocketAddr>>,
   events_tx: Sender<Event<I, SocketAddr>>,
   events_dropped: Rc<Cell<u64>>,
   observation_dropped: Rc<Cell<u64>>,
-  // Republished each loop iteration with the endpoint's cumulative coalescer drop
-  // counts so a `Serf` handle can observe them while the endpoint stays owned here.
-  coalesced_user_events_dropped: Rc<Cell<u64>>,
-  coalesced_member_events_dropped: Rc<Cell<u64>>,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   driver_opts: RuntimeOptions,
@@ -528,14 +495,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
   // and anti-entropy never run.
   endpoint.start_scheduling(Instant::now());
   refresh_snapshot::<I, RT, G, R>(&endpoint, &snapshot);
-
-  // Bundle the two handle-shared coalescer drop cells so `drain_outputs` can
-  // republish them at its entry — the single funnel for every genuinely-yielding
-  // await in the mutating region.
-  let coalesce_publisher = CoalesceDropPublisher {
-    user: coalesced_user_events_dropped.clone(),
-    member: coalesced_member_events_dropped.clone(),
-  };
 
   // Hoist the listener-accept future ACROSS loop iterations. On a
   // completion-based backend (io_uring) `accept()` is an in-flight SQE;
@@ -669,7 +628,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
-        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -738,7 +696,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
-        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -772,7 +729,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &observation_dropped,
         &obs_payload_bytes,
         obs_payload_budget,
-        &coalesce_publisher,
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
@@ -796,25 +752,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       let ready_fut = bridge_ready_rx.recv_async().fuse();
       let timer_fut = compio::time::sleep_until(timeout_deadline.into_std()).fuse();
       pin_mut!(recv_fut, cmd_fut, ready_fut, timer_fut);
-
-      // Republish the coalescer drop counters immediately before the pump parks on the
-      // select. A command burst drained earlier this iteration can shed events and
-      // complete its reply, so a caller resuming from that reply must observe the fresh
-      // cumulative total rather than the stale value the head-of-loop store left before
-      // the drain. This park is not reached by looping through the head store, and for
-      // a live (non-shutdown) node the next wake may be arbitrarily far off, so without
-      // this store the drops would stay invisible until then.
-      coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
-      coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
-
-      // The pre-select store above is the last write before this park, so the cell
-      // must equal the live counter here; a future edit that lets a shed slip in
-      // between the store and the park trips this in debug builds.
-      debug_assert_eq!(
-        coalesced_user_events_dropped.get(),
-        endpoint.coalesced_user_events_dropped(),
-        "pre-select coalescer publish must match the endpoint before the pump parks"
-      );
 
       // Arm priority (top → bottom):
       //   1. recv     — kernel-buffered UDP gossip (an Ack resolves a probe
@@ -942,7 +879,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       &observation_dropped,
       &obs_payload_bytes,
       obs_payload_budget,
-      &coalesce_publisher,
       &mut pending,
       #[cfg(encryption)]
       &*keyring,
@@ -962,15 +898,6 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       break;
     }
   }
-
-  // The coalescer drop counters are cumulative; publish them once more on teardown
-  // so the drops shed in the final drain — an overflow immediately followed by a
-  // `Shutdown` in the same fairness pass — are not lost from the public total. The
-  // head-of-loop publish keeps the live value fresh each iteration, but the last
-  // drain breaks straight into teardown before another iteration can republish it,
-  // so this final store is the completeness backstop.
-  coalesced_user_events_dropped.set(endpoint.coalesced_user_events_dropped());
-  coalesced_member_events_dropped.set(endpoint.coalesced_member_events_dropped());
 
   // Cleanup. Order: flip the shutdown flag so a racing clone observes it on
   // entry, drain queued commands with Err(Shutdown), drop the command receiver
@@ -1074,7 +1001,7 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
 /// the post-loop cleanup.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_command<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1347,7 +1274,7 @@ async fn dispatch_command<I, RT, G, R>(
 
 /// Route one bridge inbound message into the coordinator.
 fn dispatch_bridge_inbound<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   inbound: BridgeInbound,
 ) where
   I: memberlist_proto::Id + Clone,
@@ -1393,7 +1320,7 @@ fn dispatch_bridge_inbound<I, RT, G, R>(
 /// compound datagram is split into its ordered messages by `parse_messages`,
 /// each fed as a typed message.
 fn dispatch_gossip<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   src: SocketAddr,
   datagram: &[u8],
   now: Instant,
@@ -1536,7 +1463,7 @@ fn process_one_action(
 /// Drain every [`StreamAction`] the coordinator has queued. Returns `true` iff
 /// any action was processed.
 fn drain_actions<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1560,7 +1487,7 @@ where
 /// past a pending `Shutdown` / `Close` — the coordinator withholds the teardown
 /// for an exchange until its `poll_transport_transmit` queue is empty.
 fn drain_transport_transmits<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &HashMap<ExchangeId, BridgeHandle>,
 ) -> bool
 where
@@ -1589,7 +1516,7 @@ where
 /// `encode_outgoing_compound`), then — with an encryption backend built in —
 /// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
 async fn drain_transmits<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: Option<Bytes>,
 ) -> bool
@@ -1655,7 +1582,7 @@ where
 /// read-only `list` or a refused op leaves the wire untouched.
 #[cfg(encryption)]
 fn apply_key_request_live<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   delegate: &dyn KeyringDelegate,
   req: &KeyRequest<I, SocketAddr>,
 ) -> KeyResponseArgs
@@ -1692,7 +1619,7 @@ where
 /// event is still delivered to subscribers before the main loop breaks.
 #[allow(clippy::too_many_arguments)]
 async fn drain_events<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
   observation_dropped: &Cell<u64>,
   obs_payload_bytes: &Cell<u64>,
@@ -1801,7 +1728,7 @@ where
 /// break into teardown.
 #[allow(clippy::too_many_arguments)]
 async fn drain_outputs<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_ready_tx: &Sender<BridgeReady>,
   stream_opts: StreamTransportOptions,
@@ -1811,7 +1738,6 @@ async fn drain_outputs<I, RT, G, R>(
   observation_dropped: &Cell<u64>,
   obs_payload_bytes: &Cell<u64>,
   obs_payload_budget: Option<u64>,
-  coalesce_publisher: &CoalesceDropPublisher,
   pending: &mut PendingCommands,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
 ) -> bool
@@ -1822,24 +1748,11 @@ where
   R: rand::Rng + SeedableRng,
 {
   let mut terminal = false;
-  // Republish the coalescer drop counters at entry. Every drop is shed on the input
-  // side before this drain runs, and this drain is shed-free, so this single SET
-  // holds across every interior await (`send_to`, `yield_once`, a leave
-  // `resolve_all`) — a handle that resumes while the pump is parked mid-drain reads
-  // the post-burst total, not a stale pre-burst one.
-  coalesce_publisher.publish(endpoint);
   loop {
     let did_actions = drain_actions::<I, RT, G, R>(endpoint, bridges, bridge_ready_tx, stream_opts);
     let did_transports = drain_transport_transmits::<I, RT, G, R>(endpoint, bridges);
     let did_transmits =
       drain_transmits::<I, RT, G, R>(endpoint, gossip_socket, label.clone()).await;
-    // This drain must stay shed-free, so the entry publish still matches the live
-    // counter here; a shedding call added inside this loop trips this in debug builds.
-    debug_assert_eq!(
-      coalesce_publisher.user.get(),
-      endpoint.coalesced_user_events_dropped(),
-      "drain_outputs must not shed coalescer drops between its entry publish and drain_events"
-    );
     let did_events = drain_events::<I, RT, G, R>(
       endpoint,
       obs_tx,
@@ -1916,7 +1829,7 @@ async fn observation_task<I, D>(
 /// consumed is absent, so the clear removes only the streams whose exchange did
 /// not merge. `swap_remove` is sound because `joins` has no ordering.
 async fn reap_pending_joins<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   pending_joins: &mut Vec<PendingJoin>,
   now: Instant,
 ) where
@@ -1992,7 +1905,7 @@ fn min_pending_leave_deadline(pending_leave: &Option<PendingLeave>) -> Option<In
 /// is the sole builder of recv SQEs here.
 #[allow(clippy::too_many_arguments)]
 async fn fire_timeout_with_drain<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   bridge_inbound_rx: &mut mpsc::Receiver<BridgeInbound>,
@@ -2082,7 +1995,7 @@ where
 /// snapshot — seeded at construction — stays current, and `SerfSnapshot::new`
 /// (which requires the local node) is never called with it absent.
 fn refresh_snapshot<I, RT, G, R>(
-  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   snapshot: &SnapshotCell<I>,
 ) where
   I: memberlist_proto::Id + Clone,
@@ -2109,7 +2022,7 @@ fn refresh_snapshot<I, RT, G, R>(
 /// Route one [`BridgeReady`] — an outbound-dial result — into the coordinator,
 /// spawning a per-bridge byte-mover on success.
 fn handle_bridge_ready<I, RT, G, R>(
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   ready: BridgeReady,
@@ -2162,7 +2075,7 @@ fn handle_bridge_ready<I, RT, G, R>(
 /// processed (a state-affecting event the caller treats as dirty).
 fn handle_accepted<I, RT, G, R>(
   accepted: io::Result<(TcpStream, SocketAddr)>,
-  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R>,
+  endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   bridges: &mut HashMap<ExchangeId, BridgeHandle>,
   bridge_inbound_tx: &mpsc::Sender<BridgeInbound>,
   stream_opts: StreamTransportOptions,

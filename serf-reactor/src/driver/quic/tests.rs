@@ -245,12 +245,24 @@ mod gate {
     let quic_max_udp_payload = quic_config.endpoint_ref().get_max_udp_payload_size();
     let inner = Endpoint::new(inner_opts, StdRng::seed_from_u64(0));
     let coord = Coordinator::new(inner, quic_config);
-    let endpoint = QuicEndpoint::<SmolStr, StdRng, StdRng>::new_with_rng(
+    // These pump tests do not assert coalescer shed counts, so the write halves
+    // suffice for the endpoint; the read halves are unused here.
+    let (user_drop, _) = crate::drop_counter::drop_channel();
+    let (member_drop, _) = crate::drop_counter::drop_channel();
+    let endpoint = QuicEndpoint::<SmolStr, StdRng, StdRng, ReactorDropCounter>::new_with_rng_in(
       coord,
       SerfOptions::new(),
       StdRng::seed_from_u64(1),
+      user_drop,
+      member_drop,
     );
-    let shared = Arc::new(Shared::new(initial_snapshot("drv", advertise)));
+    let (_, user_drop_reader) = crate::drop_counter::drop_channel();
+    let (_, member_drop_reader) = crate::drop_counter::drop_channel();
+    let shared = Arc::new(Shared::new(
+      initial_snapshot("drv", advertise),
+      user_drop_reader,
+      member_drop_reader,
+    ));
     let obs_payload_bytes = Arc::new(AtomicU64::new(0));
     let (obs_tx, obs_rx) = flume::unbounded();
     let driver = QuicDriver::<SmolStr, TokioRuntime, StdRng, StdRng>::new(

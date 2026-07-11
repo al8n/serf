@@ -41,6 +41,7 @@ use memberlist_proto::{
 use smol_str::SmolStr;
 
 use crate::{
+  DropCounter,
   endpoint::{Endpoint, Error, QueryId, QueryParams},
   event::{Event, QueryEvent},
   members::{Member, SerfState},
@@ -74,12 +75,13 @@ use crate::event::KeyResponseArgs;
 /// type to `SocketAddr` too.
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-pub struct QuicEndpoint<I, G = SmallRng, R = SmallRng>
+pub struct QuicEndpoint<I, G = SmallRng, R = SmallRng, D = u64>
 where
   I: Eq + core::hash::Hash,
+  D: DropCounter,
 {
   /// The serf-logic core, holding all serf state and no transport reference.
-  core: Endpoint<I, SocketAddr, R>,
+  core: Endpoint<I, SocketAddr, R, D>,
   /// The memberlist QUIC coordinator serf drives through the `Reliable` seam.
   /// Holds the single membership `Endpoint` and the quinn endpoint.
   transport: Coordinator<I, G>,
@@ -87,19 +89,41 @@ where
 
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Clone + Eq + core::hash::Hash,
   R: SeedableRng,
+  D: DropCounter,
 {
   /// Construct a `QuicEndpoint` from a memberlist QUIC coordinator `transport`,
   /// serf `opts`, and serf's own injected `rng`.
   ///
   /// `rng` is **separate** from the coordinator's RNG `G`; seed it from the
   /// driver's own entropy source.
-  pub fn new_with_rng(transport: Coordinator<I, G>, opts: Options, rng: R) -> Self {
+  pub fn new_with_rng(transport: Coordinator<I, G>, opts: Options, rng: R) -> Self
+  where
+    D: Default,
+  {
     Self {
       core: Endpoint::new_with_rng(opts, rng),
+      transport,
+    }
+  }
+
+  /// Construct a `QuicEndpoint` injecting the two coalescer shed counters, for a
+  /// driver that shares them with a detached handle.
+  ///
+  /// Forwards `user_drop` / `member_drop` into
+  /// [`Endpoint::new_with_rng_in`](crate::endpoint::Endpoint::new_with_rng_in).
+  pub fn new_with_rng_in(
+    transport: Coordinator<I, G>,
+    opts: Options,
+    rng: R,
+    user_drop: D,
+    member_drop: D,
+  ) -> Self {
+    Self {
+      core: Endpoint::new_with_rng_in(opts, rng, user_drop, member_drop),
       transport,
     }
   }
@@ -108,7 +132,10 @@ where
   ///
   /// Suitable for tests and deterministic environments.  Production drivers
   /// should use `new_with_rng` and seed from a cryptographically-secure source.
-  pub fn new(transport: Coordinator<I, G>, opts: Options) -> Self {
+  pub fn new(transport: Coordinator<I, G>, opts: Options) -> Self
+  where
+    D: Default,
+  {
     Self::new_with_rng(transport, opts, R::seed_from_u64(0))
   }
 }
@@ -123,11 +150,12 @@ where
 
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Id + Clone,
   G: Rng,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Feed one inbound UDP datagram from `from` into the coordinator.
   ///
@@ -729,11 +757,12 @@ where
 
 #[cfg(all(test, feature = "quic"))]
 #[allow(dead_code)]
-impl<I, G, R> QuicEndpoint<I, G, R>
+impl<I, G, R, D> QuicEndpoint<I, G, R, D>
 where
   I: Id + Clone,
   G: Rng,
   R: Rng + SeedableRng,
+  D: DropCounter,
 {
   /// Forwards to [`Endpoint::handle_node_join_intent`].
   pub(crate) fn handle_node_join_intent(&mut self, ltime: LamportTime, id: &I, now: Instant) -> bool
@@ -1290,7 +1319,7 @@ where
 
   /// Mutable access to the serf-logic core, for tests that manipulate its
   /// private state directly.
-  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, SocketAddr, R> {
+  pub(crate) fn core_mut(&mut self) -> &mut Endpoint<I, SocketAddr, R, D> {
     &mut self.core
   }
 
