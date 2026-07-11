@@ -179,3 +179,32 @@ fn recent_intent_kind_mismatch_returns_none() {
     Some(LamportTime::new(3))
   );
 }
+
+/// Mirrors Go serf `test_remove_old_member`
+/// (legacy/serf-core/src/serf/base/tests/serf/remove.rs): removing a named node
+/// from a reaper index list drops only that entry and retains the others.
+///
+/// The legacy helper retained `MemberState`s by node id; the Sans-I/O machine
+/// tracks the index lists as plain id `Vec`s, so this asserts the same invariant
+/// against the id-list form used by `handle_node_join` reconcile and
+/// `prune_member`.
+#[test]
+fn remove_old_member_drops_only_the_named_id() {
+  use smol_str::SmolStr;
+
+  let mut old: Vec<SmolStr> = vec!["foo".into(), "bar".into(), "baz".into()];
+  remove_old_member(&mut old, &SmolStr::from("bar"));
+  assert_eq!(old.len(), 2);
+  assert!(
+    !old.contains(&SmolStr::from("bar")),
+    "named id must be removed"
+  );
+  assert!(
+    old.contains(&SmolStr::from("foo")),
+    "other ids must be retained"
+  );
+  assert!(
+    old.contains(&SmolStr::from("baz")),
+    "other ids must be retained"
+  );
+}

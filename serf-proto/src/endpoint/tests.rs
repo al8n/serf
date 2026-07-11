@@ -60,6 +60,22 @@ fn ep() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
   e
 }
 
+/// Build a serf `Endpoint` with caller-supplied [`Options`], for tests that
+/// need non-default queue-depth / size-limit configuration.  Otherwise
+/// identical to [`ep`] (deterministic RNG seed, construction self-join drained).
+fn ep_with_options(opts: Options) -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
+  let inner_opts = EndpointOptions::new(1u32, "127.0.0.1:7946".parse().unwrap())
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap());
+  let inner = memberlist_proto::Endpoint::new_at(
+    inner_opts,
+    memberlist_proto::Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  );
+  let mut e = StreamEndpoint::new(coord(inner), opts);
+  let _ = e.poll_event();
+  e
+}
+
 /// Build a serf `Endpoint` with coordinates enabled (for coordinate-gated tests).
 #[cfg(feature = "coordinates")]
 fn ep_with_coords() -> StreamEndpoint<u32, core::net::SocketAddr, RawRecords> {
@@ -6727,6 +6743,49 @@ mod key_request_responder {
       "Key field in Debug must show redacted: {debug_str}"
     );
   }
+
+  /// Mirrors the size-bound invariant behind Go serf's key-list response sizing
+  /// (`estimate_max_keys_in_list_key_response_factor`,
+  /// legacy/serf-core/src/serf/base/tests.rs): a key response is bounded by
+  /// `query_response_size_limit`.
+  ///
+  /// The legacy `key_list_response_with_correct_size` helper TRUNCATED the key
+  /// list to fit and set a "truncated" message.  The Sans-I/O machine builds no
+  /// response itself — response construction (and any truncation) is a driver
+  /// concern — so `respond_key` instead REJECTS an over-limit key response via the
+  /// shared `respond_inner` size guard, returning `RespondTooLarge`.
+  #[test]
+  fn respond_key_oversized_key_list_is_rejected() {
+    let mut e = ep();
+    let key = test_key();
+    let q = make_key_query("_serf_list_keys", None);
+    e.test_handle_query(q);
+    let req = match e.poll_event().expect("must emit KeyRequest") {
+      Event::KeyRequest(kr) => kr,
+      other => panic!(
+        "expected KeyRequest, got {:?}",
+        core::mem::discriminant(&other)
+      ),
+    };
+    // A key list far larger than the default query_response_size_limit (1024).
+    let keys = vec![key; 512];
+    let err = e
+      .respond_key(
+        &req,
+        KeyResponseArgs {
+          result: true,
+          message: smol_str::SmolStr::default(),
+          keys,
+          primary_key: Some(key),
+        },
+        memberlist_proto::Instant::ORIGIN,
+      )
+      .expect_err("an over-limit key response must be rejected, not truncated");
+    assert!(
+      matches!(err, Error::RespondTooLarge(_, _)),
+      "oversized key response must return RespondTooLarge, got {err:?}"
+    );
+  }
 }
 
 // ── Lamport watermark boundary: integrity floor ───────────────────────────────
@@ -8336,5 +8395,200 @@ fn user_coalescing_flood_through_endpoint_bounds_burst_and_counts_drops() {
   assert_eq!(
     e.coalesced_user_events_dropped(),
     (n as u64) - cap.get() as u64
+  );
+}
+
+// ── legacy Go-parity ports (bucket-A/bucket-B) ────────────────────────────────
+
+/// Mirrors Go serf `serf_get_queue_max`
+/// (legacy/serf/test/main/net/get_queue_max.rs → serf_core::tests::serf_get_queue_max):
+/// the broadcast queue depth cap is the flat `max_queue_depth` when
+/// `min_queue_depth == 0`; otherwise `max(min_queue_depth, 2 * num_members)`, so
+/// the member-count branch takes precedence once `2 * num_members` exceeds the
+/// configured floor.  Asserted against the machine's own `queue_max()` and its
+/// default constants, not the legacy runtime's fixed 4096/1024/200/202.
+#[test]
+fn queue_max_respects_min_queue_depth_and_member_count() {
+  // min_queue_depth == 0: the flat max_queue_depth applies regardless of members.
+  let mut e = ep();
+  for id in 2u32..=101 {
+    e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(0));
+  }
+  assert_eq!(
+    e.test_queue_max(),
+    Options::new().max_queue_depth(),
+    "min_queue_depth == 0 must use the flat max_queue_depth"
+  );
+
+  // A min_queue_depth above 2 * num_members wins over the member-count branch
+  // (with ~101 members, 2 * 101 = 202 < 1024).
+  let mut e = ep_with_options(Options::new().with_min_queue_depth(1024));
+  for id in 2u32..=101 {
+    e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(0));
+  }
+  assert_eq!(
+    e.test_queue_max(),
+    1024,
+    "min_queue_depth must win when it exceeds 2 * num_members"
+  );
+
+  // A small min_queue_depth is overridden by the 2 * num_members branch.
+  let mut e = ep_with_options(Options::new().with_min_queue_depth(16));
+  for id in 2u32..=101 {
+    e.test_seed_member(id, MemberStatus::Alive, LamportTime::new(0));
+  }
+  let n = e.num_members();
+  assert_eq!(
+    e.test_queue_max(),
+    2 * n,
+    "2 * num_members must win when it exceeds min_queue_depth"
+  );
+
+  // Adjusting the node count scales the member-count branch by exactly 2.
+  e.test_seed_member(1000u32, MemberStatus::Alive, LamportTime::new(0));
+  assert_eq!(
+    e.test_queue_max(),
+    2 * (n + 1),
+    "the member-count branch must track num_members"
+  );
+}
+
+/// Mirrors Go serf `queries_conflict_same_name`
+/// (legacy/serf-core/src/serf/base/tests.rs): an internal `_serf_conflict` query
+/// is handled autonomously and must NOT surface to the app as `Event::Query`.
+///
+/// The legacy `SerfQueries` event filter intercepted `InternalQueryEvent::Conflict`
+/// before the app channel; the Sans-I/O machine intercepts `_serf_conflict` in
+/// `handle_query` (it responds via `handle_conflict_query` and returns without
+/// pushing `Event::Query`).
+#[test]
+fn conflict_query_never_surfaces_as_app_query() {
+  let mut e = ep();
+  // A well-formed conflict query: payload is an exactly-encoded node id.
+  let id_bytes = (42u32).encode_to_bytes().unwrap();
+  let q = QueryMessage {
+    ltime: LamportTime::new(3),
+    id: 77,
+    from: memberlist_proto::Node::new(99u32, "127.0.0.1:9999".parse().unwrap()),
+    filters: vec![],
+    flags: QueryFlag::empty(),
+    relay_factor: 0,
+    timeout: core::time::Duration::from_secs(5),
+    name: "_serf_conflict".into(),
+    payload: Bytes::from(id_bytes.to_vec()),
+  };
+  e.test_handle_query(q);
+  assert!(
+    e.poll_event().is_none(),
+    "internal _serf_conflict query must never surface as Event::Query"
+  );
+}
+
+/// Mirrors Go serf `delegate_nodemeta` + `delegate_nodemeta_panic`
+/// (legacy/serf-core/src/serf/base/tests/serf/delegate.rs): tags round-trip
+/// through the node-meta byte encoding, and tags that exceed the meta size limit
+/// are rejected.
+///
+/// Adaptation: the legacy `delegate_nodemeta_panic` asserted a PANIC when the
+/// encoded tags exceed the memberlist meta limit.  The Sans-I/O `set_tags`
+/// deliberately returns `Error::SetTagsMeta` instead of panicking (see its doc
+/// comment: "Surface this as `SetTagsMeta` rather than panicking so the driver
+/// can log and retry").  The invariant — over-limit tags are rejected — is
+/// preserved with the machine's own limit (`Meta::MAX_SIZE`) and rejection
+/// mechanism.
+#[test]
+fn set_tags_meta_round_trips_and_rejects_oversize() {
+  use crate::typed::Tags;
+
+  let mut e = ep();
+
+  // Round-trip: a single `role=test` tag encodes into node meta and decodes back.
+  let tags: Tags = [("role", "test")].into_iter().collect();
+  e.set_tags(tags, memberlist_proto::Instant::ORIGIN)
+    .expect("set_tags must succeed on a live endpoint");
+  let meta = e
+    .test_local_meta()
+    .expect("local node meta must be present after set_tags");
+  let decoded = decode_tags_from_meta(meta.as_bytes())
+    .expect("meta written by set_tags must decode as valid Tags");
+  assert_eq!(
+    decoded.0.get("role").map(|s| s.as_str()),
+    Some("test"),
+    "role tag must round-trip through the node-meta byte encoding"
+  );
+
+  // Oversize: tags whose encoding exceeds the meta cap are rejected (not panicked).
+  let huge = "x".repeat(70_000);
+  let oversize: Tags = [("big", huge.as_str())].into_iter().collect();
+  let err = e
+    .set_tags(oversize, memberlist_proto::Instant::ORIGIN)
+    .expect_err("tags exceeding the meta size limit must be rejected");
+  assert!(
+    matches!(err, Error::SetTagsMeta(_)),
+    "oversize tags must return SetTagsMeta, got {err:?}"
+  );
+}
+
+/// Mirrors Go serf `serf_query_size_limit_increased`
+/// (legacy/serf-core/src/serf/base/tests/serf/event.rs): raising `query_size_limit`
+/// admits a query that the default limit rejects.  The companion
+/// `query_size_limit_is_enforced` shows a ~1500-byte query is rejected at the
+/// default limit (1024); here the same query succeeds once the limit is doubled.
+#[test]
+fn raised_query_size_limit_admits_larger_query() {
+  let default_limit = Options::new().query_size_limit();
+  let mut e = ep_with_options(Options::new().with_query_size_limit(default_limit * 2));
+  // A payload that exceeds the default limit but fits within the doubled limit.
+  let payload = bytes::Bytes::from(vec![0u8; 1500]);
+  let result = e.query(
+    "this is too large a query",
+    payload,
+    QueryParams::default(),
+    memberlist_proto::Instant::ORIGIN,
+  );
+  assert!(
+    result.is_ok(),
+    "a query rejected at the default limit must succeed once the limit is doubled: {result:?}"
+  );
+}
+
+/// Mirrors Go serf `default_query`
+/// (legacy/serf-core/src/serf/base/tests/serf/event.rs): the default query
+/// parameters carry no filters, request no ack, and use no relay.
+///
+/// The legacy test also asserts `timeout == gossip_interval * query_timeout_mult`.
+/// That value is a DRIVER concern in the Sans-I/O split: the machine cannot read
+/// the inner gossip_interval, so `query()` substitutes a placeholder base when the
+/// timeout is the zero sentinel (see endpoint/mod.rs).  The gossip-derived timeout
+/// is covered by the reactor driver test `tcp_default_query_param_defaults`.  This
+/// asserts the machine-level default params, including the zero-timeout sentinel
+/// that triggers the substitution.
+#[test]
+fn default_query_params_are_empty_no_ack_no_relay() {
+  let params = QueryParams::<u32>::default();
+  assert!(params.filters.is_empty(), "default filters must be empty");
+  assert!(!params.request_ack, "default must not request an ack");
+  assert_eq!(params.relay_factor, 0, "default relay_factor must be zero");
+  assert!(
+    params.timeout.is_zero(),
+    "default timeout must be the zero sentinel (the machine computes the effective value)"
+  );
+}
+
+/// Mirrors Go serf `serf_remove_failed_node_ourself`
+/// (legacy/serf-core/src/serf/base/tests/serf/remove.rs): removing a node that is
+/// not a member is a safe no-op — it returns Ok and does not fabricate a member.
+///
+/// `remove_failed_node` maps to `force_leave(id, prune = false)` in the machine.
+#[test]
+fn force_leave_of_absent_node_is_ok_and_adds_no_member() {
+  let mut e = ep();
+  let before = e.num_members();
+  e.force_leave(999u32, false, memberlist_proto::Instant::ORIGIN)
+    .expect("force_leave of an absent node must be a safe no-op");
+  assert_eq!(
+    e.num_members(),
+    before,
+    "force_leave of an absent node must not fabricate a member"
   );
 }

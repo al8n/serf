@@ -413,5 +413,19 @@ where
   }
 }
 
+/// Removes a node `id` from a reaper index list (`left_members` /
+/// `failed_members`), retaining every other entry.
+///
+/// Mirrors Go serf `base.rs` `remove_old_member`.  The legacy helper retained
+/// `MemberState`s by node id out of an `OneOrMore<MemberState>`; the Sans-I/O
+/// machine tracks the reaper index lists as plain id `Vec`s (the full state
+/// lives in `Members::states`), so this retains ids directly.
+pub(crate) fn remove_old_member<I>(old: &mut Vec<I>, id: &I)
+where
+  I: Eq,
+{
+  old.retain(|i| i != id);
+}
+
 #[cfg(test)]
 mod tests;

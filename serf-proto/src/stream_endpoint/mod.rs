@@ -749,6 +749,12 @@ where
     self.core.test_member_status(id)
   }
 
+  /// Forwards to [`Endpoint::test_queue_max`].
+  #[cfg(test)]
+  pub(crate) fn test_queue_max(&self) -> usize {
+    self.core.test_queue_max()
+  }
+
   /// Forwards to [`Endpoint::test_member_status_time`].
   #[cfg(test)]
   pub(crate) fn test_member_status_time(&self, id: I) -> Option<LamportTime>
