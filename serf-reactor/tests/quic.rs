@@ -29,7 +29,11 @@ use rustls::{
   version::TLS13,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use serf_proto::{event::Event, members::SerfState, options::Options as SerfOptions};
+use serf_proto::{
+  event::{Event, MemberEventKind},
+  members::SerfState,
+  options::Options as SerfOptions,
+};
 #[cfg(encryption)]
 use serf_reactor::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
 use serf_reactor::{
@@ -437,6 +441,59 @@ where
   b.shutdown().await.expect("lv-b shuts down");
 }
 
+/// Peer-visible graceful departure in `Datagram` mode with a shutdown racing the
+/// leave: B's farewell must reach A even though B tears down immediately — the
+/// leave fan-out rides plain UDP with socket-handoff retention rather than
+/// quinn's congestion-gated datagram queue, so neither the racing teardown nor
+/// the QUIC datagram plane can silently discard it. A must classify B's
+/// departure as a Leave (never a Failed) and B's `leave().await` must resolve
+/// `Ok`.
+async fn leave_with_racing_shutdown_reaches_peer_as_leave<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("race-b").await;
+  let a = spawn_node::<R>("race-a").await;
+  let b_addr = b.advertise_address();
+
+  let mut a_events = a.events();
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over QUIC");
+  converge(&a, &b).await;
+
+  let (leave, shutdown) = future::join(b.leave(), b.shutdown()).await;
+  leave.expect("B leaves gracefully despite the racing shutdown");
+  shutdown.expect("B shuts down");
+
+  let kind = R::timeout(Duration::from_secs(30), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::Member(me))
+          if me
+            .members()
+            .iter()
+            .any(|m| m.node().id_ref().as_str() == "race-b")
+            && matches!(me.kind(), MemberEventKind::Leave | MemberEventKind::Failed) =>
+        {
+          break Some(me.kind());
+        }
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("A observes B's departure within the timeout");
+  assert_eq!(
+    kind,
+    Some(MemberEventKind::Leave),
+    "A must classify B's racing-shutdown departure as a graceful Leave, not a Failed"
+  );
+
+  a.shutdown().await.expect("race-a shuts down");
+}
+
 /// The QUIC driver binds a single UDP socket and drops it (releasing its FD) before
 /// acking shutdown, so `shutdown().await` releases the bound port before it
 /// resolves: a second QUIC node binding the SAME advertise address the instant the
@@ -715,6 +772,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn leave_with_racing_shutdown_reaches_peer_as_leave() {
+    super::leave_with_racing_shutdown_reaches_peer_as_leave::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn quic_shutdown_releases_bound_address_for_rebind() {
     super::quic_shutdown_releases_bound_address_for_rebind::<TokioRuntime>().await;
   }
@@ -765,6 +827,13 @@ mod smol_cells {
   #[test]
   fn leave_emits_left_cluster_smol() {
     SmolRuntime::block_on(super::leave_emits_left_cluster::<SmolRuntime>());
+  }
+
+  #[test]
+  fn leave_with_racing_shutdown_reaches_peer_as_leave_smol() {
+    SmolRuntime::block_on(super::leave_with_racing_shutdown_reaches_peer_as_leave::<
+      SmolRuntime,
+    >());
   }
 
   #[test]
