@@ -144,6 +144,13 @@ where
   /// Under an encryption backend, `keyring` is the delegate the driver applies
   /// inbound key-management requests to; a node that does not manage keys can
   /// pass `std::rc::Rc::new(VoidKeyringDelegate)`.
+  ///
+  /// `merge_delegate` is the machine's synchronous push/pull filter (`None`
+  /// admits every exchange); `snapshot` enables file persistence of the
+  /// membership and clocks, replayed here at construction — a corrupt
+  /// snapshot fails construction loudly, and the serf option
+  /// `rejoin_after_leave` decides whether a cleanly-left node replays its
+  /// previous membership or starts fresh.
   #[allow(clippy::too_many_arguments)]
   pub async fn new<T, RES, AR, D, G>(
     options: T::Options,
@@ -154,9 +161,12 @@ where
     serf_options: SerfOptions,
     gossip_rng: G,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
   ) -> core::result::Result<Self, T::Error>
   where
+    I: memberlist_proto::Id,
     T: Transport<Id = I>,
     RES: Resolver<Address = T::Address>,
     AR: AdvertiseAddrResolver,
@@ -176,6 +186,17 @@ where
     serf_options
       .validate()
       .map_err(|e| SerfError::InvalidOption(InvalidOption::new("serf_options", e.to_string())))?;
+
+    // Open and decode the snapshot BEFORE binding any socket: a corrupt file
+    // refuses construction loudly, and the decoded records ride the runtime
+    // bundle into `T::run`, which replays them into the endpoint it builds.
+    let snapshot_file = match &snapshot {
+      Some(opts) => Some(
+        serf_driver::Snapshotter::open(opts.path(), opts.compact_threshold())
+          .map_err(SerfError::from)?,
+      ),
+      None => None,
+    };
 
     // Cache the join deadline on the handle BEFORE `runtime_options` is moved
     // into the driver bundle, so each await-result join can stamp its absolute
@@ -224,6 +245,8 @@ where
       runtime_options,
       serf_options,
       reconnect_delegate,
+      merge_delegate,
+      snapshot_file,
       #[cfg(encryption)]
       keyring,
     );

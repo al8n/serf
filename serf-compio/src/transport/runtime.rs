@@ -62,6 +62,14 @@ where
   /// installed into the endpoint by `T::run` before the endpoint moves into the
   /// detached pump. `None` keeps the flat configured reap timeouts.
   pub(crate) reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
+  /// The machine's synchronous push/pull merge filter, installed into the
+  /// endpoint by `T::run`. `None` admits every exchange.
+  pub(crate) merge_delegate:
+    Option<Box<dyn memberlist_proto::delegate::MergeDelegate<T::Id, SocketAddr>>>,
+  /// The opened snapshot writer plus the records already on disk: `T::run`
+  /// replays the records into the endpoint it builds and hands the writer to
+  /// the pump for appending. `None` disables persistence.
+  pub(crate) snapshot_file: Option<serf_driver::OpenedSnapshot<T::Id>>,
   /// The driver's keyring delegate, applied to inbound key-management requests.
   /// Present only under an encryption backend.
   #[cfg(encryption)]
@@ -90,6 +98,8 @@ where
     driver_options: RuntimeOptions,
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<T::Id, SocketAddr>>>,
+    snapshot_file: Option<serf_driver::OpenedSnapshot<T::Id>>,
     #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
   ) -> Self {
     Self {
@@ -105,6 +115,8 @@ where
       driver_options,
       serf_options,
       reconnect_delegate,
+      merge_delegate,
+      snapshot_file,
       #[cfg(encryption)]
       keyring,
     }

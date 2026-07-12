@@ -433,6 +433,9 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
   // Cluster label applied to both gossip encode and decode. `None` accepts
   // datagrams from any cluster.
   label: Option<Bytes>,
+  // The snapshot writer the pump appends membership records to; `None`
+  // disables persistence.
+  mut snapshotter: Option<serf_driver::Snapshotter<I>>,
   // The driver's keyring delegate: applies inbound key-management ops and
   // produces the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
@@ -637,6 +640,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &obs_payload_bytes,
         obs_payload_budget,
         &mut pending,
+        &mut snapshotter,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -714,6 +718,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &obs_payload_bytes,
         obs_payload_budget,
         &mut pending,
+        &mut snapshotter,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -751,6 +756,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         &obs_payload_bytes,
         obs_payload_budget,
         &mut pending,
+        &mut snapshotter,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -905,6 +911,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       &obs_payload_bytes,
       obs_payload_budget,
       &mut pending,
+      &mut snapshotter,
       #[cfg(encryption)]
       &*keyring,
       #[cfg(encryption)]
@@ -1676,6 +1683,7 @@ async fn drain_events<I, RT, G, R>(
   obs_payload_bytes: &Cell<u64>,
   obs_payload_budget: Option<u64>,
   pending: &mut PendingCommands,
+  snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
   terminal: &mut bool,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
@@ -1689,6 +1697,43 @@ where
   let mut drained = false;
   while let Some(ev) = endpoint.poll_event() {
     drained = true;
+    // Snapshot persistence: append the surfaced membership change, the
+    // advancing clock floors, and the clean-leave marker, then flush (and
+    // compact past the threshold) — a change is durable once this drain
+    // returns. Restart replay + `load_snapshot` recovers the state.
+    if let Some(snap) = snapshotter.as_mut() {
+      if let Event::Member(me) = &ev {
+        use serf_proto::event::MemberEventKind as MK;
+        let alive = matches!(me.kind(), MK::Join | MK::Update);
+        for m in me.members() {
+          snap.append_member(alive, m.node());
+        }
+      }
+      if matches!(ev, Event::Member(_) | Event::LeftCluster) {
+        snap.append_clocks(
+          LamportTime::from(endpoint.member_time()),
+          LamportTime::from(endpoint.event_time()),
+          LamportTime::from(endpoint.query_time()),
+        );
+        // The leave marker is written AFTER the clocks so a clean shutdown
+        // ends the file at the Leave record — the terminal shape compaction
+        // preserves and replay expects: under the default no-rejoin posture
+        // the Leave wipes the accumulated state, and a clock record written
+        // after it would resurrect a clock the reference implementation
+        // zeroes.
+        if matches!(ev, Event::LeftCluster) {
+          snap.append_leave();
+        }
+        snap.flush_and_maybe_compact(|| {
+          endpoint
+            .members_snapshot()
+            .iter()
+            .filter(|m| m.status() == serf_proto::members::MemberStatus::Alive)
+            .map(|m| m.node().clone())
+            .collect()
+        });
+      }
+    }
     // Await-result join resolution. `ExchangeCompleted` fires for every outbound
     // bridge kind; an await-join waiter consumes only `PushPull` completions.
     // `complete_join_exchange` drives both decoupled terminals: it resolves the
@@ -1801,6 +1846,7 @@ async fn drain_outputs<I, RT, G, R>(
   obs_payload_bytes: &Cell<u64>,
   obs_payload_budget: Option<u64>,
   pending: &mut PendingCommands,
+  snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
@@ -1823,6 +1869,7 @@ where
       obs_payload_bytes,
       obs_payload_budget,
       pending,
+      snapshotter,
       &mut terminal,
       #[cfg(encryption)]
       keyring,

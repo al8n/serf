@@ -125,6 +125,13 @@ pub enum SerfError {
   #[error(transparent)]
   Proto(#[from] serf_proto::endpoint::Error),
 
+  /// The snapshot file could not be opened or decoded at construction — the
+  /// node refuses to start against membership state it cannot trust.
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+  #[error(transparent)]
+  SnapshotOpen(#[from] serf_driver::SnapshotOpenError),
+
   /// Encryption codec error from memberlist-wire.
   #[cfg(encryption)]
   #[cfg_attr(
