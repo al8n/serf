@@ -194,7 +194,8 @@ where
     let snapshot = match snapshot {
       Some(opts) => {
         let (writer, records) =
-          crate::driver::snapshotter::Snapshotter::open(&opts).map_err(SerfError::from)?;
+          serf_driver::Snapshotter::open(opts.path(), opts.compact_threshold())
+            .map_err(SerfError::from)?;
         Some((writer, records))
       }
       None => None,

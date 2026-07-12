@@ -467,7 +467,7 @@ where
   bridge_recv_buf_len: usize,
   /// Snapshot persistence: appends a record for every surfaced membership
   /// change and the advancing clock floors, `None` when persistence is off.
-  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+  snapshotter: Option<serf_driver::Snapshotter<I>>,
   /// The driver's keyring delegate: applies inbound key-management ops and
   /// produces the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)]
@@ -499,7 +499,7 @@ where
     stream_opts: StreamTransportOptions,
     label: Option<Bytes>,
     stream_timeout: Duration,
-    snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+    snapshotter: Option<serf_driver::Snapshotter<I>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     let buf_len = endpoint
@@ -2360,7 +2360,7 @@ pub(crate) fn spawn_stream_driver<I, R, T, D, G, SR>(
   stream_opts: StreamTransportOptions,
   label: Option<Bytes>,
   stream_timeout: Duration,
-  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+  snapshotter: Option<serf_driver::Snapshotter<I>>,
   #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
 ) -> StreamDriver<I, R, T, G, SR>
 where

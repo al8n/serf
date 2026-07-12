@@ -157,7 +157,7 @@ pub enum SerfError {
   #[cfg(any(feature = "tcp", feature = "quic"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
   #[error(transparent)]
-  SnapshotOpen(#[from] crate::driver::snapshotter::SnapshotOpenError),
+  SnapshotOpen(#[from] serf_driver::SnapshotOpenError),
 
   /// The driver task has shut down and is no longer accepting commands.
   #[error("driver shut down")]

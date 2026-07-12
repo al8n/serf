@@ -6,12 +6,39 @@ use smol_str::SmolStr;
 
 use super::*;
 
-fn opts(name: &str) -> SnapshotOptions {
+/// A fresh snapshot path plus the compaction threshold under test.
+struct TestSnapshot {
+  path: PathBuf,
+  compact_threshold: u64,
+}
+
+impl TestSnapshot {
+  fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+
+  fn with_compact_threshold(mut self, threshold: u64) -> Self {
+    self.compact_threshold = threshold;
+    self
+  }
+
+  fn open<I>(&self) -> Result<OpenedSnapshot<I>, SnapshotOpenError>
+  where
+    I: memberlist_proto::Data + Clone + Eq + core::hash::Hash,
+  {
+    Snapshotter::open(&self.path, self.compact_threshold)
+  }
+}
+
+fn opts(name: &str) -> TestSnapshot {
   let mut p = std::env::temp_dir();
   p.push(format!("serf-snapshotter-{name}-{}", std::process::id()));
   // Ignoring Err: a leftover file from a previous run is fine to lose.
   let _ = fs::remove_file(&p);
-  SnapshotOptions::new(p)
+  TestSnapshot {
+    path: p,
+    compact_threshold: crate::DEFAULT_SNAPSHOT_COMPACT_THRESHOLD,
+  }
 }
 
 fn node(id: &str, port: u16) -> Node<SmolStr, SocketAddr> {
@@ -21,7 +48,7 @@ fn node(id: &str, port: u16) -> Node<SmolStr, SocketAddr> {
   )
 }
 
-fn cleanup(o: &SnapshotOptions) {
+fn cleanup(o: &TestSnapshot) {
   // Ignoring Err: best-effort test-file cleanup.
   let _ = fs::remove_file(o.path());
 }
@@ -33,7 +60,7 @@ fn cleanup(o: &SnapshotOptions) {
 fn appends_replay_across_reopen() {
   let o = opts("roundtrip");
   {
-    let (mut snap, records) = Snapshotter::<SmolStr>::open(&o).expect("first open of a fresh path");
+    let (mut snap, records) = o.open::<SmolStr>().expect("first open of a fresh path");
     assert!(records.is_empty(), "a fresh path replays to nothing");
     snap.append_member(true, &node("a", 7001));
     snap.append_member(true, &node("b", 7002));
@@ -46,7 +73,7 @@ fn appends_replay_across_reopen() {
     snap.flush_and_maybe_compact(Vec::new);
   }
 
-  let (_snap, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen parses");
+  let (_snap, records) = o.open::<SmolStr>().expect("reopen parses");
   let replay = ReplayResult::replay(records, false);
   assert_eq!(replay.alive_nodes, vec![node("a", 7001)]);
   assert_eq!(replay.last_clock, LamportTime::new(5));
@@ -61,14 +88,14 @@ fn appends_replay_across_reopen() {
 fn leave_marker_gates_the_replay() {
   let o = opts("leave-gate");
   {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     snap.append_member(true, &node("a", 7001));
     snap.append_clocks(LamportTime::new(9), LamportTime::ZERO, LamportTime::ZERO);
     snap.append_leave();
     snap.flush_and_maybe_compact(Vec::new);
   }
 
-  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen");
+  let (_s, records) = o.open::<SmolStr>().expect("reopen");
   let fresh = ReplayResult::replay(records.clone(), false);
   assert!(fresh.alive_nodes.is_empty(), "a clean leave starts fresh");
   assert_eq!(fresh.last_clock, LamportTime::ZERO);
@@ -90,7 +117,7 @@ fn leave_marker_gates_the_replay() {
 fn truncated_tail_is_tolerated_and_repaired() {
   let o = opts("torn-tail");
   {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     snap.append_member(true, &node("a", 7001));
     snap.flush_and_maybe_compact(Vec::new);
   }
@@ -105,7 +132,7 @@ fn truncated_tail_is_tolerated_and_repaired() {
     f.write_all(&[0x00, 0xff, 0xff]).expect("write torn tail");
   }
 
-  let (mut snap, records) = Snapshotter::<SmolStr>::open(&o).expect("torn tail tolerated");
+  let (mut snap, records) = o.open::<SmolStr>().expect("torn tail tolerated");
   let replay = ReplayResult::replay(records, false);
   assert_eq!(replay.alive_nodes, vec![node("a", 7001)]);
 
@@ -113,7 +140,7 @@ fn truncated_tail_is_tolerated_and_repaired() {
   snap.append_member(true, &node("b", 7002));
   snap.flush_and_maybe_compact(Vec::new);
   drop(snap);
-  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen after repair");
+  let (_s, records) = o.open::<SmolStr>().expect("reopen after repair");
   let replay = ReplayResult::replay(records, false);
   assert_eq!(replay.alive_nodes, vec![node("a", 7001), node("b", 7002)]);
   cleanup(&o);
@@ -135,10 +162,7 @@ fn corrupt_middle_record_refuses_to_open() {
     f.write_all(&rec).expect("write trailing record");
   }
   assert!(
-    matches!(
-      Snapshotter::<SmolStr>::open(&o),
-      Err(SnapshotOpenError::Corrupt(_))
-    ),
+    matches!(o.open::<SmolStr>(), Err(SnapshotOpenError::Corrupt(_))),
     "an unknown tag before the tail must refuse the open"
   );
   cleanup(&o);
@@ -150,7 +174,7 @@ fn corrupt_middle_record_refuses_to_open() {
 fn compaction_rewrites_to_the_live_state() {
   let o = opts("compact").with_compact_threshold(64);
   {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     // Churn well past 64 bytes: many joins and removals of a transient peer.
     for i in 0..32u16 {
       snap.append_member(true, &node("transient", 8000 + i));
@@ -168,7 +192,7 @@ fn compaction_rewrites_to_the_live_state() {
     size < 128,
     "compaction must shrink the churned file, got {size} bytes"
   );
-  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen compacted");
+  let (_s, records) = o.open::<SmolStr>().expect("reopen compacted");
   let replay = ReplayResult::replay(records, false);
   assert_eq!(replay.alive_nodes, vec![node("kept", 7001)]);
   assert_eq!(replay.last_clock, LamportTime::new(7));
@@ -185,7 +209,7 @@ fn compaction_rewrites_to_the_live_state() {
 fn compaction_preserves_the_clean_leave_gate() {
   let o = opts("compact-leave").with_compact_threshold(1);
   {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     snap.append_member(true, &node("peer", 7001));
     snap.append_clocks(LamportTime::new(4), LamportTime::ZERO, LamportTime::ZERO);
     snap.append_leave();
@@ -193,7 +217,7 @@ fn compaction_preserves_the_clean_leave_gate() {
     snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
   }
 
-  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen compacted");
+  let (_s, records) = o.open::<SmolStr>().expect("reopen compacted");
   let fresh = ReplayResult::replay(records.clone(), false);
   assert!(
     fresh.alive_nodes.is_empty(),
@@ -225,7 +249,7 @@ fn leave_tail_replays_identically_across_compaction() {
   let plain = opts("leave-order-plain");
   let compacted = opts("leave-order-compacted").with_compact_threshold(1);
   for o in [&plain, &compacted] {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     snap.append_member(true, &node("peer", 7001));
     snap.append_clocks(
       LamportTime::new(8),
@@ -236,9 +260,8 @@ fn leave_tail_replays_identically_across_compaction() {
     snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
   }
 
-  let (_p, plain_records) = Snapshotter::<SmolStr>::open(&plain).expect("reopen the original");
-  let (_c, compacted_records) =
-    Snapshotter::<SmolStr>::open(&compacted).expect("reopen the compacted");
+  let (_p, plain_records) = plain.open::<SmolStr>().expect("reopen the original");
+  let (_c, compacted_records) = compacted.open::<SmolStr>().expect("reopen the compacted");
   for rejoin in [false, true] {
     let original = ReplayResult::replay(plain_records.clone(), rejoin);
     let rewritten = ReplayResult::replay(compacted_records.clone(), rejoin);
@@ -278,12 +301,12 @@ fn leave_tail_replays_identically_across_compaction() {
 fn membership_after_a_leave_clears_the_compacted_gate() {
   let o = opts("compact-rejoined").with_compact_threshold(1);
   {
-    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
     snap.append_leave();
     snap.append_member(true, &node("peer", 7001));
     snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
   }
-  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen");
+  let (_s, records) = o.open::<SmolStr>().expect("reopen");
   let fresh = ReplayResult::replay(records, false);
   assert_eq!(
     fresh.alive_nodes,

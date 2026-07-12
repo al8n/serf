@@ -19,12 +19,14 @@ use std::{
 use memberlist_proto::Data;
 use serf_proto::{LamportTime, snapshot::SnapshotRecord};
 
-use super::options::SnapshotOptions;
+/// Default snapshot compaction threshold: the append file is rewritten to the
+/// live state once it grows past this many bytes.
+pub const DEFAULT_SNAPSHOT_COMPACT_THRESHOLD: u64 = 128 * 1024;
 
 /// The snapshot writer paired with the records already on disk, as handed
 /// from the constructor (which opens and decodes) to the transport body
 /// (which replays and pumps).
-pub(crate) type OpenedSnapshot<I> = (Snapshotter<I>, Vec<SnapshotRecord<I, std::net::SocketAddr>>);
+pub type OpenedSnapshot<I> = (Snapshotter<I>, Vec<SnapshotRecord<I, std::net::SocketAddr>>);
 
 /// The append-side of the snapshot file, held by the driver pump.
 ///
@@ -33,7 +35,7 @@ pub(crate) type OpenedSnapshot<I> = (Snapshotter<I>, Vec<SnapshotRecord<I, std::
 /// grows past the compaction threshold, the next append rewrites it to just
 /// the current alive set and clock floors (via a sibling temp file and an
 /// atomic rename), exactly the state a replay needs.
-pub(crate) struct Snapshotter<I> {
+pub struct Snapshotter<I> {
   path: PathBuf,
   file: io::BufWriter<fs::File>,
   bytes_written: u64,
@@ -61,8 +63,11 @@ where
   /// partial trailing record and appends continue after the last whole one. A
   /// malformed record BEFORE the tail (an unknown tag or an undecodable node)
   /// is a hard error — the file is not trustworthy.
-  pub(crate) fn open(opts: &SnapshotOptions) -> Result<OpenedSnapshot<I>, SnapshotOpenError> {
-    let path = opts.path().to_path_buf();
+  pub fn open(
+    path: impl Into<PathBuf>,
+    compact_threshold: u64,
+  ) -> Result<OpenedSnapshot<I>, SnapshotOpenError> {
+    let path: PathBuf = path.into();
     let raw = match fs::read(&path) {
       Ok(b) => b,
       Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -106,7 +111,7 @@ where
         path,
         file: io::BufWriter::new(file),
         bytes_written: cursor as u64,
-        compact_threshold: opts.compact_threshold(),
+        compact_threshold,
         last_member_clock: LamportTime::ZERO,
         last_event_clock: LamportTime::ZERO,
         last_query_clock: LamportTime::ZERO,
@@ -155,11 +160,7 @@ where
 
   /// Append the membership records for one surfaced member event: `Alive` for
   /// a joined or updated member, `NotAlive` for a left, failed, or reaped one.
-  pub(crate) fn append_member(
-    &mut self,
-    alive: bool,
-    node: &memberlist_proto::Node<I, SocketAddr>,
-  ) {
+  pub fn append_member(&mut self, alive: bool, node: &memberlist_proto::Node<I, SocketAddr>) {
     let record = if alive {
       SnapshotRecord::Alive(node.clone())
     } else {
@@ -170,12 +171,7 @@ where
   }
 
   /// Append any clock high-water marks that advanced since the last append.
-  pub(crate) fn append_clocks(
-    &mut self,
-    member: LamportTime,
-    event: LamportTime,
-    query: LamportTime,
-  ) {
+  pub fn append_clocks(&mut self, member: LamportTime, event: LamportTime, query: LamportTime) {
     if member > self.last_member_clock {
       self.append(&SnapshotRecord::Clock(member));
       self.last_member_clock = member;
@@ -193,7 +189,7 @@ where
   /// Append the leave marker: the local node cleanly left the cluster. On the
   /// next start, replay clears the recovered state unless
   /// `rejoin_after_leave` ignores it.
-  pub(crate) fn append_leave(&mut self) {
+  pub fn append_leave(&mut self) {
     self.clean_left = true;
     self.append(&SnapshotRecord::Leave);
   }
@@ -201,7 +197,7 @@ where
   /// Flush the buffered appends to the OS, and — when the file has grown past
   /// the compaction threshold — rewrite it to just `alive` and the clock
   /// floors via a sibling temp file and an atomic rename.
-  pub(crate) fn flush_and_maybe_compact(
+  pub fn flush_and_maybe_compact(
     &mut self,
     alive: impl FnOnce() -> Vec<memberlist_proto::Node<I, SocketAddr>>,
   ) {

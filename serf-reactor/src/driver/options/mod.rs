@@ -604,7 +604,7 @@ impl Default for StreamTransportOptions {
 
 /// Default snapshot compaction threshold: the append file is rewritten to the
 /// live state once it grows past this many bytes.
-pub const DEFAULT_SNAPSHOT_COMPACT_THRESHOLD: u64 = 128 * 1024;
+pub use serf_driver::DEFAULT_SNAPSHOT_COMPACT_THRESHOLD;
 
 /// Snapshot persistence wiring: where the driver appends membership records
 /// and when it compacts the file. Supplied as a constructor argument (`None`

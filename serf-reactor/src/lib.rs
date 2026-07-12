@@ -196,4 +196,4 @@ pub use driver::options::{
 };
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-pub use driver::snapshotter::SnapshotOpenError;
+pub use serf_driver::SnapshotOpenError;
