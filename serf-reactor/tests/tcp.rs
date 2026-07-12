@@ -1965,6 +1965,191 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Port of legacy `serf_per_node_reconnect_timeout` (Go
+/// `TestSerf_PerNodeReconnectTimeout`): a per-member `ReconnectDelegate`
+/// override drives the FAILED-member reap timeout, not just the graceful-LEFT
+/// tombstone. Node A carries a delegate that zeroes node B's reconnect timeout
+/// while A's flat `reconnect_timeout` stays at 24h; after B is abruptly killed
+/// and A detects it Failed, A reaps B early — which can only happen if the
+/// reaper consulted the delegate on the FAILED path (the flat 24h timeout would
+/// otherwise hold B for the whole test). The companion
+/// `reconnect_delegate_reaps_left_member` covers the LEFT/tombstone path; this
+/// covers the FAILED/reconnect path.
+async fn serf_per_node_reconnect_timeout<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("prt-b").await;
+  let b_addr = b.advertise_address();
+
+  // A: fast SWIM so it detects B's kill sub-second, a long flat reconnect
+  // timeout so a default reap never fires within the test, and a delegate
+  // zeroing ONLY B's reconnect timeout.
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("prt-a"))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  let serf_opts = SerfOptions::new()
+    .with_reap_interval(Duration::from_millis(100))
+    .with_reconnect_timeout(Duration::from_secs(86_400));
+  let a = Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf_opts,
+    Some(Box::new(ReapImmediately {
+      target: SmolStr::new("prt-b"),
+    })),
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf tcp node A with a reconnect delegate");
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  // Abruptly kill B (no farewell) so A detects a probe-timeout Failed rather
+  // than a graceful Leave.
+  b.shutdown().await.expect("prt-b shuts down abruptly");
+
+  // A detects B Failed, then the delegate zeroes B's reconnect timeout so A's
+  // next reap tick drops B — back to a single member. Without the delegate
+  // consult, A would hold the failed B for the flat 24h.
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 1 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A reaps the failed member B early via the reconnect-delegate override");
+
+  a.shutdown().await.expect("prt-a shuts down");
+}
+
+/// Port of legacy `serf_snapshot_recovery` (Go `TestSerf_SnapshotRecovery`): a
+/// snapshot-backed node that fails, is force-removed by the survivor, then
+/// restarts from its snapshot and rejoins — WITHOUT replaying the pre-failure
+/// user event onto its fresh event channel. Distinguishes itself from
+/// `snapshot_restart_rejoins_the_cluster` by the explicit `remove_failed_node`
+/// before the restart (the survivor tombstones B as Left, not merely Failed)
+/// and by asserting the recovered node surfaces zero user/query events.
+async fn serf_snapshot_recovery<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path::<R>("recovery");
+  let a = spawn_node::<R>("sr-a").await;
+  let b =
+    spawn_node_with_snapshot::<R>("sr-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let a_addr = a.advertise_address();
+  let b_id = b.local_id();
+
+  let mut b_events = b.events();
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // A fires a user event; fence on the pre-failure B receiving it, so the
+  // recovery below is genuinely tested for NOT replaying it.
+  a.user_event("event!", Bytes::from_static(b"test"), false)
+    .await
+    .expect("user event dispatched");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      match b_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "event!" => break,
+        Some(_) => {}
+        None => break,
+      }
+    }
+  })
+  .await
+  .expect("pre-failure B observes A's user event");
+
+  // Abruptly kill B; A detects it Failed.
+  b.shutdown().await.expect("sr-b shuts down");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let failed = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &b_id && m.status() == MemberStatus::Failed);
+      if failed {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A detects B failed");
+
+  // Force-remove the failed B: A tombstones it Left (not merely Failed), so the
+  // restart below revives against a Left tombstone.
+  a.remove_failed_node(b_id.clone())
+    .await
+    .expect("A force-removes the failed B");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let left = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &b_id && m.status() == MemberStatus::Left);
+      if left {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A holds B as a Left tombstone after the force-remove");
+
+  // Restart B from the snapshot with a FRESH event channel, then let it
+  // auto-rejoin A from the recovered membership.
+  let b2 =
+    spawn_node_with_snapshot::<R>("sr-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let mut b2_events = b2.events();
+  converge(&a, &b2).await;
+
+  // The recovery must NOT replay the pre-failure user event (nor any query) onto
+  // the restarted node's channel — only membership events are permitted. Drain a
+  // settle window and fail on any surfaced user/query event.
+  let quiet = R::timeout(Duration::from_secs(2), async {
+    loop {
+      match b2_events.next().await {
+        Some(Event::User(u)) => break Some(format!("user:{}", u.name)),
+        Some(Event::Query(q)) => break Some(format!("query:{}", q.name())),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await;
+  assert!(
+    quiet.is_err(),
+    "the recovered node must replay no user/query events, saw {quiet:?}"
+  );
+
+  a.shutdown().await.expect("sr-a shuts down");
+  b2.shutdown().await.expect("sr-b2 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -2278,6 +2463,16 @@ mod tokio_cells {
     super::serf_leave_rejoin_different_role::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_per_node_reconnect_timeout() {
+    super::serf_per_node_reconnect_timeout::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_snapshot_recovery() {
+    super::serf_snapshot_recovery::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -2460,6 +2655,16 @@ mod smol_cells {
   #[test]
   fn serf_leave_rejoin_different_role_smol() {
     SmolRuntime::block_on(super::serf_leave_rejoin_different_role::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_per_node_reconnect_timeout_smol() {
+    SmolRuntime::block_on(super::serf_per_node_reconnect_timeout::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_snapshot_recovery_smol() {
+    SmolRuntime::block_on(super::serf_snapshot_recovery::<SmolRuntime>());
   }
 
   #[cfg(encryption)]
