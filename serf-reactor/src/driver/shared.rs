@@ -79,11 +79,41 @@ pub(crate) async fn dispatch_event_delegate<I, A, D>(
 // failure while `leave()` reported success — so once `leave()` has been
 // initiated the pump RETAINS the fan-out datagrams whose send did not complete
 // and retries them until the socket accepts them (or teardown exhausts them).
+//
+// An errored send never accepted the CURRENT datagram, and on a shared
+// unconnected UDP socket the kernel may surface an asynchronous error left by
+// an EARLIER packet to a DIFFERENT peer — so an ICMP-reflection-class error
+// (reset/refused) is disambiguated by bounded retry: the retry both drains the
+// stale error slot and re-hands this datagram to the socket, and an error that
+// persists across the retries is credibly this destination's own answer (a
+// peer that is itself gone), which the reference implementation logs and
+// proceeds past. Every other error kind — aborts (a local software abort on
+// Windows), unreachables (usually the LOCAL routing table's answer), a closed
+// or invalid socket — is a local delivery failure that fails the leave.
 
-/// Encoded-and-transformed leave-farewell gossip datagrams retained after a
-/// non-completing UDP send, keyed by their destination and retried FIFO.
+/// One retained leave-farewell gossip datagram: its destination, the
+/// encoded-and-transformed bytes, and how many ICMP-class send errors it has
+/// absorbed (bounded by [`FAREWELL_ICMP_ERROR_LIMIT`]).
 #[cfg(any(feature = "tcp", feature = "quic"))]
-pub(crate) type LeaveDrain = VecDeque<(SocketAddr, Vec<u8>)>;
+pub(crate) struct LeaveDatagram {
+  peer: SocketAddr,
+  bytes: Vec<u8>,
+  icmp_errors: u8,
+}
+
+/// Leave-farewell datagrams retained after a non-completing UDP send, retried
+/// FIFO.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) type LeaveDrain = VecDeque<LeaveDatagram>;
+
+/// Total ICMP-class (`ConnectionReset` / `ConnectionRefused`) send errors one
+/// farewell datagram absorbs before it is dropped as answered-by-the-network.
+/// The first errors are ambiguous (a stale asynchronous error from an earlier
+/// packet to a different peer may occupy the socket's error slot), so the
+/// datagram is retried; at the limit the answer is attributed to this
+/// destination itself.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) const FAREWELL_ICMP_ERROR_LIMIT: u8 = 3;
 
 /// Surface a leave-farewell datagram the driver could not deliver. Unlike
 /// best-effort periodic gossip the drop is logged (the send error is
@@ -105,6 +135,20 @@ pub(crate) fn trace_leave_drain_residue(_count: usize) {
   tracing::debug!(
     residual = _count,
     "serf leave farewell datagrams abandoned at the teardown drain deadline"
+  );
+}
+
+/// Surface a leave-farewell datagram dropped after absorbing
+/// [`FAREWELL_ICMP_ERROR_LIMIT`] ICMP-class send errors: the network's answer
+/// is attributed to this destination (a peer that is itself gone), and the
+/// reference implementation logs such peers and proceeds. A no-op without the
+/// `tracing` feature.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+fn trace_leave_peer_answered(_peer: SocketAddr) {
+  #[cfg(feature = "tracing")]
+  tracing::debug!(
+    peer = %_peer,
+    "serf leave farewell dropped after repeated ICMP-class send errors; peer presumed gone"
   );
 }
 
@@ -131,28 +175,52 @@ pub(crate) fn leave_outcome(send_failed: bool) -> crate::error::Result<()> {
   }
 }
 
-/// Whether a leave-farewell send error is a LOCAL socket failure (the leave
-/// contract is broken — the datagram never left this host) rather than a
-/// per-peer network signal.
-///
-/// Per-peer signals — a reset/refusal reflected for a peer that is itself gone,
-/// or an unreachable route — are the network's answer to a delivered attempt:
-/// the reference implementation logs them and proceeds, and failing the whole
-/// leave because one peer already died would be wrong (and flaky on platforms
-/// that reflect ICMP errors into UDP sends). Everything else — a closed or
-/// invalid socket, a vanished source address (`EADDRNOTAVAIL`, e.g. the bound
-/// interface disappeared), a broken pipe, an out-of-memory send path — means
-/// the farewell could not be handed off at all.
+/// The disposition of one errored leave-farewell send.
 #[cfg(any(feature = "tcp", feature = "quic"))]
-pub(crate) fn farewell_send_failure_is_local(err: &io::Error) -> bool {
-  !matches!(
+#[derive(Debug, PartialEq, Eq)]
+enum ErroredFarewell {
+  /// Ambiguous ICMP-class error under the retry limit: retain the datagram
+  /// (with the bumped absorb count) and re-attempt it — the retry drains a
+  /// possibly-stale asynchronous error slot and re-hands the datagram to the
+  /// socket.
+  Retry(u8),
+  /// ICMP-class errors persisted to [`FAREWELL_ICMP_ERROR_LIMIT`]: the answer
+  /// is credibly this destination's own (the peer is itself gone). Logged and
+  /// dropped without failing the leave, as the reference implementation does.
+  PeerAnswered,
+  /// Any other error kind: a LOCAL delivery failure — the farewell never left
+  /// this host — so the leave resolves
+  /// [`LeaveFarewellUndelivered`](crate::error::SerfError::LeaveFarewellUndelivered).
+  LocalFailure,
+}
+
+/// Classify one errored farewell send, given how many ICMP-class errors this
+/// datagram has already absorbed.
+///
+/// Only `ConnectionReset` / `ConnectionRefused` are the ambiguous
+/// ICMP-reflection class: they are what a gone peer's ICMP answer surfaces on
+/// every platform (and what Windows reflects routinely after a send to a
+/// closed port), and on a shared unconnected socket they may equally be a
+/// stale answer to an EARLIER packet for a different peer — hence bounded
+/// retry rather than trusting either reading. `ConnectionAborted` is a local
+/// software abort on Windows, the unreachables usually report the LOCAL
+/// routing table's answer, and everything else (a closed or invalid socket, a
+/// vanished source address, a broken pipe) is unambiguously local.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+fn classify_errored_farewell(icmp_errors: u8, err: &io::Error) -> ErroredFarewell {
+  if matches!(
     err.kind(),
-    io::ErrorKind::ConnectionReset
-      | io::ErrorKind::ConnectionRefused
-      | io::ErrorKind::ConnectionAborted
-      | io::ErrorKind::HostUnreachable
-      | io::ErrorKind::NetworkUnreachable
-  )
+    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+  ) {
+    let absorbed = icmp_errors.saturating_add(1);
+    if absorbed < FAREWELL_ICMP_ERROR_LIMIT {
+      ErroredFarewell::Retry(absorbed)
+    } else {
+      ErroredFarewell::PeerAnswered
+    }
+  } else {
+    ErroredFarewell::LocalFailure
+  }
 }
 
 /// Upper bound on how long a pump's teardown parks waiting for retained
@@ -166,14 +234,16 @@ pub(crate) const LEAVE_DRAIN_TEARDOWN_BOUND: core::time::Duration =
 /// Record the outcome of one readiness-based leave-farewell datagram send into
 /// `retained`:
 /// - `Ready(Ok)` — it left the socket; nothing to retain.
-/// - `Ready(Err)` — attempted; logged and NOT retained (retrying a socket that
-///   errors is futile). A LOCAL failure additionally sets `send_failed`, so the
-///   parked leave resolves with an error instead of a false success.
-/// - `Pending` — the socket is backpressured; `(peer, datagram)` is retained for
-///   the next writable wake (the datagram is copied only on this path).
+/// - `Ready(Err)` — the socket did NOT accept this datagram. An ICMP-class
+///   error retains it for a bounded retry (the error slot may hold a stale
+///   answer to an earlier packet for a different peer); a LOCAL failure sets
+///   `send_failed`, so the parked leave resolves with an error instead of a
+///   false success.
+/// - `Pending` — the socket is backpressured; the datagram is retained for the
+///   next writable wake.
 ///
-/// Returns `true` when the datagram was retained, so a caller draining fresh
-/// transmits learns the socket is backpressured.
+/// The datagram bytes are copied only on the retain paths. Returns `true` when
+/// the datagram was retained.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) fn retain_leave_datagram(
   retained: &mut LeaveDrain,
@@ -186,13 +256,31 @@ pub(crate) fn retain_leave_datagram(
     Poll::Ready(Ok(_)) => false,
     Poll::Ready(Err(err)) => {
       trace_leave_send_error(peer, &err);
-      if farewell_send_failure_is_local(&err) {
-        *send_failed = true;
+      match classify_errored_farewell(0, &err) {
+        ErroredFarewell::Retry(absorbed) => {
+          retained.push_back(LeaveDatagram {
+            peer,
+            bytes: datagram.to_vec(),
+            icmp_errors: absorbed,
+          });
+          true
+        }
+        ErroredFarewell::PeerAnswered => {
+          trace_leave_peer_answered(peer);
+          false
+        }
+        ErroredFarewell::LocalFailure => {
+          *send_failed = true;
+          false
+        }
       }
-      false
     }
     Poll::Pending => {
-      retained.push_back((peer, datagram.to_vec()));
+      retained.push_back(LeaveDatagram {
+        peer,
+        bytes: datagram.to_vec(),
+        icmp_errors: 0,
+      });
       true
     }
   }
@@ -224,12 +312,14 @@ pub(crate) fn poll_send_gossip<S>(
   }
 }
 
-/// Retry the retained leave-farewell datagrams FIRST (oldest to newest), sending
-/// each over `socket` until one is backpressured. A `Ready(Err)` is logged and
-/// counts as attempted — a LOCAL failure sets `send_failed` so the parked leave
-/// resolves with an error; a `Pending` keeps that datagram (and every later one)
-/// retained and stops the pass. Bounded: a single front-to-back sweep with no
-/// re-enqueue of a just-sent datagram, so it cannot loop.
+/// Retry the retained leave-farewell datagrams FIRST (oldest to newest),
+/// sending each over `socket` until one is backpressured. An ICMP-class
+/// `Ready(Err)` re-retains the datagram at the BACK of the queue (bounded by
+/// its absorb count) so the rest of the queue drains ahead of the re-attempt; a
+/// LOCAL failure sets `send_failed` so the parked leave resolves with an error;
+/// a `Pending` keeps that datagram (and every later one) retained and stops the
+/// pass. Bounded: the pass pops at most the queue's initial length, so a
+/// re-retained datagram is re-attempted on the NEXT pass, never this one.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) fn retry_retained_leave<S>(
   retained: &mut LeaveDrain,
@@ -242,19 +332,46 @@ pub(crate) fn retry_retained_leave<S>(
   let Some(socket) = socket else {
     return;
   };
-  while let Some((peer, datagram)) = retained.pop_front() {
-    match socket.poll_send_to(cx, &datagram, peer) {
-      Poll::Ready(Ok(_)) => {}
-      Poll::Ready(Err(err)) => {
-        trace_leave_send_error(peer, &err);
-        if farewell_send_failure_is_local(&err) {
-          *send_failed = true;
+  let mut budget = retained.len();
+  while budget > 0 {
+    budget -= 1;
+    let Some(d) = retained.pop_front() else {
+      break;
+    };
+    let outcome = socket.poll_send_to(cx, &d.bytes, d.peer);
+    if settle_retried_farewell(retained, d, outcome, send_failed) {
+      break;
+    }
+  }
+}
+
+/// Fold one retried farewell's send outcome back into the retention state.
+/// Returns `true` when the sweep must stop (the socket is backpressured; the
+/// datagram went back to the FRONT so FIFO order is preserved).
+#[cfg(any(feature = "tcp", feature = "quic"))]
+fn settle_retried_farewell(
+  retained: &mut LeaveDrain,
+  mut d: LeaveDatagram,
+  outcome: Poll<io::Result<usize>>,
+  send_failed: &mut bool,
+) -> bool {
+  match outcome {
+    Poll::Ready(Ok(_)) => false,
+    Poll::Ready(Err(err)) => {
+      trace_leave_send_error(d.peer, &err);
+      match classify_errored_farewell(d.icmp_errors, &err) {
+        ErroredFarewell::Retry(absorbed) => {
+          d.icmp_errors = absorbed;
+          retained.push_back(d);
         }
+        ErroredFarewell::PeerAnswered => trace_leave_peer_answered(d.peer),
+        ErroredFarewell::LocalFailure => *send_failed = true,
       }
-      Poll::Pending => {
-        retained.push_front((peer, datagram));
-        break;
-      }
+      false
+    }
+    Poll::Pending => {
+      retained.push_front(d);
+      true
     }
   }
 }
