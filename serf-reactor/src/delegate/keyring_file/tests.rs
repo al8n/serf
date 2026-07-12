@@ -1,5 +1,33 @@
 use super::*;
 
+use std::cell::RefCell;
+
+/// This thread's mid-check hook, when a test installed one.
+type ObservationGap = RefCell<Option<Box<dyn FnMut(&Path)>>>;
+
+thread_local! {
+  /// Per-test hook fired between `sweepable`'s two identity observations —
+  /// the window a concurrent rotation's rename can land in. Thread-local so
+  /// parallel tests never see each other's hooks.
+  static BETWEEN_OBSERVATIONS: ObservationGap = const { RefCell::new(None) };
+}
+
+/// Called by `sweepable` between its two `metadata` observations.
+pub(super) fn between_identity_observations(path: &Path) {
+  BETWEEN_OBSERVATIONS.with(|hook| {
+    if let Some(f) = hook.borrow_mut().as_mut() {
+      f(path);
+    }
+  });
+}
+
+/// Install `f` as this thread's mid-check hook for the duration of `run`.
+fn with_observation_gap(f: impl FnMut(&Path) + 'static, run: impl FnOnce()) {
+  BETWEEN_OBSERVATIONS.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+  run();
+  BETWEEN_OBSERVATIONS.with(|hook| *hook.borrow_mut() = None);
+}
+
 /// Wait for one rotation's persistence acknowledgement.
 fn acked(p: KeyringPersistence) -> Result<(), KeyringPersistError> {
   match p {
@@ -333,6 +361,44 @@ fn a_symlinked_destination_keeps_its_target_through_construction() {
   // Ignoring Err: best-effort test-file cleanup.
   let _ = std::fs::remove_file(&link);
   let _ = std::fs::remove_file(&target);
+}
+
+/// A rename landing between the sweep's two identity observations must
+/// never lose the destination: `remove_file` unlinks a NAME, so a candidate
+/// whose name can itself name the destination is refused by the name guard
+/// BEFORE any identity observation — the widened observation gap here
+/// atomically replaces the destination exactly as a concurrent rotation
+/// would, and construction must leave the replacement intact.
+#[test]
+fn a_rename_landing_mid_check_never_loses_the_destination() {
+  let path = tmp_path("raced").with_extension("tmp");
+  std::fs::write(&path, "pre-rotation contents\n").expect("seed the destination");
+
+  with_observation_gap(
+    |dest: &Path| {
+      // The concurrent rotation: a fresh inode atomically renamed over the
+      // destination, mid-check.
+      let staged = dest.with_file_name(".raced-replacement");
+      std::fs::write(&staged, "freshly persisted contents\n").expect("stage the replacement");
+      std::fs::rename(&staged, dest).expect("land the replacement");
+    },
+    || {
+      let _delegate = FileKeyringDelegate::new(&path);
+    },
+  );
+
+  // With the name guard in place the observation gap is never reached for a
+  // name-aliasing candidate, so the original contents remain; what must hold
+  // in every world is that the destination NAME was not unlinked.
+  let contents =
+    std::fs::read_to_string(&path).expect("the destination survives construction un-unlinked");
+  assert!(
+    contents == "pre-rotation contents\n" || contents == "freshly persisted contents\n",
+    "the destination holds one of the two written generations, never nothing"
+  );
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
 }
 
 /// The success acknowledgement is durability: a rotation whose parent
