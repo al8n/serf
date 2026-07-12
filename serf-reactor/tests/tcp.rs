@@ -82,6 +82,7 @@ where
     RuntimeOptions::new(),
     SerfOptions::new(),
     None,
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
@@ -334,6 +335,7 @@ where
     Some(Box::new(ReapImmediately {
       target: SmolStr::new("rd-b"),
     })),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
@@ -642,6 +644,83 @@ where
   cluster.shutdown_all().await;
 }
 
+/// The constructor-supplied merge delegate is the predicate the machine
+/// consults: with a recording accept-all delegate installed on B, A's join
+/// push-pull drives at least one `notify_merge` on B carrying A's node state.
+/// (A veto here gates only the push/pull application — a rejected peer can
+/// still be admitted moments later through gossip Alives, exactly as in the
+/// reference implementation, so the stable assertion is consultation, not
+/// permanent exclusion.)
+async fn merge_delegate_is_consulted_on_join<R>()
+where
+  R: Runtime,
+{
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  struct RecordingMerge {
+    hits: std::sync::Arc<AtomicUsize>,
+    saw_peer: std::sync::Arc<AtomicUsize>,
+  }
+  impl serf_reactor::MergeDelegate<SmolStr, SocketAddr> for RecordingMerge {
+    fn notify_merge(
+      &self,
+      peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+      >,
+    ) -> bool {
+      self.hits.fetch_add(1, Ordering::Relaxed);
+      if peers.iter().any(|p| p.id_ref().as_str() == "merge-a") {
+        self.saw_peer.fetch_add(1, Ordering::Relaxed);
+      }
+      true
+    }
+  }
+
+  let hits = std::sync::Arc::new(AtomicUsize::new(0));
+  let saw_peer = std::sync::Arc::new(AtomicUsize::new(0));
+
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let b = Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("merge-b"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    Some(Box::new(RecordingMerge {
+      hits: hits.clone(),
+      saw_peer: saw_peer.clone(),
+    })),
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn merge-b");
+  let a = spawn_node::<R>("merge-a").await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  assert!(
+    hits.load(Ordering::Relaxed) > 0,
+    "the machine must consult the constructor-supplied merge delegate on the join push/pull"
+  );
+  assert!(
+    saw_peer.load(Ordering::Relaxed) > 0,
+    "the consulted peer set must carry the joining node's state"
+  );
+
+  a.shutdown().await.expect("merge-a shuts down");
+  b.shutdown().await.expect("merge-b shuts down");
+}
+
 /// A leave configured with a zero timeout racing a shutdown resolves
 /// `Err(LeaveTimeout)` — never `Ok` — even though the teardown still delivers
 /// the fan-out: the caller's per-leave deadline keeps governing resolution
@@ -661,6 +740,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new().with_leave_timeout(Duration::ZERO),
     SerfOptions::new(),
+    None,
     None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
@@ -751,6 +831,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     None,
     std::sync::Arc::new(VoidKeyringDelegate),
   )
@@ -938,6 +1019,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn merge_delegate_is_consulted_on_join() {
+    super::merge_delegate_is_consulted_on_join::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn leave_with_zero_timeout_racing_shutdown_times_out() {
     super::leave_with_zero_timeout_racing_shutdown_times_out::<TokioRuntime>().await;
   }
@@ -1030,6 +1116,11 @@ mod smol_cells {
   #[test]
   fn coordinates_surface_on_the_handle_smol() {
     SmolRuntime::block_on(super::coordinates_surface_on_the_handle::<SmolRuntime>());
+  }
+
+  #[test]
+  fn merge_delegate_is_consulted_on_join_smol() {
+    SmolRuntime::block_on(super::merge_delegate_is_consulted_on_join::<SmolRuntime>());
   }
 
   #[test]

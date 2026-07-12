@@ -3,21 +3,21 @@
 //!
 //! Composes four observation sub-traits (`MemberDelegate` / `UserEventDelegate`
 //! / `QueryDelegate` / `KeyringDelegate`) and a join-admission veto
-//! (`MergeDelegate`). Every observation hook returns a `Send` future
+//! (`MergeDelegate`, the machine's sync predicate). Every observation hook returns a `Send` future
 //! (`-> impl Future<Output = ()> + Send`, not `async fn`) so the observation
 //! task can run on a multi-threaded agnostic runtime; the delegate as a whole is
 //! `Send + Sync + 'static` and is held behind an `Arc`.
 //!
 //! `KeyringDelegate` and `MergeDelegate` are separate from the observation
 //! `Delegate` composite: `KeyringDelegate` is sync (keyring ops must not
-//! block), and `MergeDelegate` is an async admission veto supplied at
+//! block), and `MergeDelegate` is the machine's inline admission veto supplied at
 //! construction rather than an observation hook.
 
 #[cfg(encryption)]
 mod keyring_file;
 mod void;
 
-pub use void::{NoopMergeDelegate, VoidDelegate};
+pub use void::VoidDelegate;
 
 #[cfg(encryption)]
 #[cfg_attr(
@@ -207,40 +207,21 @@ pub trait KeyringDelegate: Send + Sync + 'static {
   }
 }
 
-/// Async veto hook invoked by the driver on the join path before accepting
-/// remote member state from a push-pull exchange.
+/// The join-merge veto predicate, re-exported from the machine.
 ///
-/// `Ok(())` permits the merge; `Err(Self::Error)` cancels it. The driver wraps
-/// the concrete error into [`SerfError`](crate::SerfError) before forwarding it
-/// to the join caller.
-///
-/// The hook is **async and driver-side** deliberately: the application may need
-/// to consult an ACL service or other async resource before deciding whether to
-/// accept a batch of remote peers. A synchronous (Sans-I/O) filter would
-/// preclude that. `notify_merge` returns a `Send` future so the driver can drive
-/// it on a multi-threaded runtime; the delegate is `Send + Sync + 'static`.
+/// Supplied at construction (the `merge_delegate` argument) and installed into
+/// the memberlist machine, which consults it INLINE for every push/pull merge
+/// — a join and a periodic anti-entropy refresh alike — before applying the
+/// remote member state. Returning `false` cancels the merge, so a vetoed peer
+/// set is never admitted. The predicate is synchronous by design: it runs
+/// inside the machine's drain, so an application needing async I/O (an ACL
+/// service, say) resolves its policy ahead of time and answers from that
+/// resolved state here.
 ///
 /// Requires a stream or QUIC transport feature (`tcp` or `quic`).
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-pub trait MergeDelegate<I, A>: Send + Sync + 'static {
-  /// The veto/error type this delegate reports when a merge is cancelled.
-  type Error;
-
-  /// Called before the driver accepts inbound push-pull peer state.
-  ///
-  /// `peers` is the slice of remote [`Member`]s the cluster is about to merge.
-  /// Return `Ok(())` to proceed, or `Err(e)` to cancel the merge.
-  ///
-  /// The default implementation always permits the merge.
-  fn notify_merge(
-    &self,
-    peers: &[Arc<Member<I, A>>],
-  ) -> impl Future<Output = Result<(), Self::Error>> + Send + '_ {
-    let _ = peers; // Unused in the default permit-all impl; an overriding delegate inspects it.
-    async { Ok(()) }
-  }
-}
+pub use memberlist_proto::delegate::MergeDelegate;
 
 #[cfg(test)]
 mod tests;

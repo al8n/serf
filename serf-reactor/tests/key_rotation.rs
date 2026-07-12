@@ -109,6 +109,7 @@ where
     RuntimeOptions::new(),
     SerfOptions::new(),
     None,
+    None,
     keyring,
   )
   .await

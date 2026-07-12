@@ -15,23 +15,35 @@ fn void_delegate_satisfies_observation_composite() {
   assert_delegate(&v);
 }
 
-/// `NoopMergeDelegate` satisfies `MergeDelegate` with `Error = Infallible` — a
-/// type-level check; no I/O needed.
+/// A boxed machine merge delegate threads through the constructor slot — a
+/// type-level check that the re-exported trait and its Box blanket compose.
 #[test]
-fn noop_merge_delegate_satisfies_trait() {
+fn boxed_merge_delegate_satisfies_trait() {
+  struct AcceptAll;
+  impl MergeDelegate<SmolStr, SocketAddr> for AcceptAll {
+    fn notify_merge(
+      &self,
+      _peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+      >,
+    ) -> bool {
+      true
+    }
+  }
   fn assert_merge<T>(_: &T)
   where
-    T: MergeDelegate<SmolStr, SocketAddr, Error = core::convert::Infallible>,
+    T: MergeDelegate<SmolStr, SocketAddr>,
   {
   }
-  assert_merge(&NoopMergeDelegate);
+  let boxed: Box<dyn MergeDelegate<SmolStr, SocketAddr>> = Box::new(AcceptAll);
+  assert_merge(&boxed);
 }
 
 /// The reactor delegate surface is `Send + Sync + 'static`: the driver holds it
 /// behind an `Arc` shared across the runtime's worker threads.
 #[test]
-fn void_delegate_and_noop_merge_are_send_sync() {
+fn void_delegate_is_send_sync() {
   fn assert_send_sync<T: Send + Sync + 'static>() {}
   assert_send_sync::<VoidDelegate<SmolStr, SocketAddr>>();
-  assert_send_sync::<NoopMergeDelegate>();
 }

@@ -434,6 +434,7 @@ where
     RuntimeOptions::new(),
     timing.serf_opts(),
     None,
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
