@@ -68,6 +68,10 @@ use crate::{
   snapshot::{SerfSnapshot, SnapshotCell},
 };
 #[cfg(encryption)]
+use serf_driver::{
+  AppliedKeyRequest, KEYRING_PERSIST_POLL_INTERVAL, PendingKeyResponse, settle_parked_key_response,
+};
+#[cfg(encryption)]
 use serf_proto::{KeyResponseArgs, event::KeyRequest};
 
 /// Driver-side state for one outstanding await-result join call.
@@ -343,6 +347,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   // closes the gossip socket so the bound port is free when the caller resumes
   // from `shutdown.await`.
   let mut shutdown_reply: Option<oneshot::Sender<Result<()>>> = None;
+  #[cfg(encryption)]
+  let mut pending_key_responses: Vec<PendingKeyResponse<I>> = Vec::new();
   let mut pending = PendingCommands {
     joins: Vec::new(),
     leave: None,
@@ -418,6 +424,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
     // `Dead`-self notices that must reach the wire before the socket drops),
     // reap, publish, break.
     if exit {
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
       drain_outputs::<I, G, R>(
         &mut endpoint,
         &gossip_socket,
@@ -429,6 +437,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
       )
       .await;
       reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
@@ -449,6 +459,10 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       Some(endpoint_deadline),
       min_pending_join_deadline(&pending.joins),
       min_pending_leave_deadline(&pending.leave),
+      #[cfg(encryption)]
+      next_key_ack_check(&pending_key_responses, setup_now),
+      #[cfg(not(encryption))]
+      None,
     ]
     .into_iter()
     .flatten()
@@ -478,6 +492,9 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         dirty = true;
       }
 
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
+
       let terminal = drain_outputs::<I, G, R>(
         &mut endpoint,
         &gossip_socket,
@@ -489,6 +506,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
       )
       .await;
       reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
@@ -508,6 +527,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
     // flush their outputs before entering the select so a snapshot observer sees
     // the post-input state promptly.
     if dirty {
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
       let terminal = drain_outputs::<I, G, R>(
         &mut endpoint,
         &gossip_socket,
@@ -519,6 +540,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         &mut pending,
         #[cfg(encryption)]
         &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
       )
       .await;
       reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
@@ -613,6 +636,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
 
     // Post-select drain (sends + sync accounting only — no second recv SQE). A
     // conflict `Event::Shutdown` drained here is terminal — fold it into `exit`.
+    #[cfg(encryption)]
+    reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
     if drain_outputs::<I, G, R>(
       &mut endpoint,
       &gossip_socket,
@@ -624,6 +649,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       &mut pending,
       #[cfg(encryption)]
       &*keyring,
+      #[cfg(encryption)]
+      &mut pending_key_responses,
     )
     .await
     {
@@ -1210,6 +1237,7 @@ async fn drain_events<I, G, R>(
   pending: &mut PendingCommands,
   terminal: &mut bool,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
+  #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
 where
   I: memberlist_proto::Id + Clone,
@@ -1259,11 +1287,21 @@ where
     // `respond_key`) ahead of the observation hand-off below.
     #[cfg(encryption)]
     if let Event::KeyRequest(req) = &ev {
-      let resp = apply_key_request_live(endpoint, keyring, req);
-      // Ignoring Err: `respond_key` fails only when the response cannot be routed
-      // (originator gone / relay dropped); the key op has already applied to the
-      // live wire keyring.
-      let _ = endpoint.respond_key(req, resp, Instant::now());
+      match apply_key_request_live(endpoint, keyring, req) {
+        AppliedKeyRequest::Ready(resp) => {
+          // Ignoring Err: `respond_key` fails only when the response cannot be
+          // routed (originator gone / relay dropped); the key op has already
+          // applied to the live wire keyring.
+          let _ = endpoint.respond_key(req, resp, Instant::now());
+        }
+        AppliedKeyRequest::AwaitingPersistence(resp, rx) => {
+          pending_key_responses.push(PendingKeyResponse {
+            req: req.clone(),
+            resp,
+            rx,
+          });
+        }
+      }
     }
 
     let payload_bytes = observation_payload_bytes(&ev);
@@ -1319,6 +1357,7 @@ async fn drain_outputs<I, G, R>(
   obs_payload_budget: Option<u64>,
   pending: &mut PendingCommands,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
+  #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
 where
   I: memberlist_proto::Id + Clone,
@@ -1340,6 +1379,8 @@ where
       &mut terminal,
       #[cfg(encryption)]
       keyring,
+      #[cfg(encryption)]
+      pending_key_responses,
     )
     .await;
     if !(did_ingress || did_transmits || did_quic || did_events) {
@@ -1357,15 +1398,17 @@ where
 /// against the live ring, and on a real mutation publishes the rotated ring back
 /// via `set_encryption_options` — re-keying the gossip datagram plane (the QUIC
 /// reliable path always skips, quinn encrypts the stream) — then notifies the
-/// keyring observer for persistence. A node with no keyring configured answers
-/// `result = false` and makes no wire change; a read-only `list` or a refused op
-/// leaves the wire untouched.
+/// keyring delegate: a durable-inline answer responds immediately, while
+/// out-of-band persistence parks the response until its acknowledgement
+/// resolves. A node with no keyring configured answers `result = false` and
+/// makes no wire change; a read-only `list` or a refused op leaves the wire
+/// untouched.
 #[cfg(encryption)]
 fn apply_key_request_live<I, G, R>(
   endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   delegate: &dyn KeyringDelegate,
   req: &KeyRequest<I, SocketAddr>,
-) -> KeyResponseArgs
+) -> AppliedKeyRequest
 where
   I: memberlist_proto::Id + Clone,
   G: Rng,
@@ -1373,19 +1416,26 @@ where
 {
   let mut encryption = endpoint.encryption_options().clone();
   let Some(current) = encryption.keyring() else {
-    return KeyResponseArgs {
+    return AppliedKeyRequest::Ready(KeyResponseArgs {
       result: false,
       message: "no keyring configured on this node".into(),
       ..Default::default()
-    };
+    });
   };
   let (resp, rotated) = serf_driver::apply_key_request(current, req.op(), req.key()).into_parts();
-  if let Some(new_ring) = rotated {
-    encryption.set_keyring(new_ring.clone());
-    endpoint.set_encryption_options(encryption);
-    delegate.keyring_updated(&new_ring);
+  match rotated {
+    Some(new_ring) => {
+      encryption.set_keyring(new_ring.clone());
+      endpoint.set_encryption_options(encryption);
+      match delegate.keyring_updated(&new_ring) {
+        serf_driver::KeyringPersistence::Durable => AppliedKeyRequest::Ready(resp),
+        serf_driver::KeyringPersistence::Pending(rx) => {
+          AppliedKeyRequest::AwaitingPersistence(resp, rx)
+        }
+      }
+    }
+    None => AppliedKeyRequest::Ready(resp),
   }
-  resp
 }
 
 /// Per-driver observation task: dispatch each event's [`Delegate`] hook, then fan
@@ -1476,6 +1526,57 @@ async fn reap_pending_joins<I, G, R>(
 
 /// Earliest pending-join deadline, if any — folded into the per-iteration
 /// `timeout_deadline` so the timer fires by the first expiring join's deadline.
+/// Settle parked key responses: send those whose persistence acknowledgement
+/// resolved (as-is on success, downgraded to a failure carrying the error
+/// otherwise), drop those whose requester's response deadline passed while
+/// the acknowledgement was still pending (nothing useful can be routed), keep
+/// the rest parked. Called ahead of each output drain so a sent response
+/// flushes in the same pass.
+#[cfg(encryption)]
+fn reap_pending_key_responses<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  parked: &mut Vec<PendingKeyResponse<I>>,
+  now: Instant,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut i = 0;
+  while i < parked.len() {
+    let entry = &parked[i];
+    match settle_parked_key_response(&entry.rx, &entry.resp) {
+      Some(resp) => {
+        let entry = parked.swap_remove(i);
+        // Ignoring Err: `respond_key` fails only when the response cannot be
+        // routed; the key op has already applied to the live wire keyring.
+        let _ = endpoint.respond_key(&entry.req, resp, now);
+      }
+      None if now >= entry.req.deadline() => {
+        drop(parked.swap_remove(i));
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+          "a keyring persistence acknowledgement outlived the key request's response deadline; the response was dropped"
+        );
+      }
+      None => i += 1,
+    }
+  }
+}
+
+/// Next instant a parked key response should be re-polled, folded into the
+/// loop's timer target; `None` when nothing is parked. The persistence
+/// acknowledgement arrives on a plain channel with no waker integration, so
+/// the interval bounds the wait.
+#[cfg(encryption)]
+fn next_key_ack_check<I>(parked: &[PendingKeyResponse<I>], now: Instant) -> Option<Instant> {
+  if parked.is_empty() {
+    None
+  } else {
+    Some(now + KEYRING_PERSIST_POLL_INTERVAL)
+  }
+}
+
 fn min_pending_join_deadline(pending_joins: &[PendingJoin]) -> Option<Instant> {
   pending_joins
     .iter()

@@ -31,8 +31,9 @@ mod snapshotter;
   )))
 )]
 pub use keyring::{
-  KeyApplyOutcome, KeyringPersistError, KeyringPersistRx, KeyringPersistence, apply_key_request,
-  keyring_carries_cross_cipher_twin,
+  AppliedKeyRequest, KEYRING_PERSIST_POLL_INTERVAL, KeyApplyOutcome, KeyringPersistError,
+  KeyringPersistRx, KeyringPersistence, PendingKeyResponse, apply_key_request,
+  keyring_carries_cross_cipher_twin, settle_parked_key_response,
 };
 #[cfg(all(encryption, any(feature = "tcp", feature = "quic"), unix))]
 #[cfg_attr(

@@ -285,75 +285,12 @@ fn classify_errored_farewell(icmp_errors: u8, err: &io::Error) -> ErroredFarewel
 pub(crate) const LEAVE_DRAIN_TEARDOWN_BOUND: core::time::Duration =
   core::time::Duration::from_secs(1);
 
-/// Cadence at which a pump re-polls parked key responses awaiting the keyring
-/// delegate's persistence acknowledgement. The acknowledgement arrives on a
-/// plain channel with no waker integration, so while any response is parked
-/// the idle-arm timer target is bounded by this interval; a file-write
-/// acknowledgement resolves in milliseconds, so one rotation costs a handful
-/// of extra polls and a quiescent pump pays nothing.
+/// The parked key-response machinery, shared with the other runtime drivers
+/// through `serf-driver`.
 #[cfg(all(any(feature = "tcp", feature = "quic"), encryption))]
-pub(crate) const KEYRING_PERSIST_POLL_INTERVAL: core::time::Duration =
-  core::time::Duration::from_millis(1);
-
-/// A key-management response parked until the keyring delegate acknowledges
-/// the rotation's persistence, bounded by the requester's response deadline.
-#[cfg(all(any(feature = "tcp", feature = "quic"), encryption))]
-pub(crate) struct PendingKeyResponse<I> {
-  pub(crate) req: serf_proto::event::KeyRequest<I, SocketAddr>,
-  pub(crate) resp: serf_proto::event::KeyResponseArgs,
-  pub(crate) rx: crate::KeyringPersistRx,
-}
-
-/// The pump-facing outcome of applying one inbound key-management request to
-/// the live wire keyring.
-#[cfg(all(any(feature = "tcp", feature = "quic"), encryption))]
-pub(crate) enum AppliedKeyRequest {
-  /// No rotation needed out-of-band persistence (a `list`, a refused op, a
-  /// node with no keyring, or a delegate durable inline): respond now.
-  Ready(serf_proto::event::KeyResponseArgs),
-  /// A rotation was applied to the wire and handed to the keyring delegate:
-  /// the response waits for the persistence acknowledgement.
-  AwaitingPersistence(serf_proto::event::KeyResponseArgs, crate::KeyringPersistRx),
-}
-
-/// Fold one acknowledgement poll into a parked key response: `None` keeps it
-/// parked; `Some` is the final response to send — unchanged on a persisted
-/// rotation, downgraded to a failure carrying the error otherwise. The
-/// reference implementation folds its keyring-file write error into the
-/// response the same way, with the live wire keyring keeping the rotation.
-/// A disconnected sender counts as a failure: the worker vanished without
-/// acknowledging.
-#[cfg(all(any(feature = "tcp", feature = "quic"), encryption))]
-pub(crate) fn settle_parked_key_response(
-  rx: &crate::KeyringPersistRx,
-  resp: &serf_proto::event::KeyResponseArgs,
-) -> Option<serf_proto::event::KeyResponseArgs> {
-  use std::sync::mpsc::TryRecvError;
-  match rx.try_recv() {
-    Ok(Ok(())) => Some(resp.clone()),
-    Ok(Err(e)) => Some(failed_key_response(
-      resp,
-      format!("keyring rotated on the wire but not persisted: {e}"),
-    )),
-    Err(TryRecvError::Disconnected) => Some(failed_key_response(
-      resp,
-      "keyring rotated on the wire but not persisted: the persistence worker exited without acknowledging".to_string(),
-    )),
-    Err(TryRecvError::Empty) => None,
-  }
-}
-
-/// `resp` downgraded to a failed key response carrying `message`.
-#[cfg(all(any(feature = "tcp", feature = "quic"), encryption))]
-fn failed_key_response(
-  resp: &serf_proto::event::KeyResponseArgs,
-  message: String,
-) -> serf_proto::event::KeyResponseArgs {
-  let mut failed = resp.clone();
-  failed.result = false;
-  failed.message = message.into();
-  failed
-}
+pub(crate) use serf_driver::{
+  AppliedKeyRequest, KEYRING_PERSIST_POLL_INTERVAL, PendingKeyResponse, settle_parked_key_response,
+};
 
 /// Record the outcome of one readiness-based leave-farewell datagram send into
 /// `retained`:

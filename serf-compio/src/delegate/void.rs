@@ -5,7 +5,7 @@
 use core::marker::PhantomData;
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
-use super::{Delegate, MemberDelegate, MergeDelegate, QueryDelegate, UserEventDelegate};
+use super::{Delegate, MemberDelegate, QueryDelegate, UserEventDelegate};
 
 #[cfg(encryption)]
 use super::KeyringDelegate;
@@ -77,26 +77,6 @@ where
 {
   type Id = I;
   type Address = A;
-}
-
-/// A merge delegate that always permits merges.
-///
-/// The default delegate for drivers that do not need join admission control.
-/// Its associated error type is [`core::convert::Infallible`], reflecting that
-/// `notify_merge` can never fail.
-///
-/// Requires a stream or QUIC transport feature (`tcp` or `quic`).
-#[cfg(any(feature = "tcp", feature = "quic"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-pub struct NoopMergeDelegate;
-
-#[cfg(any(feature = "tcp", feature = "quic"))]
-impl<I, A> MergeDelegate<I, A> for NoopMergeDelegate
-where
-  I: 'static,
-  A: 'static,
-{
-  type Error = core::convert::Infallible;
 }
 
 /// A keyring delegate that persists nothing.
