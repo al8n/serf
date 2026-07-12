@@ -650,13 +650,13 @@ where
 /// so failure detection inside the scenario window stays sub-second).
 async fn spawn_node_with_snapshot<R>(
   id: &str,
+  bind: SocketAddr,
   snapshot: serf_reactor::SnapshotOptions,
   rejoin_after_leave: bool,
-) -> Node<R>
+) -> Result<Node<R>, serf_reactor::SerfError>
 where
   R: Runtime,
 {
-  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   Serf::<SmolStr, SocketAddr, R>::tcp(
     TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
@@ -673,7 +673,11 @@ where
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
   .await
-  .expect("spawn snapshot-backed serf tcp node")
+}
+
+/// An ephemeral loopback bind (`127.0.0.1:0`).
+fn ephemeral_bind() -> SocketAddr {
+  "127.0.0.1:0".parse().expect("loopback addr")
 }
 
 /// A unique snapshot path under the system temp dir.
@@ -704,8 +708,14 @@ where
 {
   let path = snapshot_path::<R>("rejoin");
   let a = spawn_node::<R>("snap-a").await;
-  let b =
-    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b = spawn_node_with_snapshot::<R>(
+    "snap-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   let a_addr = a.advertise_address();
 
   b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
@@ -717,8 +727,14 @@ where
   b.shutdown().await.expect("snap-b shuts down");
 
   // A fresh B from the same snapshot auto-rejoins A (no join call).
-  let b2 =
-    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b2 = spawn_node_with_snapshot::<R>(
+    "snap-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   converge(&a, &b2).await;
   assert_eq!(
     b2.num_members(),
@@ -742,8 +758,14 @@ where
 {
   let path = snapshot_path::<R>("leave-gate");
   let a = spawn_node::<R>("gate-a").await;
-  let b =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   let a_addr = a.advertise_address();
 
   b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
@@ -780,8 +802,14 @@ where
   }
 
   // Default posture: the leave clears the recovered state — no auto-rejoin.
-  let b2 =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b2 = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   R::sleep(Duration::from_millis(1500)).await;
   assert_eq!(
     b2.num_members(),
@@ -791,8 +819,14 @@ where
   b2.shutdown().await.expect("gate-b2 shuts down");
 
   // Opt-in posture: the Leave marker is ignored and the membership recovers.
-  let b3 =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), true).await;
+  let b3 = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    true,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   converge(&a, &b3).await;
 
   a.shutdown().await.expect("gate-a shuts down");
@@ -2053,10 +2087,21 @@ where
 {
   let path = snapshot_path::<R>("recovery");
   let a = spawn_node::<R>("sr-a").await;
-  let b =
-    spawn_node_with_snapshot::<R>("sr-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b = spawn_node_with_snapshot::<R>(
+    "sr-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   let a_addr = a.advertise_address();
   let b_id = b.local_id();
+  // Capture B's address: the restart must rebind it EXACTLY, because A holds B
+  // as a tombstone at this address (no dead-node reclaim window is configured),
+  // so a restart at a fresh port would be a same-id-new-address name conflict —
+  // exercising conflict resolution instead of snapshot recovery.
+  let b_addr = b.advertise_address();
 
   let mut b_events = b.events();
   b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
@@ -2118,10 +2163,32 @@ where
   .await
   .expect("A holds B as a Left tombstone after the force-remove");
 
-  // Restart B from the snapshot with a FRESH event channel, then let it
-  // auto-rejoin A from the recovered membership.
-  let b2 =
-    spawn_node_with_snapshot::<R>("sr-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  // Restart B from the snapshot with a FRESH event channel, at its ORIGINAL
+  // address so the revival is a clean recovery, not an address conflict. The
+  // freed port may not be instantly rebindable, so retry a bounded number of
+  // times.
+  let b2 = {
+    let mut attempt = 0usize;
+    loop {
+      match spawn_node_with_snapshot::<R>(
+        "sr-b",
+        b_addr,
+        serf_reactor::SnapshotOptions::new(&path),
+        false,
+      )
+      .await
+      {
+        Ok(node) => break node,
+        // Ignoring Err: a transient rebind race on the just-freed port is
+        // retried; only the final attempt's failure is fatal.
+        Err(_) if attempt + 1 < 25 => {
+          attempt += 1;
+          R::sleep(Duration::from_millis(20)).await;
+        }
+        Err(e) => panic!("restart rebind for sr-b at {b_addr} failed: {e}"),
+      }
+    }
+  };
   let mut b2_events = b2.events();
   converge(&a, &b2).await;
 
