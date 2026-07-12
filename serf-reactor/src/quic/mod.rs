@@ -545,6 +545,10 @@ where
       runtime.member_drop,
     )
     .with_reconnect_delegate(runtime.reconnect_delegate);
+    let mut endpoint = endpoint;
+    if let Some(md) = runtime.merge_delegate {
+      endpoint.set_merge_delegate(md);
+    }
 
     let driver = crate::driver::quic::spawn_quic_driver::<Self::Id, R, G, StdRng, D>(
       endpoint,

@@ -153,8 +153,7 @@ pub use tls::{SniProvider, TlsOptions, TlsTransport, TlsTransportOptions};
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use delegate::{
-  Delegate, MemberDelegate, MergeDelegate, NoopMergeDelegate, QueryDelegate, UserEventDelegate,
-  VoidDelegate,
+  Delegate, MemberDelegate, MergeDelegate, QueryDelegate, UserEventDelegate, VoidDelegate,
 };
 
 #[cfg(encryption)]

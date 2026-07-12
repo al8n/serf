@@ -340,6 +340,19 @@ where
     self.transport.endpoint_ref().health_score()
   }
 
+  /// Install a custom join-merge predicate on the inner memberlist machine.
+  ///
+  /// The machine consults it inline for EVERY push/pull merge — a join and a
+  /// periodic anti-entropy refresh alike — before applying the remote member
+  /// state; returning `false` cancels the merge, so a vetoed peer set is never
+  /// admitted.
+  pub fn set_merge_delegate(
+    &mut self,
+    delegate: impl memberlist_proto::delegate::MergeDelegate<I, A>,
+  ) {
+    self.transport.set_merge_delegate(delegate);
+  }
+
   /// Forwards to [`Endpoint::coordinate_resets`].
   #[cfg(feature = "coordinates")]
   #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
