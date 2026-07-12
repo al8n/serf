@@ -271,22 +271,51 @@ fn sweep_stale_temps(path: &Path) {
 }
 
 /// Whether removing `candidate` cannot touch the keyring the destination
-/// `path` reaches. `metadata` FOLLOWS symlinks, so each side resolves to the
-/// file a reader would actually open; only a candidate proven to resolve to
-/// DIFFERENT storage — or to alias nothing at all — is sweepable.
+/// `path` reaches.
+///
+/// `remove_file` unlinks a NAME, so the guards are layered by what a name
+/// can do: a candidate whose name can itself name the destination —
+/// lexically, or equal under the ASCII case folding that aliases names on
+/// case-insensitive filesystems — is NEVER sweepable, because a rotation's
+/// rename can land between any identity observation and the unlink, and the
+/// unlink would then remove whatever the destination name holds (the freshly
+/// persisted keyring). Only for genuinely distinct names — where the unlink
+/// cannot remove the destination's entry — is resolved filesystem identity
+/// consulted: `metadata` FOLLOWS symlinks, so each side resolves to the file
+/// a reader would actually open, and a candidate reaching the destination's
+/// storage through a symlink or hard link is skipped.
 fn sweepable(path: &Path, candidate: &Path) -> bool {
   use std::os::unix::fs::MetadataExt as _;
+  if candidate == path {
+    return false;
+  }
+  match (
+    candidate.file_name().and_then(|n| n.to_str()),
+    path.file_name().and_then(|n| n.to_str()),
+  ) {
+    (Some(c), Some(p)) if c.eq_ignore_ascii_case(p) => return false,
+    (Some(_), Some(_)) => {}
+    // Un-inspectable names: never delete on uncertainty.
+    _ => return false,
+  }
   if std::fs::symlink_metadata(candidate).is_err() {
     // Nothing at the candidate name; removal would be a no-op.
     return false;
   }
-  match (std::fs::metadata(candidate), std::fs::metadata(path)) {
+  let candidate_meta = std::fs::metadata(candidate);
+  // The window between the two observations is where a concurrent rename
+  // lands; the tests widen it deterministically to prove the name guards
+  // above — not luck — are what keep a mid-check rename safe.
+  #[cfg(test)]
+  tests::between_identity_observations(path);
+  let destination_meta = std::fs::metadata(path);
+  match (candidate_meta, destination_meta) {
     // A dangling symlink at the candidate name reaches no storage at all.
     (Err(e), _) if e.kind() == io::ErrorKind::NotFound => true,
     (Ok(c), Ok(d)) => (c.dev(), c.ino()) != (d.dev(), d.ino()),
-    // The destination resolves to nothing: on any filesystem where the
-    // candidate name could alias it, resolving the destination would have
-    // found the candidate's file — the two are genuinely distinct.
+    // The destination resolves to nothing: with the name-aliasing shapes
+    // already excluded above, an existing candidate cannot BE the missing
+    // destination — the two are genuinely distinct.
     (Ok(_), Err(e)) if e.kind() == io::ErrorKind::NotFound => true,
     // Identity cannot be established: never delete on uncertainty.
     _ => false,
