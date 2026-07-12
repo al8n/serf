@@ -301,6 +301,18 @@ where
     elapsed
   }
 
+  /// Gracefully leave node `i` but keep its handle LIVE — unlike
+  /// [`leave_graceful`](Self::leave_graceful), no shutdown follows. Lets an
+  /// assertion observe the leaver's OWN post-leave convergence (it reaps its
+  /// self Left tombstone back to the surviving peer) before teardown.
+  pub async fn leave_in_place(&self, i: usize) {
+    self
+      .node(i)
+      .leave()
+      .await
+      .expect("node leaves gracefully in place");
+  }
+
   /// Gracefully leave node `i` with a shutdown racing the leave: both commands
   /// are issued concurrently, so they typically land in the same driver command
   /// batch and the teardown itself must egress the still-queued farewell before

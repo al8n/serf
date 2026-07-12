@@ -1819,23 +1819,45 @@ where
 }
 
 /// Port of legacy `serf_join_leave` (Go `TestSerf_JoinLeave`): after a peer
-/// leaves gracefully, the observer reaps its Left tombstone under the DEFAULT
-/// timeout and drops back to a single member. The other leave e2es deliberately
-/// raise the tombstone timeout to hold the tombstone and pin the event
-/// sequence; this one exercises the plain default-tombstone reap that returns
-/// the cluster to N-1 — a path none of them cover.
+/// leaves gracefully, the departure settles on BOTH sides under the DEFAULT
+/// tombstone timeout. The other leave e2es raise the tombstone timeout to HOLD
+/// the tombstone and pin the event sequence; this one exercises the plain
+/// default-tombstone reap that none of them cover, and — like the legacy body —
+/// checks the leaver's own side, not just the observer's.
+///
+/// The leaver is kept running rather than shut down so its convergence is
+/// observable. It diverges from the legacy leaver in one deliberate way: the
+/// legacy leaver reaped its self Left tombstone to a member count of 1, but the
+/// reactor keeps the local node in its own view (only peer tombstones are
+/// reaped — the reap loop walks `left_members`, and a node's own leave-in-place
+/// does not tombstone-reap itself). So the leaver-side invariant is the
+/// self → Left transition beside a still-live peer, which is what actually
+/// guards against the leaver dropping a live peer or never processing its own
+/// departure; the count-to-one reap is asserted on the observer.
 async fn serf_join_leave<R>()
 where
   R: Runtime,
 {
   let mut cluster =
     cluster::Cluster::<R>::spawn(&["jl-a", "jl-b"], cluster::ClusterTiming::fast()).await;
+  let peer = cluster.id(0);
+  let leaver = cluster.id(1);
 
-  cluster.leave_graceful(1).await;
+  // Leave in place — keep B's handle live so its own convergence is observable.
+  cluster.leave_in_place(1).await;
 
-  // The fast profile's 1ms tombstone plus 100ms reap ticks drop B's Left
-  // tombstone, returning A to a single member.
+  // A (observer) reaps the departed B under the fast profile's 1ms tombstone +
+  // 100ms reap ticks, returning to just itself.
   cluster.await_num_members(0, 1).await;
+
+  // B (the leaver) processes its own departure — self becomes Left — while
+  // still tracking the live peer A.
+  cluster
+    .await_member_status(1, leaver.as_str(), MemberStatus::Left)
+    .await;
+  cluster
+    .await_member_status(1, peer.as_str(), MemberStatus::Alive)
+    .await;
 
   cluster.shutdown_all().await;
 }
