@@ -771,29 +771,12 @@ where
     // datagrams reach the wire before that fence fires.
     // Once `leave()` has been initiated the fan-out rides plain UDP in BOTH
     // unreliable modes (the Datagram arm reroutes it — see the match below) and
-    // is RETAINED on backpressure: retry the retained datagrams FIRST (they
-    // drain as the socket becomes writable), then pop fresh transmits at the
-    // unchanged cadence — a non-completing send is retained (not dropped) so
-    // peers do not read the departure as a failure. Periodic gossip stays
-    // best-effort.
-    if self.leave_initiated {
-      retry_retained_leave(
-        &mut self.leave_drain,
-        self.socket.as_ref(),
-        cx,
-        &mut self.leave_send_failed,
-      );
-      // A `LeftCluster` observed while these datagrams were still queued
-      // deferred the parked leave; resolve it now that the socket has accepted
-      // every retained farewell.
-      if self.left_cluster_seen && self.leave_drain.is_empty() {
-        self.left_cluster_seen = false;
-        if let Some(pl) = self.pending_leave.take() {
-          let failed = self.leave_send_failed;
-          pl.resolve_all(|| leave_outcome(failed));
-        }
-      }
-    }
+    // is RETAINED on non-completion instead of dropped. The retained-datagram
+    // RETRY does NOT run here: this pass repeats inside `drain_surfaces`'
+    // fixed point, and a retained farewell must absorb at most one ICMP-class
+    // error per pump wake for the bounded retry to sample the socket's error
+    // slot across DISTINCT wakes — the single retry site is the top of `poll`.
+    // Periodic gossip stays best-effort.
     let encode_opts = EncodeOptions::new(self.label.clone());
     let unreliable = self.endpoint.unreliable_transport();
     let mut needs_flush = false;
@@ -1287,6 +1270,34 @@ where
       progress = true;
     }
 
+    // Retained leave-farewell retry: exactly ONCE per poll, before any fresh
+    // sends (normal egress or teardown drain). A retained datagram must absorb
+    // at most one ICMP-class error per pump wake, so the bounded retry samples
+    // the socket's error slot across DISTINCT wakes — running it inside
+    // `drain_surfaces`' fixed point (or again at teardown) could exhaust the
+    // whole allowance within a single wake against one stale asynchronous
+    // error. A datagram retained by THIS poll's fresh sends waits for the next
+    // wake (the leave/teardown deadline timers are always armed while any
+    // farewell is outstanding).
+    if this.leave_initiated {
+      retry_retained_leave(
+        &mut this.leave_drain,
+        this.socket.as_ref(),
+        cx,
+        &mut this.leave_send_failed,
+      );
+      // A `LeftCluster` observed while these datagrams were still queued
+      // deferred the parked leave; resolve it now that the socket has accepted
+      // every retained farewell.
+      if this.left_cluster_seen && this.leave_drain.is_empty() {
+        this.left_cluster_seen = false;
+        if let Some(pl) = this.pending_leave.take() {
+          let failed = this.leave_send_failed;
+          pl.resolve_all(|| leave_outcome(failed));
+        }
+      }
+    }
+
     // Shutdown: flush to quiescence (an explicit leave's `Dead`-self notices
     // must reach the wire before the socket drops), fail every parked waiter
     // and queued command, release the bound port, then ack. No implicit leave:
@@ -1330,19 +1341,14 @@ where
           )));
         }
       }
-      // Flush any retained leave-farewell datagrams before releasing the socket:
-      // the quiescence loop above retains a backpressured graceful-leave fan-out
-      // rather than dropping it, and it must reach the wire before the socket
-      // drops. A residue parks the teardown — bounded by a short deadline —
-      // instead of being dropped: the `Pending` send has the writable waker
-      // registered while the deadline timer keeps a dead socket from hanging
-      // shutdown.
-      retry_retained_leave(
-        &mut this.leave_drain,
-        this.socket.as_ref(),
-        cx,
-        &mut this.leave_send_failed,
-      );
+      // Retained leave-farewell datagrams must reach the wire before the
+      // socket drops. They are retried by the per-poll retry at the top of
+      // `poll` (never here — a second same-poll retry could exhaust a
+      // datagram's whole ICMP allowance in one wake); a residue parks the
+      // teardown — bounded by a short deadline — instead of being dropped: the
+      // `Pending` send has the writable waker registered while the deadline
+      // timer keeps a dead socket from hanging shutdown.
+      //
       // The caller's per-leave deadline governs resolution during teardown
       // exactly as in the normal poll's reap: a leave that missed its
       // configured window resolves `LeaveTimeout` even mid-shutdown (a zero
