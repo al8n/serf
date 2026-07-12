@@ -193,14 +193,33 @@ fn write_via_exclusive_temp(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     file.write_all(contents)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // The rename is not durable until the DIRECTORY entry is: a crash after
+    // returning `Ok` here must not revert the destination to the old file —
+    // the acknowledgement built on this return is what releases a successful
+    // key response to the cluster.
+    sync_dir(dir.unwrap_or_else(|| Path::new(".")))
   })();
   if res.is_err() {
     // Ignoring Err: removing the failed temp (it holds key bytes) is
-    // best-effort hygiene; the write error itself is what propagates.
+    // best-effort hygiene; the write error itself is what propagates. A
+    // failure after the rename consumed the temp removes nothing.
     let _ = std::fs::remove_file(&tmp);
   }
   res
+}
+
+/// Sync a directory so a completed rename of an entry inside it survives a
+/// crash. On non-Unix platforms `std` cannot open a directory handle; the
+/// rename's durability is left to the filesystem's metadata journaling there.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+  std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+  Ok(())
 }
 
 /// OS-entropy nonce for a temp-file name: unpredictable, so a
@@ -213,14 +232,21 @@ fn temp_nonce() -> io::Result<u64> {
 
 /// Remove leftovers a rotation can no longer reuse: the fixed-name sibling
 /// temp earlier releases wrote (whose permissions predate the owner-only
-/// guarantee and may already hold key material), and any `.{name}.*.tmp`
-/// temps a crashed rotation abandoned. Removing a planted symlink unlinks
-/// the LINK, never its target. Best-effort: a sweep failure never blocks
-/// construction — `create_new` already keeps every future write off any
-/// path that survives.
+/// guarantee and may already hold key material), and the exact-shape
+/// `.{name}.{16 hex}.tmp` temps a crashed rotation abandoned. Removing a
+/// planted symlink unlinks the LINK, never its target. Best-effort: a sweep
+/// failure never blocks construction — `create_new` already keeps every
+/// future write off any path that survives.
 fn sweep_stale_temps(path: &Path) {
-  // Ignoring Err: nothing to sweep, or no permission — both non-fatal.
-  let _ = std::fs::remove_file(path.with_extension("tmp"));
+  // A destination whose own extension is `tmp` IS its `with_extension`
+  // image: sweeping it would delete the persisted keyring at construction
+  // (the previous implementation wrote such a destination in place, so the
+  // file can hold the only copy of legitimate key material).
+  let legacy = path.with_extension("tmp");
+  if legacy != path {
+    // Ignoring Err: nothing to sweep, or no permission — both non-fatal.
+    let _ = std::fs::remove_file(legacy);
+  }
   let (Some(dir), Some(name)) = (
     path.parent().filter(|d| !d.as_os_str().is_empty()),
     path.file_name().and_then(|n| n.to_str()),
@@ -236,7 +262,14 @@ fn sweep_stale_temps(path: &Path) {
     let Some(f) = file_name.to_str() else {
       continue;
     };
-    if f.starts_with(&prefix) && f.ends_with(".tmp") {
+    // Exact-shape match only — a sibling file that merely shares the prefix
+    // and suffix (an operator's own backup, say) is not this delegate's to
+    // delete.
+    let matches_temp_shape = f
+      .strip_prefix(&prefix)
+      .and_then(|rest| rest.strip_suffix(".tmp"))
+      .is_some_and(|mid| mid.len() == 16 && mid.bytes().all(|b| b.is_ascii_hexdigit()));
+    if matches_temp_shape {
       // Ignoring Err: best-effort sweep of abandoned temps.
       let _ = std::fs::remove_file(entry.path());
     }
