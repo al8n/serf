@@ -1036,8 +1036,17 @@ where
   cluster.leave_graceful(2).await;
   cluster.await_left_tombstone(0, subject.as_str()).await;
   cluster.await_left_tombstone(1, subject.as_str()).await;
-  let events_before_0 = cluster.member_event_kinds(0, subject.as_str());
-  let events_before_1 = cluster.member_event_kinds(1, subject.as_str());
+  // FENCE the baselines on the COLLECTORS, not the membership snapshot: the
+  // tombstone proves the state flipped, while the graceful leave's member
+  // event may still be in flight to a detached collector. Awaiting the exact
+  // sequence pins each baseline at [Join, Leave].
+  let expected = [MemberEventKind::Join, MemberEventKind::Leave];
+  cluster
+    .assert_member_events(0, subject.as_str(), &expected)
+    .await;
+  cluster
+    .assert_member_events(1, subject.as_str(), &expected)
+    .await;
 
   cluster
     .node(0)
@@ -1059,17 +1068,34 @@ where
       "node {observer}: the Left tombstone is retained, not pruned, by a plain force_leave"
     );
   }
+  // BARRIER the comparison behind a sentinel member event: a fresh node joins
+  // and both collectors must record ITS Join before the subject's sequences
+  // are compared — each collector's stream is ordered, so any duplicate Leave
+  // queued ahead of the sentinel would already be visible.
+  let sentinel = spawn_node::<R>("fleft-sentinel").await;
+  let a_addr = cluster.node(0).advertise_address();
+  sentinel
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the sentinel joins through the issuing survivor");
+  cluster
+    .await_member_event(0, "fleft-sentinel", MemberEventKind::Join)
+    .await;
+  cluster
+    .await_member_event(1, "fleft-sentinel", MemberEventKind::Join)
+    .await;
   assert_eq!(
     cluster.member_event_kinds(0, subject.as_str()),
-    events_before_0,
+    expected,
     "the issuing survivor records no additional member event for the no-op"
   );
   assert_eq!(
     cluster.member_event_kinds(1, subject.as_str()),
-    events_before_1,
+    expected,
     "the non-issuing survivor records no additional member event for the no-op"
   );
 
+  sentinel.shutdown().await.expect("the sentinel shuts down");
   cluster.shutdown_all().await;
 }
 
