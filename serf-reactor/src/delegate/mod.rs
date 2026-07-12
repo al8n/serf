@@ -245,6 +245,7 @@ pub type KeyringPersistRx = std::sync::mpsc::Receiver<Result<(), KeyringPersistE
   docsrs,
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
+#[must_use = "dropping the acknowledgement silently un-gates the key response from persistence"]
 pub enum KeyringPersistence {
   /// The rotation needs no out-of-band persistence (or completed inline):
   /// the key response is sent immediately.

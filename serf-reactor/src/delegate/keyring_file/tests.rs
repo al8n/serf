@@ -240,6 +240,73 @@ fn a_planted_symlink_never_receives_key_bytes() {
   let _ = std::fs::remove_file(&victim);
 }
 
+/// A destination whose own extension is `tmp` is NOT its legacy temp: the
+/// construction sweep must preserve it — the previous implementation wrote
+/// such a destination in place, so the file can hold the only copy of the
+/// keyring.
+#[test]
+fn a_tmp_extension_destination_survives_construction() {
+  let path = tmp_path("selfnamed").with_extension("tmp");
+  // Ignoring Err: a leftover file from a previous run is about to be rewritten.
+  let _ = std::fs::remove_file(&path);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([10u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([10u8; 32]);
+  {
+    let delegate = FileKeyringDelegate::new(&path);
+    acked(delegate.keyring_updated(&Keyring::new(key))).expect("the rotation persists");
+  }
+
+  let reopened = FileKeyringDelegate::new(&path);
+  let loaded = reopened
+    .load()
+    .expect("the persisted keyring parses")
+    .expect("constructing a delegate must not sweep a .tmp-named destination");
+  assert_eq!(loaded.primary_ref(), &key);
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// The success acknowledgement is durability: a rotation whose parent
+/// directory cannot be synced reports failure, because the completed rename
+/// is not crash-durable until the directory entry is.
+#[cfg(unix)]
+#[test]
+fn an_unsyncable_directory_fails_the_acknowledgement() {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let mut dir = std::env::temp_dir();
+  dir.push(format!("serf-keyring-unsync-{}", std::process::id()));
+  // Ignoring Err: a leftover directory from a previous run is fine to reuse.
+  let _ = std::fs::create_dir(&dir);
+  std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("open the dir");
+  let path = dir.join("ring");
+  let delegate = FileKeyringDelegate::new(&path);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([11u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([11u8; 32]);
+
+  // Write+search without read: the temp creation, write, and rename all
+  // succeed, but the directory handle needed for the durability sync cannot
+  // be opened — the acknowledgement must report that as a failure.
+  std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300))
+    .expect("make the dir unsyncable");
+  let outcome = acked(delegate.keyring_updated(&Keyring::new(key)));
+  std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("restore the dir");
+  assert!(
+    outcome.is_err(),
+    "an un-syncable rename must not acknowledge success"
+  );
+
+  // Ignoring Err: best-effort test-tree cleanup.
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A write failure is acknowledged as an error — the response gate's failure
 /// signal — not silently swallowed.
 #[test]
