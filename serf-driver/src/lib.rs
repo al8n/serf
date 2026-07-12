@@ -33,4 +33,4 @@ pub use keyring::{KeyApplyOutcome, apply_key_request, keyring_carries_cross_ciph
 pub use observation::observation_payload_bytes;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-pub use snapshot::SerfSnapshot;
+pub use snapshot::{SerfSnapshot, SerfStats};

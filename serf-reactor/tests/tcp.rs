@@ -127,6 +127,16 @@ where
   assert_eq!(a.num_members(), 2, "A sees the 2-member cluster");
   assert_eq!(b.num_members(), 2, "B sees the 2-member cluster");
 
+  // The operator aggregate reflects the converged view and the live endpoint
+  // readings: full member count, nothing failed or left, a healthy awareness
+  // score, and no keyring on these plaintext nodes.
+  let stats = a.stats();
+  assert_eq!(stats.members(), 2);
+  assert_eq!(stats.failed(), 0);
+  assert_eq!(stats.left(), 0);
+  assert_eq!(stats.health_score(), 0, "a healthy node scores 0");
+  assert!(!a.encryption_enabled(), "no keyring is configured");
+
   a.shutdown().await.expect("conv-a shuts down");
   b.shutdown().await.expect("conv-b shuts down");
 }

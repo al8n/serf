@@ -5944,6 +5944,15 @@ where
   pub fn cached_coordinate(&self, node: &I) -> Option<crate::typed::Coordinate> {
     self.coord_cache.get(node).cloned()
   }
+
+  /// The number of times the local Vivaldi coordinate has been reset after
+  /// degenerating (a defense the coordinate client applies when its model
+  /// stops converging). `None` when coordinates are disabled.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  pub fn coordinate_resets(&self) -> Option<usize> {
+    self.coord_client.as_ref().map(|cc| cc.stats().resets())
+  }
 }
 
 pub(crate) mod reliable;

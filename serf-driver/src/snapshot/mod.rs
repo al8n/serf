@@ -37,6 +37,22 @@ pub struct SerfSnapshot<I, A> {
   /// `None` when coordinates are disabled or no coordinate exists yet.
   #[cfg(feature = "coordinates")]
   coordinate: Option<serf_proto::typed::Coordinate>,
+  /// The node-awareness health score at the instant of the snapshot (`0` =
+  /// healthy; higher stretches the failure-detection timeouts). Set by the
+  /// publishing driver via [`with_ops_stats`](Self::with_ops_stats).
+  health_score: usize,
+  /// Depth of the gossip broadcast queue (the total across the intent, event,
+  /// and query tiers) at the instant of the snapshot. Set by the publishing
+  /// driver via [`with_ops_stats`](Self::with_ops_stats).
+  broadcast_queue_depth: usize,
+  /// Whether a gossip/reliable encryption keyring is configured on the node.
+  /// Set by the publishing driver via [`with_ops_stats`](Self::with_ops_stats).
+  encrypted: bool,
+  /// The number of times the local Vivaldi coordinate was reset after
+  /// degenerating; `None` when coordinates are disabled. Set by the publishing
+  /// driver via [`with_coordinate_resets`](Self::with_coordinate_resets).
+  #[cfg(feature = "coordinates")]
+  coordinate_resets: Option<usize>,
 }
 
 impl<I, A> SerfSnapshot<I, A> {
@@ -87,6 +103,92 @@ impl<I, A> SerfSnapshot<I, A> {
       member_count,
       #[cfg(feature = "coordinates")]
       coordinate: None,
+      health_score: 0,
+      broadcast_queue_depth: 0,
+      encrypted: false,
+      #[cfg(feature = "coordinates")]
+      coordinate_resets: None,
+    }
+  }
+
+  /// Attach the operator statistics a driver reads live from its endpoint
+  /// (builder form, called by the publishing driver after [`new`](Self::new)).
+  #[must_use]
+  pub fn with_ops_stats(
+    mut self,
+    health_score: usize,
+    broadcast_queue_depth: usize,
+    encrypted: bool,
+  ) -> Self {
+    self.health_score = health_score;
+    self.broadcast_queue_depth = broadcast_queue_depth;
+    self.encrypted = encrypted;
+    self
+  }
+
+  /// Attach the coordinate-reset counter (builder form).
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub fn with_coordinate_resets(mut self, resets: Option<usize>) -> Self {
+    self.coordinate_resets = resets;
+    self
+  }
+
+  /// The node-awareness health score at the instant of the snapshot (`0` =
+  /// healthy; higher stretches the failure-detection timeouts).
+  #[must_use]
+  pub const fn health_score(&self) -> usize {
+    self.health_score
+  }
+
+  /// Depth of the gossip broadcast queue (the total across the intent, event,
+  /// and query tiers) at the instant of the snapshot.
+  #[must_use]
+  pub const fn broadcast_queue_depth(&self) -> usize {
+    self.broadcast_queue_depth
+  }
+
+  /// Whether a gossip/reliable encryption keyring is configured on the node.
+  #[must_use]
+  pub const fn encrypted(&self) -> bool {
+    self.encrypted
+  }
+
+  /// The number of times the local Vivaldi coordinate was reset after
+  /// degenerating; `None` when coordinates are disabled.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub const fn coordinate_resets(&self) -> Option<usize> {
+    self.coordinate_resets
+  }
+
+  /// Assemble the aggregate operator statistics from this snapshot.
+  #[must_use]
+  pub fn stats(&self) -> SerfStats {
+    let failed = self
+      .members
+      .iter()
+      .filter(|m| m.status() == MemberStatus::Failed)
+      .count();
+    let left = self
+      .members
+      .iter()
+      .filter(|m| m.status() == MemberStatus::Left)
+      .count();
+    SerfStats {
+      members: self.member_count,
+      failed,
+      left,
+      health_score: self.health_score,
+      member_clock: self.member_clock,
+      event_clock: self.event_clock,
+      query_clock: self.query_clock,
+      broadcast_queue_depth: self.broadcast_queue_depth,
+      encrypted: self.encrypted,
+      #[cfg(feature = "coordinates")]
+      coordinate_resets: self.coordinate_resets,
     }
   }
 
@@ -228,3 +330,90 @@ impl<I, A> SerfSnapshot<I, A> {
 
 #[cfg(test)]
 mod tests;
+
+/// Aggregate operator statistics assembled from one [`SerfSnapshot`].
+///
+/// The counts and clocks come from the snapshot's member view; the health
+/// score, broadcast queue depth, and encryption flag are the live endpoint
+/// readings the publishing driver attached at the same instant.
+#[derive(Debug, Clone)]
+pub struct SerfStats {
+  members: usize,
+  failed: usize,
+  left: usize,
+  health_score: usize,
+  member_clock: LamportTime,
+  event_clock: LamportTime,
+  query_clock: LamportTime,
+  broadcast_queue_depth: usize,
+  encrypted: bool,
+  #[cfg(feature = "coordinates")]
+  coordinate_resets: Option<usize>,
+}
+
+impl SerfStats {
+  /// The count of all known members (alive + leaving + left + failed).
+  #[must_use]
+  pub const fn members(&self) -> usize {
+    self.members
+  }
+
+  /// The count of members currently in the failed state.
+  #[must_use]
+  pub const fn failed(&self) -> usize {
+    self.failed
+  }
+
+  /// The count of members currently in the gracefully-left state.
+  #[must_use]
+  pub const fn left(&self) -> usize {
+    self.left
+  }
+
+  /// The node-awareness health score (`0` = healthy; higher stretches the
+  /// failure-detection timeouts).
+  #[must_use]
+  pub const fn health_score(&self) -> usize {
+    self.health_score
+  }
+
+  /// The member Lamport clock.
+  #[must_use]
+  pub const fn member_clock(&self) -> LamportTime {
+    self.member_clock
+  }
+
+  /// The event Lamport clock.
+  #[must_use]
+  pub const fn event_clock(&self) -> LamportTime {
+    self.event_clock
+  }
+
+  /// The query Lamport clock.
+  #[must_use]
+  pub const fn query_clock(&self) -> LamportTime {
+    self.query_clock
+  }
+
+  /// Depth of the gossip broadcast queue (the total across the intent, event,
+  /// and query tiers).
+  #[must_use]
+  pub const fn broadcast_queue_depth(&self) -> usize {
+    self.broadcast_queue_depth
+  }
+
+  /// Whether a gossip/reliable encryption keyring is configured on the node.
+  #[must_use]
+  pub const fn encrypted(&self) -> bool {
+    self.encrypted
+  }
+
+  /// The number of times the local Vivaldi coordinate was reset after
+  /// degenerating; `None` when coordinates are disabled.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub const fn coordinate_resets(&self) -> Option<usize> {
+    self.coordinate_resets
+  }
+}

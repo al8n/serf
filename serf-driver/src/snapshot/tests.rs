@@ -215,3 +215,44 @@ fn new_panics_when_local_id_absent() {
     LamportTime::ZERO,
   );
 }
+
+/// `stats()` assembles the aggregate from the member view plus the
+/// driver-attached live readings: failed/left counts come from the statuses,
+/// and the ops-stats builder carries health score, queue depth, and the
+/// encryption flag; the defaults are the zero posture.
+#[test]
+fn stats_assembles_counts_and_ops_readings() {
+  let members = vec![
+    make_member(1, "127.0.0.1:7946", MemberStatus::Alive),
+    make_member(2, "127.0.0.1:7947", MemberStatus::Failed),
+    make_member(3, "127.0.0.1:7948", MemberStatus::Failed),
+    make_member(4, "127.0.0.1:7949", MemberStatus::Left),
+    make_member(5, "127.0.0.1:7950", MemberStatus::Leaving),
+  ];
+  let snap = SerfSnapshot::new(
+    members,
+    &1u32,
+    SerfState::Alive,
+    LamportTime::new(7),
+    LamportTime::new(8),
+    LamportTime::new(9),
+  );
+
+  // Defaults before the driver attaches its live readings.
+  let zero = snap.stats();
+  assert_eq!(zero.health_score(), 0);
+  assert_eq!(zero.broadcast_queue_depth(), 0);
+  assert!(!zero.encrypted());
+
+  let snap = snap.with_ops_stats(2, 5, true);
+  let stats = snap.stats();
+  assert_eq!(stats.members(), 5);
+  assert_eq!(stats.failed(), 2);
+  assert_eq!(stats.left(), 1, "Leaving is not Left");
+  assert_eq!(stats.health_score(), 2);
+  assert_eq!(stats.broadcast_queue_depth(), 5);
+  assert!(stats.encrypted());
+  assert_eq!(stats.member_clock(), LamportTime::new(7));
+  assert_eq!(stats.event_clock(), LamportTime::new(8));
+  assert_eq!(stats.query_clock(), LamportTime::new(9));
+}

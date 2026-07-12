@@ -678,6 +678,32 @@ impl<I, A, R> Serf<I, A, R> {
     self.shared.datagrams_sent()
   }
 
+  /// Aggregate operator statistics — member/failed/left counts, the health
+  /// score, the three Lamport clocks, the broadcast queue depth, and the
+  /// encryption flag — assembled lock-free from the latest published snapshot.
+  #[must_use]
+  pub fn stats(&self) -> serf_driver::SerfStats {
+    self.shared.load_snapshot().stats()
+  }
+
+  /// Whether a gossip/reliable encryption keyring is configured on this node,
+  /// read lock-free from the latest published snapshot. The keyring's presence
+  /// is fixed at construction (key rotation replaces its contents, never adds
+  /// or removes the ring itself), so this answer is stable for the node's
+  /// lifetime once the driver's first snapshot lands.
+  #[must_use]
+  pub fn encryption_enabled(&self) -> bool {
+    self.shared.load_snapshot().encrypted()
+  }
+
+  /// The node-awareness health score, read lock-free from the latest published
+  /// snapshot: `0` = healthy; higher values stretch the failure-detection
+  /// timeouts (the node believes itself degraded).
+  #[must_use]
+  pub fn health_score(&self) -> usize {
+    self.shared.load_snapshot().health_score()
+  }
+
   /// The local node's current Vivaldi network coordinate, read lock-free from
   /// the latest published snapshot.
   ///

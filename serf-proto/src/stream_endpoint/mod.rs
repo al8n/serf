@@ -333,6 +333,20 @@ where
     self.transport.endpoint_ref().user_broadcast_queue_len()
   }
 
+  /// The inner memberlist node-awareness health score: `0` = healthy, higher
+  /// values stretch the failure-detection timeouts (the node believes itself
+  /// degraded).
+  pub fn health_score(&self) -> usize {
+    self.transport.endpoint_ref().health_score()
+  }
+
+  /// Forwards to [`Endpoint::coordinate_resets`].
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  pub fn coordinate_resets(&self) -> Option<usize> {
+    self.core.coordinate_resets()
+  }
+
   // ── driver-owned transport surface (additive forwarders) ────────────────────
   //
   // These reach the memberlist coordinator's already-public driver methods. The
