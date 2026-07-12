@@ -1396,6 +1396,253 @@ where
   b.shutdown().await.expect("cancel-b shuts down");
 }
 
+/// Port of legacy `serf_set_tags` folding `serf_role` (Go `TestSerf_SetTags`
+/// / `TestSerf_Role`): a tag change on one node propagates to the peer in
+/// BOTH directions — the observer records an Update member event for the
+/// setter and its member view carries the new tag value.
+async fn serf_set_tags_propagates<R>()
+where
+  R: Runtime,
+{
+  let mut cluster =
+    cluster::Cluster::<R>::spawn(&["tags-a", "tags-b"], cluster::ClusterTiming::fast()).await;
+  let a_id = cluster.id(0);
+  let b_id = cluster.id(1);
+
+  let mut tags_b = serf_proto::Tags::new();
+  tags_b
+    .0
+    .insert(SmolStr::new("role"), SmolStr::new("worker"));
+  cluster
+    .node(1)
+    .set_tags(tags_b)
+    .await
+    .expect("B re-tags itself");
+  cluster
+    .await_member_event(0, b_id.as_str(), MemberEventKind::Update)
+    .await;
+  let seen = cluster
+    .node(0)
+    .members()
+    .iter()
+    .find(|m| m.node().id_ref().as_str() == b_id.as_str())
+    .map(|m| m.tags().0.get("role").cloned())
+    .expect("A tracks B");
+  assert_eq!(
+    seen.as_deref(),
+    Some("worker"),
+    "A's view of B carries the propagated role tag"
+  );
+
+  // And the reverse direction.
+  let mut tags_a = serf_proto::Tags::new();
+  tags_a.0.insert(SmolStr::new("role"), SmolStr::new("lead"));
+  cluster
+    .node(0)
+    .set_tags(tags_a)
+    .await
+    .expect("A re-tags itself");
+  cluster
+    .await_member_event(1, a_id.as_str(), MemberEventKind::Update)
+    .await;
+  let seen = cluster
+    .node(1)
+    .members()
+    .iter()
+    .find(|m| m.node().id_ref().as_str() == a_id.as_str())
+    .map(|m| m.tags().0.get("role").cloned())
+    .expect("B tracks A");
+  assert_eq!(
+    seen.as_deref(),
+    Some("lead"),
+    "B's view of A carries the propagated role tag"
+  );
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_update` (Go `TestSerf_Update`): a node fails, rejoins,
+/// and presents new tags — the observer records the Update and its view
+/// carries the refreshed tag. (The new stack has no start-time tag config;
+/// tags always enter through set_tags, which rides the same meta re-broadcast
+/// an updated rejoin config would, so the port re-tags immediately after the
+/// rejoin.)
+async fn serf_update_after_rejoin<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["upd-a", "upd-b"],
+    // The explicit rejoin below is the single revival path: the survivor's
+    // own reconnect re-dial is parked out of the window so its push/pull
+    // merge cannot race the retag (a merge refreshes tags without a member
+    // event), and the failed member is retained throughout.
+    cluster::ClusterTiming::fast()
+      .with_reconnect_interval(Duration::from_secs(600))
+      .with_reconnect_timeout(Duration::from_secs(600)),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  cluster.kill_abrupt(1).await;
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+  cluster.restart(1).await;
+  // The restarted node's serf clock begins fresh; an explicit join runs the
+  // push/pull that witnesses the survivor's clocks, so the tag update minted
+  // below stamps ABOVE the observer's recorded status time instead of
+  // arriving stale (the reference test also rejoins explicitly).
+  let a_addr = cluster.node(0).advertise_address();
+  cluster
+    .node(1)
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the restarted node rejoins through the survivor");
+  // Fence the REVIVAL on the observer's event sequence — the member count is
+  // vacuous here (the failed tombstone still counts toward it), and a retag
+  // racing ahead of the join would ride the join itself, leaving no separate
+  // Update to observe.
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Failed,
+        MemberEventKind::Join,
+      ],
+    )
+    .await;
+
+  let mut tags = serf_proto::Tags::new();
+  tags.0.insert(SmolStr::new("version"), SmolStr::new("v2"));
+  cluster
+    .node(1)
+    .set_tags(tags)
+    .await
+    .expect("the rejoined node re-tags itself");
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Update)
+    .await;
+  let seen = cluster
+    .node(0)
+    .members()
+    .iter()
+    .find(|m| m.node().id_ref().as_str() == subject.as_str())
+    .map(|m| m.tags().0.get("version").cloned())
+    .expect("A tracks the rejoined B");
+  assert_eq!(
+    seen.as_deref(),
+    Some("v2"),
+    "the failure/rejoin cycle ends with the refreshed tag visible"
+  );
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_query_filter` (Go `TestSerf_Query_Filter`): an
+/// Id-filtered query with relay redundancy surfaces on the FILTERED node
+/// only, and the originator collects exactly that node's response (the
+/// relayed duplicate is deduped by the machine). Standalone nodes rather
+/// than the cluster fixture: the fixture's collector round-robins the event
+/// stream away from scenario subscribers.
+async fn serf_query_filter<R>()
+where
+  R: Runtime,
+{
+  let a = spawn_node::<R>("qf-a").await;
+  let b = spawn_node::<R>("qf-b").await;
+  let c = spawn_node::<R>("qf-c").await;
+  let a_addr = a.advertise_address();
+
+  // Subscribe before any join so no event races the subscriptions.
+  let mut a_events = a.events();
+  let mut b_events = b.events();
+  let mut c_events = c.events();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("B joins through A");
+  c.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("C joins through A");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 3 && b.num_members() == 3 && c.num_members() == 3 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the three nodes converge");
+
+  let mut params = a.default_query_param();
+  params.filters = vec![serf_proto::typed::Filter::Id(vec![SmolStr::new("qf-b")])];
+  params.relay_factor = 1;
+  a.query("who", Bytes::from_static(b"filtered"), params)
+    .await
+    .expect("the filtered query dispatches");
+
+  // B — the filtered target — surfaces the query and answers it.
+  let responded = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match b_events.next().await {
+        Some(Event::Query(qe)) if qe.name() == "who" => {
+          b.respond(qe, Bytes::from_static(b"b-here"))
+            .await
+            .expect("B responds to the filtered query");
+          break true;
+        }
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .expect("B surfaces the filtered query within the timeout");
+  assert!(responded, "the filtered target answers");
+
+  // The originator collects exactly B's response.
+  let (from, payload) = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::QueryResponse(qr)) => break Some((qr.from().clone(), qr.payload().clone())),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("A collects the response within the timeout")
+  .expect("the response stream stays open");
+  assert_eq!(from.id_ref().as_str(), "qf-b");
+  assert_eq!(payload, Bytes::from_static(b"b-here"));
+
+  // C — filtered out — must never surface the query. Drain its stream for a
+  // bounded window and require silence on this query name.
+  let saw_query = R::timeout(Duration::from_secs(2), async {
+    loop {
+      match c_events.next().await {
+        Some(Event::Query(qe)) if qe.name() == "who" => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !saw_query,
+    "a node outside the Id filter must not surface the query"
+  );
+
+  a.shutdown().await.expect("qf-a shuts down");
+  b.shutdown().await.expect("qf-b shuts down");
+  c.shutdown().await.expect("qf-c shuts down");
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -1674,6 +1921,21 @@ mod tokio_cells {
     super::serf_join_cancel::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_set_tags_propagates() {
+    super::serf_set_tags_propagates::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_update_after_rejoin() {
+    super::serf_update_after_rejoin::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_query_filter() {
+    super::serf_query_filter::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -1819,6 +2081,21 @@ mod smol_cells {
   #[test]
   fn serf_join_cancel_smol() {
     SmolRuntime::block_on(super::serf_join_cancel::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_set_tags_propagates_smol() {
+    SmolRuntime::block_on(super::serf_set_tags_propagates::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_update_after_rejoin_smol() {
+    SmolRuntime::block_on(super::serf_update_after_rejoin::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_query_filter_smol() {
+    SmolRuntime::block_on(super::serf_query_filter::<SmolRuntime>());
   }
 
   #[cfg(encryption)]

@@ -109,6 +109,12 @@ impl ClusterTiming {
   /// member. Raise it well beyond the test's kill-to-restart window to hold a
   /// failed peer for reconnection instead of reaping it.
   #[must_use]
+  pub fn with_reconnect_interval(mut self, v: Duration) -> Self {
+    self.reconnect_interval = v;
+    self
+  }
+
+  /// Override the failed-member retention window.
   pub fn with_reconnect_timeout(mut self, v: Duration) -> Self {
     self.reconnect_timeout = v;
     self
