@@ -1461,12 +1461,16 @@ where
   cluster.shutdown_all().await;
 }
 
-/// Port of legacy `serf_update` (Go `TestSerf_Update`): a node fails, rejoins,
-/// and presents new tags — the observer records the Update and its view
-/// carries the refreshed tag. (The new stack has no start-time tag config;
-/// tags always enter through set_tags, which rides the same meta re-broadcast
-/// an updated rejoin config would, so the port re-tags immediately after the
-/// rejoin.)
+/// A rejoin-cycle regression guard: after a fail/restart/rejoin cycle, a tag
+/// change still propagates as an Update with the refreshed value visible —
+/// pinning the clock-sync and event-fencing subtleties of the revival path.
+///
+/// This is NOT the port of Go `TestSerf_Update`, which presents CHANGED tags
+/// at restart and expects the observer's Update to come from the rejoin merge
+/// itself: the new stack has no start-time tag configuration, and a push/pull
+/// merge currently refreshes member tags WITHOUT emitting a member event — a
+/// machine-side parity gap tracked separately (al8n/serf#86); the legacy
+/// scenario stays unresolved until it lands.
 async fn serf_update_after_rejoin<R>()
 where
   R: Runtime,
@@ -1578,9 +1582,14 @@ where
   .await
   .expect("the three nodes converge");
 
+  // An explicit timeout makes the query LIFETIME known, so the exclusivity
+  // drains below can cover it whole (the default would be computed from the
+  // gossip cadence and member count).
+  let query_lifetime = Duration::from_secs(3);
   let mut params = a.default_query_param();
   params.filters = vec![serf_proto::typed::Filter::Id(vec![SmolStr::new("qf-b")])];
   params.relay_factor = 1;
+  params.timeout = query_lifetime;
   a.query("who", Bytes::from_static(b"filtered"), params)
     .await
     .expect("the filtered query dispatches");
@@ -1604,25 +1613,39 @@ where
   .expect("B surfaces the filtered query within the timeout");
   assert!(responded, "the filtered target answers");
 
-  // The originator collects exactly B's response.
-  let (from, payload) = R::timeout(Duration::from_secs(20), async {
+  // Drain the originator across the WHOLE query lifetime plus a margin:
+  // exactly one matching response (the relayed duplicate is deduped), from
+  // B, and no surfaced `Event::Query` — the originator is outside its own
+  // Id filter too.
+  let drain_window = query_lifetime + Duration::from_secs(1);
+  let mut responses: Vec<(SmolStr, Bytes)> = Vec::new();
+  // Ignoring Err: the timeout IS the drain bound; events collected until it
+  // elapses are what the assertions below examine.
+  let _ = R::timeout(drain_window, async {
     loop {
       match a_events.next().await {
-        Some(Event::QueryResponse(qr)) => break Some((qr.from().clone(), qr.payload().clone())),
+        Some(Event::Query(qe)) if qe.name() == "who" => {
+          panic!("the originator is outside the Id filter and must not surface the query");
+        }
+        Some(Event::QueryResponse(qr)) => {
+          responses.push((qr.from().id_ref().clone(), qr.payload().clone()));
+        }
         Some(_) => {}
-        None => break None,
+        None => break,
       }
     }
   })
-  .await
-  .expect("A collects the response within the timeout")
-  .expect("the response stream stays open");
-  assert_eq!(from.id_ref().as_str(), "qf-b");
-  assert_eq!(payload, Bytes::from_static(b"b-here"));
+  .await;
+  assert_eq!(
+    responses.len(),
+    1,
+    "exactly one response survives the relay deduplication (got {responses:?})"
+  );
+  assert_eq!(responses[0].0.as_str(), "qf-b");
+  assert_eq!(responses[0].1, Bytes::from_static(b"b-here"));
 
-  // C — filtered out — must never surface the query. Drain its stream for a
-  // bounded window and require silence on this query name.
-  let saw_query = R::timeout(Duration::from_secs(2), async {
+  // C — filtered out — must stay silent across the same whole lifetime.
+  let saw_query = R::timeout(drain_window, async {
     loop {
       match c_events.next().await {
         Some(Event::Query(qe)) if qe.name() == "who" => break true,
