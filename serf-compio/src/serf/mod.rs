@@ -273,6 +273,61 @@ where
     })
   }
 
+  /// The operator aggregate — member/failed/left counts, clock floors, and
+  /// the driver-attached live readings (health score, broadcast queue depth,
+  /// encryption flag) — read lock-free from the latest published snapshot.
+  #[must_use]
+  pub fn stats(&self) -> serf_driver::SerfStats {
+    self.shared.snapshot.borrow().stats()
+  }
+
+  /// Whether a gossip/reliable encryption keyring is configured on this node,
+  /// read lock-free from the latest published snapshot. The keyring's presence
+  /// is fixed at construction (key rotation replaces its contents, never adds
+  /// or removes the ring itself), so this answer is stable for the node's
+  /// lifetime once the driver's first snapshot lands.
+  #[must_use]
+  pub fn encryption_enabled(&self) -> bool {
+    self.shared.snapshot.borrow().stats().encrypted()
+  }
+
+  /// The node-awareness health score, read lock-free from the latest published
+  /// snapshot: `0` = healthy; higher values stretch the failure-detection
+  /// timeouts (the node believes itself degraded).
+  #[must_use]
+  pub fn health_score(&self) -> usize {
+    self.shared.snapshot.borrow().stats().health_score()
+  }
+
+  /// The local node's current Vivaldi network coordinate, read lock-free from
+  /// the latest published snapshot.
+  ///
+  /// `None` when coordinates are disabled
+  /// (`Options::with_disable_coordinates(true)`) or before the driver's first
+  /// snapshot publish. Coordinates converge as probe round-trips accumulate;
+  /// estimate inter-node RTT by comparing two nodes' coordinates.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub fn coordinate(&self) -> Option<serf_proto::typed::Coordinate> {
+    self.shared.snapshot.borrow().coordinate().cloned()
+  }
+
+  /// The most-recently-observed Vivaldi coordinate of the peer `id`, updated on
+  /// each successful probe round-trip from that peer.
+  ///
+  /// Resolves `None` when coordinates are disabled or no RTT sample has been
+  /// received from `id` yet.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  pub async fn cached_coordinate(&self, id: I) -> Result<Option<serf_proto::typed::Coordinate>> {
+    let (tx, rx) = oneshot::channel();
+    self.send(Command::CachedCoordinate(
+      crate::command::CachedCoordinateCmd { id, reply: tx },
+    ))?;
+    await_reply(rx).await
+  }
+
   /// The local node identifier.
   #[inline]
   pub fn local_id(&self) -> &I {
