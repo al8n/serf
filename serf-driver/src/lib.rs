@@ -51,6 +51,13 @@ pub use observation::observation_payload_bytes;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use snapshot::{SerfSnapshot, SerfStats};
+/// Whether this build of the shared engines compiles their `tracing`
+/// telemetry — the persistence-failure warnings in the snapshotter and the
+/// keyring-file engine. The runtime crates' `tracing` features must forward
+/// here; their wiring tests assert this constant so a dropped forward fails
+/// loudly instead of silencing operator diagnostics.
+pub const TRACING_WIRED: bool = cfg!(feature = "tracing");
+
 pub use snapshotter::{
   DEFAULT_SNAPSHOT_COMPACT_THRESHOLD, OpenedSnapshot, SnapshotOpenError, Snapshotter,
 };
