@@ -1048,17 +1048,45 @@ where
     .assert_member_events(1, subject.as_str(), &expected)
     .await;
 
+  let clock_before = cluster.node(0).stats().member_clock();
   cluster
     .node(0)
     .force_leave(subject.clone(), false)
     .await
     .expect("force_leave on an already-left member is an accepted no-op");
 
-  // The no-op must HOLD across the propagation horizon: give the intent a
-  // full broadcast window, then require both survivors unchanged — still the
-  // Left tombstone, still three members, and NO additional member event
-  // (a late mutation or prune on either view fails these).
-  R::sleep(Duration::from_millis(1500)).await;
+  // CAUSAL FENCE: the force-leave stamps the member clock and the intent
+  // carries that ltime, which every receiver witnesses BEFORE deciding
+  // whether the intent applies — so the non-issuing survivor's clock
+  // reaching the issuer's post-command value proves THIS intent was
+  // received and processed there, not merely that unrelated traffic flowed.
+  let stamp = R::timeout(Duration::from_secs(20), async {
+    loop {
+      let c = cluster.node(0).stats().member_clock();
+      if c > clock_before {
+        break c;
+      }
+      R::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("the issuer stamps the member clock for the no-op intent");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if cluster.node(1).stats().member_clock() >= stamp {
+        break;
+      }
+      R::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("the non-issuing survivor witnesses the no-op intent's clock");
+
+  // A short settle lets the survivors reprocess any rebroadcast echo of the
+  // intent (a stale re-receipt must also stay a no-op), then both views must
+  // be unchanged — still the Left tombstone, still three members, and NO
+  // additional member event.
+  R::sleep(Duration::from_millis(500)).await;
   cluster.await_left_tombstone(0, subject.as_str()).await;
   cluster.await_left_tombstone(1, subject.as_str()).await;
   for observer in [0usize, 1] {
@@ -1068,10 +1096,11 @@ where
       "node {observer}: the Left tombstone is retained, not pruned, by a plain force_leave"
     );
   }
-  // BARRIER the comparison behind a sentinel member event: a fresh node joins
-  // and both collectors must record ITS Join before the subject's sequences
-  // are compared — each collector's stream is ordered, so any duplicate Leave
-  // queued ahead of the sentinel would already be visible.
+  // With propagation causally fenced above, BARRIER the collector drainage:
+  // a fresh sentinel node joins and both collectors must record ITS Join
+  // before the subject's sequences are compared — each collector's stream is
+  // ordered, so any duplicate event the (already-processed) intent emitted
+  // is queued ahead of the sentinel and would already be visible.
   let sentinel = spawn_node::<R>("fleft-sentinel").await;
   let a_addr = cluster.node(0).advertise_address();
   sentinel
