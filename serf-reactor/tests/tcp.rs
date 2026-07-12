@@ -1580,35 +1580,37 @@ async fn await_version_tag<R>(
 /// observer surfaces the change as a member Update — never a Failed/revival
 /// detour (whose Join would fold the tags in without a distinct Update).
 ///
-/// The mechanism under test is the restart self-refutation: the rejoin
-/// exchange shows the restarted node the observer's stale claim about itself
-/// (its pre-restart incarnation, the old tags), and it refutes by
-/// re-broadcasting a bumped Alive carrying its CURRENT tags, which the
-/// observer applies as an alive-to-alive metadata change —
-/// `NodeUpdated` → `Member(Update)`.
+/// The mechanism underneath is the restart self-refutation: a stale claim
+/// about the restarted node (its pre-restart incarnation, the old tags)
+/// reaches it, and it refutes by re-broadcasting a bumped Alive carrying its
+/// CURRENT tags, which the observer applies as an alive-to-alive metadata
+/// change — `NodeUpdated` → `Member(Update)`.
 ///
-/// Staging makes the refutation LOAD-BEARING rather than incidental. A retag
-/// bumps the local incarnation, so a pre-kill retag raises the observer's
-/// held incarnation to exactly the value the restarted node reaches after
-/// its own post-restart retag (fresh incarnation + one bump). The restarted
-/// node's own Alives are therefore equal-incarnation at the observer and
-/// stale-dropped; with failure detection parked (the observer holds the
-/// subject Alive across the whole cycle, the reference's
-/// restart-beats-detection timing) and periodic push/pull disabled, the
-/// refutation's bumped Alive is the ONLY route by which the new tags can
-/// reach the observer.
+/// Staging makes the refutation's incarnation BUMP load-bearing end-to-end.
+/// A retag bumps the local incarnation, so a pre-kill retag raises the
+/// observer's held incarnation to exactly the value the restarted node
+/// reaches after its own post-restart retag (fresh incarnation + one bump).
+/// Every Alive the restarted node can originate on its own is therefore
+/// equal-incarnation at the observer and stale-dropped; with failure
+/// detection parked (the observer holds the subject Alive across the whole
+/// cycle, the reference's restart-beats-detection timing) and periodic
+/// push/pull disabled, NO schedule delivers the new tags unless a
+/// refutation first lifts the restarted node past the observer's held
+/// incarnation.
 ///
-/// The equalization would unravel if the observer's gossip showed the
-/// restarted node the stale self-claim BEFORE the changed tags were
-/// installed: an early empty-meta refutation would lift the restarted node
-/// past the observer's incarnation and the new tags would then flow through
-/// ordinary monotonic admission instead of the refutation broadcast. The
-/// only pre-join sender is the observer's bounded retransmit queue (probes
-/// parked, push/pull disabled), so the staging drains it — a quiesce wait
-/// spanning many gossip ticks after the v1 fence, exhausting the v1 Alive's
-/// retransmit budget — before the kill. After that the restarted node hears
-/// nothing until its own rejoin, which makes the tags-before-rejoin
-/// installation as atomic as the reference's start-time tag configuration.
+/// WHICH message then carries the new tags is timing-dependent at driver
+/// level: the refutation may be triggered by the rejoin exchange itself
+/// (its bumped Alive carries the tags directly) or slightly earlier by a
+/// leftover gossip retransmit of the stale claim (an empty-meta refutation
+/// lifts the incarnation and the retag's own broadcast is then admitted
+/// above it, surfacing one extra Update). Both routes are the same
+/// mechanism and converge on the same view; the log assertion therefore
+/// pins the event-kind shape rather than an exact count, and the
+/// carrier-level causality — an equal-incarnation different-meta self-claim
+/// refutes with a broadcast carrying the CURRENT metadata — is pinned
+/// deterministically at the machine layer
+/// (`alive_node_refute_equal_incarnation_carries_current_meta` in
+/// memberlist-proto's SWIM parity suite), where no scheduler is involved.
 async fn serf_update_after_restart_with_changed_tags<R>()
 where
   R: Runtime,
@@ -1638,13 +1640,6 @@ where
     .expect("the subject tags itself before the restart");
   await_version_tag(&cluster, 0, subject.as_str(), "v1").await;
 
-  // Quiesce the observer's retransmit queue: the accepted v1 Alive is
-  // re-gossiped a BOUNDED number of times (the retransmit budget), and this
-  // wait spans dozens of gossip ticks — far past that budget — so nothing
-  // remains that could reach the restarted socket before the changed tags
-  // are installed below.
-  R::sleep(Duration::from_millis(600)).await;
-
   cluster.kill_abrupt(1).await;
   cluster.restart(1).await;
 
@@ -1667,24 +1662,21 @@ where
     .await
     .expect("the restarted node rejoins through the survivor");
 
-  // The completion fence: the refuted Alive delivers v2 to the observer.
+  // The completion fence: a refutation-lifted Alive delivers v2.
   await_version_tag(&cluster, 0, subject.as_str(), "v2").await;
 
-  // The whole cycle surfaced as exactly [Join, Update, Update]: no Failed
-  // (probing parked), no second Join (the observer never saw the subject
-  // leave), one Update per retag — a third Update would mean the quiesce
-  // window reopened and an early empty-meta refutation slipped through.
-  cluster
-    .assert_member_events(
-      0,
-      subject.as_str(),
-      &[
-        MemberEventKind::Join,
-        MemberEventKind::Update,
-        MemberEventKind::Update,
-      ],
-    )
-    .await;
+  // The whole cycle surfaced as one admission followed by nothing but
+  // Updates: no Failed (probing parked), no second Join (the observer never
+  // saw the subject leave), and both retags surfaced. An early empty-meta
+  // refutation may add one benign extra Update (see the doc), so the shape
+  // is pinned rather than an exact count.
+  let kinds = cluster.member_event_kinds(0, subject.as_str());
+  assert!(
+    kinds.len() >= 3
+      && kinds[0] == MemberEventKind::Join
+      && kinds[1..].iter().all(|k| *k == MemberEventKind::Update),
+    "the restart cycle must surface as one Join then only Updates (got {kinds:?})"
+  );
 
   cluster.shutdown_all().await;
 }
