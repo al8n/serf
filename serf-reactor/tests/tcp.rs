@@ -1547,24 +1547,60 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Poll `observer`'s member view until `subject`'s `version` tag equals
+/// `want` — the propagation fence for a retag.
+async fn await_version_tag<R>(
+  cluster: &cluster::Cluster<R>,
+  observer: usize,
+  subject: &str,
+  want: &str,
+) where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let seen = cluster
+        .node(observer)
+        .members()
+        .iter()
+        .find(|m| m.node().id_ref().as_str() == subject)
+        .and_then(|m| m.tags().0.get("version").cloned());
+      if seen.as_deref() == Some(want) {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .unwrap_or_else(|_| panic!("the observer never sees {subject}'s version tag reach {want:?}"));
+}
+
 /// Port of legacy `serf_update` (Go `TestSerf_Update`): a node restarts with
 /// CHANGED tags and rejoins while the observer still holds it Alive, and the
 /// observer surfaces the change as a member Update — never a Failed/revival
 /// detour (whose Join would fold the tags in without a distinct Update).
 ///
-/// The mechanism under test: the restarted node comes back with a fresh
-/// incarnation; the rejoin exchange shows it the observer's stale claim
-/// about itself (old incarnation, old tags), it refutes with a bumped
-/// incarnation carrying the new tags, and the observer applies the
-/// alive-to-alive metadata change as `NodeUpdated` → `Member(Update)`.
-/// Failure detection is parked (`probe_interval` beyond the window) so the
-/// observer holds the subject Alive across the whole kill/restart cycle —
-/// the reference test relies on the same restart-beats-detection timing —
-/// and the periodic push/pull is disabled so anti-entropy cannot deliver the
-/// state ahead of the rejoin. The refuted Alive may reach the observer via
-/// the rejoin exchange itself or the gossip it triggers; either route is the
-/// same restart-with-changed-tags scenario, and the pinned observable is the
-/// `[Join, Update]` sequence with the new value visible.
+/// The mechanism under test is the restart self-refutation: the rejoin
+/// exchange shows the restarted node the observer's stale claim about itself
+/// (its pre-restart incarnation, the old tags), and it refutes by
+/// re-broadcasting a bumped Alive carrying its CURRENT tags, which the
+/// observer applies as an alive-to-alive metadata change —
+/// `NodeUpdated` → `Member(Update)`.
+///
+/// Staging makes the refutation LOAD-BEARING rather than incidental. A retag
+/// bumps the local incarnation, so a pre-kill retag raises the observer's
+/// held incarnation to exactly the value the restarted node reaches after
+/// its own post-restart retag (fresh incarnation + one bump). The restarted
+/// node's own Alives are therefore equal-incarnation at the observer and
+/// stale-dropped; with failure detection parked (the observer holds the
+/// subject Alive across the whole cycle, the reference's
+/// restart-beats-detection timing) and periodic push/pull disabled, the
+/// refutation's bumped Alive is the ONLY route by which the new tags can
+/// reach the observer. The observer's own gossip may show the restarted node
+/// the stale claim slightly before the rejoin exchange does — either trigger
+/// is the same restart-refutation mechanism, so the log assertion pins the
+/// event KIND shape (one admission, only Updates after) rather than an exact
+/// count.
 async fn serf_update_after_restart_with_changed_tags<R>()
 where
   R: Runtime,
@@ -1582,12 +1618,25 @@ where
     .assert_member_events(0, subject.as_str(), &[MemberEventKind::Join])
     .await;
 
+  // The incarnation-equalizing retag: after this propagates, the observer
+  // holds the subject at fresh-incarnation-plus-one — the same value the
+  // subject reaches below after restarting and retagging once.
+  let mut tags = serf_proto::Tags::new();
+  tags.0.insert(SmolStr::new("version"), SmolStr::new("v1"));
+  cluster
+    .node(1)
+    .set_tags(tags)
+    .await
+    .expect("the subject tags itself before the restart");
+  await_version_tag(&cluster, 0, subject.as_str(), "v1").await;
+
   cluster.kill_abrupt(1).await;
   cluster.restart(1).await;
 
-  // Present the changed tags BEFORE rejoining: with probing parked and
-  // anti-entropy disabled, the observer can only learn them through the
-  // rejoin, mirroring the reference's restart-with-new-tags configuration.
+  // Present the changed tags BEFORE rejoining, mirroring the reference's
+  // restart-with-new-tags configuration. This lands the restarted node at
+  // the observer's held incarnation, so only the refutation below can carry
+  // the new value.
   let mut tags = serf_proto::Tags::new();
   tags.0.insert(SmolStr::new("version"), SmolStr::new("v2"));
   cluster
@@ -1603,29 +1652,18 @@ where
     .await
     .expect("the restarted node rejoins through the survivor");
 
-  cluster
-    .await_member_event(0, subject.as_str(), MemberEventKind::Update)
-    .await;
-  // The whole cycle surfaced as exactly [Join, Update]: no Failed (probing
-  // parked), no second Join (the observer never saw the subject leave).
-  cluster
-    .assert_member_events(
-      0,
-      subject.as_str(),
-      &[MemberEventKind::Join, MemberEventKind::Update],
-    )
-    .await;
-  let seen = cluster
-    .node(0)
-    .members()
-    .iter()
-    .find(|m| m.node().id_ref().as_str() == subject.as_str())
-    .map(|m| m.tags().0.get("version").cloned())
-    .expect("the observer tracks the restarted node");
-  assert_eq!(
-    seen.as_deref(),
-    Some("v2"),
-    "the rejoin delivers the changed tags as an alive-to-alive Update"
+  // The completion fence: the refuted Alive delivers v2 to the observer.
+  await_version_tag(&cluster, 0, subject.as_str(), "v2").await;
+
+  // The whole cycle surfaced as one admission followed by nothing but
+  // Updates: no Failed (probing parked), no second Join (the observer never
+  // saw the subject leave), and both retags surfaced.
+  let kinds = cluster.member_event_kinds(0, subject.as_str());
+  assert!(
+    kinds.len() >= 3
+      && kinds[0] == MemberEventKind::Join
+      && kinds[1..].iter().all(|k| *k == MemberEventKind::Update),
+    "the restart cycle must surface as one Join then only Updates (got {kinds:?})"
   );
 
   cluster.shutdown_all().await;
