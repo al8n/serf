@@ -3227,6 +3227,24 @@ fn make_coord_payload(coord: &crate::typed::Coordinate) -> Bytes {
   Bytes::from(buf)
 }
 
+/// A fresh coordinates-enabled endpoint installs the ORIGIN coordinate as its
+/// probe-ack payload on its first drain, so a peer's very first probe
+/// round-trip already observes a coordinate. Without the seed the coordinate
+/// plane deadlocks at bootstrap: updates refresh the payload, but no update
+/// can ever succeed until some ack carries one.
+#[cfg(feature = "coordinates")]
+#[test]
+fn coordinate_ack_payload_is_seeded_on_first_drain() {
+  let mut e = ep_with_coords();
+  e.handle_timeout(memberlist_proto::Instant::ORIGIN);
+  let payload = e.test_ack_payload();
+  assert!(
+    !payload.is_empty(),
+    "the first drain must install the initial coordinate ack payload"
+  );
+  assert_eq!(payload[0], 1u8, "PING_VERSION leads the seeded ack payload");
+}
+
 #[cfg(feature = "coordinates")]
 #[test]
 fn ping_completed_updates_local_coordinate_and_caches_remote() {

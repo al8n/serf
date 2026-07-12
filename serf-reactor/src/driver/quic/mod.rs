@@ -70,6 +70,8 @@ use serf_proto::{
 };
 use smallvec::SmallVec;
 
+#[cfg(feature = "coordinates")]
+use crate::command::CachedCoordinateCmd;
 #[cfg(encryption)]
 use crate::command::{KeyCmd, ListKeysCmd};
 #[cfg(encryption)]
@@ -674,6 +676,13 @@ where
         // Ignoring Err: caller dropped the reply receiver.
         let _ = reply.send(res);
       }
+      #[cfg(feature = "coordinates")]
+      Command::CachedCoordinate(CachedCoordinateCmd { id, reply }) => {
+        // A read-only probe of the coordinate cache: answerable in every
+        // lifecycle state (post-leave introspection stays valid).
+        // Ignoring Err: caller dropped the reply receiver.
+        let _ = reply.send(Ok(self.endpoint.cached_coordinate(&id)));
+      }
       Command::Shutdown(ShutdownCmd { reply }) => {
         // Do NOT ack inline: the UDP socket is still bound. Flag shutdown and park
         // the reply; the teardown branch acks every parked caller only AFTER it
@@ -1192,6 +1201,8 @@ where
       LamportTime::from(self.endpoint.event_time()),
       LamportTime::from(self.endpoint.query_time()),
     );
+    #[cfg(feature = "coordinates")]
+    let snap = snap.with_coordinate(self.endpoint.get_coordinate());
     self.shared.publish(snap);
   }
 
@@ -1253,6 +1264,10 @@ where
       }
       #[cfg(encryption)]
       Command::ListKeys(ListKeysCmd { reply, .. }) => {
+        let _ = reply.send(Err(SerfError::Shutdown));
+      }
+      #[cfg(feature = "coordinates")]
+      Command::CachedCoordinate(CachedCoordinateCmd { reply, .. }) => {
         let _ = reply.send(Err(SerfError::Shutdown));
       }
       Command::Shutdown(ShutdownCmd { reply }) => {

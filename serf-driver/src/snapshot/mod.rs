@@ -32,6 +32,11 @@ pub struct SerfSnapshot<I, A> {
   query_clock: LamportTime,
   alive_count: usize,
   member_count: usize,
+  /// The local node's Vivaldi coordinate at the instant of the snapshot, set by
+  /// the publishing driver via [`with_coordinate`](Self::with_coordinate);
+  /// `None` when coordinates are disabled or no coordinate exists yet.
+  #[cfg(feature = "coordinates")]
+  coordinate: Option<serf_proto::typed::Coordinate>,
 }
 
 impl<I, A> SerfSnapshot<I, A> {
@@ -80,7 +85,31 @@ impl<I, A> SerfSnapshot<I, A> {
       query_clock,
       alive_count,
       member_count,
+      #[cfg(feature = "coordinates")]
+      coordinate: None,
     }
+  }
+
+  /// Attach the local node's Vivaldi coordinate to the snapshot (builder form,
+  /// called by the publishing driver after [`new`](Self::new)).
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub fn with_coordinate(mut self, coordinate: Option<serf_proto::typed::Coordinate>) -> Self {
+    self.coordinate = coordinate;
+    self
+  }
+
+  /// The local node's Vivaldi coordinate at the instant of the snapshot.
+  ///
+  /// `None` when coordinates are disabled
+  /// (`Options::with_disable_coordinates(true)`), when the publishing driver
+  /// does not forward them, or when no coordinate exists yet.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub const fn coordinate(&self) -> Option<&serf_proto::typed::Coordinate> {
+    self.coordinate.as_ref()
   }
 
   /// All known members (full [`Member`], carrying tags and status) — alive, leaving, left,

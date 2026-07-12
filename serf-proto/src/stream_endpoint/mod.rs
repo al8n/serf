@@ -873,6 +873,12 @@ where
       .test_handle_leave_intent(&mut self.transport, id, ltime, now)
   }
 
+  /// The inner memberlist endpoint's stored probe-ack payload (test read).
+  #[cfg(all(test, feature = "coordinates"))]
+  pub(crate) fn test_ack_payload(&self) -> bytes::Bytes {
+    self.transport.endpoint_ref().ack_payload_bytes()
+  }
+
   /// Forwards to [`Endpoint::test_inner_node_joined`].
   #[cfg(test)]
   pub(crate) fn test_inner_node_joined(&mut self, id: I, now: Instant)

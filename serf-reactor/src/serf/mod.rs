@@ -29,6 +29,8 @@ use serf_proto::{
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
+#[cfg(feature = "coordinates")]
+use crate::command::CachedCoordinateCmd;
 #[cfg(encryption)]
 use crate::command::{KeyCmd, ListKeysCmd};
 #[cfg(encryption)]
@@ -674,6 +676,36 @@ impl<I, A, R> Serf<I, A, R> {
   #[must_use]
   pub fn datagrams_sent(&self) -> u64 {
     self.shared.datagrams_sent()
+  }
+
+  /// The local node's current Vivaldi network coordinate, read lock-free from
+  /// the latest published snapshot.
+  ///
+  /// `None` when coordinates are disabled
+  /// (`Options::with_disable_coordinates(true)`) or before the driver's first
+  /// snapshot publish. Coordinates converge as probe round-trips accumulate;
+  /// estimate inter-node RTT by comparing two nodes' coordinates.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  #[must_use]
+  pub fn coordinate(&self) -> Option<serf_proto::typed::Coordinate> {
+    self.shared.load_snapshot().coordinate().cloned()
+  }
+
+  /// The most-recently-observed Vivaldi coordinate of the peer `id`, updated on
+  /// each successful probe round-trip from that peer.
+  ///
+  /// Resolves `None` when coordinates are disabled or no RTT sample has been
+  /// received from `id` yet.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  pub async fn cached_coordinate(&self, id: I) -> Result<Option<serf_proto::typed::Coordinate>> {
+    let (tx, rx) = oneshot::channel();
+    self.send(Command::CachedCoordinate(CachedCoordinateCmd {
+      id,
+      reply: tx,
+    }))?;
+    await_reply(rx).await
   }
 
   /// Send `cmd` to the driver, failing fast if the node has shut down.

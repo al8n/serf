@@ -820,6 +820,10 @@ where
   /// Removed when a node is reaped from membership (G13).
   #[cfg(feature = "coordinates")]
   coord_cache: crate::FxHashMap<I, crate::typed::Coordinate>,
+  /// Whether the INITIAL coordinate ack payload has been installed on the
+  /// inner endpoint (see `seed_coordinate_ack`).
+  #[cfg(feature = "coordinates")]
+  coord_ack_seeded: bool,
   /// The `now` instant threaded into the most recent poll/handle call.
   ///
   /// The inner `poll_event` loop (drain_inner) fires synchronously from
@@ -985,6 +989,8 @@ where
       ignore_join_streams: Vec::new(),
       #[cfg(feature = "coordinates")]
       coord_client,
+      #[cfg(feature = "coordinates")]
+      coord_ack_seeded: false,
       #[cfg(feature = "coordinates")]
       coord_cache: crate::FxHashMap::default(),
       #[cfg(test)]
@@ -1391,11 +1397,41 @@ where
   where
     T: Reliable<I, A>,
   {
+    #[cfg(feature = "coordinates")]
+    self.seed_coordinate_ack(t);
     while let Some(ev) = t.poll_inner_event() {
       self.on_inner_event(t, ev);
     }
     if self.local_state_dirty {
       self.resync_local_state(t);
+    }
+  }
+
+  /// One-shot: install the INITIAL coordinate ack payload so a peer's very
+  /// first probe round-trip already observes a coordinate. Without the seed
+  /// the coordinate plane deadlocks at bootstrap: `handle_ping_completed`
+  /// refreshes the ack payload only after a successful update, but no update
+  /// can succeed until some ack carries a payload. The reference
+  /// implementation avoids this by re-encoding the current coordinate on
+  /// every ack; the stored-payload model needs the origin coordinate seeded
+  /// once, then stays refreshed by every subsequent update.
+  #[cfg(feature = "coordinates")]
+  fn seed_coordinate_ack<T>(&mut self, t: &mut T)
+  where
+    T: Reliable<I, A>,
+  {
+    if self.coord_ack_seeded {
+      return;
+    }
+    match self.coord_client.as_ref() {
+      Some(cc) => {
+        let payload = coord_ack_payload(cc.get_coordinate());
+        if t.set_ack_payload(payload).is_ok() {
+          self.coord_ack_seeded = true;
+        }
+      }
+      // Coordinates disabled at construction: nothing will ever be seeded.
+      None => self.coord_ack_seeded = true,
     }
   }
 
