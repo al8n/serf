@@ -57,6 +57,74 @@ pub enum KeyringPersistence {
   Pending(KeyringPersistRx),
 }
 
+/// Cadence at which a pump re-polls parked key responses awaiting the keyring
+/// delegate's persistence acknowledgement. The acknowledgement arrives on a
+/// plain channel with no waker integration, so while any response is parked
+/// the pump's timer target is bounded by this interval; a file-write
+/// acknowledgement resolves in milliseconds, so one rotation costs a handful
+/// of extra polls and a quiescent pump pays nothing.
+pub const KEYRING_PERSIST_POLL_INTERVAL: core::time::Duration =
+  core::time::Duration::from_millis(1);
+
+/// A key-management response parked until the keyring delegate acknowledges
+/// the rotation's persistence, bounded by the requester's response deadline.
+pub struct PendingKeyResponse<I> {
+  /// The originating request, kept for routing the deferred response.
+  pub req: serf_proto::event::KeyRequest<I, core::net::SocketAddr>,
+  /// The response built from the post-rotation live state.
+  pub resp: serf_proto::event::KeyResponseArgs,
+  /// The persistence acknowledgement the response waits on.
+  pub rx: KeyringPersistRx,
+}
+
+/// The pump-facing outcome of applying one inbound key-management request to
+/// the live wire keyring.
+pub enum AppliedKeyRequest {
+  /// No rotation needed out-of-band persistence (a `list`, a refused op, a
+  /// node with no keyring, or a delegate durable inline): respond now.
+  Ready(serf_proto::event::KeyResponseArgs),
+  /// A rotation was applied to the wire and handed to the keyring delegate:
+  /// the response waits for the persistence acknowledgement.
+  AwaitingPersistence(serf_proto::event::KeyResponseArgs, KeyringPersistRx),
+}
+
+/// Fold one acknowledgement poll into a parked key response: `None` keeps it
+/// parked; `Some` is the final response to send — unchanged on a persisted
+/// rotation, downgraded to a failure carrying the error otherwise. The
+/// reference implementation folds its keyring-file write error into the
+/// response the same way, with the live wire keyring keeping the rotation.
+/// A disconnected sender counts as a failure: the worker vanished without
+/// acknowledging.
+pub fn settle_parked_key_response(
+  rx: &KeyringPersistRx,
+  resp: &serf_proto::event::KeyResponseArgs,
+) -> Option<serf_proto::event::KeyResponseArgs> {
+  use std::sync::mpsc::TryRecvError;
+  match rx.try_recv() {
+    Ok(Ok(())) => Some(resp.clone()),
+    Ok(Err(e)) => Some(failed_key_response(
+      resp,
+      format!("keyring rotated on the wire but not persisted: {e}"),
+    )),
+    Err(TryRecvError::Disconnected) => Some(failed_key_response(
+      resp,
+      "keyring rotated on the wire but not persisted: the persistence worker exited without acknowledging".to_string(),
+    )),
+    Err(TryRecvError::Empty) => None,
+  }
+}
+
+/// `resp` downgraded to a failed key response carrying `message`.
+fn failed_key_response(
+  resp: &serf_proto::event::KeyResponseArgs,
+  message: String,
+) -> serf_proto::event::KeyResponseArgs {
+  let mut failed = resp.clone();
+  failed.result = false;
+  failed.message = message.into();
+  failed
+}
+
 #[cfg(test)]
 mod tests;
 

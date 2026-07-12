@@ -1048,8 +1048,11 @@ impl RecordingKeyring {
 
 #[cfg(encryption)]
 impl KeyringDelegate for RecordingKeyring {
-  fn keyring_updated(&self, keyring: &Keyring) {
+  fn keyring_updated(&self, keyring: &Keyring) -> serf_driver::KeyringPersistence {
     self.rings.borrow_mut().push(keyring.clone());
+    // The in-memory record is durable the moment it is pushed, so the key
+    // response goes out immediately.
+    serf_driver::KeyringPersistence::Durable
   }
 }
 

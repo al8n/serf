@@ -101,16 +101,29 @@ pub use error::{
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use delegate::{
-  Delegate, MemberDelegate, MergeDelegate, NoopMergeDelegate, QueryDelegate, UserEventDelegate,
-  VoidDelegate,
+  Delegate, MemberDelegate, MergeDelegate, QueryDelegate, UserEventDelegate, VoidDelegate,
 };
 
+#[cfg(all(encryption, unix))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(any(feature = "aes-gcm", feature = "chacha20-poly1305"), unix)))
+)]
+pub use delegate::{FileKeyringDelegate, KeyringFileError};
 #[cfg(encryption)]
 #[cfg_attr(
   docsrs,
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
 pub use delegate::{KeyringDelegate, VoidKeyringDelegate};
+/// The rotation-durability acknowledgement contract, shared with the other
+/// runtime drivers through `serf-driver`.
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub use serf_driver::{KeyringPersistError, KeyringPersistRx, KeyringPersistence};
 
 /// Gossip-encryption config types re-exported from `memberlist-proto`, so a
 /// caller can build a transport's `with_encryption` keyring without naming

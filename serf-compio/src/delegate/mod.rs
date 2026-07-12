@@ -8,12 +8,22 @@
 //!
 //! `KeyringDelegate` and `MergeDelegate` are separate from the observation
 //! `Delegate` composite: `KeyringDelegate` is sync (keyring ops must not
-//! block), and `MergeDelegate` is an async admission veto supplied at
-//! construction rather than an observation hook.
+//! block) and acknowledges each rotation's persistence, and `MergeDelegate`
+//! is the machine's synchronous push/pull filter, supplied at construction
+//! rather than an observation hook.
 
+#[cfg(all(encryption, unix))]
+mod keyring_file;
 mod void;
 
-pub use void::{NoopMergeDelegate, VoidDelegate};
+pub use void::VoidDelegate;
+
+#[cfg(all(encryption, unix))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(any(feature = "aes-gcm", feature = "chacha20-poly1305"), unix)))
+)]
+pub use keyring_file::{FileKeyringDelegate, KeyringFileError};
 
 #[cfg(encryption)]
 pub use void::VoidKeyringDelegate;
@@ -150,8 +160,14 @@ pub trait Delegate:
 /// no-op request do not fire it.
 ///
 /// [`keyring_updated`](Self::keyring_updated) is **synchronous and non-blocking**:
-/// it runs on the driver pump. If persistence needs async I/O, hand the ring off to
-/// a channel the observer owns and drain it elsewhere.
+/// it runs on the driver pump. If persistence needs I/O, hand the ring off to a
+/// worker and return
+/// [`KeyringPersistence::Pending`](serf_driver::KeyringPersistence::Pending);
+/// the pump polls the receiver without blocking and defers the rotated op's
+/// key response until it resolves, folding a persistence failure into that
+/// response (`result = false` carrying the error) exactly as the reference
+/// implementation folds a keyring-file write error — with the live wire
+/// keyring keeping the rotation either way.
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(encryption)]
@@ -162,49 +178,38 @@ pub trait Delegate:
 pub trait KeyringDelegate: 'static {
   /// Called after a key-management request successfully rotated the live wire
   /// keyring, with the new ring the gossip and reliable planes now encrypt under.
-  /// Not called for a `list` or any refused or no-op request. The default is a
-  /// no-op — the rotation is applied to the wire regardless; overriding this only
-  /// adds out-of-band persistence.
-  fn keyring_updated(&self, keyring: &Keyring) {
+  /// Not called for a `list` or any refused or no-op request. The default needs
+  /// no out-of-band persistence and reports
+  /// [`KeyringPersistence::Durable`](serf_driver::KeyringPersistence::Durable)
+  /// — the rotation is applied to the wire regardless; overriding this only
+  /// adds persistence and its acknowledgement.
+  fn keyring_updated(&self, keyring: &Keyring) -> serf_driver::KeyringPersistence {
     let _ = keyring; // Unused: default no-op; override to persist the rotation.
+    serf_driver::KeyringPersistence::Durable
   }
 }
 
-/// Async veto hook invoked by the driver on the join path before accepting
-/// remote member state from a push-pull exchange.
+/// The join-merge veto predicate, re-exported from the machine.
 ///
-/// `Ok(())` permits the merge; `Err(Self::Error)` cancels it. The driver wraps
-/// the concrete error into [`SerfError`](crate::SerfError) before forwarding it
-/// to the join caller.
+/// Supplied at construction (the `merge_delegate` argument) and installed into
+/// the memberlist machine, which consults it INLINE for every push/pull merge
+/// — a join and a periodic anti-entropy refresh alike — before applying the
+/// remote member state. Returning `false` cancels that merge: the vetoed peer
+/// set is not applied from the exchange.
 ///
-/// The hook is **async and driver-side** deliberately: the application may need
-/// to consult an ACL service or other async resource before deciding whether to
-/// accept a batch of remote peers. A synchronous (Sans-I/O) filter would
-/// preclude that.
-///
-/// `!Send`-agnostic: neither the trait object nor the future returned by
-/// `notify_merge` carry a `Send` bound, so compio's `!Send` driver can
-/// implement it without wrapping.
+/// This is a PUSH/PULL FILTER, not an admission-control boundary: a rejected
+/// peer can still enter membership moments later through gossiped Alive
+/// messages, exactly as in the reference implementation. Do not rely on it
+/// for durable exclusion or as an ACL — it bounds what a single state
+/// exchange can bulk-admit, nothing more. The predicate is synchronous by
+/// design: it runs inside the machine's drain, so an application needing
+/// async I/O (an ACL service, say) resolves its policy ahead of time and
+/// answers from that resolved state here.
 ///
 /// Requires a stream or QUIC transport feature (`tcp` or `quic`).
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-#[allow(async_fn_in_trait)]
-pub trait MergeDelegate<I, A>: 'static {
-  /// The veto/error type this delegate reports when a merge is cancelled.
-  type Error;
-
-  /// Called before the driver accepts inbound push-pull peer state.
-  ///
-  /// `peers` is the slice of remote [`Member`]s the cluster is about to merge.
-  /// Return `Ok(())` to proceed, or `Err(e)` to cancel the merge.
-  ///
-  /// The default implementation always permits the merge.
-  async fn notify_merge(&self, peers: &[Arc<Member<I, A>>]) -> Result<(), Self::Error> {
-    let _ = peers; // Unused in the default permit-all impl; an overriding delegate inspects it.
-    Ok(())
-  }
-}
+pub use memberlist_proto::delegate::MergeDelegate;
 
 #[cfg(test)]
 mod tests {
@@ -224,15 +229,28 @@ mod tests {
     assert_delegate(&v);
   }
 
-  /// Verify `NoopMergeDelegate` satisfies `MergeDelegate` with `Error =
-  /// Infallible` — a type-level check; no I/O needed.
+  /// The re-exported merge predicate is the machine's synchronous push/pull
+  /// filter — a type-level check that a plain permit-all impl satisfies it.
   #[cfg(any(feature = "tcp", feature = "quic"))]
   #[test]
-  fn noop_merge_delegate_satisfies_trait() {
-    fn assert_merge<T: MergeDelegate<SmolStr, SocketAddr, Error = core::convert::Infallible>>(
-      _: &T,
-    ) {
+  fn a_sync_predicate_satisfies_the_merge_delegate() {
+    struct PermitAll;
+    impl MergeDelegate<SmolStr, SocketAddr> for PermitAll {
+      fn notify_merge(
+        &self,
+        _peers: memberlist_proto::MaybeOwned<
+          '_,
+          [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+        >,
+      ) -> bool {
+        true
+      }
     }
-    assert_merge(&NoopMergeDelegate);
+    fn assert_merge<T>(_: &T)
+    where
+      T: MergeDelegate<SmolStr, SocketAddr>,
+    {
+    }
+    assert_merge(&PermitAll);
   }
 }
