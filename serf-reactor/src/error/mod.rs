@@ -151,6 +151,14 @@ pub enum SerfError {
   )]
   LeaveFarewellUndelivered,
 
+  /// The snapshot file supplied at construction could not be read or holds a
+  /// malformed record — the node refuses to start against state it cannot
+  /// trust.
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+  #[error(transparent)]
+  SnapshotOpen(#[from] crate::driver::snapshotter::SnapshotOpenError),
+
   /// The driver task has shut down and is no longer accepting commands.
   #[error("driver shut down")]
   Shutdown,

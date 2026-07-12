@@ -456,6 +456,9 @@ where
   close_timeout: Duration,
   dial_timeout: Duration,
   bridge_recv_buf_len: usize,
+  /// Snapshot persistence: appends a record for every surfaced membership
+  /// change and the advancing clock floors, `None` when persistence is off.
+  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
   /// The driver's keyring delegate: applies inbound key-management ops and
   /// produces the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)]
@@ -487,6 +490,7 @@ where
     stream_opts: StreamTransportOptions,
     label: Option<Bytes>,
     stream_timeout: Duration,
+    snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     let buf_len = endpoint
@@ -535,6 +539,7 @@ where
       close_timeout: stream_opts.close_timeout(),
       dial_timeout: stream_opts.dial_timeout(),
       bridge_recv_buf_len: stream_opts.bridge_recv_buf_len(),
+      snapshotter,
       #[cfg(encryption)]
       keyring,
     }
@@ -1307,6 +1312,39 @@ where
   /// on `LeftCluster`, begin teardown on a lost id-conflict `Shutdown`, and answer
   /// an inbound key-management request.
   fn account_event(&mut self, ev: &Event<I, SocketAddr>) {
+    // Snapshot persistence: append the surfaced membership change, the
+    // advancing clock floors, and the clean-leave marker, then flush (and
+    // compact past the threshold) — a change is durable once this poll
+    // returns. Restart replay + `load_snapshot` recovers the state.
+    if let Some(snap) = self.snapshotter.as_mut() {
+      match ev {
+        Event::Member(me) => {
+          use serf_proto::event::MemberEventKind as MK;
+          let alive = matches!(me.kind(), MK::Join | MK::Update);
+          for m in me.members() {
+            snap.append_member(alive, m.node());
+          }
+        }
+        Event::LeftCluster => snap.append_leave(),
+        _ => {}
+      }
+      if matches!(ev, Event::Member(_) | Event::LeftCluster) {
+        snap.append_clocks(
+          LamportTime::from(self.endpoint.member_time()),
+          LamportTime::from(self.endpoint.event_time()),
+          LamportTime::from(self.endpoint.query_time()),
+        );
+        let endpoint = &self.endpoint;
+        snap.flush_and_maybe_compact(|| {
+          endpoint
+            .members_snapshot()
+            .iter()
+            .filter(|m| m.status() == serf_proto::members::MemberStatus::Alive)
+            .map(|m| m.node().clone())
+            .collect()
+        });
+      }
+    }
     if let Event::ExchangeCompleted(c) = ev
       && c.kind() == ExchangeKind::PushPull
     {
@@ -2223,6 +2261,7 @@ pub(crate) fn spawn_stream_driver<I, R, T, D, G, SR>(
   stream_opts: StreamTransportOptions,
   label: Option<Bytes>,
   stream_timeout: Duration,
+  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
   #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
 ) -> StreamDriver<I, R, T, G, SR>
 where
@@ -2284,6 +2323,7 @@ where
     stream_opts,
     label,
     stream_timeout,
+    snapshotter,
     #[cfg(encryption)]
     keyring,
   )

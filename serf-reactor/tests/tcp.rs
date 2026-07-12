@@ -83,6 +83,7 @@ where
     SerfOptions::new(),
     None,
     None,
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
@@ -335,6 +336,7 @@ where
     Some(Box::new(ReapImmediately {
       target: SmolStr::new("rd-b"),
     })),
+    None,
     None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
@@ -644,6 +646,128 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Build a node persisting membership to `snapshot` (fast probe/gossip timing
+/// so failure detection inside the scenario window stays sub-second).
+async fn spawn_node_with_snapshot<R>(
+  id: &str,
+  snapshot: serf_reactor::SnapshotOptions,
+  rejoin_after_leave: bool,
+) -> Node<R>
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new().with_rejoin_after_leave(rejoin_after_leave),
+    None,
+    None,
+    Some(snapshot),
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node")
+}
+
+/// A unique snapshot path under the system temp dir.
+fn snapshot_path(name: &str) -> std::path::PathBuf {
+  let mut p = std::env::temp_dir();
+  p.push(format!("serf-e2e-snap-{name}-{}", std::process::id()));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&p);
+  p
+}
+
+/// Restart-and-rejoin: B persists its membership, is abruptly killed, and a
+/// fresh B booted from the SAME snapshot re-dials its recovered peers through
+/// the machine's own push/pull machinery — both nodes converge to two members
+/// again WITHOUT any explicit join call on the restarted node.
+async fn snapshot_restart_rejoins_the_cluster<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path("rejoin");
+  let a = spawn_node::<R>("snap-a").await;
+  let b =
+    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let a_addr = a.advertise_address();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // Abrupt kill: no leave marker lands in the snapshot.
+  b.shutdown().await.expect("snap-b shuts down");
+
+  // A fresh B from the same snapshot auto-rejoins A (no join call).
+  let b2 =
+    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  converge(&a, &b2).await;
+  assert_eq!(
+    b2.num_members(),
+    2,
+    "the restarted node recovers its membership from the snapshot"
+  );
+
+  a.shutdown().await.expect("snap-a shuts down");
+  b2.shutdown().await.expect("snap-b2 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// The clean-leave gate: after a graceful leave, a restart with the default
+/// `rejoin_after_leave = false` starts fresh (no auto-rejoin), while a restart
+/// opting in with `rejoin_after_leave = true` recovers the pre-leave
+/// membership and rejoins.
+async fn snapshot_leave_gate_controls_rejoin<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path("leave-gate");
+  let a = spawn_node::<R>("gate-a").await;
+  let b =
+    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let a_addr = a.advertise_address();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // Graceful leave: the Leave marker lands in the snapshot.
+  b.leave().await.expect("gate-b leaves gracefully");
+  b.shutdown().await.expect("gate-b shuts down");
+
+  // Default posture: the leave clears the recovered state — no auto-rejoin.
+  let b2 =
+    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  R::sleep(Duration::from_millis(1500)).await;
+  assert_eq!(
+    b2.num_members(),
+    1,
+    "a cleanly-left node must not auto-rejoin unless opted in"
+  );
+  b2.shutdown().await.expect("gate-b2 shuts down");
+
+  // Opt-in posture: the Leave marker is ignored and the membership recovers.
+  let b3 =
+    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), true).await;
+  converge(&a, &b3).await;
+
+  a.shutdown().await.expect("gate-a shuts down");
+  b3.shutdown().await.expect("gate-b3 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 /// The constructor-supplied merge delegate is the predicate the machine
 /// consults: with a recording accept-all delegate installed on B, A's join
 /// push-pull drives at least one `notify_merge` on B carrying A's node state.
@@ -695,6 +819,7 @@ where
       hits: hits.clone(),
       saw_peer: saw_peer.clone(),
     })),
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
@@ -740,6 +865,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new().with_leave_timeout(Duration::ZERO),
     SerfOptions::new(),
+    None,
     None,
     None,
     #[cfg(encryption)]
@@ -831,6 +957,7 @@ where
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
+    None,
     None,
     None,
     std::sync::Arc::new(VoidKeyringDelegate),
@@ -1019,6 +1146,16 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_restart_rejoins_the_cluster() {
+    super::snapshot_restart_rejoins_the_cluster::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_leave_gate_controls_rejoin() {
+    super::snapshot_leave_gate_controls_rejoin::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn merge_delegate_is_consulted_on_join() {
     super::merge_delegate_is_consulted_on_join::<TokioRuntime>().await;
   }
@@ -1116,6 +1253,16 @@ mod smol_cells {
   #[test]
   fn coordinates_surface_on_the_handle_smol() {
     SmolRuntime::block_on(super::coordinates_surface_on_the_handle::<SmolRuntime>());
+  }
+
+  #[test]
+  fn snapshot_restart_rejoins_the_cluster_smol() {
+    SmolRuntime::block_on(super::snapshot_restart_rejoins_the_cluster::<SmolRuntime>());
+  }
+
+  #[test]
+  fn snapshot_leave_gate_controls_rejoin_smol() {
+    SmolRuntime::block_on(super::snapshot_leave_gate_controls_rejoin::<SmolRuntime>());
   }
 
   #[test]

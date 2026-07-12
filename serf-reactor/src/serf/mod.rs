@@ -161,6 +161,7 @@ where
     gossip_rng: G,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> core::result::Result<Self, T::Error>
   where
@@ -186,6 +187,18 @@ where
     // Cache `query_timeout_mult` before `serf_options` moves into the bundle, so
     // the handle can compute `default_query_timeout` without a driver round-trip.
     let query_timeout_mult = serf_options.query_timeout_mult();
+
+    // Open (and decode) the snapshot file BEFORE any socket binds, so a
+    // corrupt or unreadable file fails construction loudly instead of
+    // silently starting a node with amnesia.
+    let snapshot = match snapshot {
+      Some(opts) => {
+        let (writer, records) =
+          crate::driver::snapshotter::Snapshotter::open(&opts).map_err(SerfError::from)?;
+        Some((writer, records))
+      }
+      None => None,
+    };
 
     let transport = T::new(options, resolver, advertise_resolver).await?;
     let local_id = transport.local_id().clone();
@@ -214,6 +227,7 @@ where
       member_drop_writer,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     );
@@ -274,6 +288,7 @@ where
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -291,6 +306,7 @@ where
       crate::gossip_rng()?,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )
@@ -310,6 +326,7 @@ where
     gossip_rng: G,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -328,6 +345,7 @@ where
       gossip_rng,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )
@@ -380,6 +398,7 @@ where
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -397,6 +416,7 @@ where
       crate::gossip_rng()?,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )
@@ -416,6 +436,7 @@ where
     gossip_rng: G,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -434,6 +455,7 @@ where
       gossip_rng,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )
@@ -485,6 +507,7 @@ where
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -502,6 +525,7 @@ where
       crate::gossip_rng()?,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )
@@ -521,6 +545,7 @@ where
     gossip_rng: G,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Result<Self>
   where
@@ -539,6 +564,7 @@ where
       gossip_rng,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     )

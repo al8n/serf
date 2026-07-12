@@ -275,6 +275,7 @@ mod gate {
       None,
       RuntimeOptions::new().with_iter_drain_cap(iter_drain_cap),
       None,
+      None,
       #[cfg(encryption)]
       Arc::new(crate::VoidKeyringDelegate),
     );

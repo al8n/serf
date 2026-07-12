@@ -6,6 +6,8 @@
 //! `StreamEndpoint` / `QuicEndpoint` and pump it as a quinn-style `Future::poll`.
 
 pub(crate) mod options;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) mod snapshotter;
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod shared;
