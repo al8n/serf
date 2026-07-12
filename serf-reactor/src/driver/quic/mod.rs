@@ -76,6 +76,10 @@ use crate::command::CachedCoordinateCmd;
 use crate::command::{KeyCmd, ListKeysCmd};
 #[cfg(encryption)]
 use crate::delegate::KeyringDelegate;
+#[cfg(encryption)]
+use crate::driver::shared::{
+  AppliedKeyRequest, KEYRING_PERSIST_POLL_INTERVAL, PendingKeyResponse, settle_parked_key_response,
+};
 use crate::{
   Channel,
   command::{
@@ -330,6 +334,11 @@ where
   /// Delivery accounting for the leave fan-out: the local-failure flag and the
   /// epoch gate spacing ICMP-class retry passes across distinct instants.
   farewell: FarewellAccounting,
+  /// Key-management responses parked until the keyring delegate acknowledges
+  /// each rotation's persistence, bounded by the requester's response
+  /// deadline.
+  #[cfg(encryption)]
+  pending_key_responses: Vec<PendingKeyResponse<I>>,
   /// Parked `Shutdown` replies — acked only after the UDP socket drops, so a caller
   /// resuming from `shutdown().await` can rebind the same address. A `Vec` because
   /// several callers can race `shutdown()`.
@@ -410,6 +419,8 @@ where
       left_cluster_seen: false,
       leave_drain_deadline: None,
       farewell: FarewellAccounting::new(),
+      #[cfg(encryption)]
+      pending_key_responses: Vec::new(),
       shutdown_reply: Vec::new(),
       recv_buf: vec![0u8; buf_len.max(1)],
       iter_drain_cap: driver_opts.iter_drain_cap().max(1),
@@ -1072,16 +1083,12 @@ where
     // compact past the threshold) — a change is durable once this poll
     // returns. Restart replay + `load_snapshot` recovers the state.
     if let Some(snap) = self.snapshotter.as_mut() {
-      match ev {
-        Event::Member(me) => {
-          use serf_proto::event::MemberEventKind as MK;
-          let alive = matches!(me.kind(), MK::Join | MK::Update);
-          for m in me.members() {
-            snap.append_member(alive, m.node());
-          }
+      if let Event::Member(me) = ev {
+        use serf_proto::event::MemberEventKind as MK;
+        let alive = matches!(me.kind(), MK::Join | MK::Update);
+        for m in me.members() {
+          snap.append_member(alive, m.node());
         }
-        Event::LeftCluster => snap.append_leave(),
-        _ => {}
       }
       if matches!(ev, Event::Member(_) | Event::LeftCluster) {
         snap.append_clocks(
@@ -1089,6 +1096,14 @@ where
           LamportTime::from(self.endpoint.event_time()),
           LamportTime::from(self.endpoint.query_time()),
         );
+        // The leave marker is written AFTER the clocks so a clean shutdown
+        // ends the file at the Leave record — the shape compaction preserves
+        // and replay expects: under the default no-rejoin posture the Leave
+        // wipes the accumulated state, and a clock record written after it
+        // would resurrect a clock the reference implementation zeroes.
+        if matches!(ev, Event::LeftCluster) {
+          snap.append_leave();
+        }
         let endpoint = &self.endpoint;
         snap.flush_and_maybe_compact(|| {
           endpoint
@@ -1139,10 +1154,20 @@ where
     }
     #[cfg(encryption)]
     if let Event::KeyRequest(req) = ev {
-      let resp = self.apply_key_request_live(req);
-      // Ignoring Err: `respond_key` fails only when the response cannot be routed;
-      // the key op has already applied to the live wire keyring.
-      let _ = self.endpoint.respond_key(req, resp, Instant::now());
+      match self.apply_key_request_live(req) {
+        AppliedKeyRequest::Ready(resp) => {
+          // Ignoring Err: `respond_key` fails only when the response cannot be
+          // routed; the key op has already applied to the live wire keyring.
+          let _ = self.endpoint.respond_key(req, resp, Instant::now());
+        }
+        AppliedKeyRequest::AwaitingPersistence(resp, rx) => {
+          self.pending_key_responses.push(PendingKeyResponse {
+            req: req.clone(),
+            resp,
+            rx,
+          });
+        }
+      }
     }
   }
 
@@ -1154,27 +1179,82 @@ where
   /// the coordinator's live `encryption_options`, applies the op variant-exactly
   /// against the live ring, and on a real mutation publishes the rotated ring back
   /// via `set_encryption_options` — re-keying the gossip datagram plane (the QUIC
-  /// reliable path always skips, quinn encrypts the stream) — then notifies the
-  /// keyring observer for persistence. A node with no keyring configured answers
-  /// `result = false` and makes no wire change; a read-only `list` or a refused op
-  /// leaves the wire untouched.
+  /// reliable path always skips, quinn encrypts the stream) — then hands the
+  /// ring to the keyring delegate: a durable-inline answer responds
+  /// immediately, while out-of-band persistence parks the response until its
+  /// acknowledgement resolves. A node with no keyring configured answers
+  /// `result = false` and makes no wire change; a read-only `list` or a
+  /// refused op leaves the wire untouched.
   #[cfg(encryption)]
-  fn apply_key_request_live(&mut self, req: &KeyRequest<I, SocketAddr>) -> KeyResponseArgs {
+  fn apply_key_request_live(&mut self, req: &KeyRequest<I, SocketAddr>) -> AppliedKeyRequest {
     let mut encryption = self.endpoint.encryption_options().clone();
     let Some(current) = encryption.keyring() else {
-      return KeyResponseArgs {
+      return AppliedKeyRequest::Ready(KeyResponseArgs {
         result: false,
         message: "no keyring configured on this node".into(),
         ..Default::default()
-      };
+      });
     };
     let (resp, rotated) = serf_driver::apply_key_request(current, req.op(), req.key()).into_parts();
-    if let Some(new_ring) = rotated {
-      encryption.set_keyring(new_ring.clone());
-      self.endpoint.set_encryption_options(encryption);
-      self.keyring.keyring_updated(&new_ring);
+    match rotated {
+      Some(new_ring) => {
+        encryption.set_keyring(new_ring.clone());
+        self.endpoint.set_encryption_options(encryption);
+        match self.keyring.keyring_updated(&new_ring) {
+          crate::KeyringPersistence::Durable => AppliedKeyRequest::Ready(resp),
+          crate::KeyringPersistence::Pending(rx) => {
+            AppliedKeyRequest::AwaitingPersistence(resp, rx)
+          }
+        }
+      }
+      None => AppliedKeyRequest::Ready(resp),
     }
-    resp
+  }
+
+  /// Settle parked key responses: send those whose persistence
+  /// acknowledgement resolved (as-is on success, downgraded to a failure
+  /// carrying the error otherwise), drop those whose requester's response
+  /// deadline passed while the acknowledgement was still pending (nothing
+  /// useful can be routed), keep the rest parked. Returns whether any
+  /// response was sent (the queued transmit needs a follow-up poll to flush).
+  #[cfg(encryption)]
+  fn reap_pending_key_responses(&mut self, now: Instant) -> bool {
+    let mut sent = false;
+    let mut i = 0;
+    while i < self.pending_key_responses.len() {
+      let entry = &self.pending_key_responses[i];
+      match settle_parked_key_response(&entry.rx, &entry.resp) {
+        Some(resp) => {
+          let entry = self.pending_key_responses.swap_remove(i);
+          // Ignoring Err: `respond_key` fails only when the response cannot be
+          // routed; the key op has already applied to the live wire keyring.
+          let _ = self.endpoint.respond_key(&entry.req, resp, now);
+          sent = true;
+        }
+        None if now >= entry.req.deadline() => {
+          drop(self.pending_key_responses.swap_remove(i));
+          #[cfg(feature = "tracing")]
+          tracing::warn!(
+            "a keyring persistence acknowledgement outlived the key request's response deadline; the response was dropped"
+          );
+        }
+        None => i += 1,
+      }
+    }
+    sent
+  }
+
+  /// Next instant a parked key response should be re-polled, folded into the
+  /// idle-arm timer target; `None` when nothing is parked. The persistence
+  /// acknowledgement arrives on a plain channel with no waker integration, so
+  /// the interval bounds the wait.
+  #[cfg(encryption)]
+  fn next_key_ack_check(&self, now: Instant) -> Option<Instant> {
+    if self.pending_key_responses.is_empty() {
+      None
+    } else {
+      Some(now + KEYRING_PERSIST_POLL_INTERVAL)
+    }
   }
 
   /// Reap await-result join waiters on the deadline timer (the reply terminal),
@@ -1417,6 +1497,12 @@ where
       // `ExchangeCompleted` events would be partially skipped, leaving contacted
       // addresses unaccounted in the `Err` tuple. `account_event` folds every
       // terminal completion into the matching pending join as it drains.
+      // Parked key responses settle before the drain so a response sent here
+      // flushes in this same pass; entries still pending when the pump exits
+      // drop with it (their requesters' deadlines cover the loss). Ignoring
+      // the sent flag: the drain below flushes queued transmits regardless.
+      #[cfg(encryption)]
+      let _ = this.reap_pending_key_responses(Instant::now());
       loop {
         let (_, drain_more) = this.drain_surfaces(cx);
         if !drain_more {
@@ -1572,6 +1658,14 @@ where
       more = true;
     }
 
+    // Settle parked key responses whose persistence acknowledgement resolved;
+    // a sent response queues transmits the follow-up poll flushes.
+    #[cfg(encryption)]
+    if this.reap_pending_key_responses(now) {
+      progress = true;
+      more = true;
+    }
+
     // Timer + deadline reaps under the shared-UDP-path quiescence gate. On QUIC
     // every resolving input (a reliable push/pull completion, a probe Ack) rides
     // the one UDP recv, so — with no disjoint FIFO to watermark — the non-premature
@@ -1664,6 +1758,10 @@ where
       }
       if let Some(epoch) = this.farewell_retry_deadline() {
         target = target.min(epoch);
+      }
+      #[cfg(encryption)]
+      if let Some(check) = this.next_key_ack_check(now) {
+        target = target.min(check);
       }
       if this.arm_and_poll_timer(target, now, cx) {
         more = true;

@@ -211,6 +211,67 @@ fn compaction_preserves_the_clean_leave_gate() {
   cleanup(&o);
 }
 
+/// A clean-leave tail replays identically before and after compaction, under
+/// both rejoin postures. The pumps append the clocks BEFORE the leave marker
+/// — the compacted terminal shape — so compaction can never change what a
+/// restart recovers: were the order reversed, the original file would replay
+/// clock floors the no-rejoin posture is supposed to zero, while its
+/// compacted replacement zeroed them.
+#[test]
+fn leave_tail_replays_identically_across_compaction() {
+  // Identical production-ordered appends (member, clocks, leave — the
+  // pumps' account_event order); only the threshold differs, so one flush
+  // compacts and the other keeps the original records.
+  let plain = opts("leave-order-plain");
+  let compacted = opts("leave-order-compacted").with_compact_threshold(1);
+  for o in [&plain, &compacted] {
+    let (mut snap, _) = Snapshotter::<SmolStr>::open(o).expect("open");
+    snap.append_member(true, &node("peer", 7001));
+    snap.append_clocks(
+      LamportTime::new(8),
+      LamportTime::new(2),
+      LamportTime::new(1),
+    );
+    snap.append_leave();
+    snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
+  }
+
+  let (_p, plain_records) = Snapshotter::<SmolStr>::open(&plain).expect("reopen the original");
+  let (_c, compacted_records) =
+    Snapshotter::<SmolStr>::open(&compacted).expect("reopen the compacted");
+  for rejoin in [false, true] {
+    let original = ReplayResult::replay(plain_records.clone(), rejoin);
+    let rewritten = ReplayResult::replay(compacted_records.clone(), rejoin);
+    assert_eq!(
+      original.alive_nodes, rewritten.alive_nodes,
+      "membership must replay identically across compaction (rejoin: {rejoin})"
+    );
+    assert_eq!(
+      (
+        original.last_clock,
+        original.last_event_clock,
+        original.last_query_clock
+      ),
+      (
+        rewritten.last_clock,
+        rewritten.last_event_clock,
+        rewritten.last_query_clock
+      ),
+      "clock floors must replay identically across compaction (rejoin: {rejoin})"
+    );
+  }
+  // And both match the reference semantics: a clean leave zeroes the clocks
+  // and empties the membership unless the rejoin posture ignores it.
+  let fresh = ReplayResult::replay(plain_records, false);
+  assert!(fresh.alive_nodes.is_empty());
+  assert_eq!(fresh.last_clock, LamportTime::ZERO);
+  let rejoined = ReplayResult::replay(compacted_records, true);
+  assert_eq!(rejoined.alive_nodes, vec![node("peer", 7001)]);
+  assert_eq!(rejoined.last_clock, LamportTime::new(8));
+  cleanup(&plain);
+  cleanup(&compacted);
+}
+
 /// Membership activity after a leave clears the clean-left state: the next
 /// compaction does not re-emit a stale Leave marker over live members.
 #[test]

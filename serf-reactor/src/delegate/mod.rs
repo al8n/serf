@@ -181,14 +181,18 @@ pub trait Delegate:
 /// that live keyring directly — install adds a secondary, use promotes the primary,
 /// remove drops a secondary, every op variant-exact — and answers the originator
 /// from the post-op live state via `respond_key`. This delegate does NOT author
-/// those responses; it only OBSERVES a successful rotation, receiving the new live
-/// [`Keyring`] so the application can persist it. A `list` and every refused or
-/// no-op request do not fire it.
+/// those responses, but it does GATE them: the driver defers a rotated op's
+/// response until the returned [`KeyringPersistence`] resolves, and folds a
+/// persistence failure into that response (`result = false` carrying the error)
+/// exactly as the reference implementation folds a keyring-file write error —
+/// with the live wire keyring keeping the rotation either way. A `list` and
+/// every refused or no-op request do not fire it.
 ///
 /// [`keyring_updated`](Self::keyring_updated) is **synchronous and non-blocking**:
-/// it runs on the driver pump. If persistence needs async I/O, hand the ring off to
-/// a channel the observer owns and drain it elsewhere. `Send + Sync + 'static`
-/// because the driver holds it behind an `Arc` shared across worker threads.
+/// it runs on the driver pump. If persistence needs I/O, hand the ring off to a
+/// worker and return [`KeyringPersistence::Pending`]; the pump polls the receiver
+/// without blocking. `Send + Sync + 'static` because the driver holds it behind
+/// an `Arc` shared across worker threads.
 ///
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(encryption)]
@@ -199,12 +203,55 @@ pub trait Delegate:
 pub trait KeyringDelegate: Send + Sync + 'static {
   /// Called after a key-management request successfully rotated the live wire
   /// keyring, with the new ring the gossip and reliable planes now encrypt under.
-  /// Not called for a `list` or any refused or no-op request. The default is a
-  /// no-op — the rotation is applied to the wire regardless; overriding this only
-  /// adds out-of-band persistence.
-  fn keyring_updated(&self, keyring: &Keyring) {
+  /// Not called for a `list` or any refused or no-op request. The default needs
+  /// no out-of-band persistence and reports [`KeyringPersistence::Durable`] —
+  /// the rotation is applied to the wire regardless; overriding this only adds
+  /// persistence and its acknowledgement.
+  fn keyring_updated(&self, keyring: &Keyring) -> KeyringPersistence {
     let _ = keyring; // Unused: default no-op; override to persist the rotation.
+    KeyringPersistence::Durable
   }
+}
+
+/// A persistence failure reported through [`KeyringPersistence::Pending`].
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub type KeyringPersistError = Box<dyn core::error::Error + Send + Sync>;
+
+/// Receiver half of one rotation's persistence acknowledgement.
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub type KeyringPersistRx = std::sync::mpsc::Receiver<Result<(), KeyringPersistError>>;
+
+/// How one keyring rotation reaches durability, reported back from
+/// [`KeyringDelegate::keyring_updated`].
+///
+/// The reference implementation writes its keyring file synchronously inside
+/// the key-management query handler and folds a write failure into the
+/// response. These drivers keep the pump non-blocking instead: a persisting
+/// delegate hands back a receiver, the pump parks the key response, and sends
+/// it once the receiver resolves — unchanged on success, downgraded to a
+/// failed response carrying the error otherwise (a disconnected sender counts
+/// as a failure: the worker vanished without acknowledging). The live wire
+/// keyring keeps the rotation in every outcome.
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub enum KeyringPersistence {
+  /// The rotation needs no out-of-band persistence (or completed inline):
+  /// the key response is sent immediately.
+  Durable,
+  /// Persistence runs out-of-band; the pump defers the key response until
+  /// the receiver resolves.
+  Pending(KeyringPersistRx),
 }
 
 /// The join-merge veto predicate, re-exported from the machine.

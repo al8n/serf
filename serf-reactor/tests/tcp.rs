@@ -677,9 +677,18 @@ where
 }
 
 /// A unique snapshot path under the system temp dir.
-fn snapshot_path(name: &str) -> std::path::PathBuf {
+fn snapshot_path<R>(name: &str) -> std::path::PathBuf
+where
+  R: Runtime,
+{
   let mut p = std::env::temp_dir();
-  p.push(format!("serf-e2e-snap-{name}-{}", std::process::id()));
+  // Keyed by runtime as well as pid: the tokio and smol cells run
+  // concurrently in one test binary and must not share a snapshot file.
+  p.push(format!(
+    "serf-e2e-snap-{name}-{}-{}",
+    std::process::id(),
+    core::any::type_name::<R>().replace("::", "-"),
+  ));
   // Ignoring Err: a leftover file from a previous run is fine to lose.
   let _ = std::fs::remove_file(&p);
   p
@@ -693,7 +702,7 @@ async fn snapshot_restart_rejoins_the_cluster<R>()
 where
   R: Runtime,
 {
-  let path = snapshot_path("rejoin");
+  let path = snapshot_path::<R>("rejoin");
   let a = spawn_node::<R>("snap-a").await;
   let b =
     spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
@@ -731,7 +740,7 @@ async fn snapshot_leave_gate_controls_rejoin<R>()
 where
   R: Runtime,
 {
-  let path = snapshot_path("leave-gate");
+  let path = snapshot_path::<R>("leave-gate");
   let a = spawn_node::<R>("gate-a").await;
   let b =
     spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
@@ -745,6 +754,30 @@ where
   // Graceful leave: the Leave marker lands in the snapshot.
   b.leave().await.expect("gate-b leaves gracefully");
   b.shutdown().await.expect("gate-b shuts down");
+
+  // The pump writes the clock floors BEFORE the leave marker, so a clean
+  // shutdown ends the file at the Leave record — the terminal shape replay
+  // expects and compaction preserves. A record written after it would
+  // resurrect state the default posture is supposed to zero.
+  {
+    let bytes = std::fs::read(&path).expect("the snapshot survives the leave");
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+      let (rec, used) =
+        serf_proto::snapshot::SnapshotRecord::<SmolStr, SocketAddr>::decode(&bytes[cursor..])
+          .expect("a clean-leave snapshot decodes whole");
+      records.push(rec);
+      cursor += used;
+    }
+    assert!(
+      matches!(
+        records.last(),
+        Some(serf_proto::snapshot::SnapshotRecord::Leave)
+      ),
+      "a clean shutdown must end the snapshot at the Leave record"
+    );
+  }
 
   // Default posture: the leave clears the recovered state — no auto-rejoin.
   let b2 =
