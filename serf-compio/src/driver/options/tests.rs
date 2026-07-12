@@ -467,8 +467,12 @@ fn runtime_options_update_applies_explicit_override() {
 #[cfg(feature = "tracing")]
 #[test]
 fn tracing_forwards_to_the_shared_engines() {
-  assert!(
-    serf_driver::TRACING_WIRED,
-    "the tracing feature must forward serf-driver/tracing"
-  );
+  // A dropped forward fails this build outright: the pin is const-evaluated,
+  // so every tracing-featured compile of the test target enforces it.
+  const {
+    assert!(
+      serf_driver::TRACING_WIRED,
+      "the tracing feature must forward serf-driver/tracing"
+    )
+  };
 }
