@@ -24,11 +24,17 @@ quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring", "serf-driver/quic-rus
 coordinates = ["serf-proto/coordinates", "serf-driver/coordinates"]
 # Encryption backends — forward to serf-proto (key-management messages) and to
 # memberlist-proto (the coordinator's gossip-encryption keyring + encrypt/decrypt).
-aes-gcm = ["serf-proto/aes-gcm", "serf-driver/aes-gcm", "memberlist-proto/aes-gcm"]
+aes-gcm = [
+  "serf-proto/aes-gcm",
+  "serf-driver/aes-gcm",
+  "memberlist-proto/aes-gcm",
+  "dep:zeroize",
+]
 chacha20-poly1305 = [
   "serf-proto/chacha20-poly1305",
   "serf-driver/chacha20-poly1305",
   "memberlist-proto/chacha20-poly1305",
+  "dep:zeroize",
 ]
 # Regex-backed tag-filter matching.
 tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
@@ -58,6 +64,7 @@ smol_str.workspace = true
 smallvec.workspace = true
 bytes = { workspace = true }
 thiserror.workspace = true
+zeroize = { version = "1", optional = true, default-features = false }
 futures-channel.workspace = true
 futures-util = { workspace = true, default-features = false, features = [
   "std",
