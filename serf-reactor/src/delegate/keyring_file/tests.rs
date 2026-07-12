@@ -363,6 +363,55 @@ fn a_symlinked_destination_keeps_its_target_through_construction() {
   let _ = std::fs::remove_file(&target);
 }
 
+/// The legacy-sweep classifier admits only extensions provably distinct
+/// from `tmp` under every supported filename-alias relation: pure-ASCII
+/// non-tmp extensions (or none, where the image appends characters no
+/// folding can absorb) pass; any tmp case-fold or any non-ASCII scalar —
+/// case-insensitive HFS+ ignores certain Unicode scalars when comparing
+/// names, so `ring.t\u{200D}mp` aliases `ring.tmp` there — is refused.
+#[test]
+fn the_legacy_sweep_classifier_refuses_unprovable_extensions() {
+  for (destination, distinct) in [
+    ("ring.keys", true),
+    ("ring", true),
+    ("ring.tmp", false),
+    ("ring.TMP", false),
+    ("ring.Tmp", false),
+    // An HFS+-ignorable scalar (ZERO WIDTH JOINER) inside the extension.
+    ("ring.t\u{200D}mp", false),
+    // Any non-ASCII scalar is unprovable, ignorable or not.
+    ("ring.cl\u{00E9}s", false),
+  ] {
+    assert_eq!(
+      legacy_temp_provably_distinct(Path::new(destination)),
+      distinct,
+      "{destination:?}"
+    );
+  }
+}
+
+/// A destination whose extension is not provably distinct keeps its legacy
+/// image on EVERY filesystem: whether or not the running filesystem folds
+/// the two names together, the conservative refusal leaves the sibling file
+/// alone — the fold-aliasing filesystems are exactly where that sibling IS
+/// the persisted keyring.
+#[test]
+fn an_unprovable_extension_keeps_the_legacy_sibling() {
+  let path = tmp_path("ignorable").with_extension("t\u{200D}mp");
+  let sibling = path.with_extension("tmp");
+  std::fs::write(&sibling, "possibly the persisted keyring\n").expect("seed the sibling");
+
+  let _delegate = FileKeyringDelegate::new(&path);
+  assert!(
+    sibling.exists(),
+    "an unprovable extension must refuse the legacy sweep"
+  );
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&sibling);
+  let _ = std::fs::remove_file(&path);
+}
+
 /// A rename landing between the sweep's two identity observations must
 /// never lose the destination: `remove_file` unlinks a NAME, so a candidate
 /// whose name can itself name the destination is refused by the name guard
