@@ -784,11 +784,15 @@ where
       #[cfg(encryption)]
       Command::InstallKey(KeyCmd {
         key,
+        relay_factor,
         now: at,
         reply,
       }) => {
         let res = if running {
-          self.endpoint.install_key(key, at).map_err(SerfError::from)
+          self
+            .endpoint
+            .install_key(key, relay_factor, at)
+            .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };
@@ -798,11 +802,15 @@ where
       #[cfg(encryption)]
       Command::UseKey(KeyCmd {
         key,
+        relay_factor,
         now: at,
         reply,
       }) => {
         let res = if running {
-          self.endpoint.use_key(key, at).map_err(SerfError::from)
+          self
+            .endpoint
+            .use_key(key, relay_factor, at)
+            .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };
@@ -812,11 +820,15 @@ where
       #[cfg(encryption)]
       Command::RemoveKey(KeyCmd {
         key,
+        relay_factor,
         now: at,
         reply,
       }) => {
         let res = if running {
-          self.endpoint.remove_key(key, at).map_err(SerfError::from)
+          self
+            .endpoint
+            .remove_key(key, relay_factor, at)
+            .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };
@@ -824,9 +836,16 @@ where
         let _ = reply.send(res);
       }
       #[cfg(encryption)]
-      Command::ListKeys(ListKeysCmd { now: at, reply }) => {
+      Command::ListKeys(ListKeysCmd {
+        relay_factor,
+        now: at,
+        reply,
+      }) => {
         let res = if running {
-          self.endpoint.list_keys(at).map_err(SerfError::from)
+          self
+            .endpoint
+            .list_keys(relay_factor, at)
+            .map_err(SerfError::from)
         } else {
           Err(SerfError::NotRunning)
         };

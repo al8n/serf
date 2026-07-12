@@ -930,9 +930,22 @@ impl<I, A, R> Serf<I, A, R> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub async fn install_key(&self, key: SecretKey) -> Result<QueryId> {
+    self.install_key_with(key, 0).await
+  }
+
+  /// As [`install_key`](Self::install_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub async fn install_key_with(&self, key: SecretKey, relay_factor: u8) -> Result<QueryId> {
     let (tx, rx) = oneshot::channel();
     self.send(Command::InstallKey(KeyCmd {
       key,
+      relay_factor,
       now: Instant::now(),
       reply: tx,
     }))?;
@@ -946,9 +959,22 @@ impl<I, A, R> Serf<I, A, R> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub async fn use_key(&self, key: SecretKey) -> Result<QueryId> {
+    self.use_key_with(key, 0).await
+  }
+
+  /// As [`use_key`](Self::use_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub async fn use_key_with(&self, key: SecretKey, relay_factor: u8) -> Result<QueryId> {
     let (tx, rx) = oneshot::channel();
     self.send(Command::UseKey(KeyCmd {
       key,
+      relay_factor,
       now: Instant::now(),
       reply: tx,
     }))?;
@@ -962,9 +988,22 @@ impl<I, A, R> Serf<I, A, R> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub async fn remove_key(&self, key: SecretKey) -> Result<QueryId> {
+    self.remove_key_with(key, 0).await
+  }
+
+  /// As [`remove_key`](Self::remove_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub async fn remove_key_with(&self, key: SecretKey, relay_factor: u8) -> Result<QueryId> {
     let (tx, rx) = oneshot::channel();
     self.send(Command::RemoveKey(KeyCmd {
       key,
+      relay_factor,
       now: Instant::now(),
       reply: tx,
     }))?;
@@ -978,8 +1017,21 @@ impl<I, A, R> Serf<I, A, R> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub async fn list_keys(&self) -> Result<QueryId> {
+    self.list_keys_with(0).await
+  }
+
+  /// As [`list_keys`](Self::list_keys), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub async fn list_keys_with(&self, relay_factor: u8) -> Result<QueryId> {
     let (tx, rx) = oneshot::channel();
     self.send(Command::ListKeys(ListKeysCmd {
+      relay_factor,
       now: Instant::now(),
       reply: tx,
     }))?;

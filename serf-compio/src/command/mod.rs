@@ -252,6 +252,10 @@ pub(crate) struct SetTagsCmd {
 pub(crate) struct KeyCmd {
   /// The secret key to install, promote, or remove.
   pub(crate) key: SecretKey,
+  /// Relay redundancy for the responses: each node relays its answer through
+  /// this many random intermediaries (`0` = direct-only).
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  pub(crate) relay_factor: u8,
   /// Wall-clock instant passed to the machine's key-op call.
   #[cfg(any(feature = "tcp", feature = "quic"))]
   pub(crate) now: Instant,
@@ -265,6 +269,10 @@ pub(crate) struct KeyCmd {
 /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
 #[cfg(encryption)]
 pub(crate) struct ListKeysCmd {
+  /// Relay redundancy for the responses: each node relays its answer through
+  /// this many random intermediaries (`0` = direct-only).
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  pub(crate) relay_factor: u8,
   /// Wall-clock instant passed to `Endpoint::list_keys`.
   #[cfg(any(feature = "tcp", feature = "quic"))]
   pub(crate) now: Instant,
