@@ -383,6 +383,12 @@ impl<I, A> KeyRequest<I, A> {
     &self.from
   }
 
+  /// Relay redundancy requested by the issuer: the answering node relays its
+  /// response through this many random intermediary nodes (`0` = direct-only).
+  pub const fn relay_factor(&self) -> u8 {
+    self.relay_factor
+  }
+
   /// Opaque query id (forwarded to `Endpoint::respond_key`).
   pub const fn id(&self) -> u32 {
     self.id

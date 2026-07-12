@@ -4992,6 +4992,7 @@ where
     name: SmolStr,
     payload: Bytes,
     purpose: QueryPurpose,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
@@ -5023,7 +5024,7 @@ where
       ),
       filters: vec![],
       flags: QueryFlag::empty(),
-      relay_factor: 0,
+      relay_factor,
       timeout,
       name,
       payload,
@@ -5111,6 +5112,7 @@ where
       SmolStr::new("_serf_conflict"),
       payload,
       QueryPurpose::Conflict,
+      0,
       now,
     );
   }
@@ -5365,7 +5367,9 @@ where
     self.pending_events.push_back(Event::KeyResponse(kr));
   }
 
-  /// Issue a cluster-wide `install_key` query for `key`.
+  /// Issue a cluster-wide `install_key` query for `key`. `relay_factor`
+  /// relays each response through that many random intermediary nodes for
+  /// delivery redundancy (`0` = direct-only, the default posture).
   ///
   /// Requires the `aes-gcm` or `chacha20-poly1305` feature.
   #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
@@ -5377,6 +5381,7 @@ where
     &mut self,
     t: &mut T,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
@@ -5390,6 +5395,7 @@ where
       SmolStr::new("_serf_install_key"),
       payload,
       QueryPurpose::Key,
+      relay_factor,
       now,
     )
   }
@@ -5406,6 +5412,7 @@ where
     &mut self,
     t: &mut T,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
@@ -5419,6 +5426,7 @@ where
       SmolStr::new("_serf_use_key"),
       payload,
       QueryPurpose::Key,
+      relay_factor,
       now,
     )
   }
@@ -5435,6 +5443,7 @@ where
     &mut self,
     t: &mut T,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
@@ -5448,6 +5457,7 @@ where
       SmolStr::new("_serf_remove_key"),
       payload,
       QueryPurpose::Key,
+      relay_factor,
       now,
     )
   }
@@ -5460,7 +5470,12 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub(crate) fn list_keys<T>(&mut self, t: &mut T, now: Instant) -> Result<QueryId, Error>
+  pub(crate) fn list_keys<T>(
+    &mut self,
+    t: &mut T,
+    relay_factor: u8,
+    now: Instant,
+  ) -> Result<QueryId, Error>
   where
     T: Reliable<I, A>,
     I: Clone + Data,
@@ -5472,6 +5487,7 @@ where
       SmolStr::new("_serf_list_keys"),
       payload,
       QueryPurpose::Key,
+      relay_factor,
       now,
     )
   }

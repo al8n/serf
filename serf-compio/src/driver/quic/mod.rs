@@ -909,11 +909,14 @@ async fn dispatch_command<I, G, R>(
     #[cfg(encryption)]
     Command::InstallKey(KeyCmd {
       key,
+      relay_factor,
       now: at,
       reply,
     }) => {
       let res = if running {
-        endpoint.install_key(key, at).map_err(SerfError::from)
+        endpoint
+          .install_key(key, relay_factor, at)
+          .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };
@@ -923,11 +926,14 @@ async fn dispatch_command<I, G, R>(
     #[cfg(encryption)]
     Command::UseKey(KeyCmd {
       key,
+      relay_factor,
       now: at,
       reply,
     }) => {
       let res = if running {
-        endpoint.use_key(key, at).map_err(SerfError::from)
+        endpoint
+          .use_key(key, relay_factor, at)
+          .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };
@@ -937,11 +943,14 @@ async fn dispatch_command<I, G, R>(
     #[cfg(encryption)]
     Command::RemoveKey(KeyCmd {
       key,
+      relay_factor,
       now: at,
       reply,
     }) => {
       let res = if running {
-        endpoint.remove_key(key, at).map_err(SerfError::from)
+        endpoint
+          .remove_key(key, relay_factor, at)
+          .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };
@@ -949,9 +958,15 @@ async fn dispatch_command<I, G, R>(
       let _ = reply.send(res);
     }
     #[cfg(encryption)]
-    Command::ListKeys(ListKeysCmd { now: at, reply }) => {
+    Command::ListKeys(ListKeysCmd {
+      relay_factor,
+      now: at,
+      reply,
+    }) => {
       let res = if running {
-        endpoint.list_keys(at).map_err(SerfError::from)
+        endpoint
+          .list_keys(relay_factor, at)
+          .map_err(SerfError::from)
       } else {
         Err(SerfError::NotRunning)
       };

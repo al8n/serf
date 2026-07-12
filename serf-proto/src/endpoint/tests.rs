@@ -2769,19 +2769,19 @@ fn shutdown_refuses_key_management() {
 
   // Every issuance funnels through internal_query → ensure_not_shutdown.
   assert!(
-    matches!(e.list_keys(now), Err(Error::Shutdown)),
+    matches!(e.list_keys(0, now), Err(Error::Shutdown)),
     "list_keys must be refused after shutdown"
   );
   assert!(
-    matches!(e.install_key(key, now), Err(Error::Shutdown)),
+    matches!(e.install_key(key, 0, now), Err(Error::Shutdown)),
     "install_key must be refused after shutdown"
   );
   assert!(
-    matches!(e.use_key(key, now), Err(Error::Shutdown)),
+    matches!(e.use_key(key, 0, now), Err(Error::Shutdown)),
     "use_key must be refused after shutdown"
   );
   assert!(
-    matches!(e.remove_key(key, now), Err(Error::Shutdown)),
+    matches!(e.remove_key(key, 0, now), Err(Error::Shutdown)),
     "remove_key must be refused after shutdown"
   );
 
@@ -6246,7 +6246,7 @@ fn local_key_op_self_applies_when_inbound_cap_is_full() {
   // Issue a local install_key: the initiating node MUST process its own query
   // and surface Event::KeyRequest even though the inbound cap is full.
   let now = memberlist_proto::Instant::ORIGIN;
-  e.install_key(test_key, now)
+  e.install_key(test_key, 0, now)
     .expect("install_key must succeed");
 
   let ev = e
@@ -6261,6 +6261,44 @@ fn local_key_op_self_applies_when_inbound_cap_is_full() {
     }
     other => panic!(
       "expected Event::KeyRequest from local install_key, got {:?}",
+      core::mem::discriminant(&other)
+    ),
+  }
+}
+
+/// The per-op `relay_factor` rides the issued key query end-to-end: the
+/// initiating node loopback-processes its own `_serf_install_key`, and the
+/// surfaced [`Event::KeyRequest`] token carries the issuer's relay factor —
+/// which the responding driver hands to `respond_key`, driving the relay
+/// fan-out on every answering node.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn key_op_relay_factor_rides_the_issued_query() {
+  use crate::event::Event;
+  use memberlist_proto::SecretKey;
+
+  #[cfg(feature = "aes-gcm")]
+  let test_key = SecretKey::Aes128([7u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let test_key = SecretKey::ChaCha20Poly1305([7u8; 32]);
+
+  let mut e = ep();
+  while e.poll_event().is_some() {}
+
+  e.install_key(test_key, 2, memberlist_proto::Instant::ORIGIN)
+    .expect("install_key with a relay factor must issue");
+
+  let ev = e
+    .poll_event()
+    .expect("the initiating node loopback-processes its own key query");
+  match ev {
+    Event::KeyRequest(req) => assert_eq!(
+      req.relay_factor(),
+      2,
+      "the issued query's relay factor must reach the responder token"
+    ),
+    other => panic!(
+      "expected Event::KeyRequest, got {:?}",
       core::mem::discriminant(&other)
     ),
   }

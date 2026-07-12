@@ -551,12 +551,15 @@ where
   pub fn use_key(
     &mut self,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
     I: Clone + Data,
   {
-    self.core.use_key(&mut self.transport, key, now)
+    self
+      .core
+      .use_key(&mut self.transport, key, relay_factor, now)
   }
 
   /// Issue a cluster-wide `remove_key` query to remove `key` from all nodes.
@@ -570,12 +573,15 @@ where
   pub fn remove_key(
     &mut self,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
     I: Clone + Data,
   {
-    self.core.remove_key(&mut self.transport, key, now)
+    self
+      .core
+      .remove_key(&mut self.transport, key, relay_factor, now)
   }
 
   /// Issue a cluster-wide `list_keys` query to enumerate installed keys.
@@ -586,11 +592,11 @@ where
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
-  pub fn list_keys(&mut self, now: Instant) -> Result<QueryId, Error>
+  pub fn list_keys(&mut self, relay_factor: u8, now: Instant) -> Result<QueryId, Error>
   where
     I: Clone + Data,
   {
-    self.core.list_keys(&mut self.transport, now)
+    self.core.list_keys(&mut self.transport, relay_factor, now)
   }
 
   /// Install a new encryption key into the local keyring.
@@ -604,12 +610,15 @@ where
   pub fn install_key(
     &mut self,
     key: memberlist_proto::SecretKey,
+    relay_factor: u8,
     now: Instant,
   ) -> Result<QueryId, Error>
   where
     I: Clone + Data,
   {
-    self.core.install_key(&mut self.transport, key, now)
+    self
+      .core
+      .install_key(&mut self.transport, key, relay_factor, now)
   }
 
   /// Forwards to [`Endpoint::state`].
