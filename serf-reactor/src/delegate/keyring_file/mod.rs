@@ -33,11 +33,17 @@ use super::{KeyringDelegate, KeyringPersistError, KeyringPersistence};
 /// then atomically renamed over the destination: a crash mid-write never
 /// truncates the previous ring, a restrictive mode on the key file is never
 /// widened by a rotation, and key bytes can never land in a pre-existing
-/// inode or behind a planted symlink. On non-Unix platforms there is no mode
-/// to assert — the file inherits the destination directory's ACLs, so place
-/// it in an owner-restricted directory. Dropping the delegate joins the
+/// inode or behind a planted symlink. Dropping the delegate joins the
 /// worker after it drains every queued rotation, so a shutdown cannot discard
 /// a write that was already acknowledged toward the wire.
+///
+/// UNIX-ONLY: the acknowledgement contract is rename durability — the
+/// containing directory is synced before a rotation reports success — and no
+/// safe standard API can flush a directory entry on Windows, so this turnkey
+/// delegate does not exist there rather than acknowledge a rotation a power
+/// loss could revert. A Windows application implements [`KeyringDelegate`]
+/// itself with a platform-durable strategy (a write-through rename via the
+/// platform APIs, or storage with its own durability contract).
 pub struct FileKeyringDelegate {
   path: PathBuf,
   /// Hand-off to the persistence thread; `None` only during drop, which hangs
@@ -152,9 +158,7 @@ fn persist(path: &Path, keyring: &Keyring) -> Result<(), KeyringFileError> {
 /// keeps such a path from being plantable ahead of time. The inode is born
 /// `0600` on Unix and re-asserted on the open handle, so raw key material
 /// only ever lands in a fresh owner-only inode this process created; a crash
-/// mid-write never truncates the previous ring. On non-Unix platforms there
-/// is no mode to assert: the fresh inode inherits the parent directory's
-/// ACLs, so the destination directory itself must be access-restricted.
+/// mid-write never truncates the previous ring.
 fn write_via_exclusive_temp(path: &Path, contents: &[u8]) -> io::Result<()> {
   use std::io::Write as _;
   let name = path
@@ -171,7 +175,6 @@ fn write_via_exclusive_temp(path: &Path, contents: &[u8]) -> io::Result<()> {
     };
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
     {
       use std::os::unix::fs::OpenOptionsExt as _;
       opts.mode(0o600);
@@ -186,7 +189,6 @@ fn write_via_exclusive_temp(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
   };
   let res = (|| {
-    #[cfg(unix)]
     {
       use std::os::unix::fs::PermissionsExt as _;
       file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -210,16 +212,9 @@ fn write_via_exclusive_temp(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Sync a directory so a completed rename of an entry inside it survives a
-/// crash. On non-Unix platforms `std` cannot open a directory handle; the
-/// rename's durability is left to the filesystem's metadata journaling there.
-#[cfg(unix)]
+/// crash.
 fn sync_dir(dir: &Path) -> io::Result<()> {
   std::fs::File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-  Ok(())
 }
 
 /// OS-entropy nonce for a temp-file name: unpredictable, so a
@@ -238,14 +233,20 @@ fn temp_nonce() -> io::Result<u64> {
 /// failure never blocks construction — `create_new` already keeps every
 /// future write off any path that survives.
 fn sweep_stale_temps(path: &Path) {
-  // A destination whose own extension is `tmp` IS its `with_extension`
-  // image: sweeping it would delete the persisted keyring at construction
-  // (the previous implementation wrote such a destination in place, so the
-  // file can hold the only copy of legitimate key material).
-  let legacy = path.with_extension("tmp");
-  if legacy != path {
+  // A destination whose own extension is `tmp` — in ANY case — must keep
+  // its `with_extension` image: lexically the paths can differ (`ring.TMP`
+  // versus `ring.tmp`) yet alias the same file on the case-insensitive
+  // filesystems that are the default on macOS and Windows, and the previous
+  // implementation wrote such a destination in place, so the file can hold
+  // the only copy of legitimate key material. Sweeping hygiene is never
+  // worth risking the persisted keyring.
+  let legacy_aliases_destination = path
+    .extension()
+    .and_then(|e| e.to_str())
+    .is_some_and(|e| e.eq_ignore_ascii_case("tmp"));
+  if !legacy_aliases_destination {
     // Ignoring Err: nothing to sweep, or no permission — both non-fatal.
-    let _ = std::fs::remove_file(legacy);
+    let _ = std::fs::remove_file(path.with_extension("tmp"));
   }
   let (Some(dir), Some(name)) = (
     path.parent().filter(|d| !d.as_os_str().is_empty()),

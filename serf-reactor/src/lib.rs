@@ -156,10 +156,10 @@ pub use delegate::{
   Delegate, MemberDelegate, MergeDelegate, QueryDelegate, UserEventDelegate, VoidDelegate,
 };
 
-#[cfg(encryption)]
+#[cfg(all(encryption, unix))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  doc(cfg(all(any(feature = "aes-gcm", feature = "chacha20-poly1305"), unix)))
 )]
 pub use delegate::{FileKeyringDelegate, KeyringFileError};
 #[cfg(encryption)]

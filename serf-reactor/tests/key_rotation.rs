@@ -333,6 +333,7 @@ where
 /// the query window — and because the response was gated on that
 /// acknowledgement, the persisted file already carries the new key when the
 /// response arrives.
+#[cfg(unix)]
 async fn file_backed_rotation_gates_the_response_on_persistence<R>()
 where
   R: Runtime,
@@ -403,6 +404,7 @@ mod tokio_cells {
     super::key_rotation_across_two_nodes_rotates_both_live_keyrings::<TokioRuntime>().await;
   }
 
+  #[cfg(unix)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn file_backed_rotation_gates_the_response_on_persistence() {
     super::file_backed_rotation_gates_the_response_on_persistence::<TokioRuntime>().await;
@@ -422,6 +424,7 @@ mod smol_cells {
     );
   }
 
+  #[cfg(unix)]
   #[test]
   fn file_backed_rotation_gates_the_response_on_persistence_smol() {
     SmolRuntime::block_on(

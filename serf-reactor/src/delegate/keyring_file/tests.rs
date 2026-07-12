@@ -140,7 +140,6 @@ fn a_second_rotation_replaces_the_first() {
 /// one: the replacing temp inode is born owner-only, so a fresh file is
 /// created `0600` and a pre-existing `0644` destination is `0600` after the
 /// next rotation, even under a permissive umask.
-#[cfg(unix)]
 #[test]
 fn rotation_enforces_owner_only_permissions() {
   use std::os::unix::fs::PermissionsExt as _;
@@ -202,7 +201,6 @@ fn construction_sweeps_stale_temps() {
 /// its target — and no rotation ever writes through it: the exclusive
 /// creation refuses any pre-existing path, so key bytes cannot be redirected
 /// into an attacker-chosen file.
-#[cfg(unix)]
 #[test]
 fn a_planted_symlink_never_receives_key_bytes() {
   let path = tmp_path("symlink");
@@ -270,10 +268,40 @@ fn a_tmp_extension_destination_survives_construction() {
   let _ = std::fs::remove_file(&path);
 }
 
+/// The alias guard is case-insensitive: a destination named with an
+/// uppercase `TMP` extension lexically differs from its lowercase
+/// `with_extension` image, yet the two alias the same file on the
+/// case-insensitive filesystems that are the default on macOS — construction
+/// must preserve it.
+#[test]
+fn an_uppercase_tmp_destination_survives_construction() {
+  let path = tmp_path("selfnamed-upper").with_extension("TMP");
+  // Ignoring Err: a leftover file from a previous run is about to be rewritten.
+  let _ = std::fs::remove_file(&path);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([12u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([12u8; 32]);
+  {
+    let delegate = FileKeyringDelegate::new(&path);
+    acked(delegate.keyring_updated(&Keyring::new(key))).expect("the rotation persists");
+  }
+
+  let reopened = FileKeyringDelegate::new(&path);
+  let loaded = reopened
+    .load()
+    .expect("the persisted keyring parses")
+    .expect("constructing a delegate must not sweep a case-aliased .TMP destination");
+  assert_eq!(loaded.primary_ref(), &key);
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 /// The success acknowledgement is durability: a rotation whose parent
 /// directory cannot be synced reports failure, because the completed rename
 /// is not crash-durable until the directory entry is.
-#[cfg(unix)]
 #[test]
 fn an_unsyncable_directory_fails_the_acknowledgement() {
   use std::os::unix::fs::PermissionsExt as _;
