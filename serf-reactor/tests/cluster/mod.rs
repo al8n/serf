@@ -64,6 +64,13 @@ pub struct ClusterTiming {
   reconnect_interval: Duration,
   reconnect_timeout: Duration,
   tombstone_timeout: Duration,
+  /// Dead-node reclaim window (`None` keeps revival-at-a-new-address a
+  /// conflict, the coordinator default).
+  pub dead_node_reclaim: Option<Duration>,
+  /// Periodic anti-entropy push/pull override (`None` keeps the coordinator
+  /// default; `Duration::ZERO` disables it, leaving gossiped intents as the
+  /// only dissemination path — the exclusivity a causal clock fence needs).
+  pub push_pull_interval: Option<Duration>,
   leave_propagate_delay: Duration,
 }
 
@@ -90,6 +97,8 @@ impl ClusterTiming {
       reconnect_interval: Duration::from_millis(100),
       reconnect_timeout: Duration::from_millis(1),
       tombstone_timeout: Duration::from_millis(1),
+      dead_node_reclaim: None,
+      push_pull_interval: None,
       // Short enough to keep a graceful leave sub-second, long enough to give
       // in-flight probes a gossip cycle to observe the leave intent.
       leave_propagate_delay: Duration::from_millis(100),
@@ -110,6 +119,18 @@ impl ClusterTiming {
   /// in the tombstone view instead of reaping it, so a graceful-leave assertion
   /// observes `[Join, Leave]` without a trailing `Reap`.
   #[must_use]
+  pub fn with_dead_node_reclaim(mut self, v: Duration) -> Self {
+    self.dead_node_reclaim = Some(v);
+    self
+  }
+
+  /// Override (or, at zero, disable) the periodic anti-entropy push/pull.
+  pub fn with_push_pull_interval(mut self, v: Duration) -> Self {
+    self.push_pull_interval = Some(v);
+    self
+  }
+
+  /// Override the tombstone retention window.
   pub fn with_tombstone_timeout(mut self, v: Duration) -> Self {
     self.tombstone_timeout = v;
     self
@@ -122,13 +143,20 @@ impl ClusterTiming {
     id: &str,
     advertise: SocketAddr,
   ) -> TcpTransportOptions<SmolStr, SocketAddr> {
-    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    let mut opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
       .with_advertise_addr(MaybeResolved::Resolved(advertise))
       .with_probe_interval(self.probe_interval)
       .with_probe_timeout(self.probe_timeout)
       .with_gossip_interval(self.gossip_interval)
-      .with_suspicion_mult(self.suspicion_mult)
+      .with_suspicion_mult(self.suspicion_mult);
+    if let Some(v) = self.dead_node_reclaim {
+      opts = opts.with_dead_node_reclaim_time(v);
+    }
+    if let Some(v) = self.push_pull_interval {
+      opts = opts.with_push_pull_interval(v);
+    }
+    opts
   }
 
   /// The serf `Options` for every node: the fast reap / reconnect timing.
@@ -292,6 +320,48 @@ where
     self.slots[i].serf = Some(serf);
   }
 
+  /// Restart a previously-killed node `i` at the SAME id but a FRESH ephemeral
+  /// port on the same interface, re-attaching a collector to the slot's
+  /// existing log and updating the recorded address. Unlike
+  /// [`restart`](Self::restart), the serf reconnect re-dial cannot reach the
+  /// node (it targets the old address), so the caller re-joins explicitly —
+  /// exercising the same-name-new-address revival path.
+  pub async fn restart_at_ephemeral(&mut self, i: usize) {
+    assert!(
+      self.slots[i].serf.is_none(),
+      "node {i} must be killed before restart"
+    );
+    let id = self.slots[i].id.clone();
+    let old_addr = self.slots[i].addr;
+    // An ephemeral bind guarantees an AVAILABLE port, not a DIFFERENT one:
+    // the OS can hand the just-released port straight back, which would
+    // silently degrade a new-address scenario into a same-address one.
+    // Rebind until the address genuinely differs.
+    const DISTINCT_PORT_RETRIES: usize = 25;
+    let mut attempt = 0usize;
+    let serf = loop {
+      let serf = build_node::<R>(
+        id.as_str(),
+        "127.0.0.1:0".parse().expect("loopback addr"),
+        &self.timing,
+      )
+      .await
+      .expect("an ephemeral rebind cannot collide");
+      if serf.advertise_address() != old_addr {
+        break serf;
+      }
+      assert!(
+        attempt + 1 < DISTINCT_PORT_RETRIES,
+        "the OS kept re-issuing the released port {old_addr}"
+      );
+      attempt += 1;
+      serf.shutdown().await.expect("same-port rebind shuts down");
+    };
+    self.slots[i].addr = serf.advertise_address();
+    attach_collector::<R>(&serf, self.slots[i].log.clone());
+    self.slots[i].serf = Some(serf);
+  }
+
   /// Poll every live node until each reports exactly `expect` members, or fail on
   /// the poll timeout.
   pub async fn converge(&self, expect: usize) {
@@ -343,7 +413,7 @@ where
       }
     })
     .await
-    .expect("observer holds the subject as a Left tombstone");
+    .unwrap_or_else(|_| panic!("node {observer} never holds {subject:?} as a Left tombstone"));
   }
 
   /// Poll until `observer`'s log records a member event of `kind` naming
@@ -358,7 +428,12 @@ where
       }
     })
     .await
-    .expect("observer records the expected member event");
+    .unwrap_or_else(|_| {
+      panic!(
+        "node {observer} never records {kind:?} for {subject:?} (saw {:?})",
+        self.member_event_kinds(observer, subject)
+      )
+    });
   }
 
   /// Poll until the ordered member-event kinds `observer` recorded about `subject`
@@ -399,7 +474,7 @@ where
   }
 
   /// The ordered member-event kinds `observer` recorded about `subject`.
-  fn member_event_kinds(&self, observer: usize, subject: &str) -> Vec<MemberEventKind> {
+  pub fn member_event_kinds(&self, observer: usize, subject: &str) -> Vec<MemberEventKind> {
     self.slots[observer]
       .log
       .lock()

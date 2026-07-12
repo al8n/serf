@@ -960,6 +960,442 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Port of legacy `serf_force_leave_failed` (Go `TestSerf_ForceLeaveFailed`):
+/// an operator force-leaving a FAILED member transitions it to Left on every
+/// surviving node, rather than leaving it to linger Failed until the reap.
+async fn serf_force_leave_failed<R>()
+where
+  R: Runtime,
+{
+  // A long tombstone keeps the force-left member observable as Left for the
+  // whole assertion window, and a long reconnect timeout keeps the FAILED
+  // member from being reaped out of the views before the intent lands (the
+  // reference tests run with the default day-scale reconnect timeout).
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["fleave-a", "fleave-b", "fleave-c"],
+    cluster::ClusterTiming::fast()
+      .with_tombstone_timeout(Duration::from_secs(120))
+      .with_reconnect_timeout(Duration::from_secs(120)),
+  )
+  .await;
+  let subject = cluster.id(2);
+
+  cluster.kill_abrupt(2).await;
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+  cluster
+    .await_member_event(1, subject.as_str(), MemberEventKind::Failed)
+    .await;
+
+  cluster
+    .node(0)
+    .force_leave(subject.clone(), false)
+    .await
+    .expect("force_leave dispatches for a failed member");
+
+  // The force-leave propagates: BOTH survivors converge the failed member to
+  // a Left tombstone, and the observer's event log records the full
+  // Join -> Failed -> Leave lifecycle.
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+  cluster.await_left_tombstone(1, subject.as_str()).await;
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Failed,
+        MemberEventKind::Leave,
+      ],
+    )
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_force_leave_left` (Go `TestSerf_ForceLeaveLeft`,
+/// folding `TestSerf_ForceLeaveLeaving`): force-leaving a member that already
+/// departed gracefully is an accepted no-op — it stays a Left tombstone and
+/// the membership view is unchanged. The transient Leaving window itself is
+/// machine-covered (`endpoint::force_leave_transitions_alive_member_to_leaving`);
+/// a driver cannot deterministically observe it mid-flight.
+async fn serf_force_leave_left_is_idempotent<R>()
+where
+  R: Runtime,
+{
+  // A long tombstone keeps the departed member observable as Left for the
+  // whole assertion window, and push/pull is DISABLED so the gossiped intent
+  // is the only path that can advance the survivor's member clock — the
+  // exclusivity the causal fence below relies on (anti-entropy also
+  // witnesses remote clocks and would replay the Left state, masking the
+  // fresh intent).
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["fleft-a", "fleft-b", "fleft-c"],
+    cluster::ClusterTiming::fast()
+      .with_tombstone_timeout(Duration::from_secs(120))
+      .with_push_pull_interval(Duration::ZERO),
+  )
+  .await;
+  let subject = cluster.id(2);
+
+  cluster.leave_graceful(2).await;
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+  cluster.await_left_tombstone(1, subject.as_str()).await;
+  // FENCE the baselines on the COLLECTORS, not the membership snapshot: the
+  // tombstone proves the state flipped, while the graceful leave's member
+  // event may still be in flight to a detached collector. Awaiting the exact
+  // sequence pins each baseline at [Join, Leave].
+  let expected = [MemberEventKind::Join, MemberEventKind::Leave];
+  cluster
+    .assert_member_events(0, subject.as_str(), &expected)
+    .await;
+  cluster
+    .assert_member_events(1, subject.as_str(), &expected)
+    .await;
+
+  let clock_before = cluster.node(0).stats().member_clock();
+  cluster
+    .node(0)
+    .force_leave(subject.clone(), false)
+    .await
+    .expect("force_leave on an already-left member is an accepted no-op");
+
+  // CAUSAL FENCE: the force-leave stamps the member clock and the intent
+  // carries that ltime, which every receiver witnesses BEFORE deciding
+  // whether the intent applies — so the non-issuing survivor's clock
+  // reaching the issuer's post-command value proves THIS intent was
+  // received and processed there, not merely that unrelated traffic flowed.
+  let stamp = R::timeout(Duration::from_secs(20), async {
+    loop {
+      let c = cluster.node(0).stats().member_clock();
+      if c > clock_before {
+        break c;
+      }
+      R::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("the issuer stamps the member clock for the no-op intent");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if cluster.node(1).stats().member_clock() >= stamp {
+        break;
+      }
+      R::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("the non-issuing survivor witnesses the no-op intent's clock");
+
+  // A short settle lets the survivors reprocess any rebroadcast echo of the
+  // intent (a stale re-receipt must also stay a no-op), then both views must
+  // be unchanged — still the Left tombstone, still three members, and NO
+  // additional member event.
+  R::sleep(Duration::from_millis(500)).await;
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+  cluster.await_left_tombstone(1, subject.as_str()).await;
+  for observer in [0usize, 1] {
+    assert_eq!(
+      cluster.node(observer).num_members(),
+      3,
+      "node {observer}: the Left tombstone is retained, not pruned, by a plain force_leave"
+    );
+  }
+  // With propagation causally fenced above, BARRIER the collector drainage:
+  // a fresh sentinel node joins and both collectors must record ITS Join
+  // before the subject's sequences are compared — each collector's stream is
+  // ordered, so any duplicate event the (already-processed) intent emitted
+  // is queued ahead of the sentinel and would already be visible.
+  let sentinel = spawn_node::<R>("fleft-sentinel").await;
+  let a_addr = cluster.node(0).advertise_address();
+  sentinel
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the sentinel joins through the issuing survivor");
+  cluster
+    .await_member_event(0, "fleft-sentinel", MemberEventKind::Join)
+    .await;
+  cluster
+    .await_member_event(1, "fleft-sentinel", MemberEventKind::Join)
+    .await;
+  assert_eq!(
+    cluster.member_event_kinds(0, subject.as_str()),
+    expected,
+    "the issuing survivor records no additional member event for the no-op"
+  );
+  assert_eq!(
+    cluster.member_event_kinds(1, subject.as_str()),
+    expected,
+    "the non-issuing survivor records no additional member event for the no-op"
+  );
+
+  sentinel.shutdown().await.expect("the sentinel shuts down");
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_remove_failed_node` + `serf_remove_failed_events_leave`
+/// (Go `TestSerf_RemoveFailedNode` / `TestSerfRemoveFailedEventsLeave`): after
+/// a failure, `remove_failed_node` on one survivor propagates — the OTHER
+/// survivor also observes a Leave member event for the failed node and holds
+/// it as a Left tombstone.
+async fn serf_remove_failed_node_propagates<R>()
+where
+  R: Runtime,
+{
+  // A long tombstone keeps the removed member observable as Left for the
+  // whole assertion window.
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["remove-a", "remove-b", "remove-c"],
+    cluster::ClusterTiming::fast()
+      .with_tombstone_timeout(Duration::from_secs(120))
+      .with_reconnect_timeout(Duration::from_secs(120)),
+  )
+  .await;
+  let subject = cluster.id(2);
+
+  cluster.kill_abrupt(2).await;
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+  cluster
+    .await_member_event(1, subject.as_str(), MemberEventKind::Failed)
+    .await;
+
+  cluster
+    .node(0)
+    .remove_failed_node(subject.clone())
+    .await
+    .expect("remove_failed_node dispatches");
+
+  // Propagation: the NON-issuing survivor holds the tombstone too.
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+  cluster.await_left_tombstone(1, subject.as_str()).await;
+  cluster
+    .await_member_event(1, subject.as_str(), MemberEventKind::Leave)
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_remove_failed_node_prune`
+/// (Go `TestSerf_RemoveFailedNode_prune`): removing with prune erases the
+/// failed member outright on every survivor — the membership count drops
+/// without waiting out the Left tombstone.
+async fn serf_remove_failed_node_prune_erases<R>()
+where
+  R: Runtime,
+{
+  // Hold the failed member (no reap, no reconnect eviction) so the prune —
+  // not the reaper — is what erases it.
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["prune-a", "prune-b", "prune-c"],
+    cluster::ClusterTiming::fast().with_reconnect_timeout(Duration::from_secs(120)),
+  )
+  .await;
+  let subject = cluster.id(2);
+
+  cluster.kill_abrupt(2).await;
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+  cluster
+    .await_member_event(1, subject.as_str(), MemberEventKind::Failed)
+    .await;
+
+  cluster
+    .node(0)
+    .remove_failed_node_prune(subject.clone())
+    .await
+    .expect("remove_failed_node_prune dispatches");
+
+  cluster.await_num_members(0, 2).await;
+  cluster.await_num_members(1, 2).await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of the legacy `serf_remove_failed_node` absent-member edge
+/// (Go `TestSerf_RemoveFailedNode_ourself` shape): removing a name that is
+/// not a member reports success as a no-op.
+async fn remove_failed_node_absent_is_a_noop<R>()
+where
+  R: Runtime,
+{
+  let a = spawn_node::<R>("absent-a").await;
+  a.remove_failed_node(SmolStr::new("no-such-node"))
+    .await
+    .expect("removing an absent member is an accepted no-op");
+  assert_eq!(a.num_members(), 1, "the membership view is unchanged");
+  a.shutdown().await.expect("absent-a shuts down");
+}
+
+/// Port of legacy `serf_reconnect_same_ip` (Go `TestSerf_Reconnect_SameIP`):
+/// the failed node returns at the SAME IP but a DIFFERENT port and re-joins —
+/// the same-name member revives at its new address (Join, Failed, Join), and
+/// the observer's view carries the updated port.
+async fn serf_reconnect_same_ip<R>()
+where
+  R: Runtime,
+{
+  // The reclaim window is what allows a SAME-name member to revive at a NEW
+  // address at all — without it a different-address Alive is a name conflict,
+  // exactly as in the reference implementation's dead-node reclaim.
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["sameip-a", "sameip-b"],
+    cluster::ClusterTiming::fast()
+      .with_reconnect_timeout(Duration::from_secs(30))
+      .with_dead_node_reclaim(Duration::from_millis(1)),
+  )
+  .await;
+  let subject = cluster.id(1);
+  let old_addr = cluster.node(1).advertise_address();
+
+  cluster.kill_abrupt(1).await;
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
+    .await;
+  // The reclaim admits a new-address revival only once the failed state is
+  // STRICTLY older than the window; observing the Failed event is not that
+  // fence, so wait comfortably past the (1ms) window before rejoining.
+  R::sleep(Duration::from_millis(100)).await;
+
+  cluster.restart_at_ephemeral(1).await;
+  let new_addr = cluster.node(1).advertise_address();
+  assert_ne!(old_addr, new_addr, "the restart rebinds a fresh port");
+  let a_addr = cluster.node(0).advertise_address();
+  cluster
+    .node(1)
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the restarted node rejoins through the survivor");
+
+  // The failed tombstone still counts toward the member view, so the revival
+  // signal is the SECOND Join event; the sequence assertion below polls until
+  // the third event lands.
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Failed,
+        MemberEventKind::Join,
+      ],
+    )
+    .await;
+  // The revived member is tracked at its NEW address.
+  let seen = cluster
+    .node(0)
+    .members()
+    .iter()
+    .find(|m| m.node().id_ref().as_str() == subject.as_str())
+    .map(|m| *m.node().addr_ref())
+    .expect("the observer tracks the revived member");
+  assert_eq!(
+    seen, new_addr,
+    "the same-name revival updates the tracked address"
+  );
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_join_cancel` (Go `TestSerf_Join_Cancel`): with a
+/// vetoing merge predicate on BOTH nodes, a join attempt admits nothing —
+/// each side's delegate is consulted with the peer's state and each
+/// membership view stays at one. (The machine's veto is a push/pull FILTER:
+/// with neither side ever admitting the other, no gossip path exists either,
+/// so the exclusion here is total and deterministic.)
+async fn serf_join_cancel<R>()
+where
+  R: Runtime,
+{
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  struct VetoAll {
+    hits: std::sync::Arc<AtomicUsize>,
+  }
+  impl serf_reactor::MergeDelegate<SmolStr, SocketAddr> for VetoAll {
+    fn notify_merge(
+      &self,
+      _peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+      >,
+    ) -> bool {
+      self.hits.fetch_add(1, Ordering::Relaxed);
+      false
+    }
+  }
+
+  async fn spawn_vetoing<R>(id: &str, hits: std::sync::Arc<AtomicUsize>) -> Node<R>
+  where
+    R: Runtime,
+  {
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+    Serf::<SmolStr, SocketAddr, R>::tcp(
+      TcpTransportOptions::<SmolStr, SocketAddr>::new()
+        .with_local_id(SmolStr::new(id))
+        .with_advertise_addr(MaybeResolved::Resolved(bind)),
+      &SocketAddrResolver,
+      &FirstAddrResolver,
+      VoidDelegate::<SmolStr, SocketAddr>::new(),
+      RuntimeOptions::new(),
+      SerfOptions::new(),
+      None,
+      Some(Box::new(VetoAll { hits })),
+      None,
+      #[cfg(encryption)]
+      std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+    )
+    .await
+    .expect("spawn vetoing serf node")
+  }
+
+  let a_hits = std::sync::Arc::new(AtomicUsize::new(0));
+  let b_hits = std::sync::Arc::new(AtomicUsize::new(0));
+  let b = spawn_vetoing::<R>("cancel-b", b_hits.clone()).await;
+  let a = spawn_vetoing::<R>("cancel-a", a_hits.clone()).await;
+  let b_addr = b.advertise_address();
+
+  let outcome = a
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await;
+
+  // The SEED's predicate runs and refuses; its machine then closes the
+  // exchange WITHOUT sending its own state — a vetoed filter must not leak
+  // the peer's state — so the joiner's predicate never receives anything to
+  // judge. (The reference implementation consults both sides because it
+  // ships its state before the remote verdict; the machine here deliberately
+  // tightens that.)
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if b_hits.load(Ordering::Relaxed) >= 1 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the seed's merge predicate is consulted by the join push/pull");
+  assert_eq!(
+    a_hits.load(Ordering::Relaxed),
+    0,
+    "no state reaches the joiner's predicate once the seed refused"
+  );
+  // Nothing admitted anywhere: with no member ever merged there is no gossip
+  // path either, so the exclusion holds on both views.
+  assert_eq!(a.num_members(), 1, "the joiner admitted nothing");
+  assert_eq!(b.num_members(), 1, "the seed admitted nothing");
+  assert!(
+    outcome.is_err(),
+    "a fully vetoed join reports failure to the caller (got {outcome:?})"
+  );
+
+  a.shutdown().await.expect("cancel-a shuts down");
+  b.shutdown().await.expect("cancel-b shuts down");
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -1203,6 +1639,41 @@ mod tokio_cells {
     super::serf_reconnect::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_force_leave_failed() {
+    super::serf_force_leave_failed::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_force_leave_left_is_idempotent() {
+    super::serf_force_leave_left_is_idempotent::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_remove_failed_node_propagates() {
+    super::serf_remove_failed_node_propagates::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_remove_failed_node_prune_erases() {
+    super::serf_remove_failed_node_prune_erases::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn remove_failed_node_absent_is_a_noop() {
+    super::remove_failed_node_absent_is_a_noop::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_reconnect_same_ip() {
+    super::serf_reconnect_same_ip::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_join_cancel() {
+    super::serf_join_cancel::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -1313,6 +1784,41 @@ mod smol_cells {
   #[test]
   fn serf_reconnect_smol() {
     SmolRuntime::block_on(super::serf_reconnect::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_force_leave_failed_smol() {
+    SmolRuntime::block_on(super::serf_force_leave_failed::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_force_leave_left_is_idempotent_smol() {
+    SmolRuntime::block_on(super::serf_force_leave_left_is_idempotent::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_remove_failed_node_propagates_smol() {
+    SmolRuntime::block_on(super::serf_remove_failed_node_propagates::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_remove_failed_node_prune_erases_smol() {
+    SmolRuntime::block_on(super::serf_remove_failed_node_prune_erases::<SmolRuntime>());
+  }
+
+  #[test]
+  fn remove_failed_node_absent_is_a_noop_smol() {
+    SmolRuntime::block_on(super::remove_failed_node_absent_is_a_noop::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_reconnect_same_ip_smol() {
+    SmolRuntime::block_on(super::serf_reconnect_same_ip::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_join_cancel_smol() {
+    SmolRuntime::block_on(super::serf_join_cancel::<SmolRuntime>());
   }
 
   #[cfg(encryption)]

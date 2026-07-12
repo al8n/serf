@@ -92,6 +92,10 @@ pub struct QuicTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   /// SWIM suspicion multiplier override. `None` keeps the coordinator default. See
   /// [`with_suspicion_mult`](Self::with_suspicion_mult).
   suspicion_mult: Option<u32>,
+  /// Reclaim window for a same-name member returning at a NEW address: a
+  /// dead member older than this is revived in place of a conflict. See
+  /// [`with_dead_node_reclaim_time`](Self::with_dead_node_reclaim_time).
+  dead_node_reclaim_time: Option<Duration>,
   /// SWIM suspicion max-timeout multiplier override. `None` keeps the coordinator
   /// default. See [`with_suspicion_max_timeout_mult`](Self::with_suspicion_max_timeout_mult).
   suspicion_max_timeout_mult: Option<u32>,
@@ -121,6 +125,7 @@ impl<I, A> QuicTransportOptions<I, A> {
       probe_timeout: None,
       gossip_interval: None,
       suspicion_mult: None,
+      dead_node_reclaim_time: None,
       suspicion_max_timeout_mult: None,
       #[cfg(encryption)]
       encryption: EncryptionOptions::new(),
@@ -216,6 +221,18 @@ impl<I, A> QuicTransportOptions<I, A> {
     self
   }
 
+  /// Builder: allow a dead member to be revived under the SAME id at a NEW
+  /// address once it has been dead longer than `window` — the reference
+  /// implementation's dead-node reclaim. Left unset (the default), a
+  /// same-name Alive from a different address is a name conflict, never a
+  /// revival.
+  #[must_use]
+  #[inline]
+  pub const fn with_dead_node_reclaim_time(mut self, window: Duration) -> Self {
+    self.dead_node_reclaim_time = Some(window);
+    self
+  }
+
   /// Builder: override the memberlist SWIM suspicion max-timeout multiplier — the
   /// upper bound on the suspicion timeout as a multiple of the minimum.
   ///
@@ -295,6 +312,13 @@ impl<I, A> QuicTransportOptions<I, A> {
     self.suspicion_mult
   }
 
+  /// The configured dead-node reclaim window, if overridden.
+  #[must_use]
+  #[inline]
+  pub const fn dead_node_reclaim_time(&self) -> Option<Duration> {
+    self.dead_node_reclaim_time
+  }
+
   /// The SWIM suspicion max-timeout-multiplier override, if set.
   #[inline]
   pub const fn suspicion_max_timeout_mult(&self) -> Option<u32> {
@@ -347,6 +371,7 @@ where
   probe_timeout: Option<Duration>,
   gossip_interval: Option<Duration>,
   suspicion_mult: Option<u32>,
+  dead_node_reclaim_time: Option<Duration>,
   suspicion_max_timeout_mult: Option<u32>,
   /// Independent OS-seeded seed for the serf core's RNG, drawn once per node in
   /// [`Transport::new`] and consumed when [`Transport::run`] builds the endpoint via
@@ -453,6 +478,7 @@ where
       probe_timeout: options.probe_timeout,
       gossip_interval: options.gossip_interval,
       suspicion_mult: options.suspicion_mult,
+      dead_node_reclaim_time: options.dead_node_reclaim_time,
       suspicion_max_timeout_mult: options.suspicion_max_timeout_mult,
       serf_rng,
       #[cfg(encryption)]
@@ -508,6 +534,9 @@ where
     }
     if let Some(v) = self.suspicion_mult {
       inner_opts = inner_opts.with_suspicion_mult(v);
+    }
+    if let Some(v) = self.dead_node_reclaim_time {
+      inner_opts = inner_opts.with_dead_node_reclaim_time(v);
     }
     if let Some(v) = self.suspicion_max_timeout_mult {
       inner_opts = inner_opts.with_suspicion_max_timeout_mult(v);
