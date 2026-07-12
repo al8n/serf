@@ -13,16 +13,16 @@
 //! block), and `MergeDelegate` is the machine's inline admission veto supplied at
 //! construction rather than an observation hook.
 
-#[cfg(encryption)]
+#[cfg(all(encryption, unix))]
 mod keyring_file;
 mod void;
 
 pub use void::VoidDelegate;
 
-#[cfg(encryption)]
+#[cfg(all(encryption, unix))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  doc(cfg(all(any(feature = "aes-gcm", feature = "chacha20-poly1305"), unix)))
 )]
 pub use keyring_file::{FileKeyringDelegate, KeyringFileError};
 #[cfg(encryption)]
