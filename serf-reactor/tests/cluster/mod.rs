@@ -105,19 +105,37 @@ impl ClusterTiming {
     }
   }
 
-  /// Override the reconnect timeout — the age at which the reaper removes a Failed
-  /// member. Raise it well beyond the test's kill-to-restart window to hold a
-  /// failed peer for reconnection instead of reaping it.
+  /// Override the probe interval — the failure-detection cadence. Raise it
+  /// well beyond the test window to PARK failure detection entirely, so a
+  /// killed-and-restarted peer is never declared Failed in between and the
+  /// observer holds it Alive across the whole cycle.
   #[must_use]
+  pub fn with_probe_interval(mut self, v: Duration) -> Self {
+    self.probe_interval = v;
+    self
+  }
+
+  /// Override the reconnect re-dial cadence — how often a survivor attempts to
+  /// re-establish contact with a Failed member. Raise it beyond the test window
+  /// to park the re-dial (and the push/pull merge it runs) out of the scenario.
+  #[must_use]
+  pub fn with_reconnect_interval(mut self, v: Duration) -> Self {
+    self.reconnect_interval = v;
+    self
+  }
+
+  /// Override the failed-member retention window — the age at which the reaper
+  /// removes a Failed member. Raise it well beyond the test's kill-to-restart
+  /// window to hold a failed peer for reconnection instead of reaping it.
   pub fn with_reconnect_timeout(mut self, v: Duration) -> Self {
     self.reconnect_timeout = v;
     self
   }
 
-  /// Override the tombstone timeout — the age at which the reaper removes a
-  /// gracefully-Left member. Raise it beyond the test window to HOLD a left peer
-  /// in the tombstone view instead of reaping it, so a graceful-leave assertion
-  /// observes `[Join, Leave]` without a trailing `Reap`.
+  /// Override the dead-node reclaim age — how long a dead member's identity
+  /// must age before a same-name claim at a NEW address is admitted. Set it
+  /// near zero to let a restarted node rebind at a fresh port without a name
+  /// conflict.
   #[must_use]
   pub fn with_dead_node_reclaim(mut self, v: Duration) -> Self {
     self.dead_node_reclaim = Some(v);
@@ -130,7 +148,10 @@ impl ClusterTiming {
     self
   }
 
-  /// Override the tombstone retention window.
+  /// Override the tombstone timeout — the age at which the reaper removes a
+  /// gracefully-Left member. Raise it beyond the test window to HOLD a left
+  /// peer in the tombstone view instead of reaping it, so a graceful-leave
+  /// assertion observes `[Join, Leave]` without a trailing `Reap`.
   pub fn with_tombstone_timeout(mut self, v: Duration) -> Self {
     self.tombstone_timeout = v;
     self
@@ -175,6 +196,8 @@ impl ClusterTiming {
 struct MemberRec {
   kind: MemberEventKind,
   ids: Vec<SmolStr>,
+  /// Each member's tags at the time the event surfaced, aligned with `ids`.
+  tags: Vec<serf_proto::Tags>,
 }
 
 /// One cluster node: its stable id and advertise address, the live handle (taken
@@ -484,6 +507,51 @@ where
       .map(|rec| rec.kind)
       .collect()
   }
+
+  /// Poll until `observer`'s log holds a `kind` event for `subject` whose
+  /// member payload carries `tag` = `want`, then return the subject's ordered
+  /// event kinds THROUGH that record (inclusive). Fencing on the collector's
+  /// log — rather than on the membership view, which publishes independently
+  /// of the event stream — lets a caller assert the exact event prefix that
+  /// produced an observed state without racing still-in-flight events.
+  pub async fn await_member_event_with_tag(
+    &self,
+    observer: usize,
+    subject: &str,
+    kind: MemberEventKind,
+    tag: &str,
+    want: &str,
+  ) -> Vec<MemberEventKind> {
+    let prefix_through_match = || -> Option<Vec<MemberEventKind>> {
+      let log = self.slots[observer].log.lock().expect("event log lock");
+      let mut prefix = Vec::new();
+      for rec in log.iter() {
+        let Some(i) = rec.ids.iter().position(|id| id.as_str() == subject) else {
+          continue;
+        };
+        prefix.push(rec.kind);
+        if rec.kind == kind && rec.tags[i].0.get(tag).map(SmolStr::as_str) == Some(want) {
+          return Some(prefix);
+        }
+      }
+      None
+    };
+    R::timeout(POLL_TIMEOUT, async {
+      loop {
+        if let Some(prefix) = prefix_through_match() {
+          break prefix;
+        }
+        R::sleep(POLL_STEP).await;
+      }
+    })
+    .await
+    .unwrap_or_else(|_| {
+      panic!(
+        "node {observer} never records {kind:?} for {subject:?} carrying {tag}={want:?} (saw {:?})",
+        self.member_event_kinds(observer, subject)
+      )
+    })
+  }
 }
 
 /// An ephemeral loopback bind address (`127.0.0.1:0`).
@@ -534,9 +602,11 @@ where
           .iter()
           .map(|m| m.node().id_ref().clone())
           .collect();
+        let tags = me.members().iter().map(|m| m.tags().clone()).collect();
         log.lock().expect("event log lock").push(MemberRec {
           kind: me.kind(),
           ids,
+          tags,
         });
       }
     }
