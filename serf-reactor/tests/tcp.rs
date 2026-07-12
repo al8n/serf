@@ -1662,20 +1662,30 @@ where
     .await
     .expect("the restarted node rejoins through the survivor");
 
-  // The completion fence: a refutation-lifted Alive delivers v2.
+  // The completion fence on the VIEW: a refutation-lifted Alive delivers v2.
   await_version_tag(&cluster, 0, subject.as_str(), "v2").await;
 
-  // The whole cycle surfaced as one admission followed by nothing but
-  // Updates: no Failed (probing parked), no second Join (the observer never
-  // saw the subject leave), and both retags surfaced. An early empty-meta
-  // refutation may add one benign extra Update (see the doc), so the shape
-  // is pinned rather than an exact count.
-  let kinds = cluster.member_event_kinds(0, subject.as_str());
+  // Fence the COLLECTOR too — the view publishes independently of the event
+  // stream — by waiting for the logged Update that carries v2, then assert
+  // the exact prefix through that event: one admission followed by nothing
+  // but Updates. No Failed (probing parked), no second Join (the observer
+  // never saw the subject leave), both retags surfaced, and an early
+  // empty-meta refutation may add one benign extra Update (see the doc), so
+  // the shape is pinned rather than an exact count.
+  let prefix = cluster
+    .await_member_event_with_tag(
+      0,
+      subject.as_str(),
+      MemberEventKind::Update,
+      "version",
+      "v2",
+    )
+    .await;
   assert!(
-    kinds.len() >= 3
-      && kinds[0] == MemberEventKind::Join
-      && kinds[1..].iter().all(|k| *k == MemberEventKind::Update),
-    "the restart cycle must surface as one Join then only Updates (got {kinds:?})"
+    prefix.len() >= 3
+      && prefix[0] == MemberEventKind::Join
+      && prefix[1..].iter().all(|k| *k == MemberEventKind::Update),
+    "the restart cycle through the v2 Update must surface as one Join then only Updates (got {prefix:?})"
   );
 
   cluster.shutdown_all().await;
