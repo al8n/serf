@@ -299,6 +299,42 @@ fn an_uppercase_tmp_destination_survives_construction() {
   let _ = std::fs::remove_file(&path);
 }
 
+/// A symlinked destination keeps its target through construction: with the
+/// configured path pointing at a file that happens to live at the legacy
+/// temp name, the sweep resolves filesystem IDENTITY — not names — and
+/// leaves the keyring intact for the follow-up load.
+#[test]
+fn a_symlinked_destination_keeps_its_target_through_construction() {
+  let target = tmp_path("linked").with_extension("tmp");
+  let link = tmp_path("linked").with_extension("current");
+  // Ignoring Err: leftovers from a previous run are about to be recreated.
+  let _ = std::fs::remove_file(&link);
+  let _ = std::fs::remove_file(&target);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([13u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([13u8; 32]);
+  {
+    // Persist a real ring at the target path (itself a tmp-named
+    // destination, which construction must already preserve).
+    let seed = FileKeyringDelegate::new(&target);
+    acked(seed.keyring_updated(&Keyring::new(key))).expect("the seed rotation persists");
+  }
+  std::os::unix::fs::symlink(&target, &link).expect("plant the destination symlink");
+
+  let delegate = FileKeyringDelegate::new(&link);
+  let loaded = delegate
+    .load()
+    .expect("the symlinked keyring parses")
+    .expect("construction must not sweep the storage a symlinked destination resolves to");
+  assert_eq!(loaded.primary_ref(), &key);
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&link);
+  let _ = std::fs::remove_file(&target);
+}
+
 /// The success acknowledgement is durability: a rotation whose parent
 /// directory cannot be synced reports failure, because the completed rename
 /// is not crash-durable until the directory entry is.

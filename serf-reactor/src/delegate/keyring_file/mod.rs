@@ -228,23 +228,16 @@ fn temp_nonce() -> io::Result<u64> {
 /// Remove leftovers a rotation can no longer reuse: the fixed-name sibling
 /// temp earlier releases wrote (whose permissions predate the owner-only
 /// guarantee and may already hold key material), and the exact-shape
-/// `.{name}.{16 hex}.tmp` temps a crashed rotation abandoned. Removing a
+/// `.{name}.{16 hex}.tmp` temps a crashed rotation abandoned. Every removal
+/// is gated on FILESYSTEM IDENTITY against the destination — a candidate
+/// that resolves to the destination's storage (lexical identity, a
+/// case-folding filesystem, or a symlink on either side) is never touched,
+/// so sweeping hygiene can never delete the persisted keyring. Removing a
 /// planted symlink unlinks the LINK, never its target. Best-effort: a sweep
 /// failure never blocks construction — `create_new` already keeps every
 /// future write off any path that survives.
 fn sweep_stale_temps(path: &Path) {
-  // A destination whose own extension is `tmp` — in ANY case — must keep
-  // its `with_extension` image: lexically the paths can differ (`ring.TMP`
-  // versus `ring.tmp`) yet alias the same file on the case-insensitive
-  // filesystems that are the default on macOS and Windows, and the previous
-  // implementation wrote such a destination in place, so the file can hold
-  // the only copy of legitimate key material. Sweeping hygiene is never
-  // worth risking the persisted keyring.
-  let legacy_aliases_destination = path
-    .extension()
-    .and_then(|e| e.to_str())
-    .is_some_and(|e| e.eq_ignore_ascii_case("tmp"));
-  if !legacy_aliases_destination {
+  if sweepable(path, &path.with_extension("tmp")) {
     // Ignoring Err: nothing to sweep, or no permission — both non-fatal.
     let _ = std::fs::remove_file(path.with_extension("tmp"));
   }
@@ -270,10 +263,33 @@ fn sweep_stale_temps(path: &Path) {
       .strip_prefix(&prefix)
       .and_then(|rest| rest.strip_suffix(".tmp"))
       .is_some_and(|mid| mid.len() == 16 && mid.bytes().all(|b| b.is_ascii_hexdigit()));
-    if matches_temp_shape {
+    if matches_temp_shape && sweepable(path, &entry.path()) {
       // Ignoring Err: best-effort sweep of abandoned temps.
       let _ = std::fs::remove_file(entry.path());
     }
+  }
+}
+
+/// Whether removing `candidate` cannot touch the keyring the destination
+/// `path` reaches. `metadata` FOLLOWS symlinks, so each side resolves to the
+/// file a reader would actually open; only a candidate proven to resolve to
+/// DIFFERENT storage — or to alias nothing at all — is sweepable.
+fn sweepable(path: &Path, candidate: &Path) -> bool {
+  use std::os::unix::fs::MetadataExt as _;
+  if std::fs::symlink_metadata(candidate).is_err() {
+    // Nothing at the candidate name; removal would be a no-op.
+    return false;
+  }
+  match (std::fs::metadata(candidate), std::fs::metadata(path)) {
+    // A dangling symlink at the candidate name reaches no storage at all.
+    (Err(e), _) if e.kind() == io::ErrorKind::NotFound => true,
+    (Ok(c), Ok(d)) => (c.dev(), c.ino()) != (d.dev(), d.ino()),
+    // The destination resolves to nothing: on any filesystem where the
+    // candidate name could alias it, resolving the destination would have
+    // found the candidate's file — the two are genuinely distinct.
+    (Ok(_), Err(e)) if e.kind() == io::ErrorKind::NotFound => true,
+    // Identity cannot be established: never delete on uncertainty.
+    _ => false,
   }
 }
 
