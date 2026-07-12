@@ -1036,17 +1036,38 @@ where
   cluster.leave_graceful(2).await;
   cluster.await_left_tombstone(0, subject.as_str()).await;
   cluster.await_left_tombstone(1, subject.as_str()).await;
+  let events_before_0 = cluster.member_event_kinds(0, subject.as_str());
+  let events_before_1 = cluster.member_event_kinds(1, subject.as_str());
 
   cluster
     .node(0)
     .force_leave(subject.clone(), false)
     .await
     .expect("force_leave on an already-left member is an accepted no-op");
+
+  // The no-op must HOLD across the propagation horizon: give the intent a
+  // full broadcast window, then require both survivors unchanged — still the
+  // Left tombstone, still three members, and NO additional member event
+  // (a late mutation or prune on either view fails these).
+  R::sleep(Duration::from_millis(1500)).await;
   cluster.await_left_tombstone(0, subject.as_str()).await;
+  cluster.await_left_tombstone(1, subject.as_str()).await;
+  for observer in [0usize, 1] {
+    assert_eq!(
+      cluster.node(observer).num_members(),
+      3,
+      "node {observer}: the Left tombstone is retained, not pruned, by a plain force_leave"
+    );
+  }
   assert_eq!(
-    cluster.node(0).num_members(),
-    3,
-    "the Left tombstone is retained, not pruned, by a plain force_leave"
+    cluster.member_event_kinds(0, subject.as_str()),
+    events_before_0,
+    "the issuing survivor records no additional member event for the no-op"
+  );
+  assert_eq!(
+    cluster.member_event_kinds(1, subject.as_str()),
+    events_before_1,
+    "the non-issuing survivor records no additional member event for the no-op"
   );
 
   cluster.shutdown_all().await;
@@ -1173,6 +1194,10 @@ where
   cluster
     .await_member_event(0, subject.as_str(), MemberEventKind::Failed)
     .await;
+  // The reclaim admits a new-address revival only once the failed state is
+  // STRICTLY older than the window; observing the Failed event is not that
+  // fence, so wait comfortably past the (1ms) window before rejoining.
+  R::sleep(Duration::from_millis(100)).await;
 
   cluster.restart_at_ephemeral(1).await;
   let new_addr = cluster.node(1).advertise_address();

@@ -318,13 +318,31 @@ where
       "node {i} must be killed before restart"
     );
     let id = self.slots[i].id.clone();
-    let serf = build_node::<R>(
-      id.as_str(),
-      "127.0.0.1:0".parse().expect("loopback addr"),
-      &self.timing,
-    )
-    .await
-    .expect("an ephemeral rebind cannot collide");
+    let old_addr = self.slots[i].addr;
+    // An ephemeral bind guarantees an AVAILABLE port, not a DIFFERENT one:
+    // the OS can hand the just-released port straight back, which would
+    // silently degrade a new-address scenario into a same-address one.
+    // Rebind until the address genuinely differs.
+    const DISTINCT_PORT_RETRIES: usize = 25;
+    let mut attempt = 0usize;
+    let serf = loop {
+      let serf = build_node::<R>(
+        id.as_str(),
+        "127.0.0.1:0".parse().expect("loopback addr"),
+        &self.timing,
+      )
+      .await
+      .expect("an ephemeral rebind cannot collide");
+      if serf.advertise_address() != old_addr {
+        break serf;
+      }
+      assert!(
+        attempt + 1 < DISTINCT_PORT_RETRIES,
+        "the OS kept re-issuing the released port {old_addr}"
+      );
+      attempt += 1;
+      serf.shutdown().await.expect("same-port rebind shuts down");
+    };
     self.slots[i].addr = serf.advertise_address();
     attach_collector::<R>(&serf, self.slots[i].log.clone());
     self.slots[i].serf = Some(serf);
@@ -442,7 +460,7 @@ where
   }
 
   /// The ordered member-event kinds `observer` recorded about `subject`.
-  fn member_event_kinds(&self, observer: usize, subject: &str) -> Vec<MemberEventKind> {
+  pub fn member_event_kinds(&self, observer: usize, subject: &str) -> Vec<MemberEventKind> {
     self.slots[observer]
       .log
       .lock()
