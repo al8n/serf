@@ -67,6 +67,10 @@ pub struct ClusterTiming {
   /// Dead-node reclaim window (`None` keeps revival-at-a-new-address a
   /// conflict, the coordinator default).
   pub dead_node_reclaim: Option<Duration>,
+  /// Periodic anti-entropy push/pull override (`None` keeps the coordinator
+  /// default; `Duration::ZERO` disables it, leaving gossiped intents as the
+  /// only dissemination path — the exclusivity a causal clock fence needs).
+  pub push_pull_interval: Option<Duration>,
   leave_propagate_delay: Duration,
 }
 
@@ -94,6 +98,7 @@ impl ClusterTiming {
       reconnect_timeout: Duration::from_millis(1),
       tombstone_timeout: Duration::from_millis(1),
       dead_node_reclaim: None,
+      push_pull_interval: None,
       // Short enough to keep a graceful leave sub-second, long enough to give
       // in-flight probes a gossip cycle to observe the leave intent.
       leave_propagate_delay: Duration::from_millis(100),
@@ -119,6 +124,12 @@ impl ClusterTiming {
     self
   }
 
+  /// Override (or, at zero, disable) the periodic anti-entropy push/pull.
+  pub fn with_push_pull_interval(mut self, v: Duration) -> Self {
+    self.push_pull_interval = Some(v);
+    self
+  }
+
   /// Override the tombstone retention window.
   pub fn with_tombstone_timeout(mut self, v: Duration) -> Self {
     self.tombstone_timeout = v;
@@ -141,6 +152,9 @@ impl ClusterTiming {
       .with_suspicion_mult(self.suspicion_mult);
     if let Some(v) = self.dead_node_reclaim {
       opts = opts.with_dead_node_reclaim_time(v);
+    }
+    if let Some(v) = self.push_pull_interval {
+      opts = opts.with_push_pull_interval(v);
     }
     opts
   }

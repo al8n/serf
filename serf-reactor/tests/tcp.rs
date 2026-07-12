@@ -1025,10 +1025,16 @@ where
   R: Runtime,
 {
   // A long tombstone keeps the departed member observable as Left for the
-  // whole assertion window (the fast profile would reap it under the polls).
+  // whole assertion window, and push/pull is DISABLED so the gossiped intent
+  // is the only path that can advance the survivor's member clock — the
+  // exclusivity the causal fence below relies on (anti-entropy also
+  // witnesses remote clocks and would replay the Left state, masking the
+  // fresh intent).
   let mut cluster = cluster::Cluster::<R>::spawn(
     &["fleft-a", "fleft-b", "fleft-c"],
-    cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(120)),
+    cluster::ClusterTiming::fast()
+      .with_tombstone_timeout(Duration::from_secs(120))
+      .with_push_pull_interval(Duration::ZERO),
   )
   .await;
   let subject = cluster.id(2);
