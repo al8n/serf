@@ -1596,11 +1596,19 @@ async fn await_version_tag<R>(
 /// subject Alive across the whole cycle, the reference's
 /// restart-beats-detection timing) and periodic push/pull disabled, the
 /// refutation's bumped Alive is the ONLY route by which the new tags can
-/// reach the observer. The observer's own gossip may show the restarted node
-/// the stale claim slightly before the rejoin exchange does — either trigger
-/// is the same restart-refutation mechanism, so the log assertion pins the
-/// event KIND shape (one admission, only Updates after) rather than an exact
-/// count.
+/// reach the observer.
+///
+/// The equalization would unravel if the observer's gossip showed the
+/// restarted node the stale self-claim BEFORE the changed tags were
+/// installed: an early empty-meta refutation would lift the restarted node
+/// past the observer's incarnation and the new tags would then flow through
+/// ordinary monotonic admission instead of the refutation broadcast. The
+/// only pre-join sender is the observer's bounded retransmit queue (probes
+/// parked, push/pull disabled), so the staging drains it — a quiesce wait
+/// spanning many gossip ticks after the v1 fence, exhausting the v1 Alive's
+/// retransmit budget — before the kill. After that the restarted node hears
+/// nothing until its own rejoin, which makes the tags-before-rejoin
+/// installation as atomic as the reference's start-time tag configuration.
 async fn serf_update_after_restart_with_changed_tags<R>()
 where
   R: Runtime,
@@ -1630,6 +1638,13 @@ where
     .expect("the subject tags itself before the restart");
   await_version_tag(&cluster, 0, subject.as_str(), "v1").await;
 
+  // Quiesce the observer's retransmit queue: the accepted v1 Alive is
+  // re-gossiped a BOUNDED number of times (the retransmit budget), and this
+  // wait spans dozens of gossip ticks — far past that budget — so nothing
+  // remains that could reach the restarted socket before the changed tags
+  // are installed below.
+  R::sleep(Duration::from_millis(600)).await;
+
   cluster.kill_abrupt(1).await;
   cluster.restart(1).await;
 
@@ -1655,16 +1670,21 @@ where
   // The completion fence: the refuted Alive delivers v2 to the observer.
   await_version_tag(&cluster, 0, subject.as_str(), "v2").await;
 
-  // The whole cycle surfaced as one admission followed by nothing but
-  // Updates: no Failed (probing parked), no second Join (the observer never
-  // saw the subject leave), and both retags surfaced.
-  let kinds = cluster.member_event_kinds(0, subject.as_str());
-  assert!(
-    kinds.len() >= 3
-      && kinds[0] == MemberEventKind::Join
-      && kinds[1..].iter().all(|k| *k == MemberEventKind::Update),
-    "the restart cycle must surface as one Join then only Updates (got {kinds:?})"
-  );
+  // The whole cycle surfaced as exactly [Join, Update, Update]: no Failed
+  // (probing parked), no second Join (the observer never saw the subject
+  // leave), one Update per retag — a third Update would mean the quiesce
+  // window reopened and an early empty-meta refutation slipped through.
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Update,
+        MemberEventKind::Update,
+      ],
+    )
+    .await;
 
   cluster.shutdown_all().await;
 }
