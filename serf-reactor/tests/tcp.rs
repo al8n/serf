@@ -594,6 +594,44 @@ where
   cluster.shutdown_all().await;
 }
 
+/// After a two-node join, probe round-trips feed the Vivaldi coordinate
+/// client on both nodes: the local coordinate surfaces through the published
+/// snapshot (`coordinate()`), and the peer's coordinate surfaces through the
+/// driver round-trip (`cached_coordinate(id)`). Both accessors must go `Some`
+/// within the probe cadence — the discriminator that the driver actually
+/// forwards coordinates rather than merely compiling the feature.
+#[cfg(feature = "coordinates")]
+async fn coordinates_surface_on_the_handle<R>()
+where
+  R: Runtime,
+{
+  let mut cluster =
+    cluster::Cluster::<R>::spawn(&["coord-a", "coord-b"], cluster::ClusterTiming::fast()).await;
+  let b_id = cluster.id(1);
+
+  // Probe RTTs accumulate at the fast profile's 100ms cadence; both surfaces
+  // must appear well inside the fixture's poll ceiling.
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  loop {
+    let local = cluster.node(0).coordinate();
+    let cached = cluster
+      .node(0)
+      .cached_coordinate(b_id.clone())
+      .await
+      .expect("cached_coordinate round-trips through the driver");
+    if local.is_some() && cached.is_some() {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "coordinates must surface on the handle: local={local:?} cached={cached:?}"
+    );
+    R::sleep(Duration::from_millis(50)).await;
+  }
+
+  cluster.shutdown_all().await;
+}
+
 /// A leave configured with a zero timeout racing a shutdown resolves
 /// `Err(LeaveTimeout)` — never `Ok` — even though the teardown still delivers
 /// the fan-out: the caller's per-leave deadline keeps governing resolution
@@ -883,6 +921,12 @@ mod tokio_cells {
     super::serf_events_leave_with_racing_shutdown::<TokioRuntime>().await;
   }
 
+  #[cfg(feature = "coordinates")]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn coordinates_surface_on_the_handle() {
+    super::coordinates_surface_on_the_handle::<TokioRuntime>().await;
+  }
+
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn leave_with_zero_timeout_racing_shutdown_times_out() {
     super::leave_with_zero_timeout_racing_shutdown_times_out::<TokioRuntime>().await;
@@ -970,6 +1014,12 @@ mod smol_cells {
   #[test]
   fn serf_events_leave_with_racing_shutdown_smol() {
     SmolRuntime::block_on(super::serf_events_leave_with_racing_shutdown::<SmolRuntime>());
+  }
+
+  #[cfg(feature = "coordinates")]
+  #[test]
+  fn coordinates_surface_on_the_handle_smol() {
+    SmolRuntime::block_on(super::coordinates_surface_on_the_handle::<SmolRuntime>());
   }
 
   #[test]

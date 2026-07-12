@@ -273,6 +273,19 @@ pub(crate) struct ListKeysCmd {
   pub(crate) reply: Sender<Result<QueryId>>,
 }
 
+/// Payload for [`Command::CachedCoordinate`].
+///
+/// Requires the `coordinates` feature.
+#[cfg(feature = "coordinates")]
+pub(crate) struct CachedCoordinateCmd<I> {
+  /// The peer whose most-recently-observed coordinate is requested.
+  pub(crate) id: I,
+  /// One-shot reply channel delivering the peer's cached coordinate, `None`
+  /// when coordinates are disabled or no RTT sample has arrived from the peer.
+  #[cfg(any(feature = "tcp", feature = "quic"))]
+  pub(crate) reply: Sender<Result<Option<serf_proto::typed::Coordinate>>>,
+}
+
 /// Payload for [`Command::Shutdown`].
 pub(crate) struct ShutdownCmd {
   /// One-shot reply channel for the shutdown acknowledgement.
@@ -359,6 +372,13 @@ pub(crate) enum Command<I, A> {
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   ListKeys(ListKeysCmd),
+
+  /// Read a peer's most-recently-observed Vivaldi coordinate.
+  ///
+  /// Requires the `coordinates` feature.
+  #[cfg(feature = "coordinates")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]
+  CachedCoordinate(CachedCoordinateCmd<I>),
 
   /// Signal the driver task to shut down gracefully.
   Shutdown(ShutdownCmd),
