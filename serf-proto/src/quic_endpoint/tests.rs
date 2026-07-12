@@ -383,3 +383,34 @@ fn loopback_push_pull_converges_member_clock() {
     "the acceptor learned the dialer (node 1) as a member over the exchange"
   );
 }
+
+/// The operator forwarders reach the inner machine: a fresh endpoint is
+/// healthy (score zero), a merge predicate installs through the coordinator,
+/// and the coordinate-reset counter reads through to the client when
+/// coordinates are enabled.
+#[test]
+fn operator_forwarders_reach_the_inner_machine() {
+  let mut e = ep(1, 7952);
+  assert_eq!(e.health_score(), 0, "a fresh node is healthy");
+
+  struct RejectAll;
+  impl memberlist_proto::delegate::MergeDelegate<u32, SocketAddr> for RejectAll {
+    fn notify_merge(
+      &self,
+      _peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<u32, SocketAddr>],
+      >,
+    ) -> bool {
+      false
+    }
+  }
+  e.set_merge_delegate(RejectAll);
+
+  #[cfg(feature = "coordinates")]
+  assert_eq!(
+    e.coordinate_resets(),
+    Some(0),
+    "a fresh coordinate client has reset nothing"
+  );
+}

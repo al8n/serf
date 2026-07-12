@@ -256,3 +256,29 @@ fn stats_assembles_counts_and_ops_readings() {
   assert_eq!(stats.event_clock(), LamportTime::new(8));
   assert_eq!(stats.query_clock(), LamportTime::new(9));
 }
+
+/// The coordinate readings ride the snapshot only when the driver attaches
+/// them: absent by default, carried through the builders, surfaced on the
+/// aggregate.
+#[cfg(feature = "coordinates")]
+#[test]
+fn coordinate_readings_ride_the_snapshot() {
+  let members = vec![make_member(1, "127.0.0.1:7951", MemberStatus::Alive)];
+  let snap = SerfSnapshot::new(
+    members,
+    &1u32,
+    SerfState::Alive,
+    LamportTime::ZERO,
+    LamportTime::ZERO,
+    LamportTime::ZERO,
+  );
+  assert!(snap.coordinate().is_none(), "absent until attached");
+  assert!(snap.stats().coordinate_resets().is_none());
+
+  let coordinate = serf_proto::typed::Coordinate::default();
+  let snap = snap
+    .with_coordinate(Some(coordinate.clone()))
+    .with_coordinate_resets(Some(3));
+  assert_eq!(snap.coordinate(), Some(&coordinate));
+  assert_eq!(snap.stats().coordinate_resets(), Some(3));
+}

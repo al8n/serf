@@ -344,12 +344,101 @@ where
   b.shutdown().await.expect("lv-b shuts down");
 }
 
+/// A tls node with snapshot persistence configured.
+async fn spawn_node_with_snapshot<R>(
+  id: &str,
+  snapshot: serf_reactor::SnapshotOptions,
+  rejoin_after_leave: bool,
+) -> Node<R>
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  Serf::<SmolStr, SocketAddr, R>::tls(
+    TlsTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(bind))
+      .with_tls_options(test_tls_options()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new().with_rejoin_after_leave(rejoin_after_leave),
+    None,
+    None,
+    Some(snapshot),
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn snapshot-backed serf tls node")
+}
+
+/// The clean-leave gate over the tls transport: the graceful leave persists,
+/// the default posture starts fresh on restart, the opt-in posture rejoins.
+async fn snapshot_leave_gate_controls_rejoin<R>()
+where
+  R: Runtime,
+{
+  let mut path = std::env::temp_dir();
+  // Keyed by runtime as well as pid: the tokio and smol cells run
+  // concurrently in one test binary and must not share a snapshot file.
+  path.push(format!(
+    "serf-e2e-tls-snap-leave-gate-{}-{}",
+    std::process::id(),
+    core::any::type_name::<R>().replace("::", "-"),
+  ));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&path);
+
+  let a = spawn_node::<R>("tgate-a").await;
+  let b =
+    spawn_node_with_snapshot::<R>("tgate-b", serf_reactor::SnapshotOptions::new(&path), false)
+      .await;
+  let a_addr = a.advertise_address();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  b.leave().await.expect("tgate-b leaves gracefully");
+  b.shutdown().await.expect("tgate-b shuts down");
+
+  // Default posture: the leave clears the recovered state — no auto-rejoin.
+  let b2 =
+    spawn_node_with_snapshot::<R>("tgate-b", serf_reactor::SnapshotOptions::new(&path), false)
+      .await;
+  R::sleep(Duration::from_millis(1500)).await;
+  assert_eq!(
+    b2.num_members(),
+    1,
+    "a cleanly-left node must not auto-rejoin unless opted in"
+  );
+  b2.shutdown().await.expect("tgate-b2 shuts down");
+
+  // Opt-in posture: the Leave marker is ignored and the membership recovers.
+  let b3 =
+    spawn_node_with_snapshot::<R>("tgate-b", serf_reactor::SnapshotOptions::new(&path), true).await;
+  converge(&a, &b3).await;
+
+  a.shutdown().await.expect("tgate-a shuts down");
+  b3.shutdown().await.expect("tgate-b3 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 // The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
 // runtime. Gated on the `tokio` feature so the `--test tls -- smol` build (which
 // enables only `smol`) can drop the `agnostic/tokio` code path.
 #[cfg(feature = "tokio")]
 mod tokio_cells {
   use agnostic::tokio::TokioRuntime;
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_leave_gate_controls_rejoin() {
+    super::snapshot_leave_gate_controls_rejoin::<TokioRuntime>().await;
+  }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_tls_join_converges() {
@@ -378,6 +467,11 @@ mod tokio_cells {
 #[cfg(feature = "smol")]
 mod smol_cells {
   use agnostic::{RuntimeLite, smol::SmolRuntime};
+
+  #[test]
+  fn snapshot_leave_gate_controls_rejoin_smol() {
+    SmolRuntime::block_on(super::snapshot_leave_gate_controls_rejoin::<SmolRuntime>());
+  }
 
   #[test]
   fn two_node_tls_join_converges_smol() {

@@ -745,6 +745,206 @@ where
   b.shutdown().await.expect("mis-b shuts down");
 }
 
+/// A quic node with snapshot persistence configured.
+async fn spawn_node_with_snapshot<R>(
+  id: &str,
+  snapshot: serf_reactor::SnapshotOptions,
+  rejoin_after_leave: bool,
+) -> Node<R>
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  Serf::<SmolStr, SocketAddr, R>::quic(
+    QuicTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(bind))
+      .with_quic_config(test_quic_options()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new().with_rejoin_after_leave(rejoin_after_leave),
+    None,
+    None,
+    Some(snapshot),
+    #[cfg(encryption)]
+    std::sync::Arc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn snapshot-backed serf quic node")
+}
+
+/// A unique snapshot path under the system temp dir, keyed by runtime as well
+/// as pid: the tokio and smol cells run concurrently in one test binary and
+/// must not share a snapshot file.
+fn snapshot_path<R>(name: &str) -> std::path::PathBuf
+where
+  R: Runtime,
+{
+  let mut p = std::env::temp_dir();
+  p.push(format!(
+    "serf-e2e-quic-snap-{name}-{}-{}",
+    std::process::id(),
+    core::any::type_name::<R>().replace("::", "-"),
+  ));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&p);
+  p
+}
+
+/// The clean-leave gate over the quic driver: a graceful leave ends the
+/// snapshot at the Leave record, the default posture starts fresh on restart,
+/// and the opt-in posture rejoins from the persisted membership.
+async fn snapshot_leave_gate_controls_rejoin<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path::<R>("leave-gate");
+  let a = spawn_node::<R>("qgate-a").await;
+  let b =
+    spawn_node_with_snapshot::<R>("qgate-b", serf_reactor::SnapshotOptions::new(&path), false)
+      .await;
+  let a_addr = a.advertise_address();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  b.leave().await.expect("qgate-b leaves gracefully");
+  b.shutdown().await.expect("qgate-b shuts down");
+
+  // The pump writes the clock floors BEFORE the leave marker, so a clean
+  // shutdown ends the file at the Leave record — the terminal shape replay
+  // expects and compaction preserves.
+  {
+    let bytes = std::fs::read(&path).expect("the snapshot survives the leave");
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+      let (rec, used) =
+        serf_proto::snapshot::SnapshotRecord::<SmolStr, SocketAddr>::decode(&bytes[cursor..])
+          .expect("a clean-leave snapshot decodes whole");
+      records.push(rec);
+      cursor += used;
+    }
+    assert!(
+      matches!(
+        records.last(),
+        Some(serf_proto::snapshot::SnapshotRecord::Leave)
+      ),
+      "a clean shutdown must end the snapshot at the Leave record"
+    );
+  }
+
+  // Default posture: the leave clears the recovered state — no auto-rejoin.
+  let b2 =
+    spawn_node_with_snapshot::<R>("qgate-b", serf_reactor::SnapshotOptions::new(&path), false)
+      .await;
+  R::sleep(Duration::from_millis(1500)).await;
+  assert_eq!(
+    b2.num_members(),
+    1,
+    "a cleanly-left node must not auto-rejoin unless opted in"
+  );
+  b2.shutdown().await.expect("qgate-b2 shuts down");
+
+  // Opt-in posture: the Leave marker is ignored and the membership recovers.
+  let b3 =
+    spawn_node_with_snapshot::<R>("qgate-b", serf_reactor::SnapshotOptions::new(&path), true).await;
+  converge(&a, &b3).await;
+
+  a.shutdown().await.expect("qgate-a shuts down");
+  b3.shutdown().await.expect("qgate-b3 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// A key rotation over the quic driver with node B persisting through a
+/// [`serf_reactor::FileKeyringDelegate`]: B's response is parked until the
+/// file write is acknowledged and still collected within the query window,
+/// with the file already holding the installed key when the response arrives.
+#[cfg(unix)]
+async fn file_backed_rotation_gates_the_response_on_persistence<R>()
+where
+  R: Runtime,
+{
+  let k1 = test_secret_key(0x55);
+  let k2 = test_secret_key(0x66);
+
+  let mut path = std::env::temp_dir();
+  path.push(format!(
+    "serf-quic-key-rotation-file-{}-{}",
+    std::process::id(),
+    core::any::type_name::<R>().replace("::", "-"),
+  ));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&path);
+
+  let enc = || EncryptionOptions::new().with_keyring(Keyring::new(k1));
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let b = Serf::<SmolStr, SocketAddr, R>::quic(
+    QuicTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("qfile-b"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind))
+      .with_quic_config(test_quic_options())
+      .with_encryption(enc()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    std::sync::Arc::new(serf_reactor::FileKeyringDelegate::new(&path)),
+  )
+  .await
+  .expect("spawn file-backed encrypted quic node");
+  let a = spawn_encrypted_node::<R>("qfile-a", enc()).await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  converge(&a, &b).await;
+
+  let mut a_events = a.events();
+  a.install_key(k2).await.expect("install_key dispatched");
+  let kr = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::KeyResponse(kr)) => break kr,
+        Some(_) => {}
+        None => panic!("the event stream ended before the key response"),
+      }
+    }
+  })
+  .await
+  .expect("A collects the key response within the timeout");
+  assert!(
+    kr.num_resp >= 2,
+    "install_key must collect a response from BOTH nodes, including the one parked on file persistence (num_resp={})",
+    kr.num_resp
+  );
+  assert_eq!(kr.num_err, 0, "install_key must succeed on every node");
+
+  let persisted = serf_reactor::FileKeyringDelegate::new(&path)
+    .load()
+    .expect("the acknowledged write parses")
+    .expect("the acknowledged write exists");
+  assert!(
+    persisted.secondaries().contains(&k2) || persisted.primary_ref() == &k2,
+    "the response was gated on persistence, so the file already holds the installed key"
+  );
+
+  a.shutdown().await.expect("qfile-a shuts down");
+  b.shutdown().await.expect("qfile-b shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 // The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
 // runtime. Gated on the `tokio` feature so the `--test quic -- smol` build (which
 // enables only `smol`) can drop the `agnostic/tokio` code path.
@@ -755,6 +955,17 @@ mod tokio_cells {
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_quic_join_converges() {
     super::two_node_quic_join_converges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_leave_gate_controls_rejoin() {
+    super::snapshot_leave_gate_controls_rejoin::<TokioRuntime>().await;
+  }
+
+  #[cfg(all(unix, encryption))]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn file_backed_rotation_gates_the_response_on_persistence() {
+    super::file_backed_rotation_gates_the_response_on_persistence::<TokioRuntime>().await;
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -807,6 +1018,19 @@ mod tokio_cells {
 #[cfg(feature = "smol")]
 mod smol_cells {
   use agnostic::{RuntimeLite, smol::SmolRuntime};
+
+  #[test]
+  fn snapshot_leave_gate_controls_rejoin_smol() {
+    SmolRuntime::block_on(super::snapshot_leave_gate_controls_rejoin::<SmolRuntime>());
+  }
+
+  #[cfg(all(unix, encryption))]
+  #[test]
+  fn file_backed_rotation_gates_the_response_on_persistence_smol() {
+    SmolRuntime::block_on(
+      super::file_backed_rotation_gates_the_response_on_persistence::<SmolRuntime>(),
+    );
+  }
 
   #[test]
   fn two_node_quic_join_converges_smol() {
