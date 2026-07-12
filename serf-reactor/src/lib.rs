@@ -162,6 +162,12 @@ pub use delegate::{
   docsrs,
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
+pub use delegate::{FileKeyringDelegate, KeyringFileError};
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
 pub use delegate::{KeyringDelegate, VoidKeyringDelegate};
 
 /// Gossip-encryption config types re-exported from `memberlist-proto`, so a

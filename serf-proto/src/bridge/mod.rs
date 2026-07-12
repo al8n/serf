@@ -655,7 +655,7 @@ where
 /// The transient plaintext buffer is zeroed before it is freed so the raw key
 /// material does not linger in heap memory after this call returns.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-fn secret_key_to_bytes(key: &SecretKey) -> Bytes {
+pub fn secret_key_to_bytes(key: &SecretKey) -> Bytes {
   use zeroize::Zeroize as _;
   let raw = key.as_bytes();
   let mut buf = Vec::with_capacity(1 + raw.len());
@@ -671,7 +671,7 @@ fn secret_key_to_bytes(key: &SecretKey) -> Bytes {
 /// Returns [`BridgeError::InvalidValue`] when the tag is unknown to this build
 /// or the byte count does not match the algorithm's expected key length.
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
-fn secret_key_from_bytes(buf: &Bytes) -> Result<SecretKey, BridgeError> {
+pub fn secret_key_from_bytes(buf: &Bytes) -> Result<SecretKey, BridgeError> {
   if buf.is_empty() {
     return Err(BridgeError::InvalidValue(
       "key bytes must carry at least the algorithm tag".into(),

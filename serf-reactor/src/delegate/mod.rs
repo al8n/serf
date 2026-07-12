@@ -13,10 +13,18 @@
 //! block), and `MergeDelegate` is an async admission veto supplied at
 //! construction rather than an observation hook.
 
+#[cfg(encryption)]
+mod keyring_file;
 mod void;
 
 pub use void::{NoopMergeDelegate, VoidDelegate};
 
+#[cfg(encryption)]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub use keyring_file::{FileKeyringDelegate, KeyringFileError};
 #[cfg(encryption)]
 pub use void::VoidKeyringDelegate;
 

@@ -28,6 +28,12 @@ compile_error!("serf-proto requires the `std` or `alloc` feature");
 pub(crate) use any::{AnyMessage, EncodeError};
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use bridge::BridgeError;
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+)]
+pub use bridge::{BridgeError as SecretKeyCodecError, secret_key_from_bytes, secret_key_to_bytes};
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) use framing::{FrameError, MessageType};
 #[cfg(any(feature = "tcp", feature = "quic"))]
