@@ -1296,11 +1296,23 @@ async fn farewell_retry_waits_for_its_epoch_across_polls() {
     );
   }
 
-  // The epoch elapses: the very next poll's single retry pass sends it.
+  // The epoch elapses: an eligible retry hands the datagram to the socket.
+  // The send can legitimately return `Pending` while the fresh socket's
+  // writable readiness has not yet reached the reactor (production advances
+  // on the registered writable wake), so drive bounded wake iterations
+  // rather than demanding completion on one poll.
   driver.farewell.retry_after = Some(Instant::now());
-  let _ = poll_once(&mut driver);
+  let mut sent = false;
+  for _ in 0..64 {
+    let _ = poll_once(&mut driver);
+    if driver.leave_drain.is_empty() {
+      sent = true;
+      break;
+    }
+    TokioRuntime::sleep(Duration::from_millis(5)).await;
+  }
   assert!(
-    driver.leave_drain.is_empty(),
+    sent,
     "an eligible retry must hand the retained farewell to the socket"
   );
   assert!(
