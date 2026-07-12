@@ -1825,16 +1825,16 @@ where
 /// default-tombstone reap that none of them cover, and — like the legacy body —
 /// checks the leaver's own side, not just the observer's.
 ///
-/// The leaver is kept running rather than shut down so its convergence is
-/// observable, but its side must be read from the EVENT LOG, not the membership
-/// snapshot. The leaver reaps its own self Left tombstone (matching the legacy
-/// leaver) — `handle_node_leave` adds self to `left_members` and `fire_reap`
-/// removes it — but once self is gone from the machine, `refresh_snapshot`
-/// refuses to publish a view missing the local id, so `members()` /
-/// `num_members()` FREEZE at the pre-reap `[peer, self:Left]` state. The event
-/// stream stays truthful: the leaver emits `Leave` then `Reap` for itself and
-/// only a `Join` for the peer. (The frozen-snapshot-vs-event divergence for a
-/// left-in-place node is tracked as a separate machine-side issue, al8n/serf#88.)
+/// The leaver is kept running rather than shut down so its own convergence is
+/// observable. The local node is exempt from reaping (a running node always
+/// knows itself), so the leaver HOLDS its self `Left` tombstone rather than
+/// reaping it: its own event log is exactly `Join → Leave` — no self `Reap` —
+/// and its live membership view still shows itself `Left` beside the `Alive`
+/// peer. This is the al8n/serf#88 fix: before the exemption the machine reaped
+/// self and `refresh_snapshot` then froze the view (it will not publish a
+/// snapshot missing the local id). The ABSENCE of the self `Reap` is what
+/// distinguishes the held (correct) case from the reaped-then-frozen (buggy)
+/// one — the frozen view carried the same member values.
 async fn serf_join_leave<R>()
 where
   R: Runtime,
@@ -1848,25 +1848,24 @@ where
   cluster.leave_in_place(1).await;
 
   // A (observer) reaps the departed B under the fast profile's 1ms tombstone +
-  // 100ms reap ticks, returning to just itself (A's own snapshot stays live).
+  // 100ms reap ticks, returning to just itself. This also fences past the reap
+  // window, so any (regressed) self-reap on B would have surfaced by now.
   cluster.await_num_members(0, 1).await;
 
-  // B (the leaver) processes its own departure end to end: its event log shows
-  // Join → Leave → Reap for itself — self IS reaped under the default tombstone.
+  // B (the leaver) holds its self tombstone: its own event log is exactly
+  // Join → Leave, with NO self Reap.
+  assert_eq!(
+    cluster.member_event_kinds(1, leaver.as_str()),
+    vec![MemberEventKind::Join, MemberEventKind::Leave],
+    "the leaver holds its self tombstone: Join then Leave, never a self Reap"
+  );
+  // Its live view still shows itself Left beside the still-Alive peer — never
+  // frozen, never dropping the live peer.
   cluster
-    .assert_member_events(
-      1,
-      leaver.as_str(),
-      &[
-        MemberEventKind::Join,
-        MemberEventKind::Leave,
-        MemberEventKind::Reap,
-      ],
-    )
+    .await_member_status(1, leaver.as_str(), MemberStatus::Left)
     .await;
-  // And it never fails or reaps the still-live peer — only the Join.
   cluster
-    .assert_member_events(1, peer.as_str(), &[MemberEventKind::Join])
+    .await_member_status(1, peer.as_str(), MemberStatus::Alive)
     .await;
 
   cluster.shutdown_all().await;

@@ -303,11 +303,10 @@ where
 
   /// Gracefully leave node `i` but keep its handle LIVE — unlike
   /// [`leave_graceful`](Self::leave_graceful), no shutdown follows. Lets an
-  /// assertion observe the leaver's OWN post-leave convergence before teardown.
-  /// Read that convergence from the event log, not `members()`: the leaver
-  /// reaps its self Left tombstone, but the published snapshot then freezes
-  /// (`refresh_snapshot` will not publish a view missing the local id), so the
-  /// event stream — not the membership view — is the source of truth here.
+  /// assertion observe the leaver's OWN post-leave convergence before teardown:
+  /// the leaver holds its self `Left` tombstone (the local node is never reaped
+  /// from its own view), so both its live membership view and its event log
+  /// remain readable and truthful.
   pub async fn leave_in_place(&self, i: usize) {
     self
       .node(i)

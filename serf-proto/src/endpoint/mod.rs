@@ -708,6 +708,14 @@ where
 {
   /// serf configuration knobs.
   opts: Options,
+  /// This endpoint's own node id, cached from the transport at construction.
+  ///
+  /// The machine is otherwise decoupled from its identity (the id lives on the
+  /// transport), but the reaper needs it: the local node must never be reaped
+  /// from its own view — a running node always knows itself, and reaping its
+  /// self `Left` tombstone would drop it from the published snapshot (which
+  /// requires the local member) and freeze the view.
+  local_id: I,
   /// Member (SWIM membership) Lamport clock — plain `u64`, no atomics.
   /// Single-threaded machine; no concurrent writers.
   clock: u64,
@@ -910,11 +918,11 @@ where
   /// default `u64`).  A driver that must observe the counts from a detached
   /// handle injects a shared backing via
   /// [`new_with_rng_in`](Self::new_with_rng_in) instead.
-  pub fn new_with_rng(opts: Options, rng: R) -> Self
+  pub fn new_with_rng(local_id: I, opts: Options, rng: R) -> Self
   where
     D: Default,
   {
-    Self::new_with_rng_in(opts, rng, D::default(), D::default())
+    Self::new_with_rng_in(local_id, opts, rng, D::default(), D::default())
   }
 
   /// Construct a serf `Endpoint` core injecting the two coalescer shed counters
@@ -925,7 +933,7 @@ where
   /// clones here so the handle observes every coalescer shed WITHOUT the endpoint
   /// publishing a copy each pump iteration.  The single-owner drivers use the
   /// `u64` default via [`new_with_rng`](Self::new_with_rng).
-  pub fn new_with_rng_in(opts: Options, rng: R, user_drop: D, member_drop: D) -> Self {
+  pub fn new_with_rng_in(local_id: I, opts: Options, rng: R, user_drop: D, member_drop: D) -> Self {
     // Arm the first reap/reconnect/queue-check deadlines relative to the ORIGIN instant.
     // The driver calls handle_timeout(now) and the deadlines fire when now >= deadline.
     let first_reap = Instant::ORIGIN + opts.reap_interval();
@@ -961,6 +969,7 @@ where
 
     Self {
       opts,
+      local_id,
       clock: 0,
       event_clock: 0,
       query_clock: 0,
@@ -1009,11 +1018,11 @@ where
   /// Suitable for tests and environments where determinism or an explicit seed
   /// is acceptable.  Production drivers should use `new_with_rng` and seed from
   /// a cryptographically-secure source.
-  pub fn new(opts: Options) -> Self
+  pub fn new(local_id: I, opts: Options) -> Self
   where
     D: Default,
   {
-    Self::new_with_rng(opts, R::seed_from_u64(0))
+    Self::new_with_rng(local_id, opts, R::seed_from_u64(0))
   }
 
   // ── read accessors ────────────────────────────────────────────────────────
@@ -2466,17 +2475,23 @@ where
     let mut i = 0;
     while i < self.members.left_members.len() {
       let id = self.members.left_members[i].clone();
-      let expired = match self.members.states.get(&id) {
-        Some(ms) => {
-          let timeout = match &self.reconnect_delegate {
-            Some(d) => d.reconnect_timeout(ms.member(), tombstone_timeout),
-            None => tombstone_timeout,
-          };
-          ms.leave_time()
-            .is_some_and(|lt| now.duration_since(lt) > timeout)
-        }
-        None => false,
-      };
+      // Never reap the local node from its own view. A node that leaves in
+      // place (leaves but keeps running) tombstones itself as `Left`; reaping
+      // that self tombstone would drop the local member, which the published
+      // snapshot requires, and freeze the membership view. Hold it instead —
+      // a running node always knows itself.
+      let expired = id != self.local_id
+        && match self.members.states.get(&id) {
+          Some(ms) => {
+            let timeout = match &self.reconnect_delegate {
+              Some(d) => d.reconnect_timeout(ms.member(), tombstone_timeout),
+              None => tombstone_timeout,
+            };
+            ms.leave_time()
+              .is_some_and(|lt| now.duration_since(lt) > timeout)
+          }
+          None => false,
+        };
       if expired {
         self.members.left_members.swap_remove(i);
         if let Some(ms) = self.members.states.remove(&id) {

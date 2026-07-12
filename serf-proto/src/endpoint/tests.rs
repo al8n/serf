@@ -876,6 +876,32 @@ fn reap_left_removes_after_tombstone_timeout() {
   assert!(reaped, "a Member(Reap) event should have been emitted");
 }
 
+/// The local node is never reaped from its own view. A node that leaves in
+/// place tombstones itself as `Left`; reaping that self tombstone would drop
+/// the local member from the published snapshot (which requires it) and freeze
+/// the view. Seed both the local id (`1`, the `ep()` local) and a peer (`2`) as
+/// `Left`, then reap well past the tombstone timeout: the peer is reaped, the
+/// local node is held.
+#[test]
+fn reap_left_never_reaps_the_local_node() {
+  let mut e = ep();
+  let t0 = memberlist_proto::Instant::ORIGIN;
+  e.test_seed_left_member_by_status(1, LamportTime::new(3), t0);
+  e.test_seed_left_member_by_status(2, LamportTime::new(3), t0);
+  let past_timeout = t0 + core::time::Duration::from_secs(3600 * 25);
+  e.test_fire_reap(past_timeout);
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "the peer's Left tombstone is reaped past the tombstone timeout"
+  );
+  assert_eq!(
+    e.test_member_status(1),
+    Some(MemberStatus::Left),
+    "the local node is never reaped from its own view"
+  );
+}
+
 #[test]
 fn reap_intents_removes_stale_intents() {
   let mut e = ep();

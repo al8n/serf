@@ -103,8 +103,9 @@ where
   where
     D: Default,
   {
+    let local_id = transport.endpoint_ref().local_id_ref().clone();
     Self {
-      core: Endpoint::new_with_rng(opts, rng),
+      core: Endpoint::new_with_rng(local_id, opts, rng),
       transport,
     }
   }
@@ -121,8 +122,9 @@ where
     user_drop: D,
     member_drop: D,
   ) -> Self {
+    let local_id = transport.endpoint_ref().local_id_ref().clone();
     Self {
-      core: Endpoint::new_with_rng_in(opts, rng, user_drop, member_drop),
+      core: Endpoint::new_with_rng_in(local_id, opts, rng, user_drop, member_drop),
       transport,
     }
   }
