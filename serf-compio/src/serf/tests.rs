@@ -1291,3 +1291,303 @@ async fn two_node_tcp_key_rotation_rotates_both_live_keyrings() {
   a.shutdown().await.expect("rot-a shuts down");
   b.shutdown().await.expect("rot-b shuts down");
 }
+
+/// Build a TCP node persisting membership to `snapshot`.
+async fn spawn_node_with_snapshot(
+  id: &str,
+  snapshot: crate::SnapshotOptions,
+  rejoin_after_leave: bool,
+) -> Serf<SmolStr> {
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(
+      "127.0.0.1:0".parse().expect("loopback addr"),
+    ));
+  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new().with_rejoin_after_leave(rejoin_after_leave),
+    gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
+    Some(snapshot),
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn snapshot-backed serf node")
+}
+
+/// A unique snapshot path under the system temp dir.
+fn snapshot_path(name: &str) -> std::path::PathBuf {
+  let mut p = std::env::temp_dir();
+  p.push(format!("serf-compio-snap-{name}-{}", std::process::id()));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&p);
+  p
+}
+
+/// Poll both nodes until each reports the full two-member cluster.
+async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 2 && b.num_members() == 2 {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("both nodes converge to a 2-member cluster");
+}
+
+/// The clean-leave gate over the compio driver: a graceful leave ends the
+/// snapshot at the Leave record, the default posture starts fresh on restart,
+/// and the opt-in posture rejoins from the persisted membership.
+#[compio::test]
+async fn snapshot_leave_gate_controls_rejoin() {
+  let path = snapshot_path("leave-gate");
+  let a = spawn_node("cgate-a").await;
+  let b = spawn_node_with_snapshot("cgate-b", crate::SnapshotOptions::new(&path), false).await;
+  let a_addr = a.advertise_address();
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  b.leave().await.expect("cgate-b leaves gracefully");
+  b.shutdown().await.expect("cgate-b shuts down");
+
+  // The pump writes the clock floors BEFORE the leave marker, so a clean
+  // shutdown ends the file at the Leave record — the terminal shape replay
+  // expects and compaction preserves.
+  {
+    let bytes = std::fs::read(&path).expect("the snapshot survives the leave");
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+      let (rec, used) =
+        serf_proto::snapshot::SnapshotRecord::<SmolStr, SocketAddr>::decode(&bytes[cursor..])
+          .expect("a clean-leave snapshot decodes whole");
+      records.push(rec);
+      cursor += used;
+    }
+    assert!(
+      matches!(
+        records.last(),
+        Some(serf_proto::snapshot::SnapshotRecord::Leave)
+      ),
+      "a clean shutdown must end the snapshot at the Leave record"
+    );
+  }
+
+  // Default posture: the leave clears the recovered state — no auto-rejoin.
+  let b2 = spawn_node_with_snapshot("cgate-b", crate::SnapshotOptions::new(&path), false).await;
+  compio::time::sleep(Duration::from_millis(1500)).await;
+  assert_eq!(
+    b2.num_members(),
+    1,
+    "a cleanly-left node must not auto-rejoin unless opted in"
+  );
+  b2.shutdown().await.expect("cgate-b2 shuts down");
+
+  // Opt-in posture: the Leave marker is ignored and the membership recovers.
+  let b3 = spawn_node_with_snapshot("cgate-b", crate::SnapshotOptions::new(&path), true).await;
+  converge(&a, &b3).await;
+
+  a.shutdown().await.expect("cgate-a shuts down");
+  b3.shutdown().await.expect("cgate-b3 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// The constructor-supplied merge delegate is the predicate the machine
+/// consults: with a recording accept-all delegate installed on B, A's join
+/// push-pull drives at least one `notify_merge` on B carrying A's node state.
+/// (A veto here gates only the push/pull application — a rejected peer can
+/// still be admitted moments later through gossip Alives, exactly as in the
+/// reference implementation, so the stable assertion is consultation, not
+/// permanent exclusion.)
+#[compio::test]
+async fn merge_delegate_is_consulted_on_join() {
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  struct RecordingMerge {
+    hits: std::sync::Arc<AtomicUsize>,
+    saw_peer: std::sync::Arc<AtomicUsize>,
+  }
+  impl crate::MergeDelegate<SmolStr, SocketAddr> for RecordingMerge {
+    fn notify_merge(
+      &self,
+      peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+      >,
+    ) -> bool {
+      self.hits.fetch_add(1, Ordering::Relaxed);
+      if peers.iter().any(|p| p.id_ref().as_str() == "cmerge-a") {
+        self.saw_peer.fetch_add(1, Ordering::Relaxed);
+      }
+      true
+    }
+  }
+
+  let hits = std::sync::Arc::new(AtomicUsize::new(0));
+  let saw_peer = std::sync::Arc::new(AtomicUsize::new(0));
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("cmerge-b"))
+    .with_advertise_addr(MaybeResolved::Resolved(
+      "127.0.0.1:0".parse().expect("loopback addr"),
+    ));
+  let b =
+    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+      opts,
+      &SocketAddrResolver,
+      &FirstAddrResolver,
+      VoidDelegate::<SmolStr, SocketAddr>::new(),
+      RuntimeOptions::new(),
+      SerfOptions::new(),
+      gossip_rng().expect("seed gossip rng"),
+      None,
+      Some(Box::new(RecordingMerge {
+        hits: hits.clone(),
+        saw_peer: saw_peer.clone(),
+      })),
+      None,
+      #[cfg(encryption)]
+      std::rc::Rc::new(VoidKeyringDelegate),
+    )
+    .await
+    .expect("spawn merge-recording serf node");
+  let a = spawn_node("cmerge-a").await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  assert!(
+    hits.load(Ordering::Relaxed) >= 1,
+    "the join push/pull must consult the installed merge delegate"
+  );
+  assert!(
+    saw_peer.load(Ordering::Relaxed) >= 1,
+    "the consulted merge must carry the joining peer's node state"
+  );
+
+  a.shutdown().await.expect("cmerge-a shuts down");
+  b.shutdown().await.expect("cmerge-b shuts down");
+}
+
+/// The operator aggregate reflects the converged view and the live endpoint
+/// readings on the compio handle.
+#[compio::test]
+async fn operator_accessors_surface_on_the_handle() {
+  let b = spawn_node("cstat-b").await;
+  let a = spawn_node("cstat-a").await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  let stats = a.stats();
+  assert_eq!(stats.members(), 2);
+  assert_eq!(stats.failed(), 0);
+  assert_eq!(stats.left(), 0);
+  assert_eq!(a.health_score(), 0, "a healthy node scores 0");
+  assert!(!a.encryption_enabled(), "no keyring is configured");
+
+  // Coordinates converge as probe round-trips accumulate: both the local
+  // coordinate and B's cached coordinate must surface within the window.
+  #[cfg(feature = "coordinates")]
+  {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+      let local = a.coordinate();
+      let cached = a
+        .cached_coordinate(SmolStr::new("cstat-b"))
+        .await
+        .expect("cached_coordinate round-trips through the driver");
+      if local.is_some() && cached.is_some() {
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "coordinates must surface on the handle: local={local:?} cached={cached:?}"
+      );
+      compio::time::sleep(Duration::from_millis(100)).await;
+    }
+  }
+
+  a.shutdown().await.expect("cstat-a shuts down");
+  b.shutdown().await.expect("cstat-b shuts down");
+}
+
+/// With node B persisting through a [`crate::FileKeyringDelegate`], an
+/// `install_key` from A still collects BOTH nodes' successful responses — B's
+/// response is parked until the file write is acknowledged, then routed within
+/// the query window — and because the response was gated on that
+/// acknowledgement, the persisted file already carries the new key when the
+/// response arrives.
+#[cfg(all(encryption, unix))]
+#[compio::test]
+async fn file_backed_rotation_gates_the_response_on_persistence() {
+  let k1 = test_secret_key(0x33);
+  let k2 = test_secret_key(0x44);
+
+  let mut path = std::env::temp_dir();
+  path.push(format!("serf-compio-key-file-{}", std::process::id()));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&path);
+
+  let enc = || EncryptionOptions::new().with_keyring(Keyring::new(k1));
+  let b = spawn_encrypted_node_with_keyring(
+    "cfile-b",
+    enc(),
+    std::rc::Rc::new(crate::FileKeyringDelegate::new(&path)),
+  )
+  .await;
+  let a = spawn_encrypted_node_with_keyring(
+    "cfile-a",
+    enc(),
+    std::rc::Rc::new(RecordingKeyring::default()),
+  )
+  .await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  converge(&a, &b).await;
+
+  let mut a_events = a.events();
+  a.install_key(k2).await.expect("install_key dispatched");
+  let kr = next_key_response(&mut a_events).await;
+  assert!(
+    kr.num_resp >= 2,
+    "install_key must collect a response from BOTH nodes, including the one parked on file persistence (num_resp={})",
+    kr.num_resp
+  );
+  assert_eq!(kr.num_err, 0, "install_key must succeed on every node");
+
+  let persisted = crate::FileKeyringDelegate::new(&path)
+    .load()
+    .expect("the acknowledged write parses")
+    .expect("the acknowledged write exists");
+  assert!(
+    persisted.secondaries().contains(&k2) || persisted.primary_ref() == &k2,
+    "the response was gated on persistence, so the file already holds the installed key"
+  );
+
+  a.shutdown().await.expect("cfile-a shuts down");
+  b.shutdown().await.expect("cfile-b shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
