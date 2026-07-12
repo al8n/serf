@@ -176,3 +176,58 @@ fn compaction_rewrites_to_the_live_state() {
   assert_eq!(replay.last_query_clock, LamportTime::new(5));
   cleanup(&o);
 }
+
+/// The clean-leave gate survives compaction: with a tiny threshold forcing a
+/// rewrite on the very batch that carried the Leave marker, the compacted
+/// file still replays to a gated fresh start under the default posture and
+/// to the preserved membership under `rejoin_after_leave = true`.
+#[test]
+fn compaction_preserves_the_clean_leave_gate() {
+  let o = opts("compact-leave").with_compact_threshold(1);
+  {
+    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    snap.append_member(true, &node("peer", 7001));
+    snap.append_clocks(LamportTime::new(4), LamportTime::ZERO, LamportTime::ZERO);
+    snap.append_leave();
+    // Threshold 1: this flush compacts, rewriting the file.
+    snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
+  }
+
+  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen compacted");
+  let fresh = ReplayResult::replay(records.clone(), false);
+  assert!(
+    fresh.alive_nodes.is_empty(),
+    "the compacted file must still gate a clean leave on the default posture"
+  );
+  assert_eq!(fresh.last_clock, LamportTime::ZERO);
+
+  let rejoin = ReplayResult::replay(records, true);
+  assert_eq!(
+    rejoin.alive_nodes,
+    vec![node("peer", 7001)],
+    "the opt-in posture must still recover the pre-leave membership"
+  );
+  assert_eq!(rejoin.last_clock, LamportTime::new(4));
+  cleanup(&o);
+}
+
+/// Membership activity after a leave clears the clean-left state: the next
+/// compaction does not re-emit a stale Leave marker over live members.
+#[test]
+fn membership_after_a_leave_clears_the_compacted_gate() {
+  let o = opts("compact-rejoined").with_compact_threshold(1);
+  {
+    let (mut snap, _) = Snapshotter::<SmolStr>::open(&o).expect("open");
+    snap.append_leave();
+    snap.append_member(true, &node("peer", 7001));
+    snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
+  }
+  let (_s, records) = Snapshotter::<SmolStr>::open(&o).expect("reopen");
+  let fresh = ReplayResult::replay(records, false);
+  assert_eq!(
+    fresh.alive_nodes,
+    vec![node("peer", 7001)],
+    "post-leave membership must survive the default-posture replay"
+  );
+  cleanup(&o);
+}
