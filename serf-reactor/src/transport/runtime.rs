@@ -49,6 +49,10 @@ pub struct TransportRuntime<I, D> {
   /// inline for EVERY push/pull merge; `None` admits every peer set.
   pub(crate) merge_delegate:
     Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+  /// Snapshot persistence, opened (and its file decoded) by the `Serf`
+  /// constructor so a corrupt file fails construction: `T::run` replays the
+  /// records into the endpoint and hands the writer to the pump.
+  pub(crate) snapshot: Option<crate::driver::snapshotter::OpenedSnapshot<I>>,
   /// The driver's keyring delegate, applied to inbound key-management requests.
   /// Present only under an encryption backend.
   #[cfg(encryption)]
@@ -70,6 +74,7 @@ impl<I, D> TransportRuntime<I, D> {
     member_drop: ReactorDropCounter,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
     merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::driver::snapshotter::OpenedSnapshot<I>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     Self {
@@ -82,6 +87,7 @@ impl<I, D> TransportRuntime<I, D> {
       member_drop,
       reconnect_delegate,
       merge_delegate,
+      snapshot,
       #[cfg(encryption)]
       keyring,
     }

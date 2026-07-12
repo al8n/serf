@@ -134,6 +134,7 @@ where
     SerfOptions::new(),
     None,
     None,
+    None,
     #[cfg(encryption)]
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )

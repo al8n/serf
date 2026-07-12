@@ -110,6 +110,7 @@ where
     SerfOptions::new(),
     None,
     None,
+    None,
     keyring,
   )
   .await

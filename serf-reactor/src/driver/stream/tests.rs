@@ -182,6 +182,7 @@ async fn build_driver_with_stream_timeout(
     StreamTransportOptions::new().with_bridge_inbound_cap(bridge_inbound_cap),
     None,
     stream_timeout,
+    None,
     #[cfg(encryption)]
     Arc::new(crate::VoidKeyringDelegate),
   );

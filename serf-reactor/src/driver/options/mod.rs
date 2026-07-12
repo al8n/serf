@@ -602,5 +602,50 @@ impl Default for StreamTransportOptions {
   }
 }
 
+/// Default snapshot compaction threshold: the append file is rewritten to the
+/// live state once it grows past this many bytes.
+pub const DEFAULT_SNAPSHOT_COMPACT_THRESHOLD: u64 = 128 * 1024;
+
+/// Snapshot persistence wiring: where the driver appends membership records
+/// and when it compacts the file. Supplied as a constructor argument (`None`
+/// disables persistence); the replay-vs-fresh-start decision after a clean
+/// leave is the serf option `rejoin_after_leave`.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SnapshotOptions {
+  path: std::path::PathBuf,
+  compact_threshold: u64,
+}
+
+impl SnapshotOptions {
+  /// Persist to `path`, compacting at the default threshold.
+  pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+    Self {
+      path: path.into(),
+      compact_threshold: DEFAULT_SNAPSHOT_COMPACT_THRESHOLD,
+    }
+  }
+
+  /// The snapshot file path.
+  #[must_use]
+  pub fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+
+  /// Rewrite the file to the live state once it grows past `bytes`
+  /// (`0` = never compact).
+  #[must_use]
+  pub const fn with_compact_threshold(mut self, bytes: u64) -> Self {
+    self.compact_threshold = bytes;
+    self
+  }
+
+  /// The compaction threshold in bytes (`0` = never compact).
+  #[must_use]
+  pub const fn compact_threshold(&self) -> u64 {
+    self.compact_threshold
+  }
+}
+
 #[cfg(test)]
 mod tests;
