@@ -213,47 +213,14 @@ pub trait KeyringDelegate: Send + Sync + 'static {
   }
 }
 
-/// A persistence failure reported through [`KeyringPersistence::Pending`].
+/// The rotation-durability acknowledgement contract, shared with the other
+/// runtime drivers through `serf-driver`.
 #[cfg(encryption)]
 #[cfg_attr(
   docsrs,
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
-pub type KeyringPersistError = Box<dyn core::error::Error + Send + Sync>;
-
-/// Receiver half of one rotation's persistence acknowledgement.
-#[cfg(encryption)]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
-)]
-pub type KeyringPersistRx = std::sync::mpsc::Receiver<Result<(), KeyringPersistError>>;
-
-/// How one keyring rotation reaches durability, reported back from
-/// [`KeyringDelegate::keyring_updated`].
-///
-/// The reference implementation writes its keyring file synchronously inside
-/// the key-management query handler and folds a write failure into the
-/// response. These drivers keep the pump non-blocking instead: a persisting
-/// delegate hands back a receiver, the pump parks the key response, and sends
-/// it once the receiver resolves — unchanged on success, downgraded to a
-/// failed response carrying the error otherwise (a disconnected sender counts
-/// as a failure: the worker vanished without acknowledging). The live wire
-/// keyring keeps the rotation in every outcome.
-#[cfg(encryption)]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
-)]
-#[must_use = "dropping the acknowledgement silently un-gates the key response from persistence"]
-pub enum KeyringPersistence {
-  /// The rotation needs no out-of-band persistence (or completed inline):
-  /// the key response is sent immediately.
-  Durable,
-  /// Persistence runs out-of-band; the pump defers the key response until
-  /// the receiver resolves.
-  Pending(KeyringPersistRx),
-}
+pub use serf_driver::{KeyringPersistError, KeyringPersistRx, KeyringPersistence};
 
 /// The join-merge veto predicate, re-exported from the machine.
 ///

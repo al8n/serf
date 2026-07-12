@@ -372,7 +372,7 @@ where
   recv_force_pending: bool,
   /// Snapshot persistence: appends a record for every surfaced membership
   /// change and the advancing clock floors, `None` when persistence is off.
-  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+  snapshotter: Option<serf_driver::Snapshotter<I>>,
   /// The driver's keyring delegate: applies inbound key-management ops and produces
   /// the `respond_key` answer. Present only under an encryption backend.
   #[cfg(encryption)]
@@ -399,7 +399,7 @@ where
     obs_payload_budget: Option<u64>,
     driver_opts: RuntimeOptions,
     label: Option<Bytes>,
-    snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+    snapshotter: Option<serf_driver::Snapshotter<I>>,
     #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
   ) -> Self {
     let buf_len = recv_buf_len_for(endpoint.gossip_mtu(), quic_max_udp_payload);
@@ -1873,7 +1873,7 @@ pub(crate) fn spawn_quic_driver<I, R, G, SR, D>(
   delegate: D,
   driver_opts: RuntimeOptions,
   label: Option<Bytes>,
-  snapshotter: Option<crate::driver::snapshotter::Snapshotter<I>>,
+  snapshotter: Option<serf_driver::Snapshotter<I>>,
   #[cfg(encryption)] keyring: Arc<dyn KeyringDelegate>,
 ) -> QuicDriver<I, R, G, SR>
 where
