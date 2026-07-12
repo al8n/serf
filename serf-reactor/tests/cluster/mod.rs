@@ -439,6 +439,26 @@ where
     .unwrap_or_else(|_| panic!("node {observer} never holds {subject:?} as a Left tombstone"));
   }
 
+  /// Poll until `observer`'s membership view holds `subject` with `status`, or
+  /// fail on the poll timeout.
+  pub async fn await_member_status(&self, observer: usize, subject: &str, status: MemberStatus) {
+    R::timeout(POLL_TIMEOUT, async {
+      loop {
+        if self
+          .node(observer)
+          .members()
+          .iter()
+          .any(|m| m.node().id_ref().as_str() == subject && m.status() == status)
+        {
+          break;
+        }
+        R::sleep(POLL_STEP).await;
+      }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("node {observer} never holds {subject:?} as {status:?}"));
+  }
+
   /// Poll until `observer`'s log records a member event of `kind` naming
   /// `subject`.
   pub async fn await_member_event(&self, observer: usize, subject: &str, kind: MemberEventKind) {
