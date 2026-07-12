@@ -128,6 +128,8 @@ async fn try_spawn_node_at(id: &str, bind: SocketAddr) -> Result<Serf<SmolStr>, 
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
     None,
+    None,
+    None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
   )
@@ -177,6 +179,8 @@ async fn tls_new_rejects_zero_observation_channel() {
       RuntimeOptions::new().with_observation_channel(Channel::Bounded(0)),
       SerfOptions::new(),
       gossip_rng().expect("seed gossip rng"),
+      None,
+      None,
       None,
       #[cfg(encryption)]
       std::rc::Rc::new(VoidKeyringDelegate),
@@ -412,6 +416,8 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<S
     RuntimeOptions::new(),
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
     None,
     std::rc::Rc::new(VoidKeyringDelegate),
   )

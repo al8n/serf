@@ -353,7 +353,8 @@ where
     // Serf's core RNG is seeded from its own OS-drawn entropy (`self.serf_rng`),
     // independent of the coordinator's gossip RNG, so two nodes never share the
     // query-ID / relay-selection stream.
-    let endpoint = serf_proto::StreamEndpoint::<
+    let rejoin_after_leave = runtime.serf_options.rejoin_after_leave();
+    let mut endpoint = serf_proto::StreamEndpoint::<
       Self::Id,
       SocketAddr,
       RawRecords,
@@ -368,6 +369,19 @@ where
       runtime.member_drop,
     )
     .with_reconnect_delegate(runtime.reconnect_delegate);
+    if let Some(md) = runtime.merge_delegate {
+      endpoint.set_merge_delegate(md);
+    }
+    let snapshotter = match runtime.snapshot_file {
+      Some((writer, records)) => {
+        let replay = serf_proto::snapshot::ReplayResult::replay(records, rejoin_after_leave);
+        // Ignoring Err: load_snapshot refuses only on a machine that already
+        // lost an id-conflict vote; a freshly built endpoint is Alive.
+        let _ = endpoint.load_snapshot(replay, memberlist_proto::Instant::now());
+        Some(writer)
+      }
+      None => None,
+    };
 
     crate::driver::stream::stream_driver_loop::<Self::Id, RawRecords, D, G, StdRng>(
       endpoint,
@@ -383,6 +397,7 @@ where
       self.stream_options,
       runtime.delegate,
       None,
+      snapshotter,
       #[cfg(encryption)]
       runtime.keyring,
     )

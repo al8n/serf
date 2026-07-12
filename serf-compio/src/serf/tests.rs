@@ -68,6 +68,8 @@ async fn try_spawn_node_at(id: &str, bind: SocketAddr) -> Result<Serf<SmolStr>, 
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
     None,
+    None,
+    None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
   )
@@ -185,6 +187,8 @@ async fn assert_tcp_new_rejects(runtime: RuntimeOptions) {
       SerfOptions::new(),
       gossip_rng().expect("seed gossip rng"),
       None,
+      None,
+      None,
       #[cfg(encryption)]
       std::rc::Rc::new(VoidKeyringDelegate),
     )
@@ -229,6 +233,8 @@ async fn tcp_new_rejects_over_ceiling_user_event_size() {
       RuntimeOptions::new(),
       serf,
       gossip_rng().expect("seed gossip rng"),
+      None,
+      None,
       None,
       #[cfg(encryption)]
       std::rc::Rc::new(VoidKeyringDelegate),
@@ -350,6 +356,8 @@ async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<S
     RuntimeOptions::new(),
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
     None,
     std::rc::Rc::new(VoidKeyringDelegate),
   )
@@ -478,6 +486,8 @@ async fn spawn_node_with_runtime(id: &str, runtime_options: RuntimeOptions) -> S
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
     None,
+    None,
+    None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
   )
@@ -568,6 +578,8 @@ async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Se
     RuntimeOptions::new(),
     serf_options,
     gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
     None,
     #[cfg(encryption)]
     std::rc::Rc::new(VoidKeyringDelegate),
@@ -1077,6 +1089,8 @@ async fn spawn_encrypted_node_with_keyring(
     RuntimeOptions::new(),
     SerfOptions::new(),
     gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
     None,
     keyring,
   )
