@@ -41,6 +41,12 @@ pub(crate) struct Snapshotter<I> {
   last_member_clock: LamportTime,
   last_event_clock: LamportTime,
   last_query_clock: LamportTime,
+  /// The local node has cleanly left (a `Leave` marker was appended) with no
+  /// membership activity since. Compaction must re-emit the marker LAST so
+  /// the rewritten file still replays to a gated fresh start under
+  /// `rejoin_after_leave = false` while preserving the pre-leave membership
+  /// for the opt-in posture.
+  clean_left: bool,
   _id: core::marker::PhantomData<fn(I)>,
 }
 
@@ -104,6 +110,15 @@ where
         last_member_clock: LamportTime::ZERO,
         last_event_clock: LamportTime::ZERO,
         last_query_clock: LamportTime::ZERO,
+        clean_left: records
+          .iter()
+          .rev()
+          .find_map(|r| match r {
+            SnapshotRecord::Leave => Some(true),
+            SnapshotRecord::Alive(_) | SnapshotRecord::NotAlive(_) => Some(false),
+            _ => None,
+          })
+          .unwrap_or(false),
         _id: core::marker::PhantomData,
       },
       records,
@@ -150,6 +165,7 @@ where
     } else {
       SnapshotRecord::NotAlive(node.clone())
     };
+    self.clean_left = false;
     self.append(&record);
   }
 
@@ -178,6 +194,7 @@ where
   /// next start, replay clears the recovered state unless
   /// `rejoin_after_leave` ignores it.
   pub(crate) fn append_leave(&mut self) {
+    self.clean_left = true;
     self.append(&SnapshotRecord::Leave);
   }
 
@@ -214,10 +231,35 @@ where
         fresh.extend_from_slice(&b);
       }
     }
+    // A clean leave survives compaction: re-emitted LAST, so the rewritten
+    // file replays to the gated fresh start under `rejoin_after_leave =
+    // false` and to the preserved membership under the opt-in posture —
+    // exactly like the original record sequence it replaces.
+    if self.clean_left
+      && let Ok(b) = SnapshotRecord::<I, SocketAddr>::Leave.encode()
+    {
+      fresh.extend_from_slice(&b);
+    }
+    // Write and OPEN the replacement before the rename, so no fallible
+    // operation remains after the swap: a failure here leaves the grown file
+    // authoritative and appends continue on it, while a completed rename is
+    // always paired with a live append handle on the SAME inode.
     let tmp = self.path.with_extension("compact");
-    let replaced = fs::write(&tmp, &fresh)
-      .and_then(|()| fs::rename(&tmp, &self.path))
-      .and_then(|()| fs::OpenOptions::new().append(true).open(&self.path));
+    // Plain write mode (append + truncate is a rejected combination): the
+    // handle's cursor sits at end-of-file after the write below, and this
+    // writer is the file's only one, so subsequent appends continue from the
+    // cursor exactly as an append-mode handle would.
+    let replaced = fs::OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .write(true)
+      .open(&tmp)
+      .and_then(|mut file| {
+        file.write_all(&fresh)?;
+        file.sync_all()?;
+        Ok(file)
+      })
+      .and_then(|file| fs::rename(&tmp, &self.path).map(|()| file));
     match replaced {
       Ok(file) => {
         self.file = io::BufWriter::new(file);

@@ -212,11 +212,17 @@ pub trait KeyringDelegate: Send + Sync + 'static {
 /// Supplied at construction (the `merge_delegate` argument) and installed into
 /// the memberlist machine, which consults it INLINE for every push/pull merge
 /// — a join and a periodic anti-entropy refresh alike — before applying the
-/// remote member state. Returning `false` cancels the merge, so a vetoed peer
-/// set is never admitted. The predicate is synchronous by design: it runs
-/// inside the machine's drain, so an application needing async I/O (an ACL
-/// service, say) resolves its policy ahead of time and answers from that
-/// resolved state here.
+/// remote member state. Returning `false` cancels that merge: the vetoed peer
+/// set is not applied from the exchange.
+///
+/// This is a PUSH/PULL FILTER, not an admission-control boundary: a rejected
+/// peer can still enter membership moments later through gossiped Alive
+/// messages, exactly as in the reference implementation. Do not rely on it
+/// for durable exclusion or as an ACL — it bounds what a single state
+/// exchange can bulk-admit, nothing more. The predicate is synchronous by
+/// design: it runs inside the machine's drain, so an application needing
+/// async I/O (an ACL service, say) resolves its policy ahead of time and
+/// answers from that resolved state here.
 ///
 /// Requires a stream or QUIC transport feature (`tcp` or `quic`).
 #[cfg(any(feature = "tcp", feature = "quic"))]
