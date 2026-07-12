@@ -105,25 +105,37 @@ impl ClusterTiming {
     }
   }
 
-  /// Override the reconnect timeout — the age at which the reaper removes a Failed
-  /// member. Raise it well beyond the test's kill-to-restart window to hold a
-  /// failed peer for reconnection instead of reaping it.
+  /// Override the probe interval — the failure-detection cadence. Raise it
+  /// well beyond the test window to PARK failure detection entirely, so a
+  /// killed-and-restarted peer is never declared Failed in between and the
+  /// observer holds it Alive across the whole cycle.
+  #[must_use]
+  pub fn with_probe_interval(mut self, v: Duration) -> Self {
+    self.probe_interval = v;
+    self
+  }
+
+  /// Override the reconnect re-dial cadence — how often a survivor attempts to
+  /// re-establish contact with a Failed member. Raise it beyond the test window
+  /// to park the re-dial (and the push/pull merge it runs) out of the scenario.
   #[must_use]
   pub fn with_reconnect_interval(mut self, v: Duration) -> Self {
     self.reconnect_interval = v;
     self
   }
 
-  /// Override the failed-member retention window.
+  /// Override the failed-member retention window — the age at which the reaper
+  /// removes a Failed member. Raise it well beyond the test's kill-to-restart
+  /// window to hold a failed peer for reconnection instead of reaping it.
   pub fn with_reconnect_timeout(mut self, v: Duration) -> Self {
     self.reconnect_timeout = v;
     self
   }
 
-  /// Override the tombstone timeout — the age at which the reaper removes a
-  /// gracefully-Left member. Raise it beyond the test window to HOLD a left peer
-  /// in the tombstone view instead of reaping it, so a graceful-leave assertion
-  /// observes `[Join, Leave]` without a trailing `Reap`.
+  /// Override the dead-node reclaim age — how long a dead member's identity
+  /// must age before a same-name claim at a NEW address is admitted. Set it
+  /// near zero to let a restarted node rebind at a fresh port without a name
+  /// conflict.
   #[must_use]
   pub fn with_dead_node_reclaim(mut self, v: Duration) -> Self {
     self.dead_node_reclaim = Some(v);
@@ -136,7 +148,10 @@ impl ClusterTiming {
     self
   }
 
-  /// Override the tombstone retention window.
+  /// Override the tombstone timeout — the age at which the reaper removes a
+  /// gracefully-Left member. Raise it beyond the test window to HOLD a left
+  /// peer in the tombstone view instead of reaping it, so a graceful-leave
+  /// assertion observes `[Join, Leave]` without a trailing `Reap`.
   pub fn with_tombstone_timeout(mut self, v: Duration) -> Self {
     self.tombstone_timeout = v;
     self

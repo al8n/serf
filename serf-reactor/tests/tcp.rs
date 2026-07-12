@@ -1465,12 +1465,13 @@ where
 /// change still propagates as an Update with the refreshed value visible —
 /// pinning the clock-sync and event-fencing subtleties of the revival path.
 ///
-/// This is NOT the port of Go `TestSerf_Update`, which presents CHANGED tags
-/// at restart and expects the observer's Update to come from the rejoin merge
-/// itself: the new stack has no start-time tag configuration, and a push/pull
-/// merge currently refreshes member tags WITHOUT emitting a member event — a
-/// machine-side parity gap tracked separately (al8n/serf#86); the legacy
-/// scenario stays unresolved until it lands.
+/// This is the retag-AFTER-revival half of the legacy update scenario: a
+/// revival folds merged tags into the Join event itself (matching the
+/// reference `handleNodeJoin`), so the retag must land after the revival
+/// fence to surface a distinct Update. The restart-with-changed-tags half —
+/// where the Update arrives from the rejoin exchange while the observer
+/// still holds the node Alive — is
+/// `serf_update_after_restart_with_changed_tags`.
 async fn serf_update_after_rejoin<R>()
 where
   R: Runtime,
@@ -1479,8 +1480,9 @@ where
     &["upd-a", "upd-b"],
     // The explicit rejoin below is the single revival path: the survivor's
     // own reconnect re-dial is parked out of the window so its push/pull
-    // merge cannot race the retag (a merge refreshes tags without a member
-    // event), and the failed member is retained throughout.
+    // merge cannot race the retag (a revival merge folds the tags into its
+    // Join rather than a distinct Update), and the failed member is retained
+    // throughout.
     cluster::ClusterTiming::fast()
       .with_reconnect_interval(Duration::from_secs(600))
       .with_reconnect_timeout(Duration::from_secs(600)),
@@ -1545,12 +1547,102 @@ where
   cluster.shutdown_all().await;
 }
 
+/// Port of legacy `serf_update` (Go `TestSerf_Update`): a node restarts with
+/// CHANGED tags and rejoins while the observer still holds it Alive, and the
+/// observer surfaces the change as a member Update — never a Failed/revival
+/// detour (whose Join would fold the tags in without a distinct Update).
+///
+/// The mechanism under test: the restarted node comes back with a fresh
+/// incarnation; the rejoin exchange shows it the observer's stale claim
+/// about itself (old incarnation, old tags), it refutes with a bumped
+/// incarnation carrying the new tags, and the observer applies the
+/// alive-to-alive metadata change as `NodeUpdated` → `Member(Update)`.
+/// Failure detection is parked (`probe_interval` beyond the window) so the
+/// observer holds the subject Alive across the whole kill/restart cycle —
+/// the reference test relies on the same restart-beats-detection timing —
+/// and the periodic push/pull is disabled so anti-entropy cannot deliver the
+/// state ahead of the rejoin. The refuted Alive may reach the observer via
+/// the rejoin exchange itself or the gossip it triggers; either route is the
+/// same restart-with-changed-tags scenario, and the pinned observable is the
+/// `[Join, Update]` sequence with the new value visible.
+async fn serf_update_after_restart_with_changed_tags<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["updm-a", "updm-b"],
+    cluster::ClusterTiming::fast()
+      .with_probe_interval(Duration::from_secs(600))
+      .with_push_pull_interval(Duration::ZERO),
+  )
+  .await;
+  let subject = cluster.id(1);
+
+  cluster
+    .assert_member_events(0, subject.as_str(), &[MemberEventKind::Join])
+    .await;
+
+  cluster.kill_abrupt(1).await;
+  cluster.restart(1).await;
+
+  // Present the changed tags BEFORE rejoining: with probing parked and
+  // anti-entropy disabled, the observer can only learn them through the
+  // rejoin, mirroring the reference's restart-with-new-tags configuration.
+  let mut tags = serf_proto::Tags::new();
+  tags.0.insert(SmolStr::new("version"), SmolStr::new("v2"));
+  cluster
+    .node(1)
+    .set_tags(tags)
+    .await
+    .expect("the restarted node presents changed tags");
+
+  let a_addr = cluster.node(0).advertise_address();
+  cluster
+    .node(1)
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the restarted node rejoins through the survivor");
+
+  cluster
+    .await_member_event(0, subject.as_str(), MemberEventKind::Update)
+    .await;
+  // The whole cycle surfaced as exactly [Join, Update]: no Failed (probing
+  // parked), no second Join (the observer never saw the subject leave).
+  cluster
+    .assert_member_events(
+      0,
+      subject.as_str(),
+      &[MemberEventKind::Join, MemberEventKind::Update],
+    )
+    .await;
+  let seen = cluster
+    .node(0)
+    .members()
+    .iter()
+    .find(|m| m.node().id_ref().as_str() == subject.as_str())
+    .map(|m| m.tags().0.get("version").cloned())
+    .expect("the observer tracks the restarted node");
+  assert_eq!(
+    seen.as_deref(),
+    Some("v2"),
+    "the rejoin delivers the changed tags as an alive-to-alive Update"
+  );
+
+  cluster.shutdown_all().await;
+}
+
 /// Port of legacy `serf_query_filter` (Go `TestSerf_Query_Filter`): an
-/// Id-filtered query with relay redundancy surfaces on the FILTERED node
-/// only, and the originator collects exactly that node's response (the
-/// relayed duplicate is deduped by the machine). Standalone nodes rather
-/// than the cluster fixture: the fixture's collector round-robins the event
-/// stream away from scenario subscribers.
+/// Id-filtered query surfaces on the FILTERED node only, and the originator
+/// collects exactly that node's response. Standalone nodes rather than the
+/// cluster fixture: the fixture's collector round-robins the event stream
+/// away from scenario subscribers.
+///
+/// `relay_factor = 1` matches the legacy parameters, but a relayed duplicate
+/// is not FORCED to reach the originator here (the responder's relay pick may
+/// select the originator itself, whose self-relay is dropped, and relay
+/// forwarding is best-effort), so duplicate suppression is NOT this
+/// scenario's claim — it is pinned deterministically at the machine layer by
+/// serf-proto's `duplicate_query_response_is_deduped`.
 async fn serf_query_filter<R>()
 where
   R: Runtime,
@@ -1614,8 +1706,8 @@ where
   assert!(responded, "the filtered target answers");
 
   // Drain the originator across the WHOLE query lifetime plus a margin:
-  // exactly one matching response (the relayed duplicate is deduped), from
-  // B, and no surfaced `Event::Query` — the originator is outside its own
+  // exactly one matching response — the single responder inside the filter —
+  // and no surfaced `Event::Query`, the originator being outside its own
   // Id filter too.
   let drain_window = query_lifetime + Duration::from_secs(1);
   let mut responses: Vec<(SmolStr, Bytes)> = Vec::new();
@@ -1639,7 +1731,7 @@ where
   assert_eq!(
     responses.len(),
     1,
-    "exactly one response survives the relay deduplication (got {responses:?})"
+    "exactly one responder sits inside the Id filter (got {responses:?})"
   );
   assert_eq!(responses[0].0.as_str(), "qf-b");
   assert_eq!(responses[0].1, Bytes::from_static(b"b-here"));
@@ -1955,6 +2047,11 @@ mod tokio_cells {
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_update_after_restart_with_changed_tags() {
+    super::serf_update_after_restart_with_changed_tags::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn serf_query_filter() {
     super::serf_query_filter::<TokioRuntime>().await;
   }
@@ -2114,6 +2211,13 @@ mod smol_cells {
   #[test]
   fn serf_update_after_rejoin_smol() {
     SmolRuntime::block_on(super::serf_update_after_rejoin::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_update_after_restart_with_changed_tags_smol() {
+    SmolRuntime::block_on(super::serf_update_after_restart_with_changed_tags::<
+      SmolRuntime,
+    >());
   }
 
   #[test]
