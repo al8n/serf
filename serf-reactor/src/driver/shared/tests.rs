@@ -9,13 +9,15 @@ fn entry(peer: SocketAddr, bytes: &[u8], icmp_errors: u8) -> LeaveDatagram {
 }
 
 /// The leave-drain retention bookkeeping for fresh sends: `Ready(Ok)` retains
-/// nothing, `Pending` retains FIFO at the back (returning `true`), and the
-/// datagram bytes are copied only on the retain paths.
+/// nothing, `Pending` retains FIFO at the back (returning `true`) without
+/// arming the retry epoch, and the datagram bytes are copied only on the
+/// retain paths.
 #[test]
 fn retain_leave_datagram_retains_pending_fifo() {
   let peer: SocketAddr = "127.0.0.1:7946".parse().unwrap();
+  let now = Instant::now();
   let mut retained: LeaveDrain = VecDeque::new();
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
 
   // Ready(Ok): sent, nothing retained.
   assert!(!retain_leave_datagram(
@@ -23,23 +25,31 @@ fn retain_leave_datagram_retains_pending_fifo() {
     peer,
     b"alpha",
     Poll::Ready(Ok(5)),
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert!(retained.is_empty(), "a completed send retains nothing");
-  assert!(!send_failed, "a completed send is not a failure");
+  assert!(!acct.send_failed, "a completed send is not a failure");
+  assert_eq!(acct.retry_after, None);
 
-  // Pending: retained at the back, returns true (socket backpressured).
+  // Pending: retained at the back, returns true (socket backpressured); the
+  // retry epoch stays unarmed — a writable wake may retry immediately.
   assert!(retain_leave_datagram(
     &mut retained,
     peer,
     b"beta",
     Poll::Pending,
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert_eq!(retained.len(), 1);
   assert_eq!(retained.back().unwrap().bytes, b"beta".to_vec());
   assert_eq!(retained.back().unwrap().icmp_errors, 0);
-  assert!(!send_failed, "backpressure is retention, not failure");
+  assert!(!acct.send_failed, "backpressure is retention, not failure");
+  assert_eq!(
+    acct.retry_after, None,
+    "backpressure does not arm the epoch"
+  );
 
   // A second Pending appends behind the first (FIFO order preserved).
   let peer2: SocketAddr = "127.0.0.1:7947".parse().unwrap();
@@ -48,7 +58,8 @@ fn retain_leave_datagram_retains_pending_fifo() {
     peer2,
     b"gamma",
     Poll::Pending,
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert_eq!(retained.len(), 2);
   assert_eq!(retained.front().unwrap().peer, peer);
@@ -59,25 +70,28 @@ fn retain_leave_datagram_retains_pending_fifo() {
 /// `ConnectionRefused`) is ambiguous on a shared unconnected socket — it may
 /// be a stale asynchronous answer to an earlier packet for a DIFFERENT peer,
 /// and either way the current datagram was not accepted — so the datagram is
-/// RETAINED for a bounded retry without failing the leave. Every other kind is
-/// a local delivery failure: `send_failed` is set and nothing is retained.
+/// RETAINED for an epoch-gated retry (arming `retry_after`) without failing
+/// the leave. Every other kind is a local delivery failure: `send_failed` is
+/// set and nothing is retained.
 #[test]
 fn retain_leave_datagram_retries_icmp_and_flags_local_failures() {
   let peer: SocketAddr = "127.0.0.1:7946".parse().unwrap();
+  let now = Instant::now();
 
-  // ICMP-class: retained with one absorbed error, leave not failed.
+  // ICMP-class: retained with one absorbed error, epoch armed, leave intact.
   for kind in [
     io::ErrorKind::ConnectionReset,
     io::ErrorKind::ConnectionRefused,
   ] {
     let mut retained: LeaveDrain = VecDeque::new();
-    let mut send_failed = false;
+    let mut acct = FarewellAccounting::new();
     assert!(retain_leave_datagram(
       &mut retained,
       peer,
       b"alpha",
       Poll::Ready(Err(io::Error::from(kind))),
-      &mut send_failed,
+      now,
+      &mut acct,
     ));
     assert_eq!(
       retained.len(),
@@ -86,8 +100,13 @@ fn retain_leave_datagram_retries_icmp_and_flags_local_failures() {
     );
     assert_eq!(retained.front().unwrap().icmp_errors, 1);
     assert!(
-      !send_failed,
+      !acct.send_failed,
       "an ICMP-class error ({kind:?}) must not fail the leave outright"
+    );
+    assert_eq!(
+      acct.retry_after,
+      Some(now + FAREWELL_ICMP_RETRY_INTERVAL),
+      "an ICMP-class absorb must arm the retry epoch"
     );
   }
 
@@ -107,18 +126,23 @@ fn retain_leave_datagram_retries_icmp_and_flags_local_failures() {
     io::ErrorKind::Other,
   ] {
     let mut retained: LeaveDrain = VecDeque::new();
-    let mut send_failed = false;
+    let mut acct = FarewellAccounting::new();
     assert!(!retain_leave_datagram(
       &mut retained,
       peer,
       b"alpha",
       Poll::Ready(Err(io::Error::from(kind))),
-      &mut send_failed,
+      now,
+      &mut acct,
     ));
     assert!(retained.is_empty());
     assert!(
-      send_failed,
+      acct.send_failed,
       "a local socket failure ({kind:?}) must fail the leave"
+    );
+    assert_eq!(
+      acct.retry_after, None,
+      "a local failure does not arm the retry epoch"
     );
   }
 }
@@ -175,84 +199,95 @@ fn classify_errored_farewell_bounds_icmp_retries() {
 
 /// The retry sweep's outcome fold: a delivered datagram leaves the queue; an
 /// ICMP-class error under the limit re-retains it at the BACK (so the rest of
-/// the queue drains ahead of the re-attempt) with the bumped count; at the
-/// limit it is dropped as answered without failing the leave; a local error
-/// sets `send_failed`; and `Pending` puts it back at the FRONT and stops the
-/// sweep (FIFO preserved).
+/// the queue drains ahead of the re-attempt) with the bumped count and arms
+/// the retry epoch; at the limit it is dropped as answered without failing
+/// the leave; a local error sets `send_failed`; and `Pending` puts it back at
+/// the FRONT and stops the sweep (FIFO preserved).
 #[test]
 fn settle_retried_farewell_dispositions() {
   let peer_a: SocketAddr = "127.0.0.1:7946".parse().unwrap();
   let peer_b: SocketAddr = "127.0.0.1:7947".parse().unwrap();
+  let now = Instant::now();
 
   // Delivered: not re-added, sweep continues.
   let mut retained: LeaveDrain = VecDeque::new();
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
   assert!(!settle_retried_farewell(
     &mut retained,
     entry(peer_a, b"alpha", 1),
     Poll::Ready(Ok(5)),
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert!(retained.is_empty());
-  assert!(!send_failed);
+  assert!(!acct.send_failed);
+  assert_eq!(acct.retry_after, None);
 
   // ICMP-class under the limit: re-retained at the BACK with a bumped count —
   // the stale-error disambiguation retry — leaving the queue's head (another
-  // peer's farewell) to drain first.
+  // peer's farewell) to drain first, and arming the retry epoch.
   let mut retained: LeaveDrain = VecDeque::from([entry(peer_b, b"beta", 0)]);
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
   assert!(!settle_retried_farewell(
     &mut retained,
     entry(peer_a, b"alpha", 1),
     Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionRefused))),
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert_eq!(retained.len(), 2);
   assert_eq!(retained.front().unwrap().peer, peer_b);
   assert_eq!(retained.back().unwrap().peer, peer_a);
   assert_eq!(retained.back().unwrap().icmp_errors, 2);
-  assert!(!send_failed);
+  assert!(!acct.send_failed);
+  assert_eq!(acct.retry_after, Some(now + FAREWELL_ICMP_RETRY_INTERVAL));
 
   // ICMP-class at the limit: dropped as answered-by-the-network, leave intact.
   let mut retained: LeaveDrain = VecDeque::new();
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
   assert!(!settle_retried_farewell(
     &mut retained,
     entry(peer_a, b"alpha", FAREWELL_ICMP_ERROR_LIMIT - 1),
     Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset))),
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert!(
     retained.is_empty(),
     "an answered peer's farewell is dropped"
   );
-  assert!(!send_failed, "a gone peer must not fail the whole leave");
+  assert!(
+    !acct.send_failed,
+    "a gone peer must not fail the whole leave"
+  );
 
   // Local failure: dropped AND the leave fails.
   let mut retained: LeaveDrain = VecDeque::new();
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
   assert!(!settle_retried_farewell(
     &mut retained,
     entry(peer_a, b"alpha", 0),
     Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert!(retained.is_empty());
-  assert!(send_failed);
+  assert!(acct.send_failed);
 
   // Pending: back at the FRONT (count preserved), sweep stops.
   let mut retained: LeaveDrain = VecDeque::from([entry(peer_b, b"beta", 0)]);
-  let mut send_failed = false;
+  let mut acct = FarewellAccounting::new();
   assert!(settle_retried_farewell(
     &mut retained,
     entry(peer_a, b"alpha", 2),
     Poll::Pending,
-    &mut send_failed,
+    now,
+    &mut acct,
   ));
   assert_eq!(retained.len(), 2);
   assert_eq!(retained.front().unwrap().peer, peer_a);
   assert_eq!(retained.front().unwrap().icmp_errors, 2);
-  assert!(!send_failed);
+  assert!(!acct.send_failed);
 }
 
 /// The leave outcome maps the accumulated failure flag onto the caller-facing

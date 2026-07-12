@@ -1258,3 +1258,52 @@ async fn join_deadline_above_stream_timeout_does_not_reap_premature_failure() {
     "the join reached its seed once the clamped deadline widened the watermark: {reached:?}"
   );
 }
+
+/// The retained-farewell retry is epoch-gated: while `retry_after` lies in the
+/// future, ANY number of pump polls — including back-to-back self-wake
+/// re-polls — leaves a retained datagram untouched (a re-poll is NOT a
+/// temporally distinct sample of the socket's error slot, so it must not burn
+/// the bounded ICMP allowance); once the epoch elapses, the next poll's single
+/// hoisted retry sends it and the drain empties.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn farewell_retry_waits_for_its_epoch_across_polls() {
+  let (mut driver, _obs_rx, _shared) = build_driver(8, 8).await;
+  // Address the retained farewell to the driver's own bound socket, so an
+  // ELIGIBLE retry deterministically completes `Ready(Ok)` on loopback.
+  let dest = driver
+    .socket
+    .as_ref()
+    .expect("gossip socket held")
+    .local_addr()
+    .expect("gossip socket local addr");
+  driver.leave_initiated = true;
+  driver
+    .leave_drain
+    .push_back(crate::driver::shared::LeaveDatagram::for_tests(
+      dest,
+      b"farewell".to_vec(),
+      1,
+    ));
+  driver.farewell.retry_after = Some(Instant::now() + Duration::from_secs(3600));
+
+  for i in 0..8 {
+    let _ = poll_once(&mut driver);
+    assert_eq!(
+      driver.leave_drain.len(),
+      1,
+      "poll {i}: the epoch gate must hold the retained farewell across re-polls"
+    );
+  }
+
+  // The epoch elapses: the very next poll's single retry pass sends it.
+  driver.farewell.retry_after = Some(Instant::now());
+  let _ = poll_once(&mut driver);
+  assert!(
+    driver.leave_drain.is_empty(),
+    "an eligible retry must hand the retained farewell to the socket"
+  );
+  assert!(
+    !driver.farewell.send_failed,
+    "a completed loopback send must not fail the leave"
+  );
+}

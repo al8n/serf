@@ -66,9 +66,9 @@ use crate::{
   driver::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{
-      ExchangeId, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain, dispatch_event_delegate, leave_outcome,
-      observation_payload_bytes, poll_send_gossip, retry_retained_leave, trace_leave_drain_residue,
-      trace_leave_transform_error,
+      ExchangeId, FarewellAccounting, LEAVE_DRAIN_TEARDOWN_BOUND, LeaveDrain,
+      dispatch_event_delegate, leave_outcome, observation_payload_bytes, poll_send_gossip,
+      retry_retained_leave, trace_leave_drain_residue, trace_leave_transform_error,
     },
   },
   drop_counter::ReactorDropCounter,
@@ -364,11 +364,9 @@ where
   left_cluster_seen: bool,
   /// Deadline bounding the teardown park that drains retained farewells.
   leave_drain_deadline: Option<Instant>,
-  /// A leave-farewell send failed on the LOCAL socket (not a per-peer network
-  /// signal): the parked leave resolves
-  /// [`LeaveFarewellUndelivered`](SerfError::LeaveFarewellUndelivered) instead
-  /// of a false `Ok`.
-  leave_send_failed: bool,
+  /// Delivery accounting for the leave fan-out: the local-failure flag and the
+  /// epoch gate spacing ICMP-class retry passes across distinct instants.
+  farewell: FarewellAccounting,
   /// Parked `Shutdown` replies — acked only after the bind sockets drop, so a
   /// caller resuming from `shutdown().await` can rebind the same address. A `Vec`
   /// because several callers can race `shutdown()`.
@@ -510,7 +508,7 @@ where
       leave_drain: LeaveDrain::new(),
       left_cluster_seen: false,
       leave_drain_deadline: None,
-      leave_send_failed: false,
+      farewell: FarewellAccounting::new(),
       shutdown_reply: Vec::new(),
       bridges: HashMap::new(),
       accepted_rx,
@@ -1136,7 +1134,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
-                self.leave_send_failed = true;
+                self.farewell.send_failed = true;
               }
               continue;
             }
@@ -1149,7 +1147,7 @@ where
             Err(_) => {
               if self.leave_initiated {
                 trace_leave_transform_error(to);
-                self.leave_send_failed = true;
+                self.farewell.send_failed = true;
               }
               continue;
             }
@@ -1165,7 +1163,7 @@ where
           Err(_) => {
             if self.leave_initiated {
               trace_leave_transform_error(peer);
-              self.leave_send_failed = true;
+              self.farewell.send_failed = true;
             }
             continue;
           }
@@ -1180,7 +1178,8 @@ where
         cx,
         peer,
         &on_wire,
-        &mut self.leave_send_failed,
+        now,
+        &mut self.farewell,
       );
     }
     worked |= sent > 0;
@@ -1304,7 +1303,7 @@ where
       // resolve when the drain empties (bounded by the caller's leave timeout).
       if self.leave_drain.is_empty() {
         if let Some(pl) = self.pending_leave.take() {
-          let failed = self.leave_send_failed;
+          let failed = self.farewell.send_failed;
           pl.resolve_all(|| leave_outcome(failed));
         }
       } else {
@@ -1405,6 +1404,18 @@ where
   /// Earliest pending-leave deadline, folded into the per-poll timer target.
   fn min_pending_leave_deadline(&self) -> Option<Instant> {
     self.pending_leave.as_ref().map(|pl| pl.deadline)
+  }
+
+  /// Earliest instant a retained farewell's epoch-gated retry becomes
+  /// eligible, folded into the per-poll timer target; `None` when nothing is
+  /// retained (a backpressure-retained datagram is woken by the socket's
+  /// writable waker instead).
+  fn farewell_retry_deadline(&self) -> Option<Instant> {
+    if self.leave_drain.is_empty() {
+      None
+    } else {
+      self.farewell.retry_after
+    }
   }
 
   /// The GREATEST join/leave deadline already due (`<= now`), or `None` when none
@@ -1543,19 +1554,27 @@ where
     // wake (the leave/teardown deadline timers are always armed while any
     // farewell is outstanding).
     if this.leave_initiated {
-      retry_retained_leave(
-        &mut this.leave_drain,
-        this.socket.as_ref(),
-        cx,
-        &mut this.leave_send_failed,
-      );
+      // Epoch gate: after an ICMP-class absorb, the next retry pass waits for
+      // `retry_after` — a self-wake re-poll is NOT a temporally distinct
+      // sample of the socket's error slot. The gate instant folds into the
+      // pump's timer targets, so the eligible wake arrives on time.
+      if this.farewell.retry_after.is_none_or(|t| now >= t) {
+        this.farewell.retry_after = None;
+        retry_retained_leave(
+          &mut this.leave_drain,
+          this.socket.as_ref(),
+          cx,
+          now,
+          &mut this.farewell,
+        );
+      }
       // A `LeftCluster` observed while these datagrams were still queued
       // deferred the parked leave; resolve it now that the socket has accepted
       // every retained farewell.
       if this.left_cluster_seen && this.leave_drain.is_empty() {
         this.left_cluster_seen = false;
         if let Some(pl) = this.pending_leave.take() {
-          let failed = this.leave_send_failed;
+          let failed = this.farewell.send_failed;
           pl.resolve_all(|| leave_outcome(failed));
         }
       }
@@ -1625,7 +1644,7 @@ where
           // nothing retained). A residue instead falls through to the reap's
           // `Err(Shutdown)` — the farewell did not fully leave this host.
           if let Some(pl) = this.pending_leave.take() {
-            let failed = this.leave_send_failed;
+            let failed = this.farewell.send_failed;
             pl.resolve_all(|| leave_outcome(failed));
           }
         } else {
@@ -1634,15 +1653,19 @@ where
             .leave_drain_deadline
             .get_or_insert(now + LEAVE_DRAIN_TEARDOWN_BOUND);
           if now < drain_deadline {
-            // Park until whichever fires first: the drain bound, or a
-            // still-parked leave's deadline — whose firing must resolve
+            // Park until whichever fires first: the drain bound, a
+            // still-parked leave's deadline (whose firing must resolve
             // `LeaveTimeout` promptly, while the drain keeps the rest of its
-            // window. A `Ready` timer re-enters the phase so the reap and the
-            // park recompute against the new now.
-            let park_until = this
+            // window), or the ICMP retry epoch (so an epoch-gated retry runs
+            // as soon as it becomes eligible). A `Ready` timer re-enters the
+            // phase so the reap and the park recompute against the new now.
+            let mut park_until = this
               .pending_leave
               .as_ref()
               .map_or(drain_deadline, |pl| pl.deadline.min(drain_deadline));
+            if let Some(epoch) = this.farewell.retry_after {
+              park_until = park_until.min(epoch);
+            }
             this.arm_timer(park_until, now);
             if let Some(timer) = this.timer.as_mut()
               && timer.as_mut().poll(cx).is_pending()
@@ -1960,7 +1983,10 @@ where
       // Idle: nothing due. Arm + poll the sleep for the next deadline; NO self-wake
       // (return `Pending` — the armed sleep, a bridge `wake_driver`, or a socket
       // readiness re-polls us).
-      let target = reap_deadline.map_or(endpoint_deadline, |d| d.min(endpoint_deadline));
+      let mut target = reap_deadline.map_or(endpoint_deadline, |d| d.min(endpoint_deadline));
+      if let Some(epoch) = this.farewell_retry_deadline() {
+        target = target.min(epoch);
+      }
       this.arm_timer(target, now);
       if let Some(timer) = this.timer.as_mut()
         && timer.as_mut().poll(cx).is_ready()

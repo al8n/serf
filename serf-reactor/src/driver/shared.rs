@@ -13,6 +13,8 @@ use agnostic::net::UdpSocket;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 use core::task::{Context, Poll};
 #[cfg(any(feature = "tcp", feature = "quic"))]
+use memberlist_proto::Instant;
+#[cfg(any(feature = "tcp", feature = "quic"))]
 use std::{collections::VecDeque, io, net::SocketAddr, vec::Vec};
 
 /// Coordinator-allocated handle for one in-flight reliable exchange.
@@ -100,6 +102,58 @@ pub(crate) struct LeaveDatagram {
   bytes: Vec<u8>,
   icmp_errors: u8,
 }
+
+#[cfg(all(test, any(feature = "tcp", feature = "quic")))]
+impl LeaveDatagram {
+  /// Test seam: build a retained entry directly (production entries are built
+  /// only by the retention helpers in this module).
+  // Test-only: consumed by the tokio-gated pump tests, so a smol-only test
+  // build sees no caller.
+  #[allow(dead_code)]
+  pub(crate) fn for_tests(peer: SocketAddr, bytes: Vec<u8>, icmp_errors: u8) -> Self {
+    Self {
+      peer,
+      bytes,
+      icmp_errors,
+    }
+  }
+}
+
+/// Per-pump accounting for the leave-farewell fan-out's delivery.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) struct FarewellAccounting {
+  /// A LOCAL send/transform failure occurred — the farewell (or part of it)
+  /// never left this host — so the parked leave resolves
+  /// [`LeaveFarewellUndelivered`](crate::error::SerfError::LeaveFarewellUndelivered)
+  /// instead of a false `Ok`.
+  pub(crate) send_failed: bool,
+  /// Earliest instant the next retained-farewell retry pass may run. Armed
+  /// whenever a datagram absorbs an ICMP-class error: consecutive absorbs must
+  /// sample the socket's error slot at temporally DISTINCT instants, so
+  /// back-to-back self-wake polls (a loaded pump re-waking itself) cannot burn
+  /// the bounded allowance against one stale asynchronous error. Folded into
+  /// the pump's timer targets so the wake arrives when the epoch elapses.
+  pub(crate) retry_after: Option<Instant>,
+}
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+impl FarewellAccounting {
+  pub(crate) const fn new() -> Self {
+    Self {
+      send_failed: false,
+      retry_after: None,
+    }
+  }
+}
+
+/// Minimum wall-clock spacing between retained-farewell retry passes once a
+/// datagram has absorbed an ICMP-class error. Short enough that the full
+/// [`FAREWELL_ICMP_ERROR_LIMIT`] allowance fits comfortably inside the
+/// teardown drain bound and any realistic leave timeout; long enough that each
+/// retry is a temporally distinct sample of the socket's error slot.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) const FAREWELL_ICMP_RETRY_INTERVAL: core::time::Duration =
+  core::time::Duration::from_millis(100);
 
 /// Leave-farewell datagrams retained after a non-completing UDP send, retried
 /// FIFO.
@@ -235,10 +289,10 @@ pub(crate) const LEAVE_DRAIN_TEARDOWN_BOUND: core::time::Duration =
 /// `retained`:
 /// - `Ready(Ok)` — it left the socket; nothing to retain.
 /// - `Ready(Err)` — the socket did NOT accept this datagram. An ICMP-class
-///   error retains it for a bounded retry (the error slot may hold a stale
-///   answer to an earlier packet for a different peer); a LOCAL failure sets
-///   `send_failed`, so the parked leave resolves with an error instead of a
-///   false success.
+///   error retains it for an epoch-gated retry (the error slot may hold a
+///   stale answer to an earlier packet for a different peer) and arms
+///   `acct.retry_after`; a LOCAL failure sets `acct.send_failed`, so the
+///   parked leave resolves with an error instead of a false success.
 /// - `Pending` — the socket is backpressured; the datagram is retained for the
 ///   next writable wake.
 ///
@@ -250,7 +304,8 @@ pub(crate) fn retain_leave_datagram(
   peer: SocketAddr,
   datagram: &[u8],
   outcome: Poll<io::Result<usize>>,
-  send_failed: &mut bool,
+  now: Instant,
+  acct: &mut FarewellAccounting,
 ) -> bool {
   match outcome {
     Poll::Ready(Ok(_)) => false,
@@ -258,6 +313,7 @@ pub(crate) fn retain_leave_datagram(
       trace_leave_send_error(peer, &err);
       match classify_errored_farewell(0, &err) {
         ErroredFarewell::Retry(absorbed) => {
+          acct.retry_after = Some(now + FAREWELL_ICMP_RETRY_INTERVAL);
           retained.push_back(LeaveDatagram {
             peer,
             bytes: datagram.to_vec(),
@@ -270,7 +326,7 @@ pub(crate) fn retain_leave_datagram(
           false
         }
         ErroredFarewell::LocalFailure => {
-          *send_failed = true;
+          acct.send_failed = true;
           false
         }
       }
@@ -292,6 +348,7 @@ pub(crate) fn retain_leave_datagram(
 /// send drops the datagram. Once `leave()` has been initiated the leave fan-out
 /// is retained on backpressure via [`retain_leave_datagram`].
 #[cfg(any(feature = "tcp", feature = "quic"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn poll_send_gossip<S>(
   retained: &mut LeaveDrain,
   leave_initiated: bool,
@@ -299,7 +356,8 @@ pub(crate) fn poll_send_gossip<S>(
   cx: &mut Context<'_>,
   peer: SocketAddr,
   on_wire: &[u8],
-  send_failed: &mut bool,
+  now: Instant,
+  acct: &mut FarewellAccounting,
 ) where
   S: UdpSocket,
 {
@@ -308,7 +366,7 @@ pub(crate) fn poll_send_gossip<S>(
   };
   let outcome = socket.poll_send_to(cx, on_wire, peer);
   if leave_initiated {
-    retain_leave_datagram(retained, peer, on_wire, outcome, send_failed);
+    retain_leave_datagram(retained, peer, on_wire, outcome, now, acct);
   }
 }
 
@@ -325,7 +383,8 @@ pub(crate) fn retry_retained_leave<S>(
   retained: &mut LeaveDrain,
   socket: Option<&S>,
   cx: &mut Context<'_>,
-  send_failed: &mut bool,
+  now: Instant,
+  acct: &mut FarewellAccounting,
 ) where
   S: UdpSocket,
 {
@@ -339,21 +398,24 @@ pub(crate) fn retry_retained_leave<S>(
       break;
     };
     let outcome = socket.poll_send_to(cx, &d.bytes, d.peer);
-    if settle_retried_farewell(retained, d, outcome, send_failed) {
+    if settle_retried_farewell(retained, d, outcome, now, acct) {
       break;
     }
   }
 }
 
 /// Fold one retried farewell's send outcome back into the retention state.
-/// Returns `true` when the sweep must stop (the socket is backpressured; the
-/// datagram went back to the FRONT so FIFO order is preserved).
+/// An ICMP-class re-retention arms `acct.retry_after`, epoch-gating the next
+/// retry pass. Returns `true` when the sweep must stop (the socket is
+/// backpressured; the datagram went back to the FRONT so FIFO order is
+/// preserved).
 #[cfg(any(feature = "tcp", feature = "quic"))]
 fn settle_retried_farewell(
   retained: &mut LeaveDrain,
   mut d: LeaveDatagram,
   outcome: Poll<io::Result<usize>>,
-  send_failed: &mut bool,
+  now: Instant,
+  acct: &mut FarewellAccounting,
 ) -> bool {
   match outcome {
     Poll::Ready(Ok(_)) => false,
@@ -361,11 +423,12 @@ fn settle_retried_farewell(
       trace_leave_send_error(d.peer, &err);
       match classify_errored_farewell(d.icmp_errors, &err) {
         ErroredFarewell::Retry(absorbed) => {
+          acct.retry_after = Some(now + FAREWELL_ICMP_RETRY_INTERVAL);
           d.icmp_errors = absorbed;
           retained.push_back(d);
         }
         ErroredFarewell::PeerAnswered => trace_leave_peer_answered(d.peer),
-        ErroredFarewell::LocalFailure => *send_failed = true,
+        ErroredFarewell::LocalFailure => acct.send_failed = true,
       }
       false
     }
