@@ -535,3 +535,12 @@ fn drop_joins_the_worker_and_flushes_queued_rotations() {
   // Ignoring Err: best-effort test-file cleanup.
   let _ = std::fs::remove_file(&path);
 }
+
+/// A destination with no file name cannot host a sibling temp: the write
+/// reports `InvalidInput` instead of panicking or writing anywhere.
+#[test]
+fn a_nameless_destination_is_an_input_error() {
+  let err = write_via_exclusive_temp(Path::new("/"), b"contents")
+    .expect_err("a bare root has no file name to derive a temp from");
+  assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}

@@ -301,3 +301,45 @@ fn leave_outcome_maps_the_failure_flag() {
     Err(crate::error::SerfError::LeaveFarewellUndelivered)
   ));
 }
+
+/// A parked key response settles by acknowledgement outcome: still-pending
+/// keeps it parked; a persisted rotation sends the response unchanged; a
+/// persistence failure — or a worker that vanished without acknowledging —
+/// downgrades it to `result = false` carrying the error, with the live wire
+/// keyring keeping the rotation either way.
+#[cfg(encryption)]
+#[test]
+fn parked_key_responses_settle_by_acknowledgement_outcome() {
+  use std::sync::mpsc;
+
+  let ok_resp = serf_proto::event::KeyResponseArgs {
+    result: true,
+    message: "".into(),
+    ..Default::default()
+  };
+
+  // Still pending: stays parked.
+  let (tx, rx) = mpsc::channel();
+  assert!(settle_parked_key_response(&rx, &ok_resp).is_none());
+
+  // Persisted: the response goes out unchanged.
+  tx.send(Ok(())).expect("ack sends");
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(settled.result);
+  assert!(settled.message.is_empty());
+
+  // Persistence failure: downgraded, carrying the error.
+  let (tx, rx) = mpsc::channel();
+  tx.send(Err(std::io::Error::other("disk gone").into()))
+    .expect("ack sends");
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(!settled.result);
+  assert!(settled.message.contains("disk gone"));
+
+  // Worker vanished without acknowledging: a failure, not a silent success.
+  let (tx, rx) = mpsc::channel::<Result<(), crate::KeyringPersistError>>();
+  drop(tx);
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(!settled.result);
+  assert!(settled.message.contains("without acknowledging"));
+}
