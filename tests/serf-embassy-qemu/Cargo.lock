@@ -590,7 +590,7 @@ checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 [[package]]
 name = "memberlist-embedded"
 version = "0.1.0"
-source = "git+https://github.com/al8n/memberlist?branch=main#2c6d2a15b554675bde472f07130817f984a3d4f5"
+source = "git+https://github.com/al8n/memberlist?branch=main#6739bc70b768d77b5380ff883ffe3d3d48d32282"
 dependencies = [
  "bytes",
  "getrandom",
@@ -603,7 +603,7 @@ dependencies = [
 [[package]]
 name = "memberlist-proto"
 version = "0.4.0"
-source = "git+https://github.com/al8n/memberlist?branch=main#2c6d2a15b554675bde472f07130817f984a3d4f5"
+source = "git+https://github.com/al8n/memberlist?branch=main#6739bc70b768d77b5380ff883ffe3d3d48d32282"
 dependencies = [
  "buffa",
  "buffa-build",
