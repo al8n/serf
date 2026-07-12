@@ -1023,6 +1023,10 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
     Command::ListKeys(ListKeysCmd { reply, .. }) => {
       let _ = reply.send(Err(SerfError::Shutdown));
     }
+    #[cfg(feature = "coordinates")]
+    Command::CachedCoordinate(crate::command::CachedCoordinateCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
   }
 }
 
@@ -1307,6 +1311,13 @@ async fn dispatch_command<I, RT, G, R>(
       };
       // Ignoring Err: caller dropped the reply receiver.
       let _ = reply.send(res);
+    }
+    #[cfg(feature = "coordinates")]
+    Command::CachedCoordinate(crate::command::CachedCoordinateCmd { id, reply }) => {
+      // A read-only probe of the coordinate cache: answerable in every
+      // lifecycle state (post-leave introspection stays valid).
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(Ok(endpoint.cached_coordinate(&id)));
     }
     Command::Shutdown(ShutdownCmd { reply }) => {
       // Drain every live bridge so the byte-movers observe the close and exit.
@@ -2179,6 +2190,19 @@ fn refresh_snapshot<I, RT, G, R>(
     LamportTime::from(endpoint.member_time()),
     LamportTime::from(endpoint.event_time()),
     LamportTime::from(endpoint.query_time()),
+  );
+  #[cfg(feature = "coordinates")]
+  let snap = snap
+    .with_coordinate(endpoint.get_coordinate())
+    .with_coordinate_resets(endpoint.coordinate_resets());
+  #[cfg(encryption)]
+  let encrypted = endpoint.encryption_options().keyring().is_some();
+  #[cfg(not(encryption))]
+  let encrypted = false;
+  let snap = snap.with_ops_stats(
+    endpoint.health_score(),
+    endpoint.user_broadcast_queue_len(),
+    encrypted,
   );
   *snapshot.borrow_mut() = Rc::new(snap);
 }
