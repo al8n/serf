@@ -167,7 +167,9 @@ pub use delegate::{FileKeyringDelegate, KeyringFileError};
   docsrs,
   doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
 )]
-pub use delegate::{KeyringDelegate, VoidKeyringDelegate};
+pub use delegate::{
+  KeyringDelegate, KeyringPersistError, KeyringPersistRx, KeyringPersistence, VoidKeyringDelegate,
+};
 
 /// Gossip-encryption config types re-exported from `memberlist-proto`, so a
 /// caller can build a transport's `with_encryption` keyring without naming

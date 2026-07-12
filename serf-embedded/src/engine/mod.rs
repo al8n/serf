@@ -1424,44 +1424,114 @@ where
   }
 
   /// Issue a cluster-wide `install_key` query to add `key` to every node's
-  /// keyring.
+  /// keyring. Responses return direct-only; see
+  /// [`install_key_with`](Self::install_key_with) for relayed delivery.
   #[cfg(encryption)]
   #[cfg_attr(
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub fn install_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
-    self.endpoint.install_key(key, now)
+    self.install_key_with(key, 0, now)
+  }
+
+  /// As [`install_key`](Self::install_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn install_key_with(
+    &mut self,
+    key: SecretKey,
+    relay_factor: u8,
+    now: Instant,
+  ) -> Result<QueryId, SerfError> {
+    self.endpoint.install_key(key, relay_factor, now)
   }
 
   /// Issue a cluster-wide `use_key` query to promote `key` to primary.
+  /// Responses return direct-only; see [`use_key_with`](Self::use_key_with)
+  /// for relayed delivery.
   #[cfg(encryption)]
   #[cfg_attr(
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub fn use_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
-    self.endpoint.use_key(key, now)
+    self.use_key_with(key, 0, now)
+  }
+
+  /// As [`use_key`](Self::use_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn use_key_with(
+    &mut self,
+    key: SecretKey,
+    relay_factor: u8,
+    now: Instant,
+  ) -> Result<QueryId, SerfError> {
+    self.endpoint.use_key(key, relay_factor, now)
   }
 
   /// Issue a cluster-wide `remove_key` query to remove `key` from all nodes.
+  /// Responses return direct-only; see
+  /// [`remove_key_with`](Self::remove_key_with) for relayed delivery.
   #[cfg(encryption)]
   #[cfg_attr(
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub fn remove_key(&mut self, key: SecretKey, now: Instant) -> Result<QueryId, SerfError> {
-    self.endpoint.remove_key(key, now)
+    self.remove_key_with(key, 0, now)
+  }
+
+  /// As [`remove_key`](Self::remove_key), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn remove_key_with(
+    &mut self,
+    key: SecretKey,
+    relay_factor: u8,
+    now: Instant,
+  ) -> Result<QueryId, SerfError> {
+    self.endpoint.remove_key(key, relay_factor, now)
   }
 
   /// Issue a cluster-wide `list_keys` query to enumerate installed keys.
+  /// Responses return direct-only; see
+  /// [`list_keys_with`](Self::list_keys_with) for relayed delivery.
   #[cfg(encryption)]
   #[cfg_attr(
     docsrs,
     doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
   )]
   pub fn list_keys(&mut self, now: Instant) -> Result<QueryId, SerfError> {
-    self.endpoint.list_keys(now)
+    self.list_keys_with(0, now)
+  }
+
+  /// As [`list_keys`](Self::list_keys), with the responses relayed through
+  /// `relay_factor` random intermediary nodes for delivery redundancy (`0` =
+  /// direct-only, the plain form's behavior).
+  #[cfg(encryption)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305")))
+  )]
+  pub fn list_keys_with(&mut self, relay_factor: u8, now: Instant) -> Result<QueryId, SerfError> {
+    self.endpoint.list_keys(relay_factor, now)
   }
 
   /// Answer an inbound key-management request. `req` is the [`KeyRequest`]

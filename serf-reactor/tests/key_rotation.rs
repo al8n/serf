@@ -67,12 +67,15 @@ impl RecordingKeyring {
 }
 
 impl KeyringDelegate for RecordingKeyring {
-  fn keyring_updated(&self, keyring: &Keyring) {
+  fn keyring_updated(&self, keyring: &Keyring) -> serf_reactor::KeyringPersistence {
     self
       .rings
       .lock()
       .expect("keyring log not poisoned")
       .push(keyring.clone());
+    // The in-memory record is durable the moment it is pushed, so the key
+    // response goes out immediately.
+    serf_reactor::KeyringPersistence::Durable
   }
 }
 
@@ -324,6 +327,70 @@ where
   b.shutdown().await.expect("rot-b shuts down");
 }
 
+/// With node B persisting through a [`serf_reactor::FileKeyringDelegate`], an
+/// `install_key` from A still collects BOTH nodes' successful responses — B's
+/// response is parked until the file write is acknowledged, then routed within
+/// the query window — and because the response was gated on that
+/// acknowledgement, the persisted file already carries the new key when the
+/// response arrives.
+async fn file_backed_rotation_gates_the_response_on_persistence<R>()
+where
+  R: Runtime,
+{
+  let k1 = secret_key(0x33);
+  let k2 = secret_key(0x44);
+
+  let mut path = std::env::temp_dir();
+  // Keyed by runtime as well as pid: the tokio and smol cells run
+  // concurrently in one test binary and must not share a file.
+  path.push(format!(
+    "serf-key-rotation-file-{}-{}",
+    std::process::id(),
+    core::any::type_name::<R>().replace("::", "-"),
+  ));
+  // Ignoring Err: a leftover file from a previous run is fine to lose.
+  let _ = std::fs::remove_file(&path);
+
+  let enc = || EncryptionOptions::new().with_keyring(Keyring::new(k1));
+  let b = spawn_encrypted_node::<R>(
+    "file-b",
+    enc(),
+    Arc::new(serf_reactor::FileKeyringDelegate::new(&path)),
+  )
+  .await;
+  let a = spawn_encrypted_node::<R>("file-a", enc(), Arc::new(RecordingKeyring::default())).await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B over the encrypted reliable plane");
+  converge(&a, &b).await;
+
+  let mut a_events = a.events();
+  a.install_key(k2).await.expect("install_key dispatched");
+  let kr = next_key_response::<R, _>(&mut a_events).await;
+  assert!(
+    kr.num_resp >= 2,
+    "install_key must collect a response from BOTH nodes, including the one parked on file persistence (num_resp={})",
+    kr.num_resp
+  );
+  assert_eq!(kr.num_err, 0, "install_key must succeed on every node");
+
+  let persisted = serf_reactor::FileKeyringDelegate::new(&path)
+    .load()
+    .expect("the acknowledged write parses")
+    .expect("the acknowledged write exists");
+  assert!(
+    persisted.secondaries().contains(&k2) || persisted.primary_ref() == &k2,
+    "the response was gated on persistence, so the file already holds the installed key"
+  );
+
+  a.shutdown().await.expect("file-a shuts down");
+  b.shutdown().await.expect("file-b shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
 // The tokio cell: the runtime-generic scenario driven on tokio's multi-thread
 // runtime. Gated on `tokio` so the `--test key_rotation -- smol` build can drop the
 // `agnostic/tokio` code path.
@@ -334,6 +401,11 @@ mod tokio_cells {
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn key_rotation_across_two_nodes_rotates_both_live_keyrings() {
     super::key_rotation_across_two_nodes_rotates_both_live_keyrings::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn file_backed_rotation_gates_the_response_on_persistence() {
+    super::file_backed_rotation_gates_the_response_on_persistence::<TokioRuntime>().await;
   }
 }
 
@@ -347,6 +419,13 @@ mod smol_cells {
   fn key_rotation_across_two_nodes_rotates_both_live_keyrings_smol() {
     SmolRuntime::block_on(
       super::key_rotation_across_two_nodes_rotates_both_live_keyrings::<SmolRuntime>(),
+    );
+  }
+
+  #[test]
+  fn file_backed_rotation_gates_the_response_on_persistence_smol() {
+    SmolRuntime::block_on(
+      super::file_backed_rotation_gates_the_response_on_persistence::<SmolRuntime>(),
     );
   }
 }

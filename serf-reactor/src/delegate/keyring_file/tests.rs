@@ -1,15 +1,13 @@
 use super::*;
 
-/// Bounded wait for the persistence worker to materialize the file state
-/// `pred` accepts (rotations hand off to a dedicated thread).
-fn await_file<T>(mut probe: impl FnMut() -> Option<T>) -> T {
-  for _ in 0..200 {
-    if let Some(v) = probe() {
-      return v;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(5));
+/// Wait for one rotation's persistence acknowledgement.
+fn acked(p: KeyringPersistence) -> Result<(), KeyringPersistError> {
+  match p {
+    KeyringPersistence::Durable => Ok(()),
+    KeyringPersistence::Pending(rx) => rx
+      .recv_timeout(std::time::Duration::from_secs(5))
+      .expect("the persistence worker acknowledges within the bound"),
   }
-  panic!("the persistence worker did not materialize the expected file state");
 }
 
 fn tmp_path(name: &str) -> PathBuf {
@@ -18,8 +16,32 @@ fn tmp_path(name: &str) -> PathBuf {
   p
 }
 
-/// A persisted rotation round-trips: `keyring_updated` writes the ring
-/// (primary first), `load` rebuilds it with the same primary and secondaries.
+/// Any sibling temp file this delegate could have produced for `path`: the
+/// legacy fixed-name temp or a random-suffix one.
+fn temp_residue(path: &Path) -> Vec<PathBuf> {
+  let mut residue = Vec::new();
+  let legacy = path.with_extension("tmp");
+  if legacy.symlink_metadata().is_ok() {
+    residue.push(legacy);
+  }
+  let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+    return residue;
+  };
+  let prefix = format!(".{name}.");
+  for entry in std::fs::read_dir(dir).expect("temp dir listable").flatten() {
+    if let Some(f) = entry.file_name().to_str()
+      && f.starts_with(&prefix)
+      && f.ends_with(".tmp")
+    {
+      residue.push(entry.path());
+    }
+  }
+  residue
+}
+
+/// A persisted rotation round-trips: the acknowledged `keyring_updated` write
+/// (primary first) is on disk, and `load` rebuilds it with the same primary
+/// and secondaries.
 #[test]
 fn rotation_round_trips_through_the_file() {
   let path = tmp_path("roundtrip");
@@ -34,9 +56,12 @@ fn rotation_round_trips_through_the_file() {
   );
 
   let ring = Keyring::with_secondaries(primary, [secondary]);
-  delegate.keyring_updated(&ring);
+  acked(delegate.keyring_updated(&ring)).expect("the rotation persists");
 
-  let loaded = await_file(|| delegate.load().ok().flatten());
+  let loaded = delegate
+    .load()
+    .expect("an acknowledged write parses")
+    .expect("an acknowledged write exists");
   assert_eq!(loaded.primary_ref(), ring.primary_ref());
   assert_eq!(loaded.secondaries(), ring.secondaries());
 
@@ -79,7 +104,7 @@ fn malformed_files_are_parse_errors() {
 }
 
 /// A second rotation atomically replaces the file: the newest ring wins and
-/// no temp-file residue remains.
+/// no temp-file residue remains under either naming scheme.
 #[test]
 fn a_second_rotation_replaces_the_first() {
   let path = tmp_path("replace");
@@ -93,36 +118,38 @@ fn a_second_rotation_replaces_the_first() {
     SecretKey::ChaCha20Poly1305([4u8; 32]),
   );
 
-  delegate.keyring_updated(&Keyring::new(first));
-  delegate.keyring_updated(&Keyring::new(second));
+  acked(delegate.keyring_updated(&Keyring::new(first))).expect("first rotation persists");
+  acked(delegate.keyring_updated(&Keyring::new(second))).expect("second rotation persists");
 
-  let loaded = await_file(|| {
-    delegate
-      .load()
-      .ok()
-      .flatten()
-      .filter(|r| r.primary_ref() == &second)
-  });
+  let loaded = delegate
+    .load()
+    .expect("parses")
+    .expect("the file exists after two rotations");
   assert_eq!(loaded.primary_ref(), &second);
   assert!(loaded.secondaries().is_empty());
   assert!(
-    !path.with_extension("tmp").exists(),
-    "the atomic rename must consume the temp file"
+    temp_residue(&path).is_empty(),
+    "the atomic rename must consume every temp file"
   );
 
   // Ignoring Err: best-effort test-file cleanup.
   let _ = std::fs::remove_file(&path);
 }
 
-/// A rotation never widens the key file's mode: the replacing temp inode is
-/// born owner-only, so a `0600` destination stays `0600` (and a fresh file is
-/// created `0600`), even under a permissive umask.
+/// A rotation never widens the key file's mode — and it NARROWS a permissive
+/// one: the replacing temp inode is born owner-only, so a fresh file is
+/// created `0600` and a pre-existing `0644` destination is `0600` after the
+/// next rotation, even under a permissive umask.
 #[cfg(unix)]
 #[test]
-fn rotation_preserves_owner_only_permissions() {
+fn rotation_enforces_owner_only_permissions() {
   use std::os::unix::fs::PermissionsExt as _;
 
   let path = tmp_path("perms");
+  // A permissive pre-existing destination (an operator's hand-created file).
+  std::fs::write(&path, "junk\n").expect("pre-create the destination");
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+    .expect("widen the destination");
   let delegate = FileKeyringDelegate::new(&path);
 
   #[cfg(feature = "aes-gcm")]
@@ -133,21 +160,131 @@ fn rotation_preserves_owner_only_permissions() {
     SecretKey::ChaCha20Poly1305([6u8; 32]),
   );
 
-  delegate.keyring_updated(&Keyring::new(first));
-  await_file(|| path.exists().then_some(()));
+  acked(delegate.keyring_updated(&Keyring::new(first))).expect("first rotation persists");
   let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-  assert_eq!(mode, 0o600, "a fresh key file is born owner-only");
+  assert_eq!(
+    mode, 0o600,
+    "the first rotation narrows a permissive destination to owner-only"
+  );
 
-  delegate.keyring_updated(&Keyring::new(second));
-  await_file(|| {
-    delegate
-      .load()
-      .ok()
-      .flatten()
-      .filter(|r| r.primary_ref() == &second)
-  });
+  acked(delegate.keyring_updated(&Keyring::new(second))).expect("second rotation persists");
   let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
   assert_eq!(mode, 0o600, "a rotation must not widen the key file's mode");
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// Construction sweeps both classes of stale sibling temps: the fixed-name
+/// temp earlier releases wrote (possibly permissive and already holding key
+/// material) and abandoned random-suffix temps from crashed rotations.
+#[test]
+fn construction_sweeps_stale_temps() {
+  let path = tmp_path("sweep");
+  let legacy = path.with_extension("tmp");
+  std::fs::write(&legacy, "stale key bytes at permissive mode\n").expect("plant the legacy temp");
+  let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+  let abandoned = path.with_file_name(format!(".{name}.00000000deadbeef.tmp"));
+  std::fs::write(&abandoned, "abandoned partial write\n").expect("plant the abandoned temp");
+
+  let _delegate = FileKeyringDelegate::new(&path);
+  assert!(
+    !legacy.exists(),
+    "the legacy fixed-name temp must be swept at construction"
+  );
+  assert!(
+    !abandoned.exists(),
+    "an abandoned random-suffix temp must be swept at construction"
+  );
+}
+
+/// A symlink planted at the legacy temp path is unlinked — the LINK, never
+/// its target — and no rotation ever writes through it: the exclusive
+/// creation refuses any pre-existing path, so key bytes cannot be redirected
+/// into an attacker-chosen file.
+#[cfg(unix)]
+#[test]
+fn a_planted_symlink_never_receives_key_bytes() {
+  let path = tmp_path("symlink");
+  let victim = tmp_path("symlink-victim");
+  std::fs::write(&victim, "victim contents\n").expect("create the victim");
+  let planted = path.with_extension("tmp");
+  // Ignoring Err: a leftover link from a previous run is about to be re-planted.
+  let _ = std::fs::remove_file(&planted);
+  std::os::unix::fs::symlink(&victim, &planted).expect("plant the symlink");
+
+  let delegate = FileKeyringDelegate::new(&path);
+  assert!(
+    planted.symlink_metadata().is_err(),
+    "construction unlinks the planted symlink"
+  );
+  assert_eq!(
+    std::fs::read_to_string(&victim).expect("victim readable"),
+    "victim contents\n",
+    "unlinking removes the LINK, never its target"
+  );
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([7u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([7u8; 32]);
+  acked(delegate.keyring_updated(&Keyring::new(key))).expect("rotation persists");
+  assert_eq!(
+    std::fs::read_to_string(&victim).expect("victim readable"),
+    "victim contents\n",
+    "no rotation writes through a planted path"
+  );
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+  let _ = std::fs::remove_file(&victim);
+}
+
+/// A write failure is acknowledged as an error — the response gate's failure
+/// signal — not silently swallowed.
+#[test]
+fn persistence_failure_is_acknowledged_as_an_error() {
+  let mut path = std::env::temp_dir();
+  path.push(format!("serf-keyring-no-such-dir-{}", std::process::id()));
+  path.push("ring");
+  let delegate = FileKeyringDelegate::new(&path);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([8u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([8u8; 32]);
+  assert!(
+    acked(delegate.keyring_updated(&Keyring::new(key))).is_err(),
+    "a write into a missing directory must acknowledge failure"
+  );
+}
+
+/// Dropping the delegate joins the worker after it drains the queue: a
+/// rotation handed off immediately before the drop is on disk when `drop`
+/// returns, so a shutdown cannot discard a write the wire already carries.
+#[test]
+fn drop_joins_the_worker_and_flushes_queued_rotations() {
+  let path = tmp_path("drop-flush");
+  let delegate = FileKeyringDelegate::new(&path);
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes128([9u8; 16]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([9u8; 32]);
+
+  let ack = delegate.keyring_updated(&Keyring::new(key));
+  drop(delegate);
+
+  // No waiting: the join inside drop already flushed the queue.
+  let loaded = FileKeyringDelegate::new(&path)
+    .load()
+    .expect("the flushed write parses")
+    .expect("the flushed write exists");
+  assert_eq!(loaded.primary_ref(), &key);
+  assert!(
+    matches!(ack, KeyringPersistence::Pending(rx) if matches!(rx.try_recv(), Ok(Ok(())))),
+    "the queued rotation was acknowledged before the worker exited"
+  );
 
   // Ignoring Err: best-effort test-file cleanup.
   let _ = std::fs::remove_file(&path);
