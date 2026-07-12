@@ -1496,7 +1496,18 @@ where
       LamportTime::from(self.endpoint.query_time()),
     );
     #[cfg(feature = "coordinates")]
-    let snap = snap.with_coordinate(self.endpoint.get_coordinate());
+    let snap = snap
+      .with_coordinate(self.endpoint.get_coordinate())
+      .with_coordinate_resets(self.endpoint.coordinate_resets());
+    #[cfg(encryption)]
+    let encrypted = self.endpoint.encryption_options().keyring().is_some();
+    #[cfg(not(encryption))]
+    let encrypted = false;
+    let snap = snap.with_ops_stats(
+      self.endpoint.health_score(),
+      self.endpoint.user_broadcast_queue_len(),
+      encrypted,
+    );
     self.shared.publish(snap);
   }
 

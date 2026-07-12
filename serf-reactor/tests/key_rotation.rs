@@ -182,6 +182,13 @@ where
     .expect("join reaches node B over the encrypted reliable plane");
   converge(&a, &b).await;
 
+  // An encrypted node reports its keyring through the operator surface.
+  assert!(
+    a.encryption_enabled(),
+    "a node constructed with a keyring must report encryption enabled"
+  );
+  assert!(a.stats().encrypted());
+
   // Subscribe before issuing any key op so no KeyResponse races the subscription.
   let mut a_events = a.events();
   let mut b_events = b.events();
