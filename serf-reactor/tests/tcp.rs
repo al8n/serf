@@ -2150,6 +2150,91 @@ where
   let _ = std::fs::remove_file(&path);
 }
 
+/// Spawn a standalone reactor TCP node with fast SWIM timing, so failure
+/// detection and query resolution run sub-second (the plain [`spawn_node`] uses
+/// default, slower timing).
+async fn spawn_fast_node<R>(id: &str) -> Node<R>
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn fast serf tcp node")
+}
+
+/// Port of legacy `serf_name_resolution` (Go `TestSerf_NameResolution`): a
+/// third node claiming an id already held in the cluster loses the conflict
+/// vote and shuts down, while the incumbent survives. `nr-dup` is spawned with
+/// the SAME id as the incumbent `nr-1`; after both are joined, the incumbent
+/// (which the rest of the cluster already knows) wins the name-resolution query
+/// and the newcomer transitions itself to Shutdown.
+async fn serf_name_resolution<R>()
+where
+  R: Runtime,
+{
+  let s1 = spawn_fast_node::<R>("nr-1").await;
+  let s2 = spawn_fast_node::<R>("nr-2").await;
+  let s3 = spawn_fast_node::<R>("nr-1").await; // duplicate of s1's id
+  let s2_addr = s2.advertise_address();
+  let s3_addr = s3.advertise_address();
+
+  // Join the incumbent to s2 first, so the cluster knows nr-1 at s1's address
+  // and will vote for it in the conflict.
+  s1.join(&SocketAddrResolver, MaybeResolved::Resolved(s2_addr), false)
+    .await
+    .expect("s1 joins s2");
+  converge(&s1, &s2).await;
+
+  // Introduce the duplicate: joining nr-1@s3 into a cluster that already holds
+  // nr-1@s1 triggers the name-resolution conflict.
+  // Ignoring Err: the join may itself surface the conflict as an error; the
+  // resolution below is what the test asserts.
+  let _ = s1
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(s3_addr), false)
+    .await;
+
+  // The newcomer loses the vote and shuts itself down; the incumbent survives.
+  R::timeout(Duration::from_secs(30), async {
+    loop {
+      if s3.state() == SerfState::Shutdown {
+        break;
+      }
+      R::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await
+  .expect("the duplicate-id newcomer loses the conflict and shuts down");
+  assert_eq!(
+    s1.state(),
+    SerfState::Alive,
+    "the incumbent survives the conflict"
+  );
+
+  s1.shutdown().await.expect("nr-1 shuts down");
+  s2.shutdown().await.expect("nr-2 shuts down");
+  // s3 already shut itself down on the conflict loss.
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -2473,6 +2558,11 @@ mod tokio_cells {
     super::serf_snapshot_recovery::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_name_resolution() {
+    super::serf_name_resolution::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -2665,6 +2755,11 @@ mod smol_cells {
   #[test]
   fn serf_snapshot_recovery_smol() {
     SmolRuntime::block_on(super::serf_snapshot_recovery::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_name_resolution_smol() {
+    SmolRuntime::block_on(super::serf_name_resolution::<SmolRuntime>());
   }
 
   #[cfg(encryption)]
