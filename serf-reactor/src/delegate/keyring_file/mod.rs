@@ -237,7 +237,7 @@ fn temp_nonce() -> io::Result<u64> {
 /// failure never blocks construction — `create_new` already keeps every
 /// future write off any path that survives.
 fn sweep_stale_temps(path: &Path) {
-  if sweepable(path, &path.with_extension("tmp")) {
+  if legacy_temp_provably_distinct(path) && sweepable(path, &path.with_extension("tmp")) {
     // Ignoring Err: nothing to sweep, or no permission — both non-fatal.
     let _ = std::fs::remove_file(path.with_extension("tmp"));
   }
@@ -267,6 +267,29 @@ fn sweep_stale_temps(path: &Path) {
       // Ignoring Err: best-effort sweep of abandoned temps.
       let _ = std::fs::remove_file(entry.path());
     }
+  }
+}
+
+/// Whether the fixed-name legacy temp's name is PROVABLY distinct from the
+/// destination's under every supported filename-alias relation.
+///
+/// The legacy image differs from the destination only in its extension, so
+/// the alias question reduces to the extension replacement. Sweeping is
+/// allowed only when the destination's extension is pure ASCII and does not
+/// ASCII-case-fold to `tmp` — case-insensitive HFS+ additionally IGNORES
+/// certain Unicode scalars when comparing names, so an extension carrying
+/// any non-ASCII scalar could fold the two names together and is
+/// conservatively refused. No extension at all is safe: the image then
+/// APPENDS `.tmp`, four non-ignorable ASCII characters no folding can
+/// absorb. Random-suffix candidates need no such classifier — their names
+/// carry a dot prefix and a 16-hex infix the destination's name does not,
+/// an excess of non-ignorable ASCII no alias relation can erase.
+fn legacy_temp_provably_distinct(path: &Path) -> bool {
+  match path.extension() {
+    None => true,
+    Some(e) => e
+      .to_str()
+      .is_some_and(|e| e.is_ascii() && !e.eq_ignore_ascii_case("tmp")),
   }
 }
 
