@@ -412,3 +412,16 @@ fn runtime_options_update_applies_explicit_override() {
     .expect("explicit override parses");
   assert_eq!(cli.o.leave_timeout(), Duration::from_secs(3));
 }
+
+/// The crate's `tracing` feature must reach the shared engines in
+/// `serf-driver`: their persistence-failure warnings (snapshot append,
+/// flush, compaction, keyring write) are the only diagnostics for silently
+/// dropped records, and they compile only under `serf-driver/tracing`.
+#[cfg(feature = "tracing")]
+#[test]
+fn tracing_forwards_to_the_shared_engines() {
+  assert!(
+    serf_driver::TRACING_WIRED,
+    "the tracing feature must forward serf-driver/tracing"
+  );
+}

@@ -37,7 +37,7 @@ chacha20-poly1305 = [
 # Regex-backed tag-filter matching.
 tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
 # Emit `tracing` spans around the public driver operations.
-tracing = ["dep:tracing"]
+tracing = ["dep:tracing", "serf-driver/tracing"]
 # Runtime conveniences: pull in the concrete agnostic runtime impls.
 tokio = ["agnostic/tokio"]
 smol = ["agnostic/smol"]
