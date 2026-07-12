@@ -301,6 +301,21 @@ where
     elapsed
   }
 
+  /// Gracefully leave node `i` but keep its handle LIVE — unlike
+  /// [`leave_graceful`](Self::leave_graceful), no shutdown follows. Lets an
+  /// assertion observe the leaver's OWN post-leave convergence before teardown.
+  /// Read that convergence from the event log, not `members()`: the leaver
+  /// reaps its self Left tombstone, but the published snapshot then freezes
+  /// (`refresh_snapshot` will not publish a view missing the local id), so the
+  /// event stream — not the membership view — is the source of truth here.
+  pub async fn leave_in_place(&self, i: usize) {
+    self
+      .node(i)
+      .leave()
+      .await
+      .expect("node leaves gracefully in place");
+  }
+
   /// Gracefully leave node `i` with a shutdown racing the leave: both commands
   /// are issued concurrently, so they typically land in the same driver command
   /// batch and the teardown itself must egress the still-queued farewell before
@@ -437,6 +452,26 @@ where
     })
     .await
     .unwrap_or_else(|_| panic!("node {observer} never holds {subject:?} as a Left tombstone"));
+  }
+
+  /// Poll until `observer`'s membership view holds `subject` with `status`, or
+  /// fail on the poll timeout.
+  pub async fn await_member_status(&self, observer: usize, subject: &str, status: MemberStatus) {
+    R::timeout(POLL_TIMEOUT, async {
+      loop {
+        if self
+          .node(observer)
+          .members()
+          .iter()
+          .any(|m| m.node().id_ref().as_str() == subject && m.status() == status)
+        {
+          break;
+        }
+        R::sleep(POLL_STEP).await;
+      }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("node {observer} never holds {subject:?} as {status:?}"));
   }
 
   /// Poll until `observer`'s log records a member event of `kind` naming

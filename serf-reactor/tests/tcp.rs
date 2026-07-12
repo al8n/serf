@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, future};
 use serf_proto::{
   event::{Event, MemberEventKind},
-  members::SerfState,
+  members::{MemberStatus, SerfState},
   options::Options as SerfOptions,
 };
 #[cfg(encryption)]
@@ -1818,6 +1818,154 @@ where
   c.shutdown().await.expect("qf-c shuts down");
 }
 
+/// Port of legacy `serf_join_leave` (Go `TestSerf_JoinLeave`): after a peer
+/// leaves gracefully, the departure settles on BOTH sides under the DEFAULT
+/// tombstone timeout. The other leave e2es raise the tombstone timeout to HOLD
+/// the tombstone and pin the event sequence; this one exercises the plain
+/// default-tombstone reap that none of them cover, and — like the legacy body —
+/// checks the leaver's own side, not just the observer's.
+///
+/// The leaver is kept running rather than shut down so its convergence is
+/// observable, but its side must be read from the EVENT LOG, not the membership
+/// snapshot. The leaver reaps its own self Left tombstone (matching the legacy
+/// leaver) — `handle_node_leave` adds self to `left_members` and `fire_reap`
+/// removes it — but once self is gone from the machine, `refresh_snapshot`
+/// refuses to publish a view missing the local id, so `members()` /
+/// `num_members()` FREEZE at the pre-reap `[peer, self:Left]` state. The event
+/// stream stays truthful: the leaver emits `Leave` then `Reap` for itself and
+/// only a `Join` for the peer. (The frozen-snapshot-vs-event divergence for a
+/// left-in-place node is tracked as a separate machine-side issue, al8n/serf#88.)
+async fn serf_join_leave<R>()
+where
+  R: Runtime,
+{
+  let mut cluster =
+    cluster::Cluster::<R>::spawn(&["jl-a", "jl-b"], cluster::ClusterTiming::fast()).await;
+  let peer = cluster.id(0);
+  let leaver = cluster.id(1);
+
+  // Leave in place — keep B's handle live so its own convergence is observable.
+  cluster.leave_in_place(1).await;
+
+  // A (observer) reaps the departed B under the fast profile's 1ms tombstone +
+  // 100ms reap ticks, returning to just itself (A's own snapshot stays live).
+  cluster.await_num_members(0, 1).await;
+
+  // B (the leaver) processes its own departure end to end: its event log shows
+  // Join → Leave → Reap for itself — self IS reaped under the default tombstone.
+  cluster
+    .assert_member_events(
+      1,
+      leaver.as_str(),
+      &[
+        MemberEventKind::Join,
+        MemberEventKind::Leave,
+        MemberEventKind::Reap,
+      ],
+    )
+    .await;
+  // And it never fails or reaps the still-live peer — only the Join.
+  cluster
+    .assert_member_events(1, peer.as_str(), &[MemberEventKind::Join])
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_join_leave_join` (Go `TestSerf_JoinLeaveJoin`): a peer
+/// leaves — the observer holds it as a Left tombstone — then the same node
+/// restarts and rejoins, and the observer transitions it Left → Alive. The
+/// tombstone timeout is raised so the Left state is observable before the
+/// rejoin rather than reaped away first.
+async fn serf_join_leave_join<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["jlj-a", "jlj-b"],
+    cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
+  )
+  .await;
+  let subject = cluster.id(1);
+  let seed = cluster.node(0).advertise_address();
+
+  cluster.leave_graceful(1).await;
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+
+  cluster.restart(1).await;
+  cluster
+    .node(1)
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(seed), false)
+    .await
+    .expect("the restarted node rejoins the seed");
+
+  // A transitions B from its Left tombstone back to Alive.
+  cluster
+    .await_member_status(0, subject.as_str(), MemberStatus::Alive)
+    .await;
+
+  cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_leave_rejoin_different_role` (Go
+/// `TestSerf_LeaveRejoin_DifferentRole`): a node leaves, then a fresh node
+/// rejoins at the SAME id and address carrying a DIFFERENT role tag, and the
+/// observer's view reflects the new role. The legacy test sets the role at
+/// construction; the Sans-I/O stack has no start-time tag surface, so the
+/// restarted node applies it via `set_tags` before the rejoin — the revival
+/// folds the tag into its Join (matching the reference `handleNodeJoin`), and
+/// the observer ends up seeing the new value.
+async fn serf_leave_rejoin_different_role<R>()
+where
+  R: Runtime,
+{
+  let mut cluster = cluster::Cluster::<R>::spawn(
+    &["lrr-a", "lrr-b"],
+    cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
+  )
+  .await;
+  let subject = cluster.id(1);
+  let seed = cluster.node(0).advertise_address();
+
+  cluster.leave_graceful(1).await;
+  cluster.await_left_tombstone(0, subject.as_str()).await;
+
+  cluster.restart(1).await;
+  let mut tags = serf_proto::Tags::new();
+  tags.0.insert(SmolStr::new("role"), SmolStr::new("bar"));
+  cluster
+    .node(1)
+    .set_tags(tags)
+    .await
+    .expect("the restarted node adopts the new role before rejoining");
+  cluster
+    .node(1)
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(seed), false)
+    .await
+    .expect("the re-roled node rejoins the seed");
+
+  // A must see B back as Alive AND carrying the new role — the two ride the
+  // same revival Join, so poll them together to avoid reading the view between
+  // the status flip and the tag landing.
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let seen = cluster.node(0).members().iter().any(|m| {
+        m.node().id_ref().as_str() == subject.as_str()
+          && m.status() == MemberStatus::Alive
+          && m.tags().0.get("role").map(SmolStr::as_str) == Some("bar")
+      });
+      if seen {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A never sees the rejoined B as Alive carrying role=bar");
+
+  cluster.shutdown_all().await;
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -2116,6 +2264,21 @@ mod tokio_cells {
     super::serf_query_filter::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_join_leave() {
+    super::serf_join_leave::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_join_leave_join() {
+    super::serf_join_leave_join::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_leave_rejoin_different_role() {
+    super::serf_leave_rejoin_different_role::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -2283,6 +2446,21 @@ mod smol_cells {
   #[test]
   fn serf_query_filter_smol() {
     SmolRuntime::block_on(super::serf_query_filter::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_join_leave_smol() {
+    SmolRuntime::block_on(super::serf_join_leave::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_join_leave_join_smol() {
+    SmolRuntime::block_on(super::serf_join_leave_join::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_leave_rejoin_different_role_smol() {
+    SmolRuntime::block_on(super::serf_leave_rejoin_different_role::<SmolRuntime>());
   }
 
   #[cfg(encryption)]
