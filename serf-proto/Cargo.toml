@@ -26,6 +26,11 @@ std = [
 ]
 alloc = ["memberlist-proto/alloc", "rand/alloc"]
 
+# Test-only fault-injection surface (a `MessageDropper` that drops inbound
+# membership messages before the machine processes them). Compiled out of every
+# non-test build — it has no production use.
+test = ["alloc"]
+
 # Encryption key management messages (KeyRequestMessage / KeyResponseMessage).
 # Pulls in the memberlist-proto encryption backend (at least one AEAD cipher
 # must be selected; both are forwarded here so the caller can pick).

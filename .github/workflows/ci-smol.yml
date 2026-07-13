@@ -33,7 +33,7 @@ on:
   schedule: [cron: "0 1 */30 * *"]
 
 env:
-  FEATURES: "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs"
+  FEATURES: "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs,test"
 
 jobs:
   test:
@@ -85,6 +85,6 @@ jobs:
         # `-- smol` selects only the `_smol` cells in each suite binary; the tokio
         # cells over the same runtime-generic scenarios run in ci-tokio.
         run: |
-          cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test tcp -- smol
+          cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs,test" --test tcp -- smol
           cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test tls -- smol
           cargo test -p serf-reactor --features "smol,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,dns,getifs" --test quic -- smol

@@ -355,6 +355,14 @@ where
     self.transport.set_merge_delegate(delegate);
   }
 
+  /// Install a test-only [`MessageDropper`](crate::MessageDropper) on the inner
+  /// serf machine. Test fault injection only — see [`Endpoint::set_message_dropper`].
+  #[cfg(any(test, feature = "test"))]
+  #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+  pub fn set_message_dropper(&mut self, dropper: std::sync::Arc<dyn crate::MessageDropper>) {
+    self.core.set_message_dropper(dropper);
+  }
+
   /// Forwards to [`Endpoint::coordinate_resets`].
   #[cfg(feature = "coordinates")]
   #[cfg_attr(docsrs, doc(cfg(feature = "coordinates")))]

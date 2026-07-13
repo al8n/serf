@@ -2302,6 +2302,134 @@ where
   // s3 already shut itself down on the conflict loss.
 }
 
+/// A test-only [`MessageDropper`](serf_proto::MessageDropper) that drops inbound
+/// joins and push/pulls while its shared flag is set — the reactor analog of
+/// the legacy `DropJoins`.
+#[cfg(feature = "test")]
+#[derive(Clone)]
+struct DropJoins {
+  drop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "test")]
+impl serf_proto::MessageDropper for DropJoins {
+  fn should_drop(&self, kind: serf_proto::DropKind) -> bool {
+    matches!(
+      kind,
+      serf_proto::DropKind::Join | serf_proto::DropKind::PushPull
+    ) && self.drop.load(std::sync::atomic::Ordering::SeqCst)
+  }
+}
+
+/// Spawn a fast-SWIM node bound to `bind`, holding Left tombstones for the whole
+/// test, and — when `drop_flag` is `Some` — dropping inbound joins/push-pulls
+/// while that flag is set.
+#[cfg(feature = "test")]
+async fn spawn_air_node<R>(
+  id: &str,
+  bind: SocketAddr,
+  drop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Node<R>, serf_reactor::SerfError>
+where
+  R: Runtime,
+{
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  let delegate = match drop_flag {
+    Some(flag) => VoidDelegate::<SmolStr, SocketAddr>::new()
+      .with_message_dropper(std::sync::Arc::new(DropJoins { drop: flag })),
+    None => VoidDelegate::<SmolStr, SocketAddr>::new(),
+  };
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    delegate,
+    RuntimeOptions::new(),
+    // Hold Left tombstones so every node's post-leave view is observable, and
+    // never auto-reap during the double-leave.
+    SerfOptions::new().with_tombstone_timeout(Duration::from_secs(30)),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+}
+
+/// Poll until every node in `nodes` reports `expect` members, or panic on the
+/// bound.
+#[cfg(feature = "test")]
+async fn await_all_num_members<R>(nodes: &[&Node<R>], expect: usize)
+where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(30), async {
+    loop {
+      if nodes.iter().all(|n| n.num_members() == expect) {
+        break;
+      }
+      R::sleep(Duration::from_millis(25)).await;
+    }
+  })
+  .await
+  .expect("all nodes reach the expected member count");
+}
+
+/// Exercises the test-only [`MessageDropper`](serf_proto::MessageDropper)
+/// infrastructure end to end: a node whose delegate drops every inbound join /
+/// push-pull never learns its peer, while the peer — dropping nothing — learns
+/// it. This proves the reactor installs the delegate's dropper on the machine
+/// and the machine consults it at ingress. (It is NOT the legacy
+/// avoid-infinite-rebroadcast scenario, whose anti-rebroadcast property is
+/// pinned deterministically at the machine layer by
+/// `handle_node_leave_intent_updates_status_time_for_leaving` +
+/// `stale_leave_intent_is_dropped`; the reactor cannot observe that property
+/// non-vacuously.)
+#[cfg(feature = "test")]
+async fn message_dropper_drops_inbound_joins<R>()
+where
+  R: Runtime,
+{
+  // B drops every inbound join/push-pull from the start.
+  let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+  let a = spawn_air_node::<R>("md-a", ephemeral_bind(), None)
+    .await
+    .expect("spawn md-a");
+  let b = spawn_air_node::<R>("md-b", ephemeral_bind(), Some(flag.clone()))
+    .await
+    .expect("spawn md-b");
+  let b_addr = b.advertise_address();
+
+  // A joins B: A dials B and learns it from the exchange. B drops A's inbound
+  // push-pull AND every gossip-induced NodeJoined, so B never learns A.
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("md-a joins md-b");
+
+  // A converges to the 2-member cluster (it sees B).
+  await_all_num_members(&[&a], 2).await;
+
+  // B stays at a single member across a settle window spanning many gossip
+  // rounds — it drops every inbound join, so it never learns A. Without the
+  // dropper B would reach 2.
+  R::sleep(Duration::from_secs(2)).await;
+  assert_eq!(
+    b.num_members(),
+    1,
+    "the dropper node never learns its peer — every inbound join is dropped"
+  );
+
+  a.shutdown().await.expect("md-a shuts down");
+  b.shutdown().await.expect("md-b shuts down");
+}
+
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
 /// compiled so the encrypted tests work under either backend.
 #[cfg(encryption)]
@@ -2630,6 +2758,12 @@ mod tokio_cells {
     super::serf_name_resolution::<TokioRuntime>().await;
   }
 
+  #[cfg(feature = "test")]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn message_dropper_drops_inbound_joins() {
+    super::message_dropper_drops_inbound_joins::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -2827,6 +2961,12 @@ mod smol_cells {
   #[test]
   fn serf_name_resolution_smol() {
     SmolRuntime::block_on(super::serf_name_resolution::<SmolRuntime>());
+  }
+
+  #[cfg(feature = "test")]
+  #[test]
+  fn message_dropper_drops_inbound_joins_smol() {
+    SmolRuntime::block_on(super::message_dropper_drops_inbound_joins::<SmolRuntime>());
   }
 
   #[cfg(encryption)]

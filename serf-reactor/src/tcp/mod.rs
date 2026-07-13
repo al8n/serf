@@ -572,6 +572,11 @@ where
     if let Some(md) = runtime.merge_delegate {
       endpoint.set_merge_delegate(md);
     }
+    // Test-only: install the delegate's inbound message-dropper on the machine.
+    #[cfg(any(test, feature = "test"))]
+    if let Some(dropper) = runtime.delegate.message_dropper() {
+      endpoint.set_message_dropper(dropper);
+    }
     let snapshotter = match runtime.snapshot {
       Some((writer, records)) => {
         let replay = serf_proto::snapshot::ReplayResult::replay(records, rejoin_after_leave);

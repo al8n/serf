@@ -30,7 +30,7 @@ on:
   schedule: [cron: "0 1 */30 * *"]
 
 env:
-  FEATURES: "tokio,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs"
+  FEATURES: "tokio,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs,test"
 
 jobs:
   test:

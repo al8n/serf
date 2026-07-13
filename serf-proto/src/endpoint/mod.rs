@@ -680,6 +680,28 @@ fn next_ltime(clock: &mut u64) -> u64 {
 
 /// The serf-logic core of the Sans-I/O super-machine.
 ///
+/// The inbound membership-message kinds a [`MessageDropper`] can drop.
+#[cfg(any(test, feature = "test"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+  /// An inbound join — a memberlist `NodeJoined` inner event.
+  Join,
+  /// An inbound push/pull merge — a memberlist `RemoteStateReceived` inner event.
+  PushPull,
+}
+
+/// A test-only fault-injection hook that drops selected inbound membership
+/// messages before the machine processes them, so a test can force an
+/// out-of-order delivery. Gated behind the `test` feature — it has NO production
+/// use (silently dropping membership messages breaks convergence).
+#[cfg(any(test, feature = "test"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+pub trait MessageDropper: Send + Sync {
+  /// Returns `true` if an inbound message of `kind` should be dropped.
+  fn should_drop(&self, kind: DropKind) -> bool;
+}
+
 /// Holds all serf state — the three Lamport clocks, membership store, options,
 /// event ring, query bookkeeping, deadlines, and (feature-gated) the coordinate
 /// client — and **no** transport reference.  It reaches a memberlist reliable
@@ -716,6 +738,10 @@ where
   /// self `Left` tombstone would drop it from the published snapshot (which
   /// requires the local member) and freeze the view.
   local_id: I,
+  /// Test-only inbound message-drop hook (see [`MessageDropper`]); `None` in
+  /// every real build.
+  #[cfg(any(test, feature = "test"))]
+  message_dropper: Option<std::sync::Arc<dyn MessageDropper>>,
   /// Member (SWIM membership) Lamport clock — plain `u64`, no atomics.
   /// Single-threaded machine; no concurrent writers.
   clock: u64,
@@ -970,6 +996,8 @@ where
     Self {
       opts,
       local_id,
+      #[cfg(any(test, feature = "test"))]
+      message_dropper: None,
       clock: 0,
       event_clock: 0,
       query_clock: 0,
@@ -1023,6 +1051,14 @@ where
     D: Default,
   {
     Self::new_with_rng(local_id, opts, R::seed_from_u64(0))
+  }
+
+  /// Install a test-only [`MessageDropper`] that drops selected inbound
+  /// membership messages before they are processed. Test fault injection only.
+  #[cfg(any(test, feature = "test"))]
+  #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+  pub fn set_message_dropper(&mut self, dropper: std::sync::Arc<dyn MessageDropper>) {
+    self.message_dropper = Some(dropper);
   }
 
   // ── read accessors ────────────────────────────────────────────────────────
@@ -1465,6 +1501,15 @@ where
     match ev {
       // ── membership ───────────────────────────────────────────────────────
       IE::NodeJoined(node) => {
+        // Test-only: drop the inbound join before processing (fault injection).
+        #[cfg(any(test, feature = "test"))]
+        if self
+          .message_dropper
+          .as_ref()
+          .is_some_and(|d| d.should_drop(DropKind::Join))
+        {
+          return;
+        }
         let now = self.drain_now;
         self.handle_node_join(&node, now);
       }
@@ -1495,6 +1540,16 @@ where
         self.handle_user_packet(t, from, data, now);
       }
       IE::RemoteStateReceived(r) => {
+        // Test-only: drop the inbound push/pull before processing (fault
+        // injection).
+        #[cfg(any(test, feature = "test"))]
+        if self
+          .message_dropper
+          .as_ref()
+          .is_some_and(|d| d.should_drop(DropKind::PushPull))
+        {
+          return;
+        }
         // Correlate the merge to the exchange that produced it by its
         // `originating_stream_id` — for an outbound join this is exactly the
         // `StreamId` `start_push_pull` returned and that the driver recorded.

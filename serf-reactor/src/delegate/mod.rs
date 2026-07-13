@@ -170,6 +170,15 @@ pub trait Delegate:
   type Id;
   /// Address type — always `SocketAddr` in the reactor driver.
   type Address;
+
+  /// Test-only inbound message-drop hook. The driver installs the returned
+  /// [`MessageDropper`](serf_proto::MessageDropper) on the machine so a test can
+  /// drop selected inbound membership messages; `None` (the default) drops
+  /// nothing. Gated behind the `test` feature — no production use.
+  #[cfg(any(test, feature = "test"))]
+  fn message_dropper(&self) -> Option<std::sync::Arc<dyn serf_proto::MessageDropper>> {
+    None
+  }
 }
 
 /// Observer the driver notifies after it rotates the LIVE wire keyring, so an
