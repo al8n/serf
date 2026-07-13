@@ -61,3 +61,6 @@ pub trait Resolver: 'static {
   /// Resolve `addr` to its concrete socket addresses.
   async fn resolve(&self, addr: &Self::Address) -> Result<Vec<SocketAddr>, Self::Error>;
 }
+
+#[cfg(test)]
+mod tests;
