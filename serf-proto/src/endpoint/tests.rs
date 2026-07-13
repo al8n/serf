@@ -1273,6 +1273,51 @@ fn user_event_arrives_over_user_packet_and_surfaces() {
   );
 }
 
+/// An installed [`MessageDropper`](crate::MessageDropper) dropping
+/// [`DropKind::Join`](crate::DropKind) drops an inbound gossiped join INTENT
+/// before it witnesses the clock — the intent path (`AnyMessage::Join` in
+/// `handle_user_packet`), distinct from the `IE::NodeJoined` membership gate. A
+/// dropped intent must not advance the member's `status_time`; the same intent
+/// without the dropper advances it.
+#[test]
+fn message_dropper_drops_inbound_join_intent() {
+  struct DropJoins;
+  impl crate::MessageDropper for DropJoins {
+    fn should_drop(&self, kind: crate::DropKind) -> bool {
+      matches!(kind, crate::DropKind::Join)
+    }
+  }
+
+  let join_bytes = AnyMessage::<u32, core::net::SocketAddr>::Join(crate::typed::JoinMessage::new(
+    8u64.into(),
+    2u32,
+  ))
+  .encode()
+  .unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+
+  // With the dropper the join intent is dropped: status_time stays at 5.
+  let mut dropped = ep();
+  dropped.test_seed_member(2, MemberStatus::Alive, LamportTime::new(5));
+  dropped.set_message_dropper(std::sync::Arc::new(DropJoins));
+  dropped.test_inject_user_packet(from, join_bytes.clone(), memberlist_proto::Instant::ORIGIN);
+  assert_eq!(
+    dropped.test_member_status_time(2),
+    Some(LamportTime::new(5)),
+    "a dropped join intent must not advance status_time"
+  );
+
+  // Without the dropper the same intent advances status_time to 8.
+  let mut kept = ep();
+  kept.test_seed_member(2, MemberStatus::Alive, LamportTime::new(5));
+  kept.test_inject_user_packet(from, join_bytes, memberlist_proto::Instant::ORIGIN);
+  assert_eq!(
+    kept.test_member_status_time(2),
+    Some(LamportTime::new(8)),
+    "an un-dropped join intent advances status_time"
+  );
+}
+
 #[test]
 fn duplicate_user_event_over_user_packet_is_deduped() {
   // Same UserEvent injected twice → second one is silently dropped.

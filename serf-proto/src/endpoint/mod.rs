@@ -3138,6 +3138,18 @@ where
         }
       }
       AnyMessage::Join(join) => {
+        // Test-only: drop the inbound join intent before it witnesses the
+        // member clock / advances status_time (fault injection). This is the
+        // gossiped-intent companion to the `IE::NodeJoined` gate — the legacy
+        // `DropJoins` drops both.
+        #[cfg(any(test, feature = "test"))]
+        if self
+          .message_dropper
+          .as_ref()
+          .is_some_and(|d| d.should_drop(DropKind::Join))
+        {
+          return;
+        }
         // handle_node_join_intent takes ltime + id reference.
         let rebroadcast = self.handle_node_join_intent(join.ltime, &join.id.clone(), now);
         if rebroadcast {
