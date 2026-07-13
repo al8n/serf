@@ -201,3 +201,129 @@ fn source_chains_only_for_wrapping_variants() {
     .is_none()
   );
 }
+
+/// A resolver error with a recognisable rendering, so the boxed `Resolve` arms can
+/// be checked for actually carrying their cause into the message and source chain.
+#[derive(Debug)]
+struct ResolverFault;
+
+impl core::fmt::Display for ResolverFault {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("the resolver gave up")
+  }
+}
+
+impl core::error::Error for ResolverFault {}
+
+/// The advertise-resolution arms name the step that failed and carry the resolver's
+/// own error into the message, so a caller need not guess which lookup broke.
+#[test]
+fn advertise_resolution_failures_render_their_cause() {
+  assert_eq!(
+    format!("{}", InitError::Resolve(Box::new(ResolverFault))),
+    "advertise address resolution failed: the resolver gave up"
+  );
+  assert_eq!(
+    format!("{}", InitError::NoAddresses),
+    "advertise address resolution returned no addresses"
+  );
+}
+
+/// The boxed resolver error chains, so a caller that knows its concrete resolver can
+/// downcast to it.
+#[cfg(feature = "std")]
+#[test]
+fn a_resolver_failure_chains_as_the_source() {
+  use std::error::Error as _;
+
+  let err = InitError::Resolve(Box::new(ResolverFault));
+  let source = err.source().expect("the boxed resolver error chains");
+  assert_eq!(format!("{source}"), "the resolver gave up");
+  assert!(
+    source.downcast_ref::<ResolverFault>().is_some(),
+    "the concrete resolver error survives boxing"
+  );
+  assert!(InitError::NoAddresses.source().is_none());
+}
+
+/// `from_embedded` maps BOTH halves of the engine's construction error: its serf
+/// options half passes through as the driver's typed cause, and its memberlist half
+/// is remapped through `from_memberlist`.
+#[test]
+fn from_embedded_maps_both_engine_halves() {
+  let invalid = crate::SerfOptions::new()
+    .with_max_user_event_size(crate::SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1)
+    .validate()
+    .expect_err("an over-ceiling max_user_event_size is invalid");
+  assert!(matches!(
+    InitError::from_embedded(serf_embedded::InitError::InvalidSerfOptions(invalid)),
+    InitError::InvalidSerfOptions(_)
+  ));
+
+  assert!(matches!(
+    InitError::from_embedded(serf_embedded::InitError::Memberlist(
+      serf_embedded::MemberlistInitError::ZeroPort
+    )),
+    InitError::ZeroPort
+  ));
+}
+
+/// The join failure modes each name the step that failed, and the wrapping ones
+/// chain their cause.
+#[test]
+fn join_error_renders_and_chains_each_cause() {
+  assert_eq!(
+    format!("{}", JoinError::Resolve(Box::new(ResolverFault))),
+    "seed address resolution failed: the resolver gave up"
+  );
+  assert_eq!(
+    format!("{}", JoinError::NoAddresses),
+    "no wire address resolved for any seed"
+  );
+
+  // The control arm names the rejection and carries the engine's own message.
+  let rejected = serf_embedded::SerfError::BadLeaveState(crate::SerfState::Leaving);
+  let rendered = format!("{}", JoinError::Control(rejected));
+  assert!(rendered.starts_with("join was rejected: "), "{rendered}");
+  assert!(
+    rendered.contains(&format!(
+      "{}",
+      serf_embedded::SerfError::BadLeaveState(crate::SerfState::Leaving)
+    )),
+    "{rendered}"
+  );
+}
+
+/// An engine rejection converts into the join error's control arm rather than being
+/// flattened into a message.
+#[test]
+fn join_error_converts_from_an_engine_rejection() {
+  let err: JoinError = serf_embedded::SerfError::LeaveClockExhausted.into();
+  assert!(err.is_control());
+  assert!(!err.is_resolve());
+  assert!(!err.is_no_addresses());
+  assert!(matches!(
+    err,
+    JoinError::Control(serf_embedded::SerfError::LeaveClockExhausted)
+  ));
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn join_error_source_chains_only_for_wrapping_variants() {
+  use std::error::Error as _;
+
+  let resolve = JoinError::Resolve(Box::new(ResolverFault));
+  assert_eq!(
+    format!("{}", resolve.source().expect("the resolver error chains")),
+    "the resolver gave up"
+  );
+
+  let control = JoinError::Control(serf_embedded::SerfError::LeaveClockExhausted);
+  assert!(control.source().is_some());
+
+  assert!(
+    JoinError::NoAddresses.source().is_none(),
+    "a discovery failure carries no inner cause"
+  );
+}

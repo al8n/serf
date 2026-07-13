@@ -33,6 +33,118 @@ fn shared() -> Shared<SmolStr> {
   Shared::new(engine, advertise)
 }
 
+/// Build an engine over an arbitrary port / advertise / transform triple.
+fn try_engine(
+  port: u16,
+  advertise: SocketAddr,
+  transform: TransformOptions,
+) -> Result<SerfEngine<SmolStr, SlotId>, serf_embedded::InitError> {
+  SerfEngine::<SmolStr, SlotId>::try_new_at(
+    Options::new()
+      .with_port(port)
+      .with_close_timeout(Duration::from_secs(10)),
+    transform,
+    EndpointOptions::new(SmolStr::new("test"), advertise),
+    SerfOptions::new(),
+    at(),
+    SmallRng::seed_from_u64(42),
+  )
+}
+
+/// A node must advertise an address its peers can route a reply to: an unspecified
+/// IP would be gossiped cluster-wide and then be useless to every peer that selected
+/// it as an egress destination, so it is refused before the endpoint exists.
+#[test]
+fn a_non_routable_advertise_address_is_refused() {
+  // `SerfEngine` is not `Debug`, so the error is matched out with a `let-else`.
+  let Err(err) = try_engine(
+    7946,
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7946),
+    TransformOptions::default(),
+  ) else {
+    panic!("an unspecified advertise address must be refused");
+  };
+  assert!(
+    matches!(
+      err,
+      serf_embedded::InitError::Memberlist(
+        serf_embedded::MemberlistInitError::NonRoutableAdvertiseAddr(_)
+      )
+    ),
+    "{err:?}"
+  );
+}
+
+/// One port serves both the gossip and reliable planes, and an embedded interface
+/// has no NAT — so a node advertising a port it does not bind would have every peer
+/// routing to a port nothing listens on.
+#[test]
+fn an_advertise_port_that_does_not_match_the_bound_port_is_refused() {
+  let Err(err) = try_engine(
+    7946,
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7947),
+    TransformOptions::default(),
+  ) else {
+    panic!("an advertise port other than the bound port must be refused");
+  };
+  assert!(
+    matches!(
+      err,
+      serf_embedded::InitError::Memberlist(
+        serf_embedded::MemberlistInitError::AdvertisePortMismatch
+      )
+    ),
+    "{err:?}"
+  );
+}
+
+/// A labelled cluster that opts out of the inbound label check still constructs: the
+/// opt-out is a migration posture (accept unlabelled peers while the label rolls
+/// out), not a rejected configuration.
+#[test]
+fn a_label_with_the_inbound_check_skipped_constructs() {
+  let advertise = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7946);
+  let transform = TransformOptions::default()
+    .with_label(Some(alloc::vec![b'm', b'i', b'g']))
+    .expect("a short label is valid")
+    .with_skip_inbound_label_check(true);
+
+  let Ok(engine) = try_engine(7946, advertise, transform) else {
+    panic!("skipping the inbound label check is a valid migration posture");
+  };
+  assert_eq!(engine.port(), 7946);
+}
+
+/// An app that never drains `poll_event` cannot grow the driver's buffer without
+/// bound: at the cap the OLDEST buffered event is shed and counted, and the public
+/// `events_dropped` total reports the loss rather than hiding it.
+#[test]
+fn the_app_event_buffer_sheds_the_oldest_at_the_cap() {
+  let shared = shared();
+  assert_eq!(shared.events_dropped(), 0);
+
+  let overflow = 5usize;
+  for _ in 0..DEFAULT_EVENT_BUFFER_CAP + overflow {
+    shared.push_app_event(Event::LeftCluster);
+  }
+
+  assert_eq!(
+    shared.app_events.borrow().len(),
+    DEFAULT_EVENT_BUFFER_CAP,
+    "the buffer must stay bounded at the cap"
+  );
+  assert_eq!(
+    shared.app_events_dropped.get(),
+    overflow as u64,
+    "every event past the cap is shed and counted"
+  );
+  assert_eq!(
+    shared.events_dropped(),
+    overflow as u64,
+    "the public total must report the driver-side shedding"
+  );
+}
+
 /// The production conflict pathway: a drained `Event::Shutdown` — the terminal event
 /// serf emits when the local node loses an id-conflict vote — routes through
 /// `route_drained_event` to `begin_shutdown` (latching the one-way shutdown state and

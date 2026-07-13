@@ -1,6 +1,9 @@
-use super::{apply_key_request, keyring_carries_cross_cipher_twin};
+use super::{
+  KeyringPersistError, apply_key_request, keyring_carries_cross_cipher_twin,
+  settle_parked_key_response,
+};
 use memberlist_proto::{Keyring, SecretKey};
-use serf_proto::KeyRequestOperation;
+use serf_proto::{KeyRequestOperation, KeyResponseArgs};
 
 #[cfg(feature = "aes-gcm")]
 fn aes(b: u8) -> SecretKey {
@@ -196,4 +199,129 @@ fn twin_detector_flags_cross_cipher_seed_ring() {
 
   let clean = Keyring::with_secondaries(aes(1), [aes(2), chacha(3)]);
   assert!(!keyring_carries_cross_cipher_twin(&clean));
+}
+
+// ── the applied outcome's parts ───────────────────────────────────────────────
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn into_parts_yields_the_response_and_the_rotated_ring() {
+  let ring = Keyring::new(aes(1));
+
+  let (response, rotated) =
+    apply_key_request(&ring, KeyRequestOperation::Install, Some(&aes(2))).into_parts();
+  assert!(response.result);
+  let rotated = rotated.expect("install mutates the ring");
+  assert_eq!(rotated.primary_ref(), &aes(1));
+  assert!(rotated.secondaries().contains(&aes(2)));
+
+  // A read-only op splits into a response with no ring to publish, so the
+  // caller never re-keys the wire on a `list`.
+  let (response, rotated) = apply_key_request(&ring, KeyRequestOperation::List, None).into_parts();
+  assert!(response.result);
+  assert_eq!(response.primary_key, Some(aes(1)));
+  assert!(rotated.is_none());
+}
+
+// ── parked key responses gated on persistence ─────────────────────────────────
+
+/// A `list` answer: the shape whose carried key material must survive a
+/// persistence downgrade untouched.
+#[cfg(feature = "aes-gcm")]
+fn listed() -> KeyResponseArgs {
+  KeyResponseArgs {
+    result: true,
+    keys: vec![aes(1), aes(2)],
+    primary_key: Some(aes(1)),
+    ..Default::default()
+  }
+}
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn an_unacknowledged_rotation_leaves_the_response_parked() {
+  // The sender is alive and silent: persistence is still in flight, so the
+  // requester must hear nothing yet.
+  let (_worker, rx) = std::sync::mpsc::channel::<Result<(), KeyringPersistError>>();
+  assert!(settle_parked_key_response(&rx, &listed()).is_none());
+}
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn a_persisted_rotation_releases_the_response_unchanged() {
+  let (worker, rx) = std::sync::mpsc::channel();
+  worker.send(Ok(())).expect("the receiver is alive");
+
+  let parked = listed();
+  let sent = settle_parked_key_response(&rx, &parked).expect("a durable rotation settles");
+  assert!(sent.result);
+  assert!(
+    sent.message.is_empty(),
+    "a durable rotation carries no failure message, got {}",
+    sent.message
+  );
+  assert_eq!(sent.keys, parked.keys);
+  assert_eq!(sent.primary_key, parked.primary_key);
+}
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn a_failed_persistence_downgrades_the_response_and_carries_the_cause() {
+  let (worker, rx) = std::sync::mpsc::channel();
+  worker
+    .send(Err(
+      Box::new(std::io::Error::other("the volume is read-only")) as KeyringPersistError,
+    ))
+    .expect("the receiver is alive");
+
+  let parked = listed();
+  let sent = settle_parked_key_response(&rx, &parked).expect("a failed rotation settles");
+  assert!(
+    !sent.result,
+    "a rotation the delegate could not persist must not report success"
+  );
+  assert!(
+    sent.message.contains("not persisted") && sent.message.contains("the volume is read-only"),
+    "the failure must name the cause, got {}",
+    sent.message
+  );
+  // Only the verdict is downgraded: the state the apply reported is intact.
+  assert_eq!(sent.keys, parked.keys);
+  assert_eq!(sent.primary_key, parked.primary_key);
+}
+
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn a_persistence_worker_that_exits_without_acknowledging_is_a_failure() {
+  // A worker that vanished mid-rotation must never be read as a silent
+  // success, and must never leave the response parked forever.
+  let (worker, rx) = std::sync::mpsc::channel::<Result<(), KeyringPersistError>>();
+  drop(worker);
+
+  let parked = listed();
+  let sent = settle_parked_key_response(&rx, &parked).expect("a disconnected ack settles");
+  assert!(!sent.result);
+  assert!(
+    sent.message.contains("without acknowledging"),
+    "the failure must name the vanished worker, got {}",
+    sent.message
+  );
+  assert_eq!(sent.keys, parked.keys);
+}
+
+/// A queued acknowledgement is read even after the worker hung up: the value is
+/// buffered in the channel, so a rotation that WAS persisted before the worker
+/// exited still releases its response as a success.
+#[cfg(feature = "aes-gcm")]
+#[test]
+fn an_acknowledgement_queued_before_the_worker_exited_still_succeeds() {
+  let (worker, rx) = std::sync::mpsc::channel();
+  worker.send(Ok(())).expect("the receiver is alive");
+  drop(worker);
+
+  let sent = settle_parked_key_response(&rx, &listed()).expect("the queued ack settles");
+  assert!(
+    sent.result,
+    "a rotation persisted before the worker exited is durable"
+  );
 }

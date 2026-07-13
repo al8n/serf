@@ -1,6 +1,9 @@
 //! Errors from constructing a [`Serf`](crate::Serf) and from an await-result
 //! [`join`](crate::Serf::join).
 
+#[cfg(test)]
+mod tests;
+
 use alloc::boxed::Box;
 use core::{fmt, time::Duration};
 
