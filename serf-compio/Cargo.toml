@@ -98,6 +98,30 @@ ring = "0.17"
 # Used in the serde option-layer tests.
 serde_json = "1"
 
+# The real-node TCP test suite: loopback nodes driving the compio stream driver
+# end to end (join/converge, user event, query round-trip, set_tags, graceful
+# leave, force-leave on a failed member, snapshot replay, observation-channel
+# backpressure, bridge teardown, and the command-queue drain at shutdown). Shares
+# the multi-node fixture in `tests/cluster/`.
+[[test]]
+name = "tcp"
+required-features = ["tcp"]
+
+# The real-node TLS test suite: the same stream driver over a self-signed cert +
+# accept-any verifier (options guards, unresolved-advertise resolution, merge
+# delegate, snapshot persistence, user event, query round-trip, graceful leave).
+[[test]]
+name = "tls"
+required-features = ["tls"]
+
+# The real-node QUIC test suite: loopback nodes over a quinn config bundle
+# driving the QUIC pump's whole command surface (join/converge, user event, query
+# round-trip, set_tags, graceful leave, not-running gate, key rotation, snapshot
+# persistence, observation backpressure, and the command-queue drain at shutdown).
+[[test]]
+name = "quic"
+required-features = ["quic-rustls-ring"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

@@ -468,3 +468,6 @@ impl<I, A> ConflictResponseMessage<I, A> {
     Self { member }
   }
 }
+
+#[cfg(test)]
+mod tests;

@@ -282,3 +282,57 @@ fn coordinate_readings_ride_the_snapshot() {
   assert_eq!(snap.coordinate(), Some(&coordinate));
   assert_eq!(snap.stats().coordinate_resets(), Some(3));
 }
+
+/// The ops readings are legible straight off the snapshot, not only through the
+/// aggregate: a handle reading `health_score` / `broadcast_queue_depth` /
+/// `encrypted` sees exactly what the driver attached, and the zero posture
+/// before it does.
+#[test]
+fn ops_readings_are_legible_on_the_snapshot_itself() {
+  let members = vec![make_member(1, "127.0.0.1:7946", MemberStatus::Alive)];
+  let snap = SerfSnapshot::new(
+    members,
+    &1u32,
+    SerfState::Alive,
+    LamportTime::new(1),
+    LamportTime::new(2),
+    LamportTime::new(3),
+  );
+
+  // The zero posture before the driver attaches its live endpoint readings.
+  assert_eq!(snap.health_score(), 0);
+  assert_eq!(snap.broadcast_queue_depth(), 0);
+  assert!(!snap.encrypted());
+
+  let snap = snap.with_ops_stats(4, 11, true);
+  assert_eq!(snap.health_score(), 4);
+  assert_eq!(snap.broadcast_queue_depth(), 11);
+  assert!(snap.encrypted());
+
+  // The snapshot's own readings and the aggregate it assembles never disagree.
+  let stats = snap.stats();
+  assert_eq!(snap.health_score(), stats.health_score());
+  assert_eq!(snap.broadcast_queue_depth(), stats.broadcast_queue_depth());
+  assert_eq!(snap.encrypted(), stats.encrypted());
+}
+
+/// The coordinate-reset counter is legible straight off the snapshot, and
+/// agrees with the aggregate.
+#[cfg(feature = "coordinates")]
+#[test]
+fn coordinate_resets_are_legible_on_the_snapshot_itself() {
+  let members = vec![make_member(1, "127.0.0.1:7952", MemberStatus::Alive)];
+  let snap = SerfSnapshot::new(
+    members,
+    &1u32,
+    SerfState::Alive,
+    LamportTime::ZERO,
+    LamportTime::ZERO,
+    LamportTime::ZERO,
+  );
+  assert_eq!(snap.coordinate_resets(), None, "absent until attached");
+
+  let snap = snap.with_coordinate_resets(Some(6));
+  assert_eq!(snap.coordinate_resets(), Some(6));
+  assert_eq!(snap.coordinate_resets(), snap.stats().coordinate_resets());
+}

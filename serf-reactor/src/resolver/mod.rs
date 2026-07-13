@@ -67,3 +67,6 @@ pub trait Resolver: Send + Sync + 'static {
     addr: &Self::Address,
   ) -> impl Future<Output = Result<Vec<SocketAddr>, Self::Error>> + Send + '_;
 }
+
+#[cfg(test)]
+mod tests;

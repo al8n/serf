@@ -584,3 +584,76 @@ fn dimensionality_zero_is_clamped_to_one_and_update_does_not_spin() {
     "update with dimensionality clamped to 1 must not spin or error: {result:?}"
   );
 }
+
+// ── Options builders ─────────────────────────────────────────────────────────
+
+/// Every tuning builder writes the field it names.  A transposed setter would be
+/// invisible to a defaults test yet silently mis-tune the Vivaldi model, so each
+/// is pinned to its own getter with a value distinct from every default.
+#[test]
+fn each_tuning_builder_writes_its_own_field() {
+  let o = CoordinateOptions::new()
+    .with_vivaldi_error_max(0.75)
+    .with_vivaldi_ce(0.11)
+    .with_vivaldi_cc(0.22)
+    .with_adjustment_window_size(33)
+    .with_height_min(0.44)
+    .with_gravity_rho(0.55);
+
+  assert_float_eq(o.vivaldi_error_max(), 0.75);
+  assert_float_eq(o.vivaldi_ce(), 0.11);
+  assert_float_eq(o.vivaldi_cc(), 0.22);
+  assert_eq!(o.adjustment_window_size(), 33);
+  assert_float_eq(o.height_min(), 0.44);
+  assert_float_eq(o.gravity_rho(), 0.55);
+}
+
+/// Zero is clamped to one on both size knobs.  A zero dimensionality leaves the
+/// coincident-point retry loop with no component to randomise — it spins forever;
+/// a zero latency-filter window indexes an emptied median buffer — it panics.
+/// Both are CPU/panic hazards, not merely odd configuration.
+#[test]
+fn zero_sized_knobs_are_clamped_to_one() {
+  assert_eq!(
+    CoordinateOptions::new()
+      .with_dimensionality(0)
+      .dimensionality(),
+    1,
+    "a zero dimensionality would hang the coincident-point retry loop"
+  );
+  assert_eq!(
+    CoordinateOptions::new()
+      .with_latency_filter_size(0)
+      .latency_filter_size(),
+    1,
+    "a zero latency-filter window would panic the median lookup"
+  );
+}
+
+// ── Coincident points ────────────────────────────────────────────────────────
+
+/// Two nodes whose coordinates are exactly coincident have no direction to push
+/// apart along.  Rather than emit a zero vector (which would stall the model at
+/// the origin forever), the client draws a random unit direction, so the update
+/// still moves the local coordinate.
+#[test]
+fn a_coincident_peer_still_moves_the_local_coordinate() {
+  let mut c = CoordinateClient::<u32>::new(opts_dim(3));
+  let mut rng = test_rng();
+
+  // The peer sits exactly where we do: the origin.
+  let coincident = zero_coord(3);
+  assert!(
+    c.get_coordinate().vec.iter().all(|x| *x == 0.0),
+    "the local coordinate starts at the origin"
+  );
+
+  let updated = c
+    .update(&1u32, &coincident, Duration::from_millis(50), &mut rng)
+    .expect("a coincident peer is a valid update");
+
+  assert!(
+    updated.vec.iter().any(|x| *x != 0.0),
+    "a coincident peer must be pushed apart along a random direction, not left at zero"
+  );
+}

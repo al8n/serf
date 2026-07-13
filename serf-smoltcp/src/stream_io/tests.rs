@@ -227,6 +227,102 @@ fn reset_is_not_reported_as_eof() {
   );
 }
 
+/// The view owns NO free-list: the engine's `ReliablePlane::pool` is the single
+/// authority, so the view must report an empty pool rather than a phantom one an
+/// engine could draw a socket from twice. `give` is the matching no-op — handing a
+/// socket back to the view must never make it appear allocatable here.
+#[test]
+fn the_view_never_claims_a_socket_pool() {
+  let (mut a, _b) = established();
+  let cell = RefCell::new(&mut a.1);
+  let mut view = SmoltcpStream::new(&mut a.0, &cell);
+
+  assert!(
+    view.take_free().is_none(),
+    "the view must not hand out sockets; the engine's pool is the sole authority"
+  );
+  assert_eq!(view.free_count(), 0);
+
+  // Returning a live handle to the view must not register it as free.
+  view.give(a.3);
+  assert!(view.take_free().is_none());
+  assert_eq!(
+    view.free_count(),
+    0,
+    "a socket given back must never surface as allocatable on the view"
+  );
+}
+
+/// The send/recv capability predicates track the real socket state: an established
+/// socket is send-capable, recv-capable, open, and "established" for the engine's
+/// promotion check; an aborted one is none of those.
+#[test]
+fn the_capability_predicates_track_the_socket_state() {
+  let (mut a, mut b) = established();
+
+  {
+    let cell = RefCell::new(&mut a.1);
+    let view = SmoltcpStream::new(&mut a.0, &cell);
+    assert!(view.may_send(a.3), "an established socket can send");
+    assert!(view.may_recv(a.3), "an established socket can receive");
+    assert!(view.is_open(a.3));
+    assert!(
+      view.is_established(a.3),
+      "the engine promotes on send-capability"
+    );
+    assert_eq!(
+      view.send_queue(a.3),
+      0,
+      "nothing is queued on a fresh established socket"
+    );
+  }
+
+  // B aborts: the RST drives A's socket to Closed, so every capability drops.
+  b.1.get_mut::<tcp::Socket>(b.3).abort();
+  settle(&mut a, &mut b, 100);
+  assert_eq!(a.1.get::<tcp::Socket>(a.3).state(), tcp::State::Closed);
+
+  let cell = RefCell::new(&mut a.1);
+  let view = SmoltcpStream::new(&mut a.0, &cell);
+  assert!(!view.may_send(a.3), "a reset socket cannot send");
+  assert!(!view.may_recv(a.3), "a reset socket cannot receive");
+  assert!(!view.is_open(a.3));
+  assert!(
+    !view.is_established(a.3),
+    "a reset socket must not be promoted as established"
+  );
+}
+
+/// `abort` through the view tears the connection down immediately: the local socket
+/// reaches `Closed` without a FIN handshake, and the peer sees the reset.
+#[test]
+fn abort_through_the_view_resets_the_connection() {
+  let (mut a, mut b) = established();
+
+  {
+    let cell = RefCell::new(&mut a.1);
+    let mut view = SmoltcpStream::new(&mut a.0, &cell);
+    view.abort(a.3);
+  }
+  assert_eq!(
+    a.1.get::<tcp::Socket>(a.3).state(),
+    tcp::State::Closed,
+    "abort must close the local socket outright, with no FIN handshake"
+  );
+
+  // The RST reaches B, which likewise drops to Closed rather than half-closing.
+  settle(&mut a, &mut b, 100);
+  assert_eq!(
+    b.1.get::<tcp::Socket>(b.3).state(),
+    tcp::State::Closed,
+    "the peer must observe the reset"
+  );
+  assert!(
+    !recv_finished(&mut b),
+    "a reset is a failure on the peer, never a graceful EOF"
+  );
+}
+
 /// A RST that arrives mid-stream (the peer aborts after sending some bytes, the
 /// classic abrupt teardown) is likewise not a clean EOF: the buffered bytes are
 /// dropped by the reset and `recv_finished` stays `false`.

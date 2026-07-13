@@ -208,3 +208,28 @@ fn remove_old_member_drops_only_the_named_id() {
     "other ids must be retained"
   );
 }
+
+/// A recent intent carries the four fields the eviction tie-break and the
+/// join/leave reconciliation read back: kind, Lamport time, the driver-threaded
+/// arrival instant, and the monotonic insertion sequence.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[test]
+fn recent_intent_reports_the_fields_it_was_built_with() {
+  use memberlist_proto::Instant;
+
+  let at = Instant::ORIGIN + core::time::Duration::from_secs(7);
+  let intent = NodeIntent::new(IntentKind::Leave, LamportTime::new(9), at, 3);
+
+  assert_eq!(intent.kind(), IntentKind::Leave);
+  assert_eq!(intent.ltime(), LamportTime::new(9));
+  assert_eq!(
+    intent.wall_time(),
+    at,
+    "the arrival instant is what the reaper ages the intent against"
+  );
+  assert_eq!(
+    intent.sequence(),
+    3,
+    "the insertion sequence is the deterministic eviction tie-break"
+  );
+}

@@ -367,3 +367,410 @@ fn completed_join_push_pull_surfaces_exchange_completed_event() {
      completed loopback Join push/pull"
   );
 }
+
+// ── composition seam: the driver-facing forwarders ────────────────────────────
+//
+// The stream and QUIC super-machines expose the same serf surface over different
+// transports; these pin the stream side of that surface so the two cannot drift.
+
+use core::time::Duration;
+use memberlist_proto::{EncodeOptions, Node, encode_outgoing, typed::Alive};
+
+use crate::{
+  event::{Event, MemberEventKind},
+  options::Options as SerfOptions,
+};
+
+/// `Instant::ORIGIN + s` seconds.
+fn t_secs(s: u64) -> Instant {
+  Instant::ORIGIN + Duration::from_secs(s)
+}
+
+/// Wrap a raw membership endpoint into the plain-TCP reliable coordinator.
+fn coord(
+  inner: memberlist_proto::Endpoint<u32, SocketAddr>,
+) -> memberlist_proto::streams::StreamEndpoint<u32, SocketAddr, RawRecords> {
+  memberlist_proto::streams::StreamEndpoint::<_, _, RawRecords>::new(
+    inner,
+    LabelOptions::new_in(Some(CLUSTER.to_vec()), ()),
+    Box::new(|_addr: &SocketAddr| None),
+    Box::new(|addr: &SocketAddr| *addr),
+  )
+}
+
+/// The inner memberlist options every fixture roots at.
+fn inner_opts(id: u32, port: u16) -> EndpointOptions<u32, SocketAddr> {
+  EndpointOptions::new(id, sa(port))
+    .with_user_broadcast_tiers(core::num::NonZeroU8::new(3).unwrap())
+}
+
+/// A raw membership endpoint at `id` / `port`, deterministically seeded.
+fn inner(id: u32, port: u16) -> memberlist_proto::Endpoint<u32, SocketAddr> {
+  memberlist_proto::Endpoint::new_at(
+    inner_opts(id, port),
+    Instant::ORIGIN,
+    SmallRng::seed_from_u64(0),
+  )
+}
+
+/// Encode one memberlist gossip `Message` exactly as the wire carries it, under
+/// the loopback cluster label.
+fn gossip_frame(msg: &memberlist_proto::typed::Message<u32, SocketAddr>) -> Bytes {
+  encode_outgoing(msg, &EncodeOptions::new(None)).expect("encode memberlist gossip frame")
+}
+
+/// An `Alive` for `id` at `addr` — the gossip message that admits a peer.
+fn alive(id: u32, addr: SocketAddr) -> memberlist_proto::typed::Message<u32, SocketAddr> {
+  memberlist_proto::typed::Message::Alive(Alive::new(1, Node::new(id, addr)))
+}
+
+/// The two coalescer shed counters are INJECTED: `new_with_rng_in` must thread
+/// `user_drop` into the user coalescer's slot and `member_drop` into the member
+/// coalescer's, without transposing them.
+#[test]
+fn new_with_rng_in_threads_each_injected_drop_counter_to_its_own_slot() {
+  let e: StreamEndpoint<u32, SocketAddr, RawRecords> = StreamEndpoint::new_with_rng_in(
+    coord(inner(1, 7946)),
+    SerfOptions::new(),
+    SmallRng::seed_from_u64(0),
+    7u64,
+    9u64,
+  );
+  assert_eq!(e.coalesced_user_events_dropped(), 7);
+  assert_eq!(e.coalesced_member_events_dropped(), 9);
+}
+
+/// The super-machine roots serf at the coordinator's local id, and publishes the
+/// membership view the driver observes.
+#[test]
+fn local_id_and_members_snapshot_come_from_the_coordinator() {
+  let mut e = ep(42, 7946);
+  assert_eq!(*e.local_id(), 42u32);
+  assert_eq!(e.health_score(), 0, "a fresh node is healthy");
+
+  e.test_seed_member(2, MemberStatus::Leaving, 1.into());
+  let mut got: Vec<(u32, MemberStatus)> = e
+    .members_snapshot()
+    .iter()
+    .map(|m| (*m.node().id_ref(), m.status()))
+    .collect();
+  got.sort_by_key(|(id, _)| *id);
+  assert_eq!(
+    got,
+    vec![(2, MemberStatus::Leaving), (42, MemberStatus::Alive)],
+    "the snapshot publishes every tracked member with its live status"
+  );
+}
+
+/// A per-member reconnect-timeout override installed through the builder shortens
+/// the reaper's failed-member window.
+#[test]
+fn builder_reconnect_delegate_overrides_the_failed_reap_timeout() {
+  struct TenSeconds;
+  impl crate::ReconnectDelegate<u32, SocketAddr> for TenSeconds {
+    fn reconnect_timeout(
+      &self,
+      _member: &crate::members::Member<u32, SocketAddr>,
+      _default: Duration,
+    ) -> Duration {
+      Duration::from_secs(10)
+    }
+  }
+
+  let mut e =
+    StreamEndpoint::<u32, SocketAddr, RawRecords>::new(coord(inner(1, 7946)), SerfOptions::new())
+      .with_reconnect_delegate(Some(Box::new(TenSeconds)));
+  let _ = e.poll_event();
+  e.test_seed_failed_member(2, sa(7000), Instant::ORIGIN);
+
+  e.test_fire_reap(t_secs(11));
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "the delegate's 10s timeout reaps the failed member at t+11s"
+  );
+}
+
+/// A well-formed gossip frame fed to `handle_packet` reaches the coordinator and
+/// the resulting `NodeJoined` is sieved into serf on the same call; `handle_message`
+/// is the same path for an already-decoded message.
+#[test]
+fn a_decoded_alive_admits_the_peer_through_either_ingress() {
+  let mut packet_side = ep(1, 7946);
+  packet_side.handle_packet(sa(7000), gossip_frame(&alive(2, sa(7000))), Instant::ORIGIN);
+  assert_eq!(
+    packet_side.test_member_status(2),
+    Some(MemberStatus::Alive),
+    "handle_packet decodes the frame and admits the peer"
+  );
+  assert!(
+    matches!(packet_side.poll_event(), Some(Event::Member(ref me)) if me.kind() == MemberEventKind::Join)
+  );
+
+  let mut typed_side = ep(1, 7946);
+  typed_side.handle_message(sa(7000), alive(2, sa(7000)), Instant::ORIGIN);
+  assert_eq!(
+    typed_side.test_member_status(2),
+    Some(MemberStatus::Alive),
+    "handle_message feeds the already-decoded message to the same path"
+  );
+}
+
+/// `handle_gossip` buffers a raw inbound datagram for the codec-owning driver to
+/// drain via `poll_memberlist_ingress`, decode, and feed back through
+/// `handle_packet` — the machine never decodes it in place.
+#[test]
+fn handle_gossip_buffers_the_datagram_for_the_codec_owning_driver() {
+  let mut e = ep(1, 7946);
+  let frame = gossip_frame(&alive(2, sa(7000)));
+  e.handle_gossip(sa(7000), &frame, Instant::ORIGIN);
+
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "handle_gossip must not decode the frame itself"
+  );
+  let (from, bytes) = e
+    .poll_memberlist_ingress()
+    .expect("the datagram is buffered for the driver");
+  assert_eq!(from, sa(7000));
+
+  e.handle_packet(from, bytes, Instant::ORIGIN);
+  assert_eq!(
+    e.test_member_status(2),
+    Some(MemberStatus::Alive),
+    "handle_gossip -> poll_memberlist_ingress -> handle_packet admits the peer"
+  );
+}
+
+/// `poll_timeout` folds the coordinator's deadline with serf's own: an
+/// un-scheduled coordinator leaves serf's reap deadline as the wake, and a
+/// shut-down machine with an un-scheduled coordinator requests no wake at all.
+#[test]
+fn poll_timeout_folds_the_coordinator_and_serf_deadlines() {
+  let mut e = ep(1, 7946);
+  assert_eq!(
+    e.poll_timeout(),
+    Some(t_secs(15)),
+    "an un-scheduled coordinator leaves serf's reap deadline as the wake"
+  );
+
+  e.start_scheduling(Instant::ORIGIN);
+  let inner_deadline = e
+    .transport_mut()
+    .poll_timeout()
+    .expect("start_scheduling arms the coordinator's timers");
+  assert!(inner_deadline < t_secs(15));
+  assert_eq!(
+    e.poll_timeout(),
+    Some(inner_deadline),
+    "the fold takes the minimum of the two deadlines"
+  );
+
+  // A machine that lost an id-conflict vote schedules no serf wakeups.
+  let mut dead = ep(1, 7946);
+  let qid = dead.test_register_conflict_query(t_secs(3600));
+  dead.test_fold_conflict_response(qid, 200u32, true);
+  dead.test_fold_conflict_response(qid, 201u32, false);
+  dead.test_fold_conflict_response(qid, 202u32, false);
+  dead.test_fire_due_query_closes(t_secs(3601));
+  assert!(matches!(dead.poll_event(), Some(Event::Shutdown)));
+  assert_eq!(
+    dead.poll_timeout(),
+    None,
+    "a shut-down serf with an un-scheduled coordinator requests no wakeup"
+  );
+
+  // Arming the coordinator re-supplies the only deadline left on a dead machine.
+  dead.start_scheduling(Instant::ORIGIN);
+  let only = dead.transport_mut().poll_timeout();
+  assert!(only.is_some(), "the coordinator schedules its own timers");
+  assert_eq!(
+    dead.poll_timeout(),
+    only,
+    "with serf shut down the coordinator's deadline is the whole fold"
+  );
+}
+
+/// The wire-size forwarders report the coordinator's CONFIGURED limits — the
+/// driver sizes its recv buffer and observation budget from them.
+#[test]
+fn wire_size_forwarders_report_the_configured_limits() {
+  let opts = inner_opts(1, 7946)
+    .with_gossip_mtu(1234)
+    .with_max_stream_frame_size(4096);
+  let raw = memberlist_proto::Endpoint::new_at(opts, Instant::ORIGIN, SmallRng::seed_from_u64(0));
+  let mut e = StreamEndpoint::<u32, SocketAddr, RawRecords>::new(coord(raw), SerfOptions::new());
+  let _ = e.poll_event();
+
+  assert_eq!(e.gossip_mtu(), 1234);
+  assert_eq!(e.max_stream_frame_size(), 4096);
+}
+
+/// A dial that never connects, and a live exchange that errors, both terminate
+/// their exchange without producing a serf-level membership signal: transport
+/// liveness is never a membership signal, so neither may invent or evict a member.
+///
+/// An `ignore_old` join that dies this way leaves its ignore-join entry behind for
+/// the driver to clear, since no merge ever consumed it.
+#[test]
+fn a_failed_dial_and_an_errored_exchange_are_not_membership_signals() {
+  let mut e = ep(1, 7946);
+
+  let dial_stream = e.start_join_push_pull(sa(7000), true, Instant::ORIGIN);
+  let dial_exchange = match e.poll_action() {
+    Some(StreamAction::Connect(c)) => c.id(),
+    other => panic!("the dialer must surface a Connect, got {other:?}"),
+  };
+  while e.poll_action().is_some() {}
+  assert!(
+    e.test_has_ignore_join_stream(dial_stream),
+    "the ignore_old join records its exchange"
+  );
+
+  e.handle_dial_failed(dial_exchange, Instant::ORIGIN);
+  assert!(
+    e.test_member_status(2).is_none(),
+    "a failed dial must not invent membership"
+  );
+  assert_failed_exchange(
+    &mut e,
+    "a failed dial resolves the exchange as Failed, never as a membership change",
+  );
+  assert!(
+    e.test_has_ignore_join_stream(dial_stream),
+    "no merge consumed the entry, so the driver must still clear it"
+  );
+  e.clear_ignore_join_stream(dial_stream);
+  assert!(!e.test_has_ignore_join_stream(dial_stream));
+
+  let second_stream = e.start_push_pull(sa(7001), PushPullKind::Join, Instant::ORIGIN);
+  let second_exchange = match e.poll_action() {
+    Some(StreamAction::Connect(c)) => c.id(),
+    other => panic!("the dialer must surface a Connect, got {other:?}"),
+  };
+  while e.poll_action().is_some() {}
+
+  e.handle_transport_error(second_exchange, Instant::ORIGIN);
+  assert!(
+    e.test_member_status(2).is_none(),
+    "a transport error must not invent membership"
+  );
+  assert_failed_exchange(
+    &mut e,
+    "a transport error resolves the exchange as Failed, never as a membership change",
+  );
+  assert!(
+    !e.test_has_ignore_join_stream(second_stream),
+    "a plain join recorded no ignore-join entry to begin with"
+  );
+}
+
+/// Drain `e`'s event queue, asserting the ONLY events it yields are terminal
+/// push/pull `ExchangeCompleted(Failed)` resolutions — never a membership change.
+fn assert_failed_exchange(e: &mut StreamEndpoint<u32, SocketAddr, RawRecords>, why: &str) {
+  use crate::{ExchangeKind, ExchangeStatus};
+
+  let mut saw = false;
+  while let Some(ev) = e.poll_event() {
+    match ev {
+      Event::ExchangeCompleted(c) => {
+        assert_eq!(c.kind(), ExchangeKind::PushPull);
+        assert_eq!(c.outcome(), ExchangeStatus::Failed, "{why}");
+        saw = true;
+      }
+      other => panic!("{why}, got {other:?}"),
+    }
+  }
+  assert!(saw, "{why}");
+}
+
+/// A custom join-merge predicate installs through the coordinator, and the
+/// coordinate-reset counter reads through to the Vivaldi client.
+#[test]
+fn operator_forwarders_reach_the_inner_machine() {
+  let mut e = ep(1, 7946);
+
+  struct RejectAll;
+  impl memberlist_proto::delegate::MergeDelegate<u32, SocketAddr> for RejectAll {
+    fn notify_merge(
+      &self,
+      _peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<u32, SocketAddr>],
+      >,
+    ) -> bool {
+      false
+    }
+  }
+  e.set_merge_delegate(RejectAll);
+
+  #[cfg(feature = "coordinates")]
+  assert_eq!(
+    e.coordinate_resets(),
+    Some(0),
+    "a fresh coordinate client has reset nothing"
+  );
+}
+
+// ── gossip-plane encryption ───────────────────────────────────────────────────
+
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+mod encryption {
+  use super::*;
+  use memberlist_proto::{EncryptionOptions, Keyring, SecretKey};
+
+  #[cfg(feature = "aes-gcm")]
+  fn key(b: u8) -> SecretKey {
+    SecretKey::Aes128([b; 16])
+  }
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  fn key(b: u8) -> SecretKey {
+    SecretKey::ChaCha20Poly1305([b; 32])
+  }
+
+  /// With no keyring the gossip transforms are the identity; installing one
+  /// re-keys the live plane so an encrypted datagram round-trips and no longer
+  /// leaves as plaintext.
+  #[test]
+  fn setting_the_encryption_options_re_keys_the_live_gossip_plane() {
+    let mut e = ep(1, 7946);
+    assert!(!e.encryption_options().is_enabled());
+
+    let plain = b"\x05gossip-frame";
+    assert_eq!(
+      e.encrypt_gossip(plain)
+        .expect("encrypt without a keyring")
+        .as_slice(),
+      plain,
+      "with no keyring the datagram is left unencrypted"
+    );
+
+    e.set_encryption_options(EncryptionOptions::new().with_keyring(Keyring::new(key(1))));
+    assert_eq!(
+      e.encryption_options().keyring().map(|kr| *kr.primary_ref()),
+      Some(key(1)),
+      "the coordinator reports the primary key outbound datagrams seal under"
+    );
+
+    let sealed = e.encrypt_gossip(plain).expect("encrypt under the keyring");
+    assert_ne!(
+      sealed.as_slice(),
+      plain,
+      "an encrypted-cluster datagram must not leave as plaintext"
+    );
+    assert_eq!(
+      e.decrypt_gossip(&sealed)
+        .expect("decrypt under the keyring"),
+      plain,
+      "the datagram round-trips through the same keyring"
+    );
+
+    let mut foreign = ep(2, 7000);
+    foreign.set_encryption_options(EncryptionOptions::new().with_keyring(Keyring::new(key(2))));
+    assert!(
+      foreign.decrypt_gossip(&sealed).is_err(),
+      "a frame the keyring cannot open must be an error, never silently admitted"
+    );
+  }
+}

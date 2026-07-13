@@ -237,3 +237,6 @@ pub(crate) async fn close_stream_sockets(
   let _ = listener.close().await;
   let _ = gossip.close().await;
 }
+
+#[cfg(all(test, any(feature = "tcp", feature = "quic")))]
+mod tests;

@@ -535,3 +535,163 @@ fn a_nameless_destination_is_an_input_error() {
     .expect_err("a bare root has no file name to derive a temp from");
   assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
+
+/// The engine reports the destination it persists to, so a caller can log or
+/// re-open the very file the worker writes.
+#[test]
+fn the_engine_reports_its_persistence_path() {
+  let path = tmp_path("path-accessor");
+  let engine = KeyringFilePersistence::new(&path);
+  assert_eq!(engine.path(), path.as_path());
+}
+
+/// A destination that exists but cannot be read is an I/O error, never the
+/// `None` that means "first boot": a node whose key file is unreadable must
+/// fail loudly rather than silently start with no keyring and gossip in the
+/// clear.
+#[test]
+fn an_unreadable_destination_is_an_io_error_not_a_first_boot() {
+  let path = tmp_path("load-io-error");
+  // Ignoring Err: a leftover directory from a previous run is fine to reuse.
+  let _ = std::fs::create_dir(&path);
+  let engine = KeyringFilePersistence::new(&path);
+
+  assert!(
+    matches!(engine.load(), Err(KeyringFileError::Io(_))),
+    "an unreadable destination must not load as a missing keyring"
+  );
+
+  // Ignoring Err: best-effort test-tree cleanup.
+  let _ = std::fs::remove_dir_all(&path);
+}
+
+/// A sibling that merely shares the temp prefix and suffix is not this engine's
+/// to delete: only the exact `.{name}.{16 hex}.tmp` shape is swept, so an
+/// operator's own backup survives construction.
+#[test]
+fn a_prefix_sharing_sibling_is_not_swept() {
+  let path = tmp_path("shape-guard");
+  let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+  let dir = path.parent().expect("the temp dir is a parent");
+
+  // Right prefix and suffix, wrong middle: too short, and not all hex.
+  let backup = dir.join(format!(".{name}.backup.tmp"));
+  let short = dir.join(format!(".{name}.0123456789abcde.tmp"));
+  let nonhex = dir.join(format!(".{name}.0123456789abcdeg.tmp"));
+  for sibling in [&backup, &short, &nonhex] {
+    std::fs::write(sibling, "not this engine's file\n").expect("plant the sibling");
+  }
+
+  let _engine = KeyringFilePersistence::new(&path);
+  for sibling in [&backup, &short, &nonhex] {
+    assert!(
+      sibling.symlink_metadata().is_ok(),
+      "a sibling outside the exact temp shape must survive the sweep: {}",
+      sibling.display()
+    );
+    // Ignoring Err: best-effort test-file cleanup.
+    let _ = std::fs::remove_file(sibling);
+  }
+}
+
+/// The destination's own name is never sweepable — `remove_file` unlinks a
+/// NAME, so a candidate that lexically IS the destination could only ever
+/// delete the persisted keyring.
+#[test]
+fn the_destination_is_never_sweepable() {
+  let path = tmp_path("sweepable-self");
+  std::fs::write(&path, "the persisted keyring\n").expect("seed the destination");
+
+  assert!(!sweepable(&path, &path));
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// A candidate whose name cannot be inspected is never swept: identity is not
+/// even consulted, because a name that cannot be compared cannot be proven
+/// distinct from the destination's.
+#[test]
+fn an_uninspectable_candidate_name_is_never_sweepable() {
+  use std::os::unix::ffi::OsStrExt as _;
+
+  let path = tmp_path("sweepable-uninspectable");
+  let dir = path.parent().expect("the temp dir is a parent");
+  let candidate = dir.join(std::ffi::OsStr::from_bytes(b"\xFFnot-utf8"));
+
+  assert!(!sweepable(&path, &candidate));
+}
+
+/// A dangling symlink at a temp-shaped name reaches no storage at all, so it
+/// cannot be the destination and IS sweepable — the abandoned link is cleaned
+/// up rather than left to fail a future exclusive create.
+#[test]
+fn a_dangling_symlink_candidate_is_sweepable() {
+  let path = tmp_path("sweepable-dangling");
+  std::fs::write(&path, "the persisted keyring\n").expect("seed the destination");
+  let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+
+  let dangling = path.with_file_name(format!(".{name}.00000000cafebabe.tmp"));
+  // Ignoring Err: a leftover link from a previous run is about to be re-planted.
+  let _ = std::fs::remove_file(&dangling);
+  std::os::unix::fs::symlink(path.with_extension("no-such-target"), &dangling)
+    .expect("plant a dangling symlink");
+
+  assert!(
+    sweepable(&path, &dangling),
+    "a link resolving to nothing cannot be the destination"
+  );
+
+  // Construction acts on that verdict, and the destination is untouched.
+  let _engine = KeyringFilePersistence::new(&path);
+  assert!(
+    dangling.symlink_metadata().is_err(),
+    "the abandoned dangling temp must be swept"
+  );
+  assert_eq!(
+    std::fs::read_to_string(&path).expect("the destination survives"),
+    "the persisted keyring\n"
+  );
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// A candidate whose storage identity cannot be established is never swept:
+/// with a symlink loop the resolution fails for a reason that is NOT
+/// "reaches nothing", so the sweep refuses it rather than unlink on uncertainty.
+#[test]
+fn a_candidate_of_unestablishable_identity_is_never_sweepable() {
+  let path = tmp_path("sweepable-loop");
+  std::fs::write(&path, "the persisted keyring\n").expect("seed the destination");
+  let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+
+  let first = path.with_file_name(format!(".{name}.00000000feedface.tmp"));
+  let second = path.with_file_name(format!(".{name}.00000000feedfacf.tmp"));
+  // Ignoring Err: leftover links from a previous run are about to be re-planted.
+  let _ = std::fs::remove_file(&first);
+  let _ = std::fs::remove_file(&second);
+  std::os::unix::fs::symlink(&second, &first).expect("plant one half of the loop");
+  std::os::unix::fs::symlink(&first, &second).expect("close the loop");
+
+  assert!(
+    !sweepable(&path, &first),
+    "a candidate that resolves to neither storage nor nothing is refused"
+  );
+
+  // Construction acts on that verdict: the loop is left alone, destination intact.
+  let _engine = KeyringFilePersistence::new(&path);
+  assert!(
+    first.symlink_metadata().is_ok(),
+    "an unresolvable candidate must survive the sweep"
+  );
+  assert_eq!(
+    std::fs::read_to_string(&path).expect("the destination survives"),
+    "the persisted keyring\n"
+  );
+
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&first);
+  let _ = std::fs::remove_file(&second);
+  let _ = std::fs::remove_file(&path);
+}

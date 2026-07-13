@@ -295,6 +295,103 @@ fn leave_tail_replays_identically_across_compaction() {
   cleanup(&compacted);
 }
 
+/// A clock record trailing the leave marker does not mask the clean leave: the
+/// clean-left state a reopen re-derives is set by the last MEMBERSHIP record,
+/// looking past the clock high-water marks the pump appends after it. Were a
+/// trailing clock read as membership activity, the next compaction would drop
+/// the marker and a restart would silently rejoin a cluster the operator left.
+#[test]
+fn a_trailing_clock_record_does_not_mask_the_clean_leave() {
+  let o = opts("clock-after-leave");
+  {
+    // The default threshold: this flush leaves the original records on disk.
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
+    snap.append_member(true, &node("peer", 7001));
+    snap.append_leave();
+    // A clock high-water mark advancing after the leave marker.
+    snap.append_clocks(LamportTime::new(4), LamportTime::ZERO, LamportTime::ZERO);
+    snap.flush_and_maybe_compact(Vec::new);
+  }
+
+  // Reopening re-derives the clean-left state from the records on disk.
+  let (mut snap, records) =
+    Snapshotter::<SmolStr>::open(o.path(), 1).expect("reopen with a compacting threshold");
+  assert!(
+    matches!(records.last(), Some(SnapshotRecord::Clock(_))),
+    "the seeded file must end with the clock record"
+  );
+  // Threshold 1: this flush compacts, and the rewrite must re-emit the marker.
+  snap.flush_and_maybe_compact(|| vec![node("peer", 7001)]);
+  drop(snap);
+
+  let (_s, records) = o.open::<SmolStr>().expect("reopen compacted");
+  let fresh = ReplayResult::replay(records.clone(), false);
+  assert!(
+    fresh.alive_nodes.is_empty(),
+    "the compacted file must still gate the clean leave on the default posture"
+  );
+  let rejoin = ReplayResult::replay(records, true);
+  assert_eq!(
+    rejoin.alive_nodes,
+    vec![node("peer", 7001)],
+    "the opt-in posture must still recover the pre-leave membership"
+  );
+  cleanup(&o);
+}
+
+/// A snapshot path that cannot be read at all fails the open loudly: a
+/// directory standing in the file's place is an I/O error, never an empty
+/// replay that would silently discard the recovered membership.
+#[test]
+fn an_unreadable_snapshot_path_is_an_io_error() {
+  let o = opts("unreadable");
+  // Ignoring Err: a leftover directory from a previous run is fine to reuse.
+  let _ = fs::create_dir(o.path());
+  assert!(
+    matches!(o.open::<SmolStr>(), Err(SnapshotOpenError::Io(_))),
+    "an unreadable snapshot path must not open as an empty replay"
+  );
+  // Ignoring Err: best-effort test-tree cleanup.
+  let _ = fs::remove_dir_all(o.path());
+}
+
+/// A compaction that cannot write its replacement leaves the GROWN file
+/// authoritative: the records already appended survive untouched, so a failed
+/// rewrite can never lose the membership the wire is carrying.
+#[test]
+fn a_failed_compaction_keeps_the_grown_file_authoritative() {
+  let o = opts("compact-blocked").with_compact_threshold(1);
+  // Occupy the compaction's temp path with a directory, so its create fails.
+  let blocked = o.path().with_extension("compact");
+  // Ignoring Err: a leftover from a previous run is fine to reuse.
+  let _ = fs::remove_dir_all(&blocked);
+  fs::create_dir(&blocked).expect("block the compaction temp path");
+
+  {
+    let (mut snap, _) = o.open::<SmolStr>().expect("open");
+    snap.append_member(true, &node("peer", 7001));
+    snap.append_clocks(LamportTime::new(6), LamportTime::ZERO, LamportTime::ZERO);
+    // A compaction that COMPLETED here would rewrite the file to this empty
+    // live set and drop the appended member; the blocked one must not.
+    snap.flush_and_maybe_compact(Vec::new);
+  }
+
+  let (_s, records) = o
+    .open::<SmolStr>()
+    .expect("reopen after the failed compaction");
+  let replay = ReplayResult::replay(records, false);
+  assert_eq!(
+    replay.alive_nodes,
+    vec![node("peer", 7001)],
+    "a failed compaction must leave the grown file's records intact"
+  );
+  assert_eq!(replay.last_clock, LamportTime::new(6));
+
+  // Ignoring Err: best-effort test-tree cleanup.
+  let _ = fs::remove_dir_all(&blocked);
+  cleanup(&o);
+}
+
 /// Membership activity after a leave clears the clean-left state: the next
 /// compaction does not re-emit a stale Leave marker over live members.
 #[test]
