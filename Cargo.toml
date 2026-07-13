@@ -12,7 +12,7 @@ members = [
 # driver. It pins a foreign default target (a Cortex-M machine) and a cortex-m-rt
 # runtime, so it cannot participate in the host `--workspace` build; it is built
 # and run on its own via `cd tests/serf-embassy-qemu && cargo run`.
-exclude = ["legacy", "tests/serf-embassy-qemu"]
+exclude = ["tests/serf-embassy-qemu"]
 resolver = "3"
 
 [workspace.package]

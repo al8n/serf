@@ -2,8 +2,7 @@ name: ci-core
 
 # The runtime-independent core: the serf-proto wire codec + Sans-I/O machine
 # and its runtime-agnostic glue crate serf-driver. Both are pure-CPU and bind no
-# sockets. This job also builds and tests the preserved `legacy/` serf-core crate
-# (excluded from the workspace) so the old implementation can't silently rot.
+# sockets.
 
 on:
   push:
@@ -167,39 +166,3 @@ jobs:
 
       - name: Test
         run: cargo test -p serf-driver --all-features
-
-  # The preserved pre-Sans-I/O implementation (legacy/serf-core). It is excluded
-  # from the workspace, so build + test it from its own directory on the feature
-  # set the old serf CI used, to keep it from silently rotting.
-  legacy:
-    name: legacy - serf-core
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          components: clippy, rustfmt
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            legacy/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('legacy/**/Cargo.lock') }}-legacy
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Test legacy serf-core
-        run: cargo test --no-default-features --features "test,encryption,serde,quickcheck"
-        working-directory: legacy/serf-core
