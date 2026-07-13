@@ -31,8 +31,8 @@ use serf_proto::{
 #[cfg(encryption)]
 use serf_reactor::{EncryptionOptions, Keyring, SecretKey, VoidKeyringDelegate};
 use serf_reactor::{
-  FirstAddrResolver, MaybeResolved, RuntimeOptions, Serf, SocketAddrResolver, TcpTransportOptions,
-  VoidDelegate,
+  FirstAddrResolver, MaybeResolved, RuntimeOptions, Serf, SerfError, SocketAddrResolver,
+  TcpTransportOptions, VoidDelegate,
 };
 use smol_str::SmolStr;
 
@@ -42,6 +42,52 @@ mod cluster;
 
 /// A reactor TCP node handle over the agnostic runtime `R`.
 type Node<R> = Serf<SmolStr, SocketAddr, R>;
+
+/// The fixture's plain-TCP backend: the fast-SWIM timing mapped onto a
+/// [`TcpTransportOptions`] block.
+struct Tcp;
+
+impl<R> cluster::Backend<R> for Tcp
+where
+  R: Runtime,
+{
+  async fn build(
+    id: &str,
+    bind: SocketAddr,
+    timing: &cluster::ClusterTiming,
+  ) -> serf_reactor::Result<cluster::Node<R>> {
+    let mut opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(bind))
+      .with_probe_interval(timing.probe_interval())
+      .with_probe_timeout(timing.probe_timeout())
+      .with_gossip_interval(timing.gossip_interval())
+      .with_suspicion_mult(timing.suspicion_mult());
+    if let Some(v) = timing.dead_node_reclaim {
+      opts = opts.with_dead_node_reclaim_time(v);
+    }
+    if let Some(v) = timing.push_pull_interval {
+      opts = opts.with_push_pull_interval(v);
+    }
+    Serf::<SmolStr, SocketAddr, R>::tcp(
+      opts,
+      &SocketAddrResolver,
+      &FirstAddrResolver,
+      VoidDelegate::<SmolStr, SocketAddr>::new(),
+      RuntimeOptions::new(),
+      timing.serf_opts(),
+      None,
+      None,
+      None,
+      #[cfg(encryption)]
+      std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+    )
+    .await
+  }
+}
+
+/// The plain-TCP fault-injection cluster.
+type TcpCluster<R> = cluster::Cluster<R, Tcp>;
 
 /// A [`ReconnectDelegate`](serf_proto::ReconnectDelegate) that forces an immediate
 /// reap (zero timeout) for one target member id and passes every other member
@@ -503,7 +549,7 @@ async fn serf_events_failed<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["events-failed-a", "events-failed-b"],
     cluster::ClusterTiming::fast(),
   )
@@ -542,7 +588,7 @@ where
   // Raise A's tombstone timeout past the test window so the reaper holds B's
   // Left tombstone rather than appending a trailing Reap to the observed
   // sequence (the fast profile otherwise reaps a left member sub-second).
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["events-leave-a", "events-leave-b"],
     cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
   )
@@ -584,7 +630,7 @@ where
   R: Runtime,
 {
   // Hold B's Left tombstone past the test window, as in `serf_events_leave`.
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["leave-race-a", "leave-race-b"],
     cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
   )
@@ -620,7 +666,7 @@ where
   R: Runtime,
 {
   let mut cluster =
-    cluster::Cluster::<R>::spawn(&["coord-a", "coord-b"], cluster::ClusterTiming::fast()).await;
+    TcpCluster::<R>::spawn(&["coord-a", "coord-b"], cluster::ClusterTiming::fast()).await;
   let b_id = cluster.id(1);
 
   // Probe RTTs accumulate at the fast profile's 100ms cadence; both surfaces
@@ -961,7 +1007,7 @@ async fn serf_reconnect<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["reconnect-a", "reconnect-b"],
     cluster::ClusterTiming::fast().with_reconnect_timeout(Duration::from_secs(30)),
   )
@@ -1005,7 +1051,7 @@ where
   // whole assertion window, and a long reconnect timeout keeps the FAILED
   // member from being reaped out of the views before the intent lands (the
   // reference tests run with the default day-scale reconnect timeout).
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["fleave-a", "fleave-b", "fleave-c"],
     cluster::ClusterTiming::fast()
       .with_tombstone_timeout(Duration::from_secs(120))
@@ -1064,7 +1110,7 @@ where
   // exclusivity the causal fence below relies on (anti-entropy also
   // witnesses remote clocks and would replay the Left state, masking the
   // fresh intent).
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["fleft-a", "fleft-b", "fleft-c"],
     cluster::ClusterTiming::fast()
       .with_tombstone_timeout(Duration::from_secs(120))
@@ -1179,7 +1225,7 @@ where
 {
   // A long tombstone keeps the removed member observable as Left for the
   // whole assertion window.
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["remove-a", "remove-b", "remove-c"],
     cluster::ClusterTiming::fast()
       .with_tombstone_timeout(Duration::from_secs(120))
@@ -1222,7 +1268,7 @@ where
 {
   // Hold the failed member (no reap, no reconnect eviction) so the prune —
   // not the reaper — is what erases it.
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["prune-a", "prune-b", "prune-c"],
     cluster::ClusterTiming::fast().with_reconnect_timeout(Duration::from_secs(120)),
   )
@@ -1275,7 +1321,7 @@ where
   // The reclaim window is what allows a SAME-name member to revive at a NEW
   // address at all — without it a different-address Alive is a name conflict,
   // exactly as in the reference implementation's dead-node reclaim.
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["sameip-a", "sameip-b"],
     cluster::ClusterTiming::fast()
       .with_reconnect_timeout(Duration::from_secs(30))
@@ -1439,7 +1485,7 @@ where
   R: Runtime,
 {
   let mut cluster =
-    cluster::Cluster::<R>::spawn(&["tags-a", "tags-b"], cluster::ClusterTiming::fast()).await;
+    TcpCluster::<R>::spawn(&["tags-a", "tags-b"], cluster::ClusterTiming::fast()).await;
   let a_id = cluster.id(0);
   let b_id = cluster.id(1);
 
@@ -1510,7 +1556,7 @@ async fn serf_update_after_rejoin<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["upd-a", "upd-b"],
     // The explicit rejoin below is the single revival path: the survivor's
     // own reconnect re-dial is parked out of the window so its push/pull
@@ -1583,12 +1629,8 @@ where
 
 /// Poll `observer`'s member view until `subject`'s `version` tag equals
 /// `want` — the propagation fence for a retag.
-async fn await_version_tag<R>(
-  cluster: &cluster::Cluster<R>,
-  observer: usize,
-  subject: &str,
-  want: &str,
-) where
+async fn await_version_tag<R>(cluster: &TcpCluster<R>, observer: usize, subject: &str, want: &str)
+where
   R: Runtime,
 {
   R::timeout(Duration::from_secs(20), async {
@@ -1649,7 +1691,7 @@ async fn serf_update_after_restart_with_changed_tags<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["updm-a", "updm-b"],
     cluster::ClusterTiming::fast()
       .with_probe_interval(Duration::from_secs(600))
@@ -1873,8 +1915,7 @@ async fn serf_join_leave<R>()
 where
   R: Runtime,
 {
-  let mut cluster =
-    cluster::Cluster::<R>::spawn(&["jl-a", "jl-b"], cluster::ClusterTiming::fast()).await;
+  let mut cluster = TcpCluster::<R>::spawn(&["jl-a", "jl-b"], cluster::ClusterTiming::fast()).await;
   let peer = cluster.id(0);
   let leaver = cluster.id(1);
 
@@ -1914,7 +1955,7 @@ async fn serf_join_leave_join<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["jlj-a", "jlj-b"],
     cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
   )
@@ -1952,7 +1993,7 @@ async fn serf_leave_rejoin_different_role<R>()
 where
   R: Runtime,
 {
-  let mut cluster = cluster::Cluster::<R>::spawn(
+  let mut cluster = TcpCluster::<R>::spawn(
     &["lrr-a", "lrr-b"],
     cluster::ClusterTiming::fast().with_tombstone_timeout(Duration::from_secs(30)),
   )
@@ -2580,6 +2621,1334 @@ where
   b.shutdown().await.expect("mis-b shuts down");
 }
 
+/// Every mutating operation is REFUSED with `NotRunning` once the node has left
+/// the cluster — `leave()` stops the periodic schedulers, so a post-leave mutation
+/// would be issued by a node no longer participating. The read-only coordinate
+/// probe is the deliberate exception: post-leave introspection stays valid.
+///
+/// `respond` is included by capturing a live query token BEFORE the leave, which
+/// is the only way its post-leave arm can be reached at all.
+async fn post_leave_operations_report_not_running<R>()
+where
+  R: Runtime,
+{
+  let a = spawn_node::<R>("nr-a").await;
+  let b = spawn_node::<R>("nr-b").await;
+  let a_addr = a.advertise_address();
+
+  let mut b_events = b.events();
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // Capture a live query token on B, so the post-leave `respond` below has
+  // something real to answer.
+  a.query("probe", Bytes::from_static(b"q"), a.default_query_param())
+    .await
+    .expect("query issued");
+  let token = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match b_events.next().await {
+        Some(Event::Query(qe)) if qe.name() == "probe" => break Some(qe),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await
+  .expect("B surfaces the query within the timeout")
+  .expect("B's event stream stays open");
+
+  b.leave().await.expect("B leaves the cluster");
+
+  let not_running = |e: &serf_reactor::SerfError| matches!(e, serf_reactor::SerfError::NotRunning);
+
+  let err = b
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect_err("a left node cannot rejoin in place");
+  assert!(not_running(&err), "join after leave: got {err:?}");
+
+  for (what, res) in [
+    (
+      "user_event",
+      b.user_event("nope", Bytes::from_static(b"x"), false).await,
+    ),
+    (
+      "query",
+      b.query("nope", Bytes::from_static(b"x"), b.default_query_param())
+        .await
+        .map(|_| ()),
+    ),
+    ("respond", b.respond(token, Bytes::from_static(b"x")).await),
+    ("set_tags", b.set_tags(serf_proto::Tags::new()).await),
+    (
+      "force_leave",
+      b.force_leave(SmolStr::new("nr-a"), false).await,
+    ),
+  ] {
+    let err = res.expect_err("a left node refuses to mutate");
+    assert!(
+      not_running(&err),
+      "{what} after leave must report NotRunning, got {err:?}"
+    );
+  }
+
+  // The read-only coordinate probe still answers after the leave.
+  #[cfg(feature = "coordinates")]
+  b.cached_coordinate(SmolStr::new("nr-a"))
+    .await
+    .expect("a read-only coordinate probe stays answerable after leave");
+
+  a.shutdown().await.expect("nr-a shuts down");
+  b.shutdown().await.expect("nr-b shuts down");
+}
+
+/// The key-management operations refuse to run on a node that has left — the same
+/// `NotRunning` gate the membership mutations take, so a departed node can never
+/// originate a cluster-wide rotation.
+#[cfg(encryption)]
+async fn post_leave_key_operations_report_not_running<R>()
+where
+  R: Runtime,
+{
+  let node = spawn_encrypted_node::<R>(
+    "nrkey",
+    EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x61))),
+  )
+  .await;
+  node.leave().await.expect("the node leaves the cluster");
+
+  let k = test_secret_key(0x62);
+  for (what, res) in [
+    ("install_key", node.install_key(k).await.map(|_| ())),
+    ("use_key", node.use_key(k).await.map(|_| ())),
+    ("remove_key", node.remove_key(k).await.map(|_| ())),
+    ("list_keys", node.list_keys().await.map(|_| ())),
+  ] {
+    let err = res.expect_err("a left node refuses a key rotation");
+    assert!(
+      matches!(err, serf_reactor::SerfError::NotRunning),
+      "{what} after leave must report NotRunning, got {err:?}"
+    );
+  }
+
+  node.shutdown().await.expect("nrkey shuts down");
+}
+
+/// Leave is a SHARED in-flight operation: two concurrent `leave()` calls JOIN one
+/// leave — the machine's `leave()` is invoked once and its single `LeftCluster`
+/// resolves BOTH callers `Ok`. (Re-invoking it would be a terminal no-op emitting
+/// no second `LeftCluster`, so the second caller would hang to its timeout.) A
+/// THIRD leave issued after the chain completed is an accepted no-op, not an
+/// error.
+async fn concurrent_leaves_share_one_in_flight_leave<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("dl-b").await;
+  let a = spawn_node::<R>("dl-a").await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  let (first, second) = future::join(a.leave(), a.leave()).await;
+  first.expect("the initiating leave resolves Ok");
+  second.expect("the leave that JOINED the in-flight one resolves Ok too");
+
+  // The shared leave still drove the endpoint to Left (poll to absorb the
+  // snapshot-refresh race after the leave chain completes).
+  R::timeout(Duration::from_secs(5), async {
+    loop {
+      if a.state() == SerfState::Left {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the shared leave drives the endpoint to Left");
+
+  // A leave on an already-left node is a terminal no-op, replied to immediately.
+  a.leave()
+    .await
+    .expect("leaving an already-left node is an accepted no-op");
+
+  a.shutdown().await.expect("dl-a shuts down");
+  b.shutdown().await.expect("dl-b shuts down");
+}
+
+/// An `ignore_old` join records each seed's exchange as a one-shot replay-suppress
+/// target, and the driver clears the recording when the exchange terminates: the
+/// join still merges membership, and the joiner does NOT replay the seed's
+/// pre-join user event onto its fresh event stream. A plain (non-ignoring) join is
+/// the control — it DOES surface the buffered event — so the suppression is
+/// proven, not merely asserted as an absence.
+async fn ignore_old_join_suppresses_the_replay<R>()
+where
+  R: Runtime,
+{
+  let seed = spawn_node::<R>("io-seed").await;
+  let seed_addr = seed.advertise_address();
+
+  // The seed buffers a user event BEFORE anyone joins.
+  seed
+    .user_event("old-news", Bytes::from_static(b"stale"), false)
+    .await
+    .expect("the seed buffers a pre-join user event");
+
+  // The control: a plain join replays the buffered event to the joiner.
+  let plain = spawn_node::<R>("io-plain").await;
+  let mut plain_events = plain.events();
+  plain
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(seed_addr),
+      false,
+    )
+    .await
+    .expect("the plain join reaches the seed");
+  let replayed = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match plain_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "old-news" => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .expect("a plain join replays the seed's buffered user event");
+  assert!(
+    replayed,
+    "the control join must surface the buffered event, or the suppression below is vacuous"
+  );
+
+  // The subject: an `ignore_old` join merges membership but suppresses the replay.
+  let quiet = spawn_node::<R>("io-quiet").await;
+  let mut quiet_events = quiet.events();
+  let reached = quiet
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(seed_addr),
+      true,
+    )
+    .await
+    .expect("the ignore_old join reaches the seed");
+  assert_eq!(reached, seed_addr, "the ignore_old join still merges");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if quiet.num_members() >= 2 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the ignore_old join still converges the membership");
+
+  // No replay reaches the ignoring joiner across a window the control proved is
+  // ample.
+  let saw = R::timeout(Duration::from_secs(2), async {
+    loop {
+      match quiet_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "old-news" => break true,
+        Some(_) => {}
+        None => break false,
+      }
+    }
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !saw,
+    "an ignore_old join must not replay the seed's pre-join user events"
+  );
+
+  quiet.shutdown().await.expect("io-quiet shuts down");
+  plain.shutdown().await.expect("io-plain shuts down");
+  seed.shutdown().await.expect("io-seed shuts down");
+}
+
+/// A datagram the gossip plane cannot parse is DROPPED and the node keeps serving:
+/// the ingress decode failure must not poison the pump. Garbage is injected from a
+/// raw UDP socket (no serf peer involved), then the node is proven still live by a
+/// fresh peer joining and converging afterwards.
+async fn malformed_gossip_datagram_is_ignored<R>()
+where
+  R: Runtime,
+{
+  let a = spawn_node::<R>("junk-a").await;
+  let a_addr = a.advertise_address();
+
+  // Raw garbage straight at the gossip socket: not a label frame, not a message.
+  let raw = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a raw sender");
+  for payload in [
+    &b"\xff\xff\xff\xff\xff\xff\xff\xff"[..],
+    &b""[..],
+    &[0x7fu8; 400][..],
+  ] {
+    raw
+      .send_to(payload, a_addr)
+      .expect("the garbage datagram is sent");
+  }
+
+  // The node survived the junk: a fresh peer still joins and converges.
+  let b = spawn_node::<R>("junk-b").await;
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the node still serves joins after the malformed datagrams");
+  converge(&a, &b).await;
+
+  a.shutdown().await.expect("junk-a shuts down");
+  b.shutdown().await.expect("junk-b shuts down");
+}
+
+/// An encrypted node DROPS a datagram it cannot authenticate — the AEAD open
+/// fails, the pump moves on, and the node keeps serving. The garbage is
+/// indistinguishable from a forged datagram, so this is the gossip plane's
+/// unauthenticated-input gate.
+#[cfg(encryption)]
+async fn unauthenticatable_gossip_datagram_is_ignored<R>()
+where
+  R: Runtime,
+{
+  let key = EncryptionOptions::new().with_keyring(Keyring::new(test_secret_key(0x51)));
+  let a = spawn_encrypted_node::<R>("forge-a", key.clone()).await;
+  let a_addr = a.advertise_address();
+
+  let raw = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a raw sender");
+  for payload in [&[0x00u8; 64][..], &[0xabu8; 300][..]] {
+    raw
+      .send_to(payload, a_addr)
+      .expect("the forged datagram is sent");
+  }
+
+  // The node survived the forgeries: a keyring-sharing peer still joins.
+  let b = spawn_encrypted_node::<R>("forge-b", key).await;
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the node still serves joins after the unauthenticatable datagrams");
+  converge(&a, &b).await;
+
+  a.shutdown().await.expect("forge-a shuts down");
+  b.shutdown().await.expect("forge-b shuts down");
+}
+
+/// A node that has LEFT admits no further inbound reliable exchange: the accept
+/// still happens (the listener is bound until shutdown), but the machine refuses
+/// the connection and the driver drops the stream rather than bridging an exchange
+/// it will never feed — so the raw peer sees an immediate EOF.
+async fn left_node_refuses_new_inbound_exchanges<R>()
+where
+  R: Runtime,
+{
+  use std::io::Read;
+
+  let a = spawn_node::<R>("closed-a").await;
+  let a_addr = a.advertise_address();
+  a.leave().await.expect("A leaves the cluster");
+
+  // A raw reliable dial after the leave: the connection is accepted and then
+  // dropped, so the read reaches EOF without a byte of protocol.
+  let eof = R::spawn_blocking(move || {
+    let mut sock = std::net::TcpStream::connect(a_addr).expect("the listener is still bound");
+    sock
+      .set_read_timeout(Some(Duration::from_secs(10)))
+      .expect("set read timeout");
+    // A push/pull request the machine would answer if it were still running.
+    let mut buf = [0u8; 64];
+    sock.read(&mut buf)
+  })
+  .await
+  .expect("the blocking dial completes");
+
+  match eof {
+    Ok(0) => {}
+    other => panic!("a left node must drop the accepted stream (EOF), got {other:?}"),
+  }
+
+  a.shutdown().await.expect("closed-a shuts down");
+}
+
+/// A peer that RESETS mid-exchange must FAIL the join, not complete it: a reset is
+/// a transport error, and a one-way frame maps a clean EOF to a SUCCESSFUL
+/// completion — so routing the reset down the benign-EOF path would report the
+/// reliable exchange as having succeeded against a peer that never answered.
+///
+/// The evil peer accepts the connection and drops it WITHOUT reading the joiner's
+/// already-sent request, so the unread bytes in its receive queue make the close a
+/// RST rather than a FIN.
+async fn peer_reset_mid_exchange_fails_the_join<R>()
+where
+  R: Runtime,
+{
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the evil peer");
+  let peer_addr = listener.local_addr().expect("the evil peer's address");
+
+  let evil = std::thread::spawn(move || {
+    if let Ok((stream, _)) = listener.accept() {
+      // Let the joiner's push/pull request land in the receive queue unread — the
+      // close then resets the connection instead of half-closing it.
+      std::thread::sleep(Duration::from_millis(250));
+      drop(stream);
+    }
+  });
+
+  let a = spawn_node::<R>("rst-a").await;
+  let outcome = a
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(peer_addr),
+      false,
+    )
+    .await;
+  assert!(
+    outcome.is_err(),
+    "a peer that never answers must fail the join, never complete it (got {outcome:?})"
+  );
+  assert_eq!(a.num_members(), 1, "nothing was merged from the evil peer");
+
+  // The driver survived the reset: a real peer still joins.
+  let b = spawn_node::<R>("rst-b").await;
+  let a_addr = a.advertise_address();
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the node still serves joins after the reset exchange");
+  converge(&a, &b).await;
+
+  a.shutdown().await.expect("rst-a shuts down");
+  b.shutdown().await.expect("rst-b shuts down");
+  evil.join().expect("the evil peer thread exits");
+}
+
+/// A subscriber that stops draining its `EventStream` must NOT stall the driver:
+/// the fan-out sheds the events it cannot deliver and COUNTS them, and the node
+/// keeps serving. The shed count is the observable — a driver that instead blocked
+/// on the full queue would never reach it.
+async fn slow_subscriber_sheds_events_and_counts_them<R>()
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let node = Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("shed-a"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    // A one-slot event queue: the second undelivered event already overflows.
+    RuntimeOptions::new().with_event_queue_cap(1),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn shed-a");
+
+  // Subscribe and NEVER poll the stream: the fan-out queue fills at once.
+  let _stalled = node.events();
+
+  for i in 0..64u32 {
+    node
+      .user_event("flood", Bytes::from(i.to_be_bytes().to_vec()), false)
+      .await
+      .expect("the driver keeps accepting commands while the subscriber stalls");
+  }
+
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if node.events_dropped() > 0 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the fan-out sheds events a stalled subscriber cannot take, and counts them");
+
+  // The node is still live and answering.
+  assert_eq!(node.num_members(), 1);
+  node.shutdown().await.expect("shed-a shuts down");
+}
+
+/// A delegate hook that PARKS must not wedge the driver: the observation channel
+/// backs up, the pump retains what application data it can (a bounded overflow),
+/// and once THAT is full it sheds the excess and COUNTS the loss — while the node
+/// keeps accepting commands throughout. The shed count is the observable; a pump
+/// that blocked on the delegate would never reach it.
+async fn stalling_delegate_sheds_observations_and_counts_them<R>()
+where
+  R: Runtime,
+{
+  /// Enough payload events to fill the two-slot channel, then the pump's bounded
+  /// retry overflow (1024 entries), and still leave a surplus that must be shed.
+  const FLOOD: u32 = 1200;
+
+  /// A delegate whose user-event hook parks until `release` is dropped. It does
+  /// NOT override the test-only message-dropper hook, so the composite's default
+  /// (drop nothing) applies.
+  struct StallingDelegate {
+    gate: flume::Receiver<()>,
+  }
+
+  impl serf_reactor::MemberDelegate for StallingDelegate {
+    type Id = SmolStr;
+    type Address = SocketAddr;
+  }
+  impl serf_reactor::QueryDelegate for StallingDelegate {
+    type Id = SmolStr;
+    type Address = SocketAddr;
+  }
+  impl serf_reactor::UserEventDelegate for StallingDelegate {
+    fn notify_user_event(
+      &self,
+      _event: &serf_proto::typed::UserEventMessage,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+      let gate = self.gate.clone();
+      async move {
+        // Ignoring Err: a disconnected gate means the test released the hook.
+        let _ = gate.recv_async().await;
+      }
+    }
+  }
+  impl serf_reactor::Delegate for StallingDelegate {
+    type Id = SmolStr;
+    type Address = SocketAddr;
+  }
+
+  // Hold the sender: while it lives, every `notify_user_event` parks.
+  let (release, gate) = flume::bounded::<()>(0);
+
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let node = Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("stall-a"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    StallingDelegate { gate },
+    // A two-slot observation channel: the parked hook fills it immediately, so the
+    // pump must shed rather than block.
+    RuntimeOptions::new().with_observation_channel(serf_reactor::Channel::Bounded(2)),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn stall-a");
+
+  // Flood payload events past the pump's bounded retry overflow while the hook parks.
+  let payload = Bytes::from(vec![0x5au8; 32]);
+  for _ in 0..FLOOD {
+    node
+      .user_event("flood", payload.clone(), false)
+      .await
+      .expect("the pump keeps accepting commands while the delegate parks");
+  }
+
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if node.observation_dropped() > 0 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the pump sheds observations a parked delegate cannot take, and counts them");
+
+  // The node is still live and answering commands.
+  assert_eq!(node.num_members(), 1);
+
+  // Release the hook so the observation task can drain, then shut down.
+  drop(release);
+  node.shutdown().await.expect("stall-a shuts down");
+}
+
+/// An UNBOUNDED observation channel never sheds: with no cap there is no byte
+/// backstop and no overflow, so a node that surfaces many payload events reports a
+/// zero observation-drop count while still delivering them.
+async fn unbounded_observation_channel_never_sheds<R>()
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let node = Serf::<SmolStr, SocketAddr, R>::tcp(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new("unb-a"))
+      .with_advertise_addr(MaybeResolved::Resolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new().with_observation_channel(serf_reactor::Channel::Unbounded),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn unb-a");
+
+  let mut events = node.events();
+  let payload = Bytes::from(vec![0x11u8; 480]);
+  for _ in 0..128u32 {
+    node
+      .user_event("flood", payload.clone(), false)
+      .await
+      .expect("user event dispatched");
+  }
+
+  // Every event still arrives, and nothing was shed at the observation channel.
+  let mut seen = 0usize;
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      match events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "flood" => {
+          seen += 1;
+          if seen == 128 {
+            break;
+          }
+        }
+        Some(_) => {}
+        None => break,
+      }
+    }
+  })
+  .await
+  .expect("an unbounded observation channel delivers every event");
+  assert_eq!(seen, 128, "every flooded event reached the subscriber");
+  assert_eq!(
+    node.observation_dropped(),
+    0,
+    "an unbounded observation channel has no backstop to shed against"
+  );
+
+  node.shutdown().await.expect("unb-a shuts down");
+}
+
+/// A shutdown racing an IN-FLIGHT await-result join resolves that join
+/// `Err(Shutdown)` — never leaves it parked forever. The seed accepts the TCP
+/// connection but never answers, so the exchange is still pending inside the
+/// driver when the teardown reaps the waiter.
+async fn shutdown_racing_an_inflight_join_resolves_it<R>()
+where
+  R: Runtime,
+{
+  // A seed that accepts and then goes silent: the join's push/pull never completes.
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the silent seed");
+  let seed_addr = listener.local_addr().expect("the silent seed's address");
+  let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+  let silent = std::thread::spawn(move || {
+    let held = listener.accept();
+    // Hold the accepted connection open (no reply) until the test releases us.
+    // Ignoring Err: a disconnected sender means the test finished.
+    let _ = stop_rx.recv();
+    drop(held);
+  });
+
+  let node = spawn_node::<R>("race-join").await;
+
+  // The join parks on the silent seed; the shutdown races it.
+  let (join, shutdown) = future::join(
+    node.join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved(seed_addr),
+      false,
+    ),
+    async {
+      // Let the dial connect and the request go out before the teardown begins, so
+      // the waiter is genuinely in flight rather than never dispatched.
+      R::sleep(Duration::from_millis(200)).await;
+      node.shutdown().await
+    },
+  )
+  .await;
+
+  shutdown.expect("the node shuts down");
+  let err = join.expect_err("a join racing a shutdown cannot succeed against a silent seed");
+  assert!(
+    matches!(
+      err,
+      serf_reactor::SerfError::Shutdown | serf_reactor::SerfError::JoinAllFailed(_)
+    ),
+    "the in-flight join must be resolved by the teardown, not stranded (got {err:?})"
+  );
+
+  // Ignoring Err: the silent-seed thread may already have exited.
+  let _ = stop_tx.send(());
+  silent.join().expect("the silent seed thread exits");
+}
+
+/// A second `shutdown()` — issued once the driver has already exited and closed
+/// its command queue — still resolves `Ok`, and only AFTER the bind address is
+/// actually free: the late caller parks on the teardown-completion latch instead
+/// of returning into a still-bound port. The freed port is proven rebindable
+/// immediately after.
+async fn second_shutdown_awaits_teardown_completion<R>()
+where
+  R: Runtime,
+{
+  let node = spawn_node::<R>("twice-a").await;
+  let addr = node.advertise_address();
+
+  node.shutdown().await.expect("the first shutdown resolves");
+  node
+    .shutdown()
+    .await
+    .expect("a second shutdown after teardown still resolves Ok");
+
+  // Every command path fails fast once the queue is closed, rather than hanging.
+  let err = node
+    .user_event("post", Bytes::from_static(b"x"), false)
+    .await
+    .expect_err("a shut-down node accepts no commands");
+  assert!(
+    matches!(err, serf_reactor::SerfError::Shutdown),
+    "a post-shutdown command reports Shutdown, got {err:?}"
+  );
+
+  // The latch fired only once the bind address was free: rebinding it succeeds.
+  let reborn = spawn_node_with_snapshot::<R>(
+    "twice-b",
+    addr,
+    serf_reactor::SnapshotOptions::new(snapshot_path::<R>("twice")),
+    false,
+  )
+  .await
+  .expect("the freed address rebinds after the awaited teardown");
+  assert_eq!(reborn.advertise_address(), addr);
+  reborn.shutdown().await.expect("twice-b shuts down");
+}
+
+/// A key-management request on a node with NO keyring is REFUSED, not silently
+/// applied: the responder answers `result = false` with an explanatory message and
+/// leaves the wire untouched, so the originator's collected response carries the
+/// error rather than a false success.
+#[cfg(encryption)]
+async fn key_op_without_a_keyring_is_refused<R>()
+where
+  R: Runtime,
+{
+  // Two PLAINTEXT nodes — neither carries a keyring.
+  let b = spawn_node::<R>("nokey-b").await;
+  let a = spawn_node::<R>("nokey-a").await;
+  let b_addr = b.advertise_address();
+
+  let mut a_events = a.events();
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  a.install_key(test_secret_key(0x77))
+    .await
+    .expect("the request itself dispatches");
+
+  let kr = R::timeout(Duration::from_secs(20), async {
+    loop {
+      match a_events.next().await {
+        Some(Event::KeyResponse(kr)) => break kr,
+        Some(_) => {}
+        None => panic!("the event stream ended before the key response"),
+      }
+    }
+  })
+  .await
+  .expect("A collects the key response within the query window");
+
+  assert!(
+    kr.num_err > 0,
+    "a node with no keyring must REFUSE the key op, not report success (num_err={}, num_resp={})",
+    kr.num_err,
+    kr.num_resp
+  );
+  assert!(
+    !kr.messages.is_empty(),
+    "the refusal carries an explanatory message"
+  );
+  assert!(
+    !a.encryption_enabled() && !b.encryption_enabled(),
+    "the refused op left both nodes plaintext"
+  );
+
+  a.shutdown().await.expect("nokey-a shuts down");
+  b.shutdown().await.expect("nokey-b shuts down");
+}
+
+/// Past its threshold the snapshot file is COMPACTED to the live state rather than
+/// growing without bound: after a churn of membership events the file stays small
+/// and still replays the live cluster — a restarted node recovers its peer from the
+/// compacted file.
+async fn snapshot_compaction_rewrites_the_live_state<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path::<R>("compact");
+  let a = spawn_node::<R>("cmp-a").await;
+  let a_addr = a.advertise_address();
+
+  // A tiny threshold: any membership churn crosses it and forces a rewrite.
+  let b = spawn_node_with_snapshot::<R>(
+    "cmp-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path).with_compact_threshold(1),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
+
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // Churn: repeated tag updates append member records the compaction must fold.
+  for i in 0..8u32 {
+    let mut tags = serf_proto::Tags::new();
+    tags
+      .0
+      .insert(SmolStr::new("gen"), SmolStr::new(i.to_string()));
+    a.set_tags(tags).await.expect("A re-tags itself");
+    R::sleep(Duration::from_millis(50)).await;
+  }
+  R::sleep(Duration::from_millis(300)).await;
+
+  // The compacted file holds the LIVE alive-set, not the whole append history: a
+  // fold of two members plus their clock floors stays far below the churn's
+  // un-compacted footprint.
+  let len = std::fs::metadata(&path).expect("the snapshot exists").len();
+  assert!(
+    len < 4096,
+    "the compaction must rewrite the file to the live state, but it grew to {len} bytes"
+  );
+
+  b.shutdown().await.expect("cmp-b shuts down");
+
+  // The compacted file still replays: a restarted node recovers its peer from it.
+  let b2 = spawn_node_with_snapshot::<R>(
+    "cmp-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path).with_compact_threshold(1),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
+  converge(&a, &b2).await;
+  assert_eq!(
+    b2.num_members(),
+    2,
+    "the compacted snapshot still recovers the live membership"
+  );
+
+  a.shutdown().await.expect("cmp-a shuts down");
+  b2.shutdown().await.expect("cmp-b2 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// Build a plain-TCP node from `opts` through the ergonomic constructor.
+async fn build_tcp<R>(opts: TcpTransportOptions<SmolStr, SocketAddr>) -> Result<Node<R>, SerfError>
+where
+  R: Runtime,
+{
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+}
+
+/// The TCP transport's construction gate: each field `TcpTransport::new` requires
+/// is refused when absent, so a half-built options block can never bind a socket.
+async fn construction_requires_id_and_advertise_addr<R>()
+where
+  R: Runtime,
+{
+  let err = build_tcp::<R>(
+    TcpTransportOptions::new().with_advertise_addr(MaybeResolved::Resolved(ephemeral_bind())),
+  )
+  .await
+  .err()
+  .expect("a node with no id cannot be built");
+  assert!(
+    matches!(err, SerfError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+    "a missing local_id is an InvalidInput, got {err:?}"
+  );
+
+  let err = build_tcp::<R>(TcpTransportOptions::new().with_local_id(SmolStr::new("no-addr")))
+    .await
+    .err()
+    .expect("a node with no advertise address cannot be built");
+  assert!(
+    matches!(err, SerfError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+    "a missing advertise_addr is an InvalidInput, got {err:?}"
+  );
+}
+
+/// A wildcard advertise address is refused AFTER the bind: the readback keeps the
+/// unspecified IP, which peers could not route back to, so construction fails and
+/// BOTH bound sockets are released rather than the node joining as an undialable
+/// member. The released port is proven free by an immediate successful rebind of
+/// the very port the failed attempt had claimed.
+async fn wildcard_advertise_is_refused_and_releases_the_bind<R>()
+where
+  R: Runtime,
+{
+  // Claim a concrete port through a successful node, then free it, so the wildcard
+  // attempt below binds a KNOWN port we can prove was released.
+  let probe = spawn_node::<R>("wild-probe").await;
+  let port = probe.advertise_address().port();
+  probe.shutdown().await.expect("probe shuts down");
+
+  let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().expect("wildcard addr");
+  let err = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("wild"))
+      .with_advertise_addr(MaybeResolved::Resolved(wildcard)),
+  )
+  .await
+  .err()
+  .expect("a wildcard advertise address is not a routable contact");
+  assert!(
+    matches!(err, SerfError::InvalidAdvertiseAddr(_)),
+    "a wildcard bind must be refused as an invalid advertise address, got {err:?}"
+  );
+
+  // The refused construction released BOTH bound sockets: the same port rebinds.
+  let after = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("wild-after"))
+      .with_advertise_addr(MaybeResolved::Resolved(
+        format!("127.0.0.1:{port}").parse().expect("loopback addr"),
+      )),
+  )
+  .await
+  .expect("the refused construction released the ports it had bound");
+  assert_eq!(after.advertise_address().port(), port);
+  after.shutdown().await.expect("wild-after shuts down");
+}
+
+/// An UNRESOLVED advertise address is resolved at construction through the
+/// caller's resolvers, and the node comes up on the resolved contact.
+async fn unresolved_advertise_addr_is_resolved_at_construction<R>()
+where
+  R: Runtime,
+{
+  let node = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("resolve-me"))
+      .with_advertise_addr(MaybeResolved::Unresolved(ephemeral_bind())),
+  )
+  .await
+  .expect("the unresolved advertise address resolves through the supplied resolver");
+
+  let bound = node.advertise_address();
+  assert!(bound.ip().is_loopback(), "the resolved contact is loopback");
+  assert_ne!(
+    bound.port(),
+    0,
+    "the ephemeral bind resolved to a concrete port"
+  );
+  node.shutdown().await.expect("resolve-me shuts down");
+}
+
+/// A resolver that FAILS, and one that resolves to NO candidate, both fail
+/// construction rather than booting an addressless node: an advertise outage must
+/// be loud, never a node that gossips a contact nobody can dial.
+async fn advertise_resolution_failure_fails_construction<R>()
+where
+  R: Runtime,
+{
+  /// Resolves nothing — a bootstrap outage the advertise picker must refuse.
+  struct EmptyResolver;
+  impl serf_reactor::Resolver for EmptyResolver {
+    type Address = SocketAddr;
+    type Error = std::io::Error;
+    fn resolve(
+      &self,
+      _addr: &SocketAddr,
+    ) -> impl core::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + '_ {
+      // The candidate set is empty whatever the input, so the future borrows nothing.
+      let out = Vec::new();
+      async move { Ok(out) }
+    }
+  }
+
+  /// Fails outright — the DNS-down shape.
+  struct FailingResolver;
+  impl serf_reactor::Resolver for FailingResolver {
+    type Address = SocketAddr;
+    type Error = std::io::Error;
+    fn resolve(
+      &self,
+      _addr: &SocketAddr,
+    ) -> impl core::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + '_ {
+      // The failure is unconditional, so the future borrows nothing.
+      let err = std::io::Error::other("resolver is down");
+      async move { Err(err) }
+    }
+  }
+
+  async fn build_with<R, RES>(resolver: &RES) -> Result<Node<R>, SerfError>
+  where
+    R: Runtime,
+    RES: serf_reactor::Resolver<Address = SocketAddr>,
+  {
+    Serf::<SmolStr, SocketAddr, R>::tcp(
+      TcpTransportOptions::new()
+        .with_local_id(SmolStr::new("unresolvable"))
+        .with_advertise_addr(MaybeResolved::Unresolved(ephemeral_bind())),
+      resolver,
+      &FirstAddrResolver,
+      VoidDelegate::<SmolStr, SocketAddr>::new(),
+      RuntimeOptions::new(),
+      SerfOptions::new(),
+      None,
+      None,
+      None,
+      #[cfg(encryption)]
+      std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+    )
+    .await
+  }
+
+  let err = build_with::<R, _>(&EmptyResolver)
+    .await
+    .err()
+    .expect("an advertise address that resolves to nothing cannot boot a node");
+  assert!(
+    matches!(err, SerfError::Resolve(_)),
+    "an empty candidate set is a resolution failure, got {err:?}"
+  );
+
+  let err = build_with::<R, _>(&FailingResolver)
+    .await
+    .err()
+    .expect("a failing resolver cannot boot a node");
+  assert!(
+    matches!(err, SerfError::Resolve(_)),
+    "a resolver error is a resolution failure, got {err:?}"
+  );
+}
+
+/// A node needs BOTH planes: the reliable TCP listener and the gossip UDP socket
+/// on the same port. When the gossip port is already taken, construction FAILS
+/// rather than coming up with a reliable plane and no gossip — a node that could
+/// merge membership but never probe, gossip, or be detected as failed.
+async fn taken_gossip_port_fails_construction<R>()
+where
+  R: Runtime,
+{
+  // Take a concrete UDP port, leaving the same TCP port free.
+  let squatter = std::net::UdpSocket::bind("127.0.0.1:0").expect("squat a UDP port");
+  let taken = squatter.local_addr().expect("the squatted address");
+
+  let err = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("squatted"))
+      .with_advertise_addr(MaybeResolved::Resolved(taken)),
+  )
+  .await
+  .err()
+  .expect("a node cannot come up without its gossip plane");
+  assert!(
+    matches!(err, SerfError::Io(_)),
+    "a taken gossip port is an I/O failure, got {err:?}"
+  );
+
+  // Freeing the port makes the very same construction succeed — the failure was
+  // the squatter, not the address.
+  drop(squatter);
+  let node = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("unsquatted"))
+      .with_advertise_addr(MaybeResolved::Resolved(taken)),
+  )
+  .await
+  .expect("the released gossip port lets the node bind");
+  assert_eq!(node.advertise_address(), taken);
+  node.shutdown().await.expect("unsquatted shuts down");
+}
+
+/// The handle's operator readouts are all live and consistent on a healthy joined
+/// node: nothing has been shed at any of the four drop counters, the awareness
+/// score is healthy, and the QUIC datagram counter stays at zero on a stream
+/// transport (it counts only datagram-plane gossip, which plain TCP never sends).
+async fn handle_readouts_are_quiet_on_a_healthy_node<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("obs-b").await;
+  let a = spawn_node::<R>("obs-a").await;
+  let b_addr = b.advertise_address();
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  // A subscriber that keeps up, a delegate that never parks, and no coalescing
+  // pressure: every shed counter must be zero.
+  assert_eq!(a.events_dropped(), 0, "no subscriber was starved");
+  assert_eq!(a.observation_dropped(), 0, "no delegate stalled the pump");
+  assert_eq!(
+    a.coalesced_user_events_dropped(),
+    0,
+    "no user event was shed by the coalescer"
+  );
+  assert_eq!(
+    a.coalesced_member_events_dropped(),
+    0,
+    "no member change was shed by the coalescer"
+  );
+  assert_eq!(
+    a.datagrams_sent(),
+    0,
+    "a stream transport never rides the QUIC datagram plane"
+  );
+  assert_eq!(a.health_score(), 0, "a healthy node scores 0");
+  assert_eq!(
+    a.health_score(),
+    a.stats().health_score(),
+    "the standalone readout and the aggregate agree"
+  );
+
+  a.shutdown().await.expect("obs-a shuts down");
+  b.shutdown().await.expect("obs-b shuts down");
+}
+
+/// The seed-resolution failure paths are LOUD on every join entry point: a
+/// resolver that fails surfaces the error from `join_many` and `dispatch_join`
+/// rather than reporting a healthy zero-contact join, and a join issued after
+/// shutdown reports `Shutdown` rather than parking on a reply that can never come.
+async fn join_entry_points_surface_their_failures<R>()
+where
+  R: Runtime,
+{
+  /// Fails outright — the DNS-down shape.
+  struct FailingResolver;
+  impl serf_reactor::Resolver for FailingResolver {
+    type Address = SocketAddr;
+    type Error = std::io::Error;
+    fn resolve(
+      &self,
+      _addr: &SocketAddr,
+    ) -> impl core::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + '_ {
+      // The failure is unconditional, so the future borrows nothing.
+      let err = std::io::Error::other("resolver is down");
+      async move { Err(err) }
+    }
+  }
+
+  let node = spawn_node::<R>("seed-fail").await;
+  // An UNRESOLVED seed is the one the resolver is actually consulted for (an
+  // already-resolved seed passes straight through).
+  let unresolved = || {
+    MaybeResolved::Unresolved(
+      "127.0.0.1:7219"
+        .parse::<SocketAddr>()
+        .expect("loopback addr"),
+    )
+  };
+
+  // `join_many` propagates the resolver failure with an empty reached set.
+  let (reached, err) = node
+    .join_many(&FailingResolver, [unresolved()].into_iter(), false)
+    .await
+    .expect_err("an unresolvable seed set cannot report a healthy join");
+  assert!(reached.is_empty(), "no seed was reached");
+  assert!(
+    matches!(err, SerfError::Resolve(_)),
+    "the resolver failure reaches the caller, got {err:?}"
+  );
+
+  // `dispatch_join` propagates it too — a fire-and-forget join must not swallow it.
+  let err = node
+    .dispatch_join(&FailingResolver, &[unresolved()])
+    .await
+    .expect_err("a fire-and-forget join still surfaces the resolver failure");
+  assert!(
+    matches!(err, SerfError::Resolve(_)),
+    "the resolver failure reaches the caller, got {err:?}"
+  );
+
+  // A dispatch_join on a LEFT node is refused, not silently dispatched.
+  node.leave().await.expect("the node leaves the cluster");
+  let err = node
+    .dispatch_join(
+      &SocketAddrResolver,
+      &[MaybeResolved::Resolved(
+        "127.0.0.1:7219".parse().expect("loopback addr"),
+      )],
+    )
+    .await
+    .expect_err("a left node cannot dispatch a join");
+  assert!(
+    matches!(err, SerfError::NotRunning),
+    "a post-leave dispatch_join reports NotRunning, got {err:?}"
+  );
+
+  // After shutdown the command never even reaches a driver: the send fails fast.
+  node.shutdown().await.expect("seed-fail shuts down");
+  let err = node
+    .join(
+      &SocketAddrResolver,
+      MaybeResolved::Resolved("127.0.0.1:7219".parse().expect("loopback addr")),
+      false,
+    )
+    .await
+    .expect_err("a shut-down node cannot join");
+  assert!(
+    matches!(err, SerfError::Shutdown),
+    "a post-shutdown join reports Shutdown, got {err:?}"
+  );
+}
+
+/// A burst of concurrent operations racing a shutdown must all RESOLVE — with a
+/// success, a `NotRunning`, or a `Shutdown` — and never strand a caller on a reply
+/// that can never come. Whichever commands the teardown finds still queued are
+/// failed by it rather than dropped, and the node still frees its bind address.
+async fn concurrent_commands_racing_shutdown_all_resolve<R>()
+where
+  R: Runtime,
+{
+  let node = spawn_node::<R>("storm-a").await;
+  let addr = node.advertise_address();
+
+  // 64 command-issuing tasks against one shutdown: whichever land in the queue as
+  // the teardown closes it must be failed by the teardown, not stranded.
+  let mut tasks = Vec::new();
+  for i in 0..64u32 {
+    let node = node.clone();
+    tasks.push(R::spawn(async move {
+      let mut outcomes = Vec::new();
+      for _ in 0..8 {
+        outcomes.push(
+          node
+            .user_event("storm", Bytes::from(i.to_be_bytes().to_vec()), false)
+            .await,
+        );
+        outcomes.push(node.set_tags(serf_proto::Tags::new()).await);
+      }
+      outcomes
+    }));
+  }
+
+  let shutdown = node.shutdown().await;
+  shutdown.expect("the node shuts down under the command storm");
+
+  for t in tasks {
+    for outcome in t.await.expect("no command task panics or is stranded") {
+      if let Err(e) = outcome {
+        assert!(
+          matches!(
+            e,
+            SerfError::Shutdown | SerfError::NotRunning | SerfError::CommandSend
+          ),
+          "a command racing the shutdown must resolve with a terminal reason, got {e:?}"
+        );
+      }
+    }
+  }
+
+  // The teardown still completed: the bind address is free.
+  let reborn = build_tcp::<R>(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("storm-b"))
+      .with_advertise_addr(MaybeResolved::Resolved(addr)),
+  )
+  .await
+  .expect("the storm did not wedge the teardown; the address is free");
+  reborn.shutdown().await.expect("storm-b shuts down");
+}
+
+/// Every SWIM override the transport options carry is threaded into the
+/// coordinator the driver builds. Two nodes configured with the FULL override set
+/// — including the reclaim window and the suspicion ceiling that no other scenario
+/// sets — still join, converge, and detect an abrupt kill, so no override is
+/// dropped or mis-wired on the way through `Transport::run`.
+async fn full_swim_override_set_is_threaded_into_the_coordinator<R>()
+where
+  R: Runtime,
+{
+  async fn spawn_tuned<R>(id: &str) -> Node<R>
+  where
+    R: Runtime,
+  {
+    build_tcp::<R>(
+      TcpTransportOptions::new()
+        .with_local_id(SmolStr::new(id))
+        .with_advertise_addr(MaybeResolved::Resolved(ephemeral_bind()))
+        .with_probe_interval(Duration::from_millis(100))
+        .with_probe_timeout(Duration::from_millis(50))
+        .with_gossip_interval(Duration::from_millis(20))
+        .with_suspicion_mult(3)
+        .with_suspicion_max_timeout_mult(4)
+        .with_dead_node_reclaim_time(Duration::from_millis(1))
+        .with_push_pull_interval(Duration::from_millis(500))
+        .with_stream(
+          serf_reactor::StreamTransportOptions::new()
+            .with_dial_timeout(Duration::from_secs(5))
+            .with_close_timeout(Duration::from_secs(5)),
+        ),
+    )
+    .await
+    .expect("spawn a fully-tuned serf tcp node")
+  }
+
+  let b = spawn_tuned::<R>("tuned-b").await;
+  let a = spawn_tuned::<R>("tuned-a").await;
+  let b_addr = b.advertise_address();
+  let b_id = SmolStr::new("tuned-b");
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("the fully-tuned nodes still join");
+  converge(&a, &b).await;
+
+  // The tuned failure detection still fires: an abrupt kill is detected Failed.
+  b.shutdown().await.expect("tuned-b shuts down abruptly");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let failed = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &b_id && m.status() != MemberStatus::Alive);
+      if failed {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("the tuned SWIM overrides still detect the killed peer");
+
+  a.shutdown().await.expect("tuned-a shuts down");
+}
+
 // The tokio cells: the runtime-generic scenarios driven on tokio's multi-thread
 // runtime. Gated on the `tokio` feature so the `--test tcp -- smol` build (which
 // enables only `smol`) can drop the `agnostic/tokio` code path.
@@ -2590,6 +3959,129 @@ mod tokio_cells {
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges() {
     super::two_node_join_converges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn construction_requires_id_and_advertise_addr() {
+    super::construction_requires_id_and_advertise_addr::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn wildcard_advertise_is_refused_and_releases_the_bind() {
+    super::wildcard_advertise_is_refused_and_releases_the_bind::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn unresolved_advertise_addr_is_resolved_at_construction() {
+    super::unresolved_advertise_addr_is_resolved_at_construction::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn advertise_resolution_failure_fails_construction() {
+    super::advertise_resolution_failure_fails_construction::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn taken_gossip_port_fails_construction() {
+    super::taken_gossip_port_fails_construction::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn full_swim_override_set_is_threaded_into_the_coordinator() {
+    super::full_swim_override_set_is_threaded_into_the_coordinator::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn handle_readouts_are_quiet_on_a_healthy_node() {
+    super::handle_readouts_are_quiet_on_a_healthy_node::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn join_entry_points_surface_their_failures() {
+    super::join_entry_points_surface_their_failures::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn concurrent_commands_racing_shutdown_all_resolve() {
+    super::concurrent_commands_racing_shutdown_all_resolve::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn post_leave_operations_report_not_running() {
+    super::post_leave_operations_report_not_running::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn post_leave_key_operations_report_not_running() {
+    super::post_leave_key_operations_report_not_running::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn concurrent_leaves_share_one_in_flight_leave() {
+    super::concurrent_leaves_share_one_in_flight_leave::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn ignore_old_join_suppresses_the_replay() {
+    super::ignore_old_join_suppresses_the_replay::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn malformed_gossip_datagram_is_ignored() {
+    super::malformed_gossip_datagram_is_ignored::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn unauthenticatable_gossip_datagram_is_ignored() {
+    super::unauthenticatable_gossip_datagram_is_ignored::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn left_node_refuses_new_inbound_exchanges() {
+    super::left_node_refuses_new_inbound_exchanges::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn peer_reset_mid_exchange_fails_the_join() {
+    super::peer_reset_mid_exchange_fails_the_join::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn slow_subscriber_sheds_events_and_counts_them() {
+    super::slow_subscriber_sheds_events_and_counts_them::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn stalling_delegate_sheds_observations_and_counts_them() {
+    super::stalling_delegate_sheds_observations_and_counts_them::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn unbounded_observation_channel_never_sheds() {
+    super::unbounded_observation_channel_never_sheds::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn shutdown_racing_an_inflight_join_resolves_it() {
+    super::shutdown_racing_an_inflight_join_resolves_it::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn second_shutdown_awaits_teardown_completion() {
+    super::second_shutdown_awaits_teardown_completion::<TokioRuntime>().await;
+  }
+
+  #[cfg(encryption)]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn key_op_without_a_keyring_is_refused() {
+    super::key_op_without_a_keyring_is_refused::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn snapshot_compaction_rewrites_the_live_state() {
+    super::snapshot_compaction_rewrites_the_live_state::<TokioRuntime>().await;
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2981,5 +4473,160 @@ mod smol_cells {
     SmolRuntime::block_on(
       super::mismatched_keyring_nodes_do_not_exchange_membership::<SmolRuntime>(),
     );
+  }
+
+  #[test]
+  fn post_leave_operations_report_not_running_smol() {
+    SmolRuntime::block_on(super::post_leave_operations_report_not_running::<SmolRuntime>());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn post_leave_key_operations_report_not_running_smol() {
+    SmolRuntime::block_on(super::post_leave_key_operations_report_not_running::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn concurrent_leaves_share_one_in_flight_leave_smol() {
+    SmolRuntime::block_on(super::concurrent_leaves_share_one_in_flight_leave::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn ignore_old_join_suppresses_the_replay_smol() {
+    SmolRuntime::block_on(super::ignore_old_join_suppresses_the_replay::<SmolRuntime>());
+  }
+
+  #[test]
+  fn malformed_gossip_datagram_is_ignored_smol() {
+    SmolRuntime::block_on(super::malformed_gossip_datagram_is_ignored::<SmolRuntime>());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn unauthenticatable_gossip_datagram_is_ignored_smol() {
+    SmolRuntime::block_on(super::unauthenticatable_gossip_datagram_is_ignored::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn left_node_refuses_new_inbound_exchanges_smol() {
+    SmolRuntime::block_on(super::left_node_refuses_new_inbound_exchanges::<SmolRuntime>());
+  }
+
+  #[test]
+  fn peer_reset_mid_exchange_fails_the_join_smol() {
+    SmolRuntime::block_on(super::peer_reset_mid_exchange_fails_the_join::<SmolRuntime>());
+  }
+
+  #[test]
+  fn slow_subscriber_sheds_events_and_counts_them_smol() {
+    SmolRuntime::block_on(super::slow_subscriber_sheds_events_and_counts_them::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn stalling_delegate_sheds_observations_and_counts_them_smol() {
+    SmolRuntime::block_on(
+      super::stalling_delegate_sheds_observations_and_counts_them::<SmolRuntime>(),
+    );
+  }
+
+  #[test]
+  fn unbounded_observation_channel_never_sheds_smol() {
+    SmolRuntime::block_on(super::unbounded_observation_channel_never_sheds::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn shutdown_racing_an_inflight_join_resolves_it_smol() {
+    SmolRuntime::block_on(super::shutdown_racing_an_inflight_join_resolves_it::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn second_shutdown_awaits_teardown_completion_smol() {
+    SmolRuntime::block_on(super::second_shutdown_awaits_teardown_completion::<
+      SmolRuntime,
+    >());
+  }
+
+  #[cfg(encryption)]
+  #[test]
+  fn key_op_without_a_keyring_is_refused_smol() {
+    SmolRuntime::block_on(super::key_op_without_a_keyring_is_refused::<SmolRuntime>());
+  }
+
+  #[test]
+  fn snapshot_compaction_rewrites_the_live_state_smol() {
+    SmolRuntime::block_on(super::snapshot_compaction_rewrites_the_live_state::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn construction_requires_id_and_advertise_addr_smol() {
+    SmolRuntime::block_on(super::construction_requires_id_and_advertise_addr::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn wildcard_advertise_is_refused_and_releases_the_bind_smol() {
+    SmolRuntime::block_on(
+      super::wildcard_advertise_is_refused_and_releases_the_bind::<SmolRuntime>(),
+    );
+  }
+
+  #[test]
+  fn unresolved_advertise_addr_is_resolved_at_construction_smol() {
+    SmolRuntime::block_on(
+      super::unresolved_advertise_addr_is_resolved_at_construction::<SmolRuntime>(),
+    );
+  }
+
+  #[test]
+  fn advertise_resolution_failure_fails_construction_smol() {
+    SmolRuntime::block_on(super::advertise_resolution_failure_fails_construction::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn taken_gossip_port_fails_construction_smol() {
+    SmolRuntime::block_on(super::taken_gossip_port_fails_construction::<SmolRuntime>());
+  }
+
+  #[test]
+  fn full_swim_override_set_is_threaded_into_the_coordinator_smol() {
+    SmolRuntime::block_on(
+      super::full_swim_override_set_is_threaded_into_the_coordinator::<SmolRuntime>(),
+    );
+  }
+
+  #[test]
+  fn handle_readouts_are_quiet_on_a_healthy_node_smol() {
+    SmolRuntime::block_on(super::handle_readouts_are_quiet_on_a_healthy_node::<
+      SmolRuntime,
+    >());
+  }
+
+  #[test]
+  fn join_entry_points_surface_their_failures_smol() {
+    SmolRuntime::block_on(super::join_entry_points_surface_their_failures::<SmolRuntime>());
+  }
+
+  #[test]
+  fn concurrent_commands_racing_shutdown_all_resolve_smol() {
+    SmolRuntime::block_on(super::concurrent_commands_racing_shutdown_all_resolve::<
+      SmolRuntime,
+    >());
   }
 }

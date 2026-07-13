@@ -429,3 +429,19 @@ fn tracing_forwards_to_the_shared_engines() {
     )
   };
 }
+
+/// `StreamTransportOptions::default()` is the `new()` state — the tuned defaults a
+/// caller who sets no stream knob at all is handed, and which `validate` admits.
+#[test]
+fn stream_transport_options_default_matches_new() {
+  let d = StreamTransportOptions::default();
+  let n = StreamTransportOptions::new();
+  assert_eq!(d.dial_timeout(), n.dial_timeout());
+  assert_eq!(d.close_timeout(), n.close_timeout());
+  assert_eq!(d.bridge_inbound_cap(), n.bridge_inbound_cap());
+  assert_eq!(d.bridge_recv_buf_len(), n.bridge_recv_buf_len());
+  assert!(
+    d.validate().is_ok(),
+    "the default stream knobs are admissible"
+  );
+}

@@ -198,3 +198,6 @@ pub(crate) fn reject_cross_cipher_keyring(
   }
   Ok(())
 }
+
+#[cfg(all(test, any(feature = "tcp", feature = "quic")))]
+mod tests;

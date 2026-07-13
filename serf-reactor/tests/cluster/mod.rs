@@ -1,21 +1,29 @@
 //! Reusable multi-node fault-injection fixture for the reactor's real-node serf
 //! driver, shared by the runtime-generic scenario bodies in the sibling test
-//! binaries.
+//! binaries (TCP, TLS, QUIC).
 //!
-//! A [`Cluster`] spins up N ephemeral loopback nodes through the ergonomic
-//! `Serf::tcp` constructor with fast SWIM failure-detection timing (the transport
-//! probe / gossip / suspicion overrides), so an abruptly-killed peer is detected
-//! as Failed in well under a second. Each node runs a detached collector that
-//! drains its event stream into a shared log; the log is a separate `Arc`, so it
-//! survives an abrupt [`kill_abrupt`](Cluster::kill_abrupt) (which drops the
-//! node's last handle) and later assertions read an ordered per-node member-event
-//! history.
+//! A [`Cluster`] spins up N ephemeral loopback nodes with fast SWIM
+//! failure-detection timing (the transport probe / gossip / suspicion
+//! overrides), so an abruptly-killed peer is detected as Failed in well under a
+//! second. Each node runs a detached collector that drains its event stream into
+//! a shared log; the log is a separate `Arc`, so it survives an abrupt
+//! [`kill_abrupt`](Cluster::kill_abrupt) (which drops the node's last handle) and
+//! later assertions read an ordered per-node member-event history.
+//!
+//! The fixture is TRANSPORT-AGNOSTIC: each test binary supplies a [`Backend`]
+//! that maps the fixture's id / bind / [`ClusterTiming`] onto its own transport
+//! options block and ergonomic `Serf::{tcp,tls,quic}` constructor, so the same
+//! scenario bodies run over every reliable plane.
 //!
 //! Mirrors the legacy Go-parity cluster helpers — `wait_until_num_nodes` /
 //! `test_events` in `legacy/serf-core/src/serf/base/tests.rs` — adapted to the
 //! reactor's `Send`/`agnostic` model.
 
-use core::time::Duration;
+// The fixture is a shared harness: each test binary exercises the subset of its
+// surface its own scenarios need.
+#![allow(dead_code)]
+
+use core::{future::Future, time::Duration};
 use std::{
   net::SocketAddr,
   sync::{Arc, Mutex},
@@ -28,14 +36,33 @@ use serf_proto::{
   members::MemberStatus,
   options::Options as SerfOptions,
 };
-use serf_reactor::{
-  FirstAddrResolver, MaybeResolved, RuntimeOptions, Serf, SocketAddrResolver, TcpTransportOptions,
-  VoidDelegate,
-};
+use serf_reactor::{MaybeResolved, Serf, SocketAddrResolver};
 use smol_str::SmolStr;
 
-/// A reactor TCP node handle over the agnostic runtime `R`.
+/// A reactor node handle over the agnostic runtime `R`. Every backend binds the
+/// same id and membership-address types; only the reliable record layer differs.
 pub type Node<R> = Serf<SmolStr, SocketAddr, R>;
+
+/// The per-transport half of the fixture: how to build one node at `bind` with
+/// the fixture's [`ClusterTiming`].
+///
+/// Implemented once per test binary (TCP / TLS / QUIC) over its own transport
+/// options block, so the scenario bodies below stay transport-agnostic. A
+/// backend MUST apply every timing knob it can carry — the fault-injection
+/// scenarios depend on the fast failure detection and the reap / reconnect
+/// windows the fixture configures.
+pub trait Backend<R>: Send + Sync + 'static
+where
+  R: Runtime,
+{
+  /// Build (and start) a node with id `id` bound to `bind` — an ephemeral
+  /// `127.0.0.1:0` for a fresh node, or a concrete address for a restart.
+  fn build(
+    id: &str,
+    bind: SocketAddr,
+    timing: &ClusterTiming,
+  ) -> impl Future<Output = serf_reactor::Result<Node<R>>> + Send;
+}
 
 /// Wall-clock ceiling for every fixture poll loop, so a convergence or detection
 /// regression surfaces as a bounded timeout rather than a hang.
@@ -115,6 +142,17 @@ impl ClusterTiming {
     self
   }
 
+  /// Override the direct-ping timeout — how long an unanswered probe waits
+  /// before escalating. A transport whose first probe to a peer must also
+  /// establish a session (QUIC's pooled connection) needs a wider timeout than
+  /// a connectionless datagram round-trip, or a LIVE peer is falsely suspected
+  /// while its session is still being set up.
+  #[must_use]
+  pub fn with_probe_timeout(mut self, v: Duration) -> Self {
+    self.probe_timeout = v;
+    self
+  }
+
   /// Override the reconnect re-dial cadence — how often a survivor attempts to
   /// re-establish contact with a Failed member. Raise it beyond the test window
   /// to park the re-dial (and the push/pull merge it runs) out of the scenario.
@@ -157,31 +195,32 @@ impl ClusterTiming {
     self
   }
 
-  /// The transport options for one node: the fast SWIM overrides plus this node's
-  /// id and advertise address.
-  fn transport_opts(
-    &self,
-    id: &str,
-    advertise: SocketAddr,
-  ) -> TcpTransportOptions<SmolStr, SocketAddr> {
-    let mut opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
-      .with_local_id(SmolStr::new(id))
-      .with_advertise_addr(MaybeResolved::Resolved(advertise))
-      .with_probe_interval(self.probe_interval)
-      .with_probe_timeout(self.probe_timeout)
-      .with_gossip_interval(self.gossip_interval)
-      .with_suspicion_mult(self.suspicion_mult);
-    if let Some(v) = self.dead_node_reclaim {
-      opts = opts.with_dead_node_reclaim_time(v);
-    }
-    if let Some(v) = self.push_pull_interval {
-      opts = opts.with_push_pull_interval(v);
-    }
-    opts
+  /// The SWIM failure-detection cadence a [`Backend`] applies to its transport
+  /// options block.
+  pub fn probe_interval(&self) -> Duration {
+    self.probe_interval
+  }
+
+  /// The SWIM direct-ping timeout a [`Backend`] applies to its transport options
+  /// block.
+  pub fn probe_timeout(&self) -> Duration {
+    self.probe_timeout
+  }
+
+  /// The gossip flush cadence a [`Backend`] applies to its transport options
+  /// block.
+  pub fn gossip_interval(&self) -> Duration {
+    self.gossip_interval
+  }
+
+  /// The SWIM suspicion multiplier a [`Backend`] applies to its transport options
+  /// block.
+  pub fn suspicion_mult(&self) -> u32 {
+    self.suspicion_mult
   }
 
   /// The serf `Options` for every node: the fast reap / reconnect timing.
-  fn serf_opts(&self) -> SerfOptions {
+  pub fn serf_opts(&self) -> SerfOptions {
     SerfOptions::new()
       .with_reap_interval(self.reap_interval)
       .with_reconnect_interval(self.reconnect_interval)
@@ -212,18 +251,22 @@ where
   log: Arc<Mutex<Vec<MemberRec>>>,
 }
 
-/// A live multi-node loopback cluster with per-node member-event logs.
-pub struct Cluster<R>
+/// A live multi-node loopback cluster with per-node member-event logs, driven
+/// over the reliable plane the [`Backend`] `B` builds.
+pub struct Cluster<R, B>
 where
   R: Runtime,
+  B: Backend<R>,
 {
   timing: ClusterTiming,
   slots: Vec<NodeSlot<R>>,
+  backend: core::marker::PhantomData<fn() -> B>,
 }
 
-impl<R> Cluster<R>
+impl<R, B> Cluster<R, B>
 where
   R: Runtime,
+  B: Backend<R>,
 {
   /// Spawn `ids.len()` ephemeral loopback nodes with `timing`, attach a per-node
   /// event collector, join every non-seed node to the first (a star), and wait
@@ -231,9 +274,9 @@ where
   pub async fn spawn(ids: &[&str], timing: ClusterTiming) -> Self {
     let mut slots = Vec::with_capacity(ids.len());
     for id in ids {
-      let serf = build_node::<R>(id, loopback_ephemeral(), &timing)
+      let serf = B::build(id, loopback_ephemeral(), &timing)
         .await
-        .expect("spawn serf tcp node");
+        .expect("spawn serf node");
       let addr = serf.advertise_address();
       let log = Arc::new(Mutex::new(Vec::new()));
       // Attach the collector before the handle moves into the slot, so no member
@@ -246,7 +289,11 @@ where
         log,
       });
     }
-    let cluster = Self { timing, slots };
+    let cluster = Self {
+      timing,
+      slots,
+      backend: core::marker::PhantomData,
+    };
     let seed = cluster.slots[0].addr;
     for i in 1..cluster.slots.len() {
       cluster
@@ -342,7 +389,7 @@ where
     const REBIND_RETRIES: usize = 25;
     let mut attempt = 0usize;
     let serf = loop {
-      match build_node::<R>(id.as_str(), addr, &self.timing).await {
+      match B::build(id.as_str(), addr, &self.timing).await {
         Ok(serf) => break serf,
         // Ignoring Err: a transient rebind race (the freed port not yet reusable)
         // is retried; only the final attempt's error is fatal.
@@ -377,13 +424,9 @@ where
     const DISTINCT_PORT_RETRIES: usize = 25;
     let mut attempt = 0usize;
     let serf = loop {
-      let serf = build_node::<R>(
-        id.as_str(),
-        "127.0.0.1:0".parse().expect("loopback addr"),
-        &self.timing,
-      )
-      .await
-      .expect("an ephemeral rebind cannot collide");
+      let serf = B::build(id.as_str(), loopback_ephemeral(), &self.timing)
+        .await
+        .expect("an ephemeral rebind cannot collide");
       if serf.advertise_address() != old_addr {
         break serf;
       }
@@ -589,34 +632,8 @@ where
 }
 
 /// An ephemeral loopback bind address (`127.0.0.1:0`).
-fn loopback_ephemeral() -> SocketAddr {
+pub fn loopback_ephemeral() -> SocketAddr {
   "127.0.0.1:0".parse().expect("loopback addr")
-}
-
-/// Spawn a fixture node at `bind` (an ephemeral `:0` for a fresh node, or a
-/// concrete addr for a restart) with `timing`.
-async fn build_node<R>(
-  id: &str,
-  bind: SocketAddr,
-  timing: &ClusterTiming,
-) -> serf_reactor::Result<Node<R>>
-where
-  R: Runtime,
-{
-  Serf::<SmolStr, SocketAddr, R>::tcp(
-    timing.transport_opts(id, bind),
-    &SocketAddrResolver,
-    &FirstAddrResolver,
-    VoidDelegate::<SmolStr, SocketAddr>::new(),
-    RuntimeOptions::new(),
-    timing.serf_opts(),
-    None,
-    None,
-    None,
-    #[cfg(encryption)]
-    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
-  )
-  .await
 }
 
 /// Attach a detached collector that drains `serf`'s event stream into `log`,

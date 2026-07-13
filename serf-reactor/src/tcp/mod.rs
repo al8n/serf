@@ -606,3 +606,6 @@ where
     driver.await;
   }
 }
+
+#[cfg(test)]
+mod tests;
