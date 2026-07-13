@@ -167,12 +167,12 @@ fn test_quic_options_jumbo() -> QuicOptions {
 }
 
 /// Build and spawn a QUIC serf node bound to an ephemeral loopback port.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   spawn_node_with(id, test_quic_options()).await
 }
 
 /// Build and spawn a QUIC serf node from a caller-supplied [`QuicOptions`].
-async fn spawn_node_with(id: &str, quic: QuicOptions) -> Serf<SmolStr> {
+async fn spawn_node_with(id: &str, quic: QuicOptions) -> Serf<SmolStr, SocketAddr> {
   try_spawn_node_at(id, quic, "127.0.0.1:0".parse().expect("loopback addr"))
     .await
     .expect("spawn serf node")
@@ -185,19 +185,18 @@ async fn try_spawn_node_at(
   id: &str,
   quic: QuicOptions,
   bind: SocketAddr,
-) -> Result<Serf<SmolStr>, SerfError> {
+) -> Result<Serf<SmolStr, SocketAddr>, SerfError> {
   let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(quic);
-  Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::quic(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -218,22 +217,20 @@ async fn assert_quic_new_rejects(runtime: RuntimeOptions) {
     .with_local_id(SmolStr::new("bad-opt-node"))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(test_quic_options());
-  let res =
-    Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-      opts,
-      &SocketAddrResolver,
-      &FirstAddrResolver,
-      VoidDelegate::<SmolStr, SocketAddr>::new(),
-      runtime,
-      SerfOptions::new(),
-      gossip_rng().expect("seed gossip rng"),
-      None,
-      None,
-      None,
-      #[cfg(encryption)]
-      std::rc::Rc::new(VoidKeyringDelegate),
-    )
-    .await;
+  let res = Serf::quic(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    runtime,
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await;
   match res {
     Err(SerfError::InvalidOption(_)) => {}
     Err(other) => panic!("expected InvalidOption, got {other:?}"),
@@ -355,6 +352,52 @@ async fn quic_shutdown_releases_bound_address_for_rebind() {
     "the second node rebinds the exact freed address"
   );
   second.shutdown().await.expect("second node shuts down");
+}
+
+/// A second `shutdown()` — issued once the QUIC driver has already exited and
+/// closed its command queue — still resolves `Ok`, and only AFTER the bound UDP
+/// address is free: the late caller parks on the teardown-completion latch rather
+/// than returning into a still-bound port. The freed address is proven rebindable
+/// immediately after.
+#[compio::test]
+async fn quic_second_shutdown_awaits_teardown_completion() {
+  let node = spawn_node("twice-a").await;
+  let addr = node.advertise_address();
+
+  node.shutdown().await.expect("the first shutdown resolves");
+  node
+    .shutdown()
+    .await
+    .expect("a second shutdown after teardown still resolves Ok");
+
+  let reborn = try_spawn_node_at("twice-b", test_quic_options(), addr)
+    .await
+    .expect("the freed address rebinds after the awaited teardown");
+  assert_eq!(reborn.advertise_address(), addr);
+  reborn.shutdown().await.expect("twice-b shuts down");
+}
+
+/// Two `shutdown()` calls issued CONCURRENTLY both land in the command queue
+/// before the QUIC pump observes either. It dispatches the first and drains the
+/// second during teardown; both must resolve `Ok` — and both only once the bound
+/// UDP socket is released, which the immediate same-address rebind proves.
+#[compio::test]
+async fn quic_concurrent_shutdowns_resolve_ok_after_the_port_is_freed() {
+  let node = spawn_node("concurrent-shutdown-a").await;
+  let addr = node.advertise_address();
+
+  let (first, second) = futures_util::future::join(node.shutdown(), node.shutdown()).await;
+  first.expect("the observed shutdown resolves Ok");
+  second.expect("the shutdown drained during teardown also resolves Ok");
+
+  let reborn = try_spawn_node_at("concurrent-shutdown-b", test_quic_options(), addr)
+    .await
+    .expect("both shutdowns resolved only after the port was freed");
+  assert_eq!(reborn.advertise_address(), addr);
+  reborn
+    .shutdown()
+    .await
+    .expect("concurrent-shutdown-b shuts down");
 }
 
 /// All `Serf` handles dropping under a continuous gossip flood must still shut the
@@ -536,21 +579,23 @@ fn test_secret_key(fill: u8) -> SecretKey {
 /// Build and spawn a QUIC serf node on an ephemeral loopback port with
 /// `encryption` installed as its gossip keyring policy.
 #[cfg(encryption)]
-async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<SmolStr> {
+async fn spawn_encrypted_node(
+  id: &str,
+  encryption: EncryptionOptions,
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(test_quic_options())
     .with_encryption(encryption);
-  Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::quic(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -610,13 +655,13 @@ async fn two_node_quic_join_observes_membership_encrypted() {
 /// blackhole join tests to shorten the await-join deadline — a QUIC dial to a
 /// closed UDP port has no fast reset, so its exchange resolves only at the
 /// deadline reaper).
-async fn spawn_node_with_runtime(id: &str, runtime: RuntimeOptions) -> Serf<SmolStr> {
+async fn spawn_node_with_runtime(id: &str, runtime: RuntimeOptions) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_quic_config(test_quic_options());
-  Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::quic_with_rng(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -725,4 +770,145 @@ async fn quic_join_zero_resolution_surfaces_join_all_failed() {
   }
 
   a.shutdown().await.expect("joiner shuts down");
+}
+
+// ── SWIM / timing knobs ───────────────────────────────────────────────────────
+
+/// Every SWIM knob starts UNSET, so a caller that sets none keeps the
+/// coordinator's own defaults — `Transport::run` applies an override only when
+/// it is `Some`.
+#[test]
+fn swim_knobs_start_unset() {
+  let opts = crate::QuicTransportOptions::<SmolStr, SocketAddr>::new();
+  assert!(opts.push_pull_interval().is_none());
+  assert!(opts.probe_interval().is_none());
+  assert!(opts.probe_timeout().is_none());
+  assert!(opts.gossip_interval().is_none());
+  assert!(opts.suspicion_mult().is_none());
+  assert!(opts.dead_node_reclaim_time().is_none());
+  assert!(opts.suspicion_max_timeout_mult().is_none());
+}
+
+/// Every builder writes its OWN field: the accessors read back exactly what was
+/// set, with distinct values per knob so a crossed assignment surfaces.
+#[test]
+fn swim_knob_builders_round_trip_each_knob() {
+  let opts = crate::QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::from_millis(1))
+    .with_probe_interval(Duration::from_millis(2))
+    .with_probe_timeout(Duration::from_millis(3))
+    .with_gossip_interval(Duration::from_millis(4))
+    .with_suspicion_mult(5)
+    .with_dead_node_reclaim_time(Duration::from_millis(6))
+    .with_suspicion_max_timeout_mult(7);
+
+  assert_eq!(opts.push_pull_interval(), Some(Duration::from_millis(1)));
+  assert_eq!(opts.probe_interval(), Some(Duration::from_millis(2)));
+  assert_eq!(opts.probe_timeout(), Some(Duration::from_millis(3)));
+  assert_eq!(opts.gossip_interval(), Some(Duration::from_millis(4)));
+  assert_eq!(opts.suspicion_mult(), Some(5));
+  assert_eq!(
+    opts.dead_node_reclaim_time(),
+    Some(Duration::from_millis(6))
+  );
+  assert_eq!(opts.suspicion_max_timeout_mult(), Some(7));
+}
+
+/// A zero push/pull interval is a MEANINGFUL setting (it disables periodic
+/// anti-entropy, isolating the gossip plane), so it must round-trip as
+/// `Some(ZERO)` — never collapse back to the `None` that means "keep the
+/// coordinator default".
+#[test]
+fn zero_push_pull_interval_is_set_not_unset() {
+  let opts = crate::QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::ZERO);
+  assert_eq!(opts.push_pull_interval(), Some(Duration::ZERO));
+}
+
+/// The identity builders round-trip through the options block.
+#[test]
+fn builders_round_trip() {
+  let addr: SocketAddr = "127.0.0.1:8300".parse().expect("addr");
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("node-a"))
+    .with_advertise_addr(MaybeResolved::Resolved(addr));
+
+  assert_eq!(opts.local_id(), Some(&SmolStr::new("node-a")));
+  match opts.advertise_addr() {
+    Some(MaybeResolved::Resolved(s)) => assert_eq!(*s, addr),
+    other => panic!("expected a resolved advertise addr, got {other:?}"),
+  }
+}
+
+/// An unresolved advertise input round-trips through the options block in its
+/// ORIGINAL form: resolution happens once at construction, not in the builder.
+#[test]
+fn unresolved_advertise_addr_round_trips_unresolved() {
+  let host: hostaddr::HostAddr<SmolStr> = "example.com:7946".parse().expect("host addr");
+  let opts = QuicTransportOptions::<SmolStr, hostaddr::HostAddr<SmolStr>>::new()
+    .with_advertise_addr(MaybeResolved::Unresolved(host.clone()));
+  match opts.advertise_addr() {
+    Some(MaybeResolved::Unresolved(h)) => assert_eq!(*h, host),
+    other => panic!("expected an unresolved advertise addr, got {other:?}"),
+  }
+}
+
+/// The gossip keyring reaches the options block through the builder. On QUIC the
+/// reliable plane rides quinn's own TLS, so this keyring protects the datagram
+/// gossip plane.
+#[cfg(encryption)]
+#[test]
+fn encryption_policy_round_trips() {
+  let key = test_secret_key(0x21);
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_encryption(EncryptionOptions::new().with_keyring(Keyring::new(key)));
+  let keyring = opts
+    .encryption()
+    .keyring()
+    .expect("the configured keyring reaches the options block");
+  assert_eq!(
+    keyring.primary_ref(),
+    &key,
+    "the primary key is the one that was configured"
+  );
+}
+
+/// `Default` delegates to `new` — the empty starting point, with no accidental
+/// pre-set id or quinn bundle.
+#[test]
+fn default_matches_new() {
+  let opts = QuicTransportOptions::<SmolStr, SocketAddr>::default();
+  assert!(opts.local_id().is_none());
+  assert!(opts.quic_config().is_none());
+}
+
+/// A constructed transport reports the identity it was built with: the local id,
+/// the advertise input in the ORIGINAL form the caller supplied, and the concrete
+/// bound contact the node will gossip (its single UDP socket's readback).
+#[compio::test]
+async fn transport_reports_its_identity_and_bound_contact() {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let transport = QuicTransport::<SmolStr, SocketAddr>::new(
+    QuicTransportOptions::new()
+      .with_local_id(SmolStr::new("ident"))
+      .with_advertise_addr(MaybeResolved::Unresolved(bind))
+      .with_quic_config(test_quic_options()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+  )
+  .await
+  .expect("the transport binds an ephemeral loopback UDP port");
+
+  assert_eq!(transport.local_id(), &SmolStr::new("ident"));
+  match transport.local_address() {
+    MaybeResolved::Unresolved(a) => assert_eq!(*a, bind),
+    other => panic!("the advertise INPUT form must be retained, got {other:?}"),
+  }
+  let advertise = *transport.advertise_address();
+  assert!(advertise.ip().is_loopback());
+  assert_ne!(
+    advertise.port(),
+    0,
+    "the bound contact carries the OS-assigned port, not the ephemeral `:0`"
+  );
 }

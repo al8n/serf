@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "tcp")]
 mod bridge;
@@ -65,8 +66,14 @@ pub(crate) fn os_seeded_std_rng() -> crate::Result<StdRng> {
 }
 
 pub use error::{
-  GossipMtuTooSmall, InvalidAdvertiseAddr, InvalidGossipMtu, InvalidOption, Result, SerfError,
+  GossipMtuTooSmall, InvalidAdvertiseAddr, InvalidGossipMtu, InvalidOption, JoinFailed, Result,
+  SerfError,
 };
+
+/// The seed/advertise address form re-exported from `memberlist-proto`: either an
+/// already-`Resolved` wire [`std::net::SocketAddr`] or an `Unresolved` user
+/// address the caller's [`Resolver`] resolves at the boundary.
+pub use memberlist_proto::MaybeResolved;
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
@@ -118,7 +125,7 @@ pub use resolver::{
 
 #[cfg(feature = "dns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-pub use resolver::{DEFAULT_DNS_TIMEOUT, DnsResolver};
+pub use resolver::{DEFAULT_DNS_TIMEOUT, DnsError, DnsResolver};
 
 #[cfg(feature = "getifs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "getifs")))]
@@ -151,7 +158,7 @@ pub use serf::Serf;
 pub use driver::options::{
   Channel, DEFAULT_BRIDGE_INBOUND_CAP, DEFAULT_BRIDGE_RECV_BUF_LEN, DEFAULT_CLOSE_TIMEOUT,
   DEFAULT_CMD_FAIRNESS_BUDGET, DEFAULT_DIAL_TIMEOUT, DEFAULT_EVENT_QUEUE_CAP,
-  DEFAULT_IDLE_WAKE_INTERVAL, DEFAULT_ITER_DRAIN_CAP, DEFAULT_LEAVE_TIMEOUT,
+  DEFAULT_IDLE_WAKE_INTERVAL, DEFAULT_ITER_DRAIN_CAP, DEFAULT_JOIN_DEADLINE, DEFAULT_LEAVE_TIMEOUT,
   DEFAULT_OBSERVATION_CHANNEL, DEFAULT_SNAPSHOT_COMPACT_THRESHOLD, ParseChannelError,
   RuntimeOptions, SnapshotOptions, StreamTransportOptions,
 };

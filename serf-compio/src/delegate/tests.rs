@@ -45,3 +45,34 @@ fn a_sync_predicate_satisfies_the_merge_delegate() {
     "a permit-all predicate admits the exchange"
   );
 }
+
+/// A BOXED machine merge delegate satisfies the trait — the shape the node
+/// constructors' `Option<Box<dyn MergeDelegate<..>>>` slot takes, so this pins
+/// that the re-exported trait and its `Box` blanket impl compose.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[test]
+fn boxed_merge_delegate_satisfies_trait() {
+  struct AcceptAll;
+  impl MergeDelegate<SmolStr, SocketAddr> for AcceptAll {
+    fn notify_merge(
+      &self,
+      _peers: memberlist_proto::MaybeOwned<
+        '_,
+        [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
+      >,
+    ) -> bool {
+      true
+    }
+  }
+  fn assert_merge<T>(t: &T) -> bool
+  where
+    T: MergeDelegate<SmolStr, SocketAddr>,
+  {
+    t.notify_merge(memberlist_proto::MaybeOwned::Borrowed(&[]))
+  }
+  let boxed: Box<dyn MergeDelegate<SmolStr, SocketAddr>> = Box::new(AcceptAll);
+  assert!(
+    assert_merge(&boxed),
+    "the boxed predicate's verdict is the one the machine acts on"
+  );
+}

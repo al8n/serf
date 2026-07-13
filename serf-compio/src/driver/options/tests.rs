@@ -476,3 +476,21 @@ fn tracing_forwards_to_the_shared_engines() {
     )
   };
 }
+
+/// `Default` and `new()` are the same source of truth for the stream knobs, and
+/// the defaults they produce are themselves admissible — a node built with no
+/// explicit stream configuration passes the same `validate` gate `Transport::new`
+/// applies.
+#[test]
+fn stream_transport_options_default_matches_new() {
+  let d = StreamTransportOptions::default();
+  let n = StreamTransportOptions::new();
+  assert_eq!(d.dial_timeout(), n.dial_timeout());
+  assert_eq!(d.close_timeout(), n.close_timeout());
+  assert_eq!(d.bridge_inbound_cap(), n.bridge_inbound_cap());
+  assert_eq!(d.bridge_recv_buf_len(), n.bridge_recv_buf_len());
+  assert!(
+    d.validate().is_ok(),
+    "the default stream knobs are admissible"
+  );
+}

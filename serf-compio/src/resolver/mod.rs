@@ -32,7 +32,7 @@ pub use socket_addr::SocketAddrResolver;
 
 #[cfg(feature = "dns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-pub use dns::{DEFAULT_DNS_TIMEOUT, DnsResolver};
+pub use dns::{DEFAULT_DNS_TIMEOUT, DnsError, DnsResolver};
 
 #[cfg(feature = "getifs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "getifs")))]
@@ -61,3 +61,6 @@ pub trait Resolver: 'static {
   /// Resolve `addr` to its concrete socket addresses.
   async fn resolve(&self, addr: &Self::Address) -> Result<Vec<SocketAddr>, Self::Error>;
 }
+
+#[cfg(test)]
+mod tests;

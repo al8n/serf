@@ -140,9 +140,12 @@ impl DnsResolver {
   /// Bounded by `self.timeout` (default [`DEFAULT_DNS_TIMEOUT`]): a
   /// slow or hostile nameserver cannot hang the caller's `join`
   /// future beyond this wall-clock budget. On timeout returns
-  /// [`DnsError::Io`]`(io::ErrorKind::TimedOut)`; the resolver's
-  /// caller falls back to the OS resolver via the standard error
-  /// path (see [`Resolver::resolve`] below).
+  /// [`DnsError::Io`]`(io::ErrorKind::TimedOut)`, which
+  /// [`Resolver::resolve`] surfaces WITHOUT the OS fallback — that
+  /// fallback runs outside this deadline, so escalating a timeout into
+  /// it would defeat the bound. A genuine unavailability (connect
+  /// refused, unreachable nameserver, malformed response) or an empty
+  /// answer does fall through to the OS resolver.
   async fn tcp_query(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, DnsError> {
     let query = self.tcp_query_inner(host, port).fuse();
     let timeout = compio::time::sleep(self.timeout).fuse();
@@ -238,15 +241,25 @@ impl Resolver for DnsResolver {
     // and only when we have at least one nameserver configured. Short
     // names will be resolved through the OS resolver's search-domain list.
     if host_str.contains('.') && !self.servers.is_empty() {
-      // Ignoring Err: TCP-first is best-effort per the upstream spec
-      // ("If this fails it's not fatal since this isn't a standard way to
-      // query DNS, and we have a fallback below.", memberlist.go:404).
-      // We unconditionally fall through to the OS resolver on any error
-      // or empty answer.
-      if let Ok(addrs) = self.tcp_query(host_str, port).await
-        && !addrs.is_empty()
-      {
-        return Ok(addrs);
+      // TCP-first is best-effort per the upstream spec ("If this fails it's not
+      // fatal since this isn't a standard way to query DNS, and we have a fallback
+      // below.", memberlist.go:404), so a genuine unavailability (connect refused,
+      // unreachable nameserver, malformed response) or an empty answer falls
+      // through to the OS resolver below.
+      match self.tcp_query(host_str, port).await {
+        // A productive TCP answer wins outright; no fallback needed.
+        Ok(addrs) if !addrs.is_empty() => return Ok(addrs),
+        // A configured-resolver TIMEOUT must NOT escalate into the OS resolver: the
+        // OS path runs OUTSIDE `self.timeout` (its DNS is unbounded /
+        // runtime-dependent), so falling through would let a slow or hostile
+        // nameserver burn the TCP deadline and THEN hang bootstrap in unbounded OS
+        // DNS — contradicting the timeout contract. Surface the timeout so the
+        // configured budget bounds the whole resolution.
+        Err(DnsError::Io(err)) if err.kind() == io::ErrorKind::TimedOut => {
+          return Err(DnsError::Io(err));
+        }
+        // Empty answer or a genuine unavailability: fall through to the OS resolver.
+        Ok(_) | Err(_) => {}
       }
     }
 

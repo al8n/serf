@@ -98,6 +98,27 @@ struct Observed {
   user_events: RefCell<Vec<SmolStr>>,
 }
 
+impl Observed {
+  /// Poll `recorded` until it contains `id`, bounded by `window`; returns
+  /// whether it landed in time. Each observation hook is delivered on a path
+  /// separate from the membership snapshot, so a hook can land a moment after
+  /// the snapshot a test has already awaited — poll for it rather than sampling
+  /// the hook once.
+  async fn recorded_within(recorded: &RefCell<Vec<SmolStr>>, id: &str, window: Duration) -> bool {
+    compio::time::timeout(window, async {
+      loop {
+        let present = recorded.borrow().iter().any(|got| got.as_str() == id);
+        if present {
+          break;
+        }
+        compio::time::sleep(Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .is_ok()
+  }
+}
+
 /// A [`Delegate`] that records which observation hooks the driver fired.
 struct RecordingDelegate(Rc<Observed>);
 
@@ -230,18 +251,17 @@ where
   }
 
   /// Build and spawn the node on an ephemeral loopback port.
-  async fn spawn(self, id: &str) -> Serf<SmolStr> {
+  async fn spawn(self, id: &str) -> Serf<SmolStr, SocketAddr> {
     let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
       .with_advertise_addr(MaybeResolved::Resolved(cluster::loopback_ephemeral()));
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    Serf::tcp(
       opts,
       &SocketAddrResolver,
       &FirstAddrResolver,
       self.delegate,
       self.runtime,
       self.serf,
-      gossip_rng().expect("seed gossip rng"),
       None,
       None,
       self.snapshot,
@@ -254,12 +274,12 @@ where
 }
 
 /// Spawn a plain loopback node.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   NodeSpec::new().spawn(id).await
 }
 
 /// Poll both nodes until each reports the full two-member cluster.
-async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+async fn converge(a: &Serf<SmolStr, SocketAddr>, b: &Serf<SmolStr, SocketAddr>) {
   compio::time::timeout(WINDOW, async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
@@ -273,7 +293,7 @@ async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
 }
 
 /// Join `joiner` to `seed` and wait for both to converge.
-async fn join_and_converge(joiner: &Serf<SmolStr>, seed: &Serf<SmolStr>) {
+async fn join_and_converge(joiner: &Serf<SmolStr, SocketAddr>, seed: &Serf<SmolStr, SocketAddr>) {
   joiner
     .join(
       &SocketAddrResolver,
@@ -410,7 +430,7 @@ async fn user_event_reaches_the_peer_stream_and_delegate() {
   assert_eq!(got, payload, "the payload survives the broadcast");
 
   assert!(
-    seen.user_events.borrow().iter().any(|n| n == "deploy"),
+    Observed::recorded_within(&seen.user_events, "deploy", WINDOW).await,
     "the driver fired A's notify_user_event hook for the broadcast"
   );
 
@@ -454,7 +474,7 @@ async fn set_tags_propagates_as_a_member_update() {
   assert_eq!(got.as_str(), "worker", "A's view of B carries the new tag");
 
   assert!(
-    seen.updated.borrow().iter().any(|id| id == "tag-b"),
+    Observed::recorded_within(&seen.updated, "tag-b", WINDOW).await,
     "the driver fired A's notify_update hook for the re-tagged peer"
   );
 
@@ -911,7 +931,7 @@ async fn an_abrupt_kill_surfaces_failed_then_reap() {
   .expect("A detects the killed peer Failed and reaps it out of the membership");
 
   assert!(
-    seen.failed.borrow().iter().any(|id| id == "kill-b"),
+    Observed::recorded_within(&seen.failed, "kill-b", WINDOW).await,
     "the driver fired notify_failed for the abruptly-killed peer (saw {:?})",
     seen.failed.borrow()
   );
@@ -1568,4 +1588,142 @@ fn test_secret_key(fill: u8) -> serf_compio::SecretKey {
   #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
   let key = serf_compio::SecretKey::ChaCha20Poly1305([fill; 32]);
   key
+}
+
+/// The transport's SWIM knobs actually reach the coordinator's `EndpointOptions`,
+/// so the memberlist failure detector is tunable from serf-compio.
+///
+/// Tuned to a 100 ms probe interval with both suspicion multipliers at 1, an
+/// abruptly-killed peer is declared Failed within a few hundred milliseconds. A
+/// coordinator left on its OWN defaults needs well over ten seconds for the same
+/// kill in a two-node cluster: the probe interval is 1 s, the minimum suspicion
+/// timeout is `suspicion_mult(4) * log10(N+1) * probe_interval`, and — with no
+/// third node to confirm the Suspect — the timer runs its full
+/// `suspicion_max_timeout_mult(6)` multiple of that minimum rather than decaying to
+/// it. Asserting detection inside the window below therefore FAILS if
+/// `Transport::run` accepted the knobs and dropped them on the floor.
+#[compio::test]
+async fn swim_knobs_reach_the_coordinator_and_speed_failure_detection() {
+  /// Detection must land far inside this bound; a default-timing coordinator
+  /// could not.
+  const DETECT_WINDOW: Duration = Duration::from_secs(3);
+
+  /// A node whose failure detector is tuned for sub-second detection.
+  async fn spawn_tuned(id: &str) -> Serf<SmolStr, SocketAddr> {
+    let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(cluster::loopback_ephemeral()))
+      .with_probe_interval(Duration::from_millis(100))
+      .with_probe_timeout(Duration::from_millis(50))
+      .with_gossip_interval(Duration::from_millis(20))
+      // A two-node cluster has no third node to confirm a Suspect, so the
+      // max-timeout multiple is what the suspicion timer actually runs. Pinning
+      // both multipliers to 1 keeps it at the probe-scaled minimum.
+      .with_suspicion_mult(1)
+      .with_suspicion_max_timeout_mult(1);
+    Serf::tcp(
+      opts,
+      &SocketAddrResolver,
+      &FirstAddrResolver,
+      VoidDelegate::<SmolStr, SocketAddr>::new(),
+      RuntimeOptions::new(),
+      // Hold the Failed member rather than reaping it, so the status is
+      // observable instead of racing the reaper.
+      SerfOptions::new().with_reconnect_timeout(Duration::from_secs(3600)),
+      None,
+      None,
+      None,
+      #[cfg(encryption)]
+      Rc::new(serf_compio::VoidKeyringDelegate),
+    )
+    .await
+    .expect("spawn tuned serf tcp node")
+  }
+
+  let a = spawn_tuned("swim-a").await;
+  let b = spawn_tuned("swim-b").await;
+
+  b.join(
+    &SocketAddrResolver,
+    MaybeResolved::Resolved(a.advertise_address()),
+    false,
+  )
+  .await
+  .expect("B joins A");
+  converge(&a, &b).await;
+
+  let subject = SmolStr::new("swim-b");
+  b.shutdown().await.expect("swim-b is killed abruptly");
+
+  compio::time::timeout(DETECT_WINDOW, async {
+    loop {
+      let failed = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &subject && m.status() == MemberStatus::Failed);
+      if failed {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect(
+    "the tuned probe/suspicion knobs must reach the coordinator: a default-timing \
+     coordinator could not declare the killed peer Failed this fast",
+  );
+
+  a.shutdown().await.expect("swim-a shuts down");
+}
+
+/// The transport's user-facing address type `A` is usable with the crate's OWN
+/// host-address resolvers, so the declared default `A = HostAddr<SmolStr>` is a
+/// real, constructible configuration rather than a dead type parameter.
+///
+/// `OsResolver` and `DnsResolver` both resolve `hostaddr::HostAddr<SmolStr>`, and
+/// `HostAddr` carries no wire-codec impl (nor could a downstream crate add one —
+/// it is a foreign type). A transport that constrained `A` to the wire-codec trait
+/// would therefore reject every one of the crate's host-address resolvers and
+/// admit only an already-resolved `SocketAddr`; `A` is only ever resolved at the
+/// boundary and never encoded, so no such bound is warranted. This spawns a real
+/// node through the default `A`, resolving `localhost:0` with `OsResolver`.
+#[compio::test]
+async fn an_unresolved_host_advertise_addr_resolves_through_the_os_resolver() {
+  let host: hostaddr::HostAddr<SmolStr> = "localhost:0".parse().expect("a host:port address");
+
+  let node = Serf::tcp_with_rng(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("hostaddr-node"))
+      .with_advertise_addr(MaybeResolved::Unresolved(host)),
+    &OsResolver,
+    &Ipv4PreferringResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    gossip_rng().expect("seed gossip rng"),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    Rc::new(serf_compio::VoidKeyringDelegate),
+  )
+  .await
+  .expect("a HostAddr advertise address resolves and binds through OsResolver");
+
+  // The resolver produced a concrete, dialable contact: the OS-assigned port is
+  // read back from the bound socket, and the loopback name resolved to a
+  // loopback IP.
+  let advertise = node.advertise_address();
+  assert!(
+    advertise.ip().is_loopback(),
+    "localhost resolved to a loopback contact, got {advertise}"
+  );
+  assert_ne!(
+    advertise.port(),
+    0,
+    "the ephemeral :0 must be read back as a concrete bound port"
+  );
+  assert_eq!(node.local_id(), &SmolStr::new("hostaddr-node"));
+
+  node.shutdown().await.expect("hostaddr-node shuts down");
 }

@@ -13,8 +13,12 @@ use flume::{Receiver, Sender};
 use serf_proto::{event::Event, options::Options as SerfOptions};
 
 use crate::{
-  command::Command, delegate::Delegate, driver::options::RuntimeOptions,
-  drop_counter::CompioDropCounter, snapshot::SnapshotCell, transport::Transport,
+  command::Command,
+  delegate::Delegate,
+  driver::{options::RuntimeOptions, shared::ShutdownComplete},
+  drop_counter::CompioDropCounter,
+  snapshot::SnapshotCell,
+  transport::Transport,
 };
 
 #[cfg(encryption)]
@@ -49,6 +53,10 @@ where
   /// Counter for events dropped at the delegate observation channel when the
   /// delegate fell behind — may include unrecoverable app-data.
   pub(crate) observation_dropped: Rc<Cell<u64>>,
+  /// Counter for gossip payloads accepted onto the QUIC datagram plane (as
+  /// opposed to the plain-UDP fallback). Only the QUIC driver increments it; the
+  /// stream backends leave it at zero.
+  pub(crate) datagrams_sent: Rc<Cell<u64>>,
   /// The write half of the user-coalescer shed counter, injected into the
   /// endpoint by `T::run` so its increments land in the cell the handle reads.
   pub(crate) user_drop: CompioDropCounter,
@@ -56,6 +64,11 @@ where
   pub(crate) member_drop: CompioDropCounter,
   pub(crate) snapshot: SnapshotCell<T::Id>,
   pub(crate) shutdown_flag: Rc<Cell<bool>>,
+  /// The driver half of the teardown-completion latch, dropped by the pump once
+  /// its bind sockets are released. A `shutdown()` the pump could no longer
+  /// accept parks on the matching waiter, so it returns only after the ports are
+  /// free.
+  pub(crate) shutdown_complete: ShutdownComplete,
   pub(crate) driver_options: RuntimeOptions,
   pub(crate) serf_options: SerfOptions,
   /// Optional per-member reconnect-timeout override (Go serf `ReconnectDelegate`),
@@ -91,10 +104,12 @@ where
     events_tx: Sender<Event<T::Id, SocketAddr>>,
     events_dropped: Rc<Cell<u64>>,
     observation_dropped: Rc<Cell<u64>>,
+    datagrams_sent: Rc<Cell<u64>>,
     user_drop: CompioDropCounter,
     member_drop: CompioDropCounter,
     snapshot: SnapshotCell<T::Id>,
     shutdown_flag: Rc<Cell<bool>>,
+    shutdown_complete: ShutdownComplete,
     driver_options: RuntimeOptions,
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
@@ -108,10 +123,12 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      datagrams_sent,
       user_drop,
       member_drop,
       snapshot,
       shutdown_flag,
+      shutdown_complete,
       driver_options,
       serf_options,
       reconnect_delegate,

@@ -8,13 +8,13 @@
 
 #![cfg(feature = "tcp")]
 
-use core::num::NonZeroU8;
+use core::{num::NonZeroU8, time::Duration};
 use std::{io::ErrorKind, net::SocketAddr};
 
 use compio::net::{TcpListener, UdpSocket};
 use hostaddr::HostAddr;
 use memberlist_proto::{
-  CheapClone, Data, Endpoint, EndpointOptions, Id, MaybeResolved, RawRecords,
+  CheapClone, Endpoint, EndpointOptions, Id, MaybeResolved, RawRecords,
   streams::{LabelOptions, StreamEndpoint as Coordinator},
 };
 use rand::rngs::StdRng;
@@ -42,6 +42,29 @@ pub struct TcpTransportOptions<I = SmolStr, A = HostAddr<SmolStr>> {
   local_id: Option<I>,
   advertise_addr: Option<MaybeResolved<A, SocketAddr>>,
   stream: StreamTransportOptions,
+  /// Override for the memberlist anti-entropy push/pull interval. `None` keeps the
+  /// coordinator default; `Some(Duration::ZERO)` disables periodic push/pull
+  /// entirely. See [`with_push_pull_interval`](Self::with_push_pull_interval).
+  push_pull_interval: Option<Duration>,
+  /// SWIM probe interval override. `None` keeps the coordinator default. See
+  /// [`with_probe_interval`](Self::with_probe_interval).
+  probe_interval: Option<Duration>,
+  /// SWIM direct-ping timeout override. `None` keeps the coordinator default. See
+  /// [`with_probe_timeout`](Self::with_probe_timeout).
+  probe_timeout: Option<Duration>,
+  /// Gossip interval override. `None` keeps the coordinator default. See
+  /// [`with_gossip_interval`](Self::with_gossip_interval).
+  gossip_interval: Option<Duration>,
+  /// SWIM suspicion multiplier override. `None` keeps the coordinator default. See
+  /// [`with_suspicion_mult`](Self::with_suspicion_mult).
+  suspicion_mult: Option<u32>,
+  /// Reclaim window for a same-name member returning at a NEW address: a dead
+  /// member older than this is revived in place of a conflict. See
+  /// [`with_dead_node_reclaim_time`](Self::with_dead_node_reclaim_time).
+  dead_node_reclaim_time: Option<Duration>,
+  /// SWIM suspicion max-timeout multiplier override. `None` keeps the coordinator
+  /// default. See [`with_suspicion_max_timeout_mult`](Self::with_suspicion_max_timeout_mult).
+  suspicion_max_timeout_mult: Option<u32>,
   /// Gossip-and-reliable encryption policy. The default (no keyring) leaves
   /// both planes plaintext; attaching a keyring via
   /// [`with_encryption`](Self::with_encryption) makes the coordinator's
@@ -61,6 +84,13 @@ impl<I, A> TcpTransportOptions<I, A> {
       local_id: None,
       advertise_addr: None,
       stream: StreamTransportOptions::new(),
+      push_pull_interval: None,
+      probe_interval: None,
+      probe_timeout: None,
+      gossip_interval: None,
+      suspicion_mult: None,
+      dead_node_reclaim_time: None,
+      suspicion_max_timeout_mult: None,
       #[cfg(encryption)]
       encryption: EncryptionOptions::new(),
     }
@@ -87,6 +117,90 @@ impl<I, A> TcpTransportOptions<I, A> {
   #[inline]
   pub fn with_stream(mut self, opts: StreamTransportOptions) -> Self {
     self.stream = opts;
+    self
+  }
+
+  /// Builder: override the memberlist anti-entropy push/pull interval.
+  ///
+  /// `None` (the default) keeps the coordinator's built-in interval. A positive
+  /// duration re-tunes the periodic full-state sync; `Duration::ZERO` disables
+  /// periodic push/pull entirely — join-time and explicit exchanges still run, but
+  /// no background anti-entropy is scheduled.
+  #[must_use]
+  #[inline]
+  pub const fn with_push_pull_interval(mut self, interval: Duration) -> Self {
+    self.push_pull_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM probe interval — how often the
+  /// coordinator probes a random peer for liveness.
+  ///
+  /// `None` (the default) keeps the coordinator default (~1s). A shorter interval
+  /// speeds failure detection at the cost of more probe traffic; it also shortens
+  /// the suspicion timeout, which scales with the probe interval.
+  #[must_use]
+  #[inline]
+  pub const fn with_probe_interval(mut self, interval: Duration) -> Self {
+    self.probe_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM direct-ping timeout — how long the
+  /// coordinator waits for a probe ack before escalating to indirect probes.
+  ///
+  /// `None` (the default) keeps the coordinator default (~500ms). It must
+  /// comfortably exceed the real network round-trip, or a live peer whose ack is
+  /// merely slow is falsely suspected.
+  #[must_use]
+  #[inline]
+  pub const fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+    self.probe_timeout = Some(timeout);
+    self
+  }
+
+  /// Builder: override the memberlist gossip interval — how often the coordinator
+  /// flushes queued gossip to a random subset of peers.
+  ///
+  /// `None` (the default) keeps the coordinator default (~200ms).
+  #[must_use]
+  #[inline]
+  pub const fn with_gossip_interval(mut self, interval: Duration) -> Self {
+    self.gossip_interval = Some(interval);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM suspicion multiplier — how long a
+  /// suspected peer is held in the Suspect state before being declared Failed.
+  ///
+  /// The minimum suspicion timeout is `suspicion_mult * log10(N+1) * probe_interval`.
+  /// `None` (the default) keeps the coordinator default.
+  #[must_use]
+  #[inline]
+  pub const fn with_suspicion_mult(mut self, mult: u32) -> Self {
+    self.suspicion_mult = Some(mult);
+    self
+  }
+
+  /// Builder: allow a dead member to be revived under the SAME id at a NEW
+  /// address once it has been dead longer than `window` — the reference
+  /// implementation's dead-node reclaim. Left unset (the default), a same-name
+  /// Alive from a different address is a name conflict, never a revival.
+  #[must_use]
+  #[inline]
+  pub const fn with_dead_node_reclaim_time(mut self, window: Duration) -> Self {
+    self.dead_node_reclaim_time = Some(window);
+    self
+  }
+
+  /// Builder: override the memberlist SWIM suspicion max-timeout multiplier — the
+  /// upper bound on the suspicion timeout as a multiple of the minimum.
+  ///
+  /// `None` (the default) keeps the coordinator default.
+  #[must_use]
+  #[inline]
+  pub const fn with_suspicion_max_timeout_mult(mut self, mult: u32) -> Self {
+    self.suspicion_max_timeout_mult = Some(mult);
     self
   }
 
@@ -127,6 +241,49 @@ impl<I, A> TcpTransportOptions<I, A> {
     &self.stream
   }
 
+  /// The push/pull interval override, if set.
+  #[inline]
+  pub const fn push_pull_interval(&self) -> Option<Duration> {
+    self.push_pull_interval
+  }
+
+  /// The SWIM probe-interval override, if set.
+  #[inline]
+  pub const fn probe_interval(&self) -> Option<Duration> {
+    self.probe_interval
+  }
+
+  /// The SWIM probe-timeout override, if set.
+  #[inline]
+  pub const fn probe_timeout(&self) -> Option<Duration> {
+    self.probe_timeout
+  }
+
+  /// The gossip-interval override, if set.
+  #[inline]
+  pub const fn gossip_interval(&self) -> Option<Duration> {
+    self.gossip_interval
+  }
+
+  /// The SWIM suspicion-multiplier override, if set.
+  #[inline]
+  pub const fn suspicion_mult(&self) -> Option<u32> {
+    self.suspicion_mult
+  }
+
+  /// The configured dead-node reclaim window, if overridden.
+  #[must_use]
+  #[inline]
+  pub const fn dead_node_reclaim_time(&self) -> Option<Duration> {
+    self.dead_node_reclaim_time
+  }
+
+  /// The SWIM suspicion max-timeout-multiplier override, if set.
+  #[inline]
+  pub const fn suspicion_max_timeout_mult(&self) -> Option<u32> {
+    self.suspicion_max_timeout_mult
+  }
+
   /// Gossip-and-reliable encryption policy.
   #[cfg(encryption)]
   #[cfg_attr(
@@ -160,6 +317,19 @@ pub struct TcpTransport<I = SmolStr, A = HostAddr<SmolStr>> {
   gossip_socket: UdpSocket,
   tcp_listener: TcpListener,
   stream_options: StreamTransportOptions,
+  /// Push/pull interval override, applied to the coordinator's `EndpointOptions`
+  /// in [`Transport::run`]. `None` keeps the default; `Some(Duration::ZERO)`
+  /// disables periodic anti-entropy.
+  push_pull_interval: Option<Duration>,
+  /// SWIM failure-detection overrides applied to the coordinator's
+  /// `EndpointOptions` in [`Transport::run`]. Each `None` keeps the coordinator
+  /// default.
+  probe_interval: Option<Duration>,
+  probe_timeout: Option<Duration>,
+  gossip_interval: Option<Duration>,
+  suspicion_mult: Option<u32>,
+  dead_node_reclaim_time: Option<Duration>,
+  suspicion_max_timeout_mult: Option<u32>,
   /// Independent OS-seeded seed for the serf core's RNG, drawn once per node in
   /// [`Transport::new`] and consumed when [`Transport::run`] builds the
   /// endpoint via `new_with_rng`. Distinct from the coordinator's gossip RNG so
@@ -174,7 +344,7 @@ pub struct TcpTransport<I = SmolStr, A = HostAddr<SmolStr>> {
 impl<I, A> Transport for TcpTransport<I, A>
 where
   I: Id + CheapClone + core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
-  A: Data + Clone + Send + 'static,
+  A: Clone + Send + 'static,
 {
   type Error = SerfError;
   type Id = I;
@@ -302,6 +472,13 @@ where
       gossip_socket,
       tcp_listener,
       stream_options: options.stream,
+      push_pull_interval: options.push_pull_interval,
+      probe_interval: options.probe_interval,
+      probe_timeout: options.probe_timeout,
+      gossip_interval: options.gossip_interval,
+      suspicion_mult: options.suspicion_mult,
+      dead_node_reclaim_time: options.dead_node_reclaim_time,
+      suspicion_max_timeout_mult: options.suspicion_max_timeout_mult,
       serf_rng,
       #[cfg(encryption)]
       encryption: options.encryption,
@@ -332,8 +509,40 @@ where
     // endpoint; build it here from `self`'s stored config. Serf ranks its user
     // broadcasts on three tiers (intent / event / query → ranks 0 / 1 / 2), so
     // the inner memberlist endpoint needs at least three broadcast tiers.
-    let inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
+    let mut inner_opts = EndpointOptions::new(self.local_id, self.advertise_socket)
       .with_user_broadcast_tiers(NonZeroU8::new(3).expect("3 is nonzero"));
+    // A caller-supplied push/pull interval re-tunes (or, at `Duration::ZERO`,
+    // disables) the periodic anti-entropy full-state sync. Left unset, the
+    // coordinator keeps its own default.
+    if let Some(interval) = self.push_pull_interval {
+      inner_opts = inner_opts.with_push_pull_interval(interval);
+    }
+    // Caller-supplied SWIM failure-detection overrides: each left unset keeps the
+    // coordinator's own default. Lowering these speeds up failure detection (probe
+    // cadence, ack timeout, gossip cadence, and the suspicion timeout that scales
+    // with the probe interval).
+    if let Some(v) = self.probe_interval {
+      inner_opts = inner_opts.with_probe_interval(v);
+    }
+    if let Some(v) = self.probe_timeout {
+      inner_opts = inner_opts.with_probe_timeout(v);
+    }
+    if let Some(v) = self.gossip_interval {
+      inner_opts = inner_opts.with_gossip_interval(v);
+    }
+    if let Some(v) = self.suspicion_mult {
+      inner_opts = inner_opts.with_suspicion_mult(v);
+    }
+    if let Some(v) = self.dead_node_reclaim_time {
+      inner_opts = inner_opts.with_dead_node_reclaim_time(v);
+    }
+    if let Some(v) = self.suspicion_max_timeout_mult {
+      inner_opts = inner_opts.with_suspicion_max_timeout_mult(v);
+    }
+    // Snapshot the reliable push/pull exchange timeout from the SAME options the
+    // coordinator is built from, so the driver reconciles an await-result join's
+    // caller deadline against the exact deadline the coordinator will stamp.
+    let stream_timeout = inner_opts.stream_timeout();
     let inner = Endpoint::new(inner_opts, gossip_rng);
     // Plain TCP has no SNI (`|_| None`) and a membership address that IS the
     // transport socket (`|addr| *addr`). No cluster label at this stage.
@@ -372,6 +581,11 @@ where
     if let Some(md) = runtime.merge_delegate {
       endpoint.set_merge_delegate(md);
     }
+    // Test-only: install the delegate's inbound message-dropper on the machine.
+    #[cfg(feature = "test")]
+    if let Some(dropper) = runtime.delegate.message_dropper() {
+      endpoint.set_message_dropper(dropper);
+    }
     let snapshotter = match runtime.snapshot_file {
       Some((writer, records)) => {
         let replay = serf_proto::snapshot::ReplayResult::replay(records, rejoin_after_leave);
@@ -393,10 +607,12 @@ where
       runtime.observation_dropped,
       runtime.snapshot,
       runtime.shutdown_flag,
+      runtime.shutdown_complete,
       runtime.driver_options,
       self.stream_options,
       runtime.delegate,
       None,
+      stream_timeout,
       snapshotter,
       #[cfg(encryption)]
       runtime.keyring,

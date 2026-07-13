@@ -36,6 +36,21 @@ async fn wildcard_respects_address_family() {
   assert!(v6.iter().all(|s| s.is_ipv6()), "[::] must yield only IPv6");
 }
 
+/// Each named constructor carries its own scope, and the `Default` impl is the
+/// `private` scope — the conservative choice for a node advertising itself on an
+/// unknown host.
+#[test]
+fn named_constructors_carry_their_scope() {
+  assert_eq!(LocalAddrResolver::private().scope, LocalAddrScope::Private);
+  assert_eq!(LocalAddrResolver::public().scope, LocalAddrScope::Public);
+  assert_eq!(LocalAddrResolver::all().scope, LocalAddrScope::All);
+  assert_eq!(
+    LocalAddrResolver::default().scope,
+    LocalAddrScope::Private,
+    "the default scope is private"
+  );
+}
+
 #[test]
 fn local_advertise_attaches_port() {
   // Best-effort: a host may have no address in a given scope, but when one is

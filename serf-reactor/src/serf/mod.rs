@@ -56,10 +56,10 @@ use crate::{
   snapshot::SerfSnapshot,
   transport::{Transport, TransportRuntime},
 };
+#[cfg(any(feature = "tcp", feature = "quic"))]
+use memberlist_proto::CheapClone;
 #[cfg(encryption)]
 use memberlist_proto::SecretKey;
-#[cfg(any(feature = "tcp", feature = "quic"))]
-use memberlist_proto::{CheapClone, Data};
 
 /// The initial published snapshot: the local node, `Alive`, with empty tags and
 /// zeroed Lamport clocks. Superseded by the driver's first real republish.
@@ -88,11 +88,23 @@ where
 /// last handle is dropped (or [`shutdown`](Serf::shutdown) is called). Membership
 /// reads are lock-free via the published [`SerfSnapshot`].
 ///
-/// `Serf<I, A, R>` carries the wire id type `I`, the resolver's unresolved address
-/// type `A`, and the agnostic runtime `R` its driver was spawned on. `I` flows
-/// into the snapshot and events channel (both `<I, SocketAddr>`); `A` ties `join`'s
-/// seeds to the address domain the node was built with; `R` brands the handle so a
-/// tokio-backed node is a distinct type from a smol-backed one.
+/// `Serf<I, A, R>` carries the wire id type `I`, the unresolved address type `A`
+/// the node's ADVERTISE address was configured in, and the agnostic runtime `R` its
+/// driver was spawned on. `I` flows into the snapshot and events channel (both
+/// `<I, SocketAddr>`); `R` brands the handle so a tokio-backed node is a distinct
+/// type from a smol-backed one.
+///
+/// `A` is a brand, not a wire type: the advertise address is resolved to a
+/// [`SocketAddr`] once at construction, and every membership address from then on is
+/// a `SocketAddr`. It is therefore free to be a hostname type — e.g. the
+/// [`hostaddr::HostAddr<SmolStr>`](hostaddr::HostAddr) that
+/// [`OsResolver`](crate::OsResolver) consumes.
+///
+/// `A` does NOT constrain the seeds accepted by [`join`](Serf::join) /
+/// [`join_many`](Serf::join_many) / [`dispatch_join`](Serf::dispatch_join): each is
+/// generic over the [`Resolver`](crate::Resolver) it is handed and takes its seeds
+/// in THAT resolver's address domain. Joining by hostname while advertising a
+/// resolved `SocketAddr` (or the reverse) is deliberately allowed.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub struct Serf<I, A, R> {
@@ -105,8 +117,10 @@ pub struct Serf<I, A, R> {
   /// [`default_query_timeout`](Serf::default_query_timeout) derives the query
   /// timeout from the live snapshot member count without a driver round-trip.
   query_timeout_mult: usize,
-  /// Ties the handle to the resolver's unresolved address type. Not held in any
-  /// field — `join` enforces seeds resolve in this address domain.
+  /// Brands the handle with the unresolved address type the node's advertise
+  /// address was configured in. No `A` value survives construction (it is resolved
+  /// to a `SocketAddr` before the driver starts), and the `join` family is generic
+  /// over the resolver it is handed, so this constrains no seed.
   _a: PhantomData<fn(A)>,
   /// Brands the handle with the agnostic runtime its driver was spawned on. Not
   /// held in any field — the driver task is spawned detached.
@@ -264,7 +278,7 @@ where
     + Sync
     + Unpin
     + 'static,
-  A: Data + Clone + Send + Sync + 'static,
+  A: Clone + Send + Sync + 'static,
   R: Runtime,
 {
   /// Build a TCP-backed serf node and spawn its driver on the runtime `R`.
@@ -370,7 +384,7 @@ where
     + Sync
     + Unpin
     + 'static,
-  A: Data + Clone + Send + Sync + 'static,
+  A: Clone + Send + Sync + 'static,
   R: Runtime,
 {
   /// Build a TLS-backed serf node and spawn its driver on the runtime `R`.
@@ -479,7 +493,7 @@ where
     + Sync
     + Unpin
     + 'static,
-  A: Data + Clone + Send + Sync + 'static,
+  A: Clone + Send + Sync + 'static,
   R: Runtime,
 {
   /// Build a QUIC-backed serf node and spawn its driver on the runtime `R`.

@@ -32,7 +32,7 @@ use rustls::{
 use serf_compio::{
   FirstAddrResolver, Ipv4PreferringResolver, MergeDelegate, Resolver, RuntimeOptions, Serf,
   SerfError, SnapshotOptions, SocketAddrResolver, TlsOptions, TlsTransport, TlsTransportOptions,
-  Transport, VoidDelegate, gossip_rng,
+  Transport, VoidDelegate,
 };
 use serf_proto::{
   event::{Event, MemberEventKind, QueryEvent},
@@ -168,7 +168,7 @@ impl MergeDelegate<SmolStr, SocketAddr> for RecordingMerge {
 }
 
 /// Build a TLS node on an ephemeral loopback port with the fixture's cert bundle.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   spawn_node_with(id, None, None)
     .await
     .expect("spawn serf tls node")
@@ -179,19 +179,18 @@ async fn spawn_node_with(
   id: &str,
   merge: Option<Box<dyn MergeDelegate<SmolStr, SocketAddr>>>,
   snapshot: Option<SnapshotOptions>,
-) -> Result<Serf<SmolStr>, SerfError> {
+) -> Result<Serf<SmolStr, SocketAddr>, SerfError> {
   let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(loopback_ephemeral()))
     .with_tls_options(test_tls_options());
-  Serf::new::<TlsTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tls(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     merge,
     snapshot,
@@ -202,7 +201,7 @@ async fn spawn_node_with(
 }
 
 /// Poll both nodes until each reports the full two-member cluster.
-async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+async fn converge(a: &Serf<SmolStr, SocketAddr>, b: &Serf<SmolStr, SocketAddr>) {
   compio::time::timeout(WINDOW, async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {

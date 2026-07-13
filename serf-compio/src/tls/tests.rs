@@ -104,7 +104,7 @@ fn test_tls_options() -> TlsOptions {
 
 /// Build and spawn a TLS serf node bound to an ephemeral loopback port. The
 /// default SNI provider (`Some("localhost")`) matches the self-signed cert SAN.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   try_spawn_node_at(id, "127.0.0.1:0".parse().expect("loopback addr"))
     .await
     .expect("spawn serf node")
@@ -114,19 +114,21 @@ async fn spawn_node(id: &str) -> Serf<SmolStr> {
 /// construction result so the same-address rebind regression can assert a freed
 /// port accepts an immediate rebind. A fresh self-signed bundle is built per
 /// node, matching `spawn_node`.
-async fn try_spawn_node_at(id: &str, bind: SocketAddr) -> Result<Serf<SmolStr>, SerfError> {
+async fn try_spawn_node_at(
+  id: &str,
+  bind: SocketAddr,
+) -> Result<Serf<SmolStr, SocketAddr>, SerfError> {
   let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_tls_options(test_tls_options());
-  Serf::new::<TlsTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tls(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -170,22 +172,20 @@ async fn tls_new_rejects_zero_observation_channel() {
     .with_local_id(SmolStr::new("bad-opt-node"))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_tls_options(test_tls_options());
-  let res =
-    Serf::new::<TlsTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-      opts,
-      &SocketAddrResolver,
-      &FirstAddrResolver,
-      VoidDelegate::<SmolStr, SocketAddr>::new(),
-      RuntimeOptions::new().with_observation_channel(Channel::Bounded(0)),
-      SerfOptions::new(),
-      gossip_rng().expect("seed gossip rng"),
-      None,
-      None,
-      None,
-      #[cfg(encryption)]
-      std::rc::Rc::new(VoidKeyringDelegate),
-    )
-    .await;
+  let res = Serf::tls(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new().with_observation_channel(Channel::Bounded(0)),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await;
   match res {
     Err(SerfError::InvalidOption(_)) => {}
     Err(other) => panic!("expected InvalidOption, got {other:?}"),
@@ -401,14 +401,17 @@ fn test_secret_key(fill: u8) -> SecretKey {
 /// Build and spawn a TLS serf node on an ephemeral loopback port with
 /// `encryption` installed as its gossip keyring policy.
 #[cfg(encryption)]
-async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<SmolStr> {
+async fn spawn_encrypted_node(
+  id: &str,
+  encryption: EncryptionOptions,
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_tls_options(test_tls_options())
     .with_encryption(encryption);
-  Serf::new::<TlsTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tls_with_rng(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -469,4 +472,174 @@ async fn two_node_tls_join_observes_membership_encrypted() {
 
   a.shutdown().await.expect("node A shuts down");
   b.shutdown().await.expect("node B shuts down");
+}
+
+// ── SWIM / timing knobs ───────────────────────────────────────────────────────
+
+/// Every SWIM knob starts UNSET, so a caller that sets none keeps the
+/// coordinator's own defaults — `Transport::run` applies an override only when
+/// it is `Some`.
+#[test]
+fn swim_knobs_start_unset() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new();
+  assert!(opts.push_pull_interval().is_none());
+  assert!(opts.probe_interval().is_none());
+  assert!(opts.probe_timeout().is_none());
+  assert!(opts.gossip_interval().is_none());
+  assert!(opts.suspicion_mult().is_none());
+  assert!(opts.dead_node_reclaim_time().is_none());
+  assert!(opts.suspicion_max_timeout_mult().is_none());
+}
+
+/// Every builder writes its OWN field: the accessors read back exactly what was
+/// set, with distinct values per knob so a crossed assignment surfaces.
+#[test]
+fn swim_knob_builders_round_trip_each_knob() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::from_millis(1))
+    .with_probe_interval(Duration::from_millis(2))
+    .with_probe_timeout(Duration::from_millis(3))
+    .with_gossip_interval(Duration::from_millis(4))
+    .with_suspicion_mult(5)
+    .with_dead_node_reclaim_time(Duration::from_millis(6))
+    .with_suspicion_max_timeout_mult(7);
+
+  assert_eq!(opts.push_pull_interval(), Some(Duration::from_millis(1)));
+  assert_eq!(opts.probe_interval(), Some(Duration::from_millis(2)));
+  assert_eq!(opts.probe_timeout(), Some(Duration::from_millis(3)));
+  assert_eq!(opts.gossip_interval(), Some(Duration::from_millis(4)));
+  assert_eq!(opts.suspicion_mult(), Some(5));
+  assert_eq!(
+    opts.dead_node_reclaim_time(),
+    Some(Duration::from_millis(6))
+  );
+  assert_eq!(opts.suspicion_max_timeout_mult(), Some(7));
+}
+
+/// A zero push/pull interval is a MEANINGFUL setting (it disables periodic
+/// anti-entropy, isolating the gossip plane), so it must round-trip as
+/// `Some(ZERO)` — never collapse back to the `None` that means "keep the
+/// coordinator default".
+#[test]
+fn zero_push_pull_interval_is_set_not_unset() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::ZERO);
+  assert_eq!(opts.push_pull_interval(), Some(Duration::ZERO));
+}
+
+/// The SNI provider is consulted PER PEER: the dial-time server name is derived
+/// from the peer's address, and a provider that refuses a peer (returns `None`)
+/// aborts that dial before the handshake rather than falling back to a default
+/// name.
+#[test]
+fn sni_provider_is_consulted_per_peer() {
+  let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new().with_sni_provider(Box::new(|a| {
+    (a.port() != 9).then(|| format!("peer-{}.example", a.port()))
+  }));
+  let sni = opts.sni_provider();
+  assert_eq!(
+    sni(&"127.0.0.1:1".parse().unwrap()),
+    Some("peer-1.example".to_string())
+  );
+  assert_eq!(
+    sni(&"127.0.0.1:2".parse().unwrap()),
+    Some("peer-2.example".to_string())
+  );
+  assert_eq!(
+    sni(&"127.0.0.1:9".parse().unwrap()),
+    None,
+    "a provider may refuse a peer, which aborts the dial before the handshake"
+  );
+}
+
+/// The gossip keyring reaches the options block through the builder. On TLS it
+/// seals only the gossip datagrams — the reliable plane rides the TLS session.
+#[cfg(encryption)]
+#[test]
+fn encryption_policy_round_trips() {
+  let key = test_secret_key(0x31);
+  let opts = TlsTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_encryption(EncryptionOptions::new().with_keyring(Keyring::new(key)));
+  let keyring = opts
+    .encryption()
+    .keyring()
+    .expect("the configured keyring reaches the options block");
+  assert_eq!(
+    keyring.primary_ref(),
+    &key,
+    "the primary key is the one that was configured"
+  );
+}
+
+/// The reliable listener and the gossip socket share one port. A port whose UDP
+/// half is already taken must fail construction — a node cannot come up without
+/// its gossip plane — and releasing the squatter must make the very same
+/// construction succeed, proving the squatter (not the address) was the failure.
+#[compio::test]
+async fn taken_gossip_port_fails_construction() {
+  let squatter = std::net::UdpSocket::bind("127.0.0.1:0").expect("squat a UDP port");
+  let taken = squatter.local_addr().expect("the squatted address");
+
+  let err = TlsTransport::<SmolStr, SocketAddr>::new(
+    TlsTransportOptions::new()
+      .with_local_id(SmolStr::new("squatted"))
+      .with_advertise_addr(MaybeResolved::Resolved(taken))
+      .with_tls_options(test_tls_options()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+  )
+  .await
+  .err()
+  .expect("a node cannot come up without its gossip plane");
+  assert!(
+    matches!(err, SerfError::Io(_)),
+    "a taken gossip port is an I/O failure, got {err:?}"
+  );
+
+  drop(squatter);
+  let transport = TlsTransport::<SmolStr, SocketAddr>::new(
+    TlsTransportOptions::new()
+      .with_local_id(SmolStr::new("unsquatted"))
+      .with_advertise_addr(MaybeResolved::Resolved(taken))
+      .with_tls_options(test_tls_options()),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+  )
+  .await
+  .expect("the released gossip port lets the transport bind");
+  assert_eq!(*transport.advertise_address(), taken);
+}
+
+/// An advertise address that resolves to NO candidate fails construction rather
+/// than booting a node with no reachable contact.
+#[compio::test]
+async fn advertise_resolution_failure_fails_construction() {
+  /// Resolves nothing — a bootstrap outage the advertise picker must refuse.
+  struct EmptyResolver;
+
+  impl crate::Resolver for EmptyResolver {
+    type Address = SocketAddr;
+    type Error = std::io::Error;
+
+    async fn resolve(&self, _addr: &SocketAddr) -> std::io::Result<Vec<SocketAddr>> {
+      Ok(Vec::new())
+    }
+  }
+
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let err = TlsTransport::<SmolStr, SocketAddr>::new(
+    TlsTransportOptions::new()
+      .with_local_id(SmolStr::new("unresolvable"))
+      .with_advertise_addr(MaybeResolved::Unresolved(bind))
+      .with_tls_options(test_tls_options()),
+    &EmptyResolver,
+    &FirstAddrResolver,
+  )
+  .await
+  .err()
+  .expect("an advertise address that resolves to nothing cannot boot a node");
+  assert!(
+    matches!(err, SerfError::Resolve(_)),
+    "an empty candidate set is a resolution failure, got {err:?}"
+  );
 }

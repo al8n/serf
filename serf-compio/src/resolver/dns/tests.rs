@@ -410,3 +410,82 @@ async fn tcp_query_empty_answers_falls_through_to_os_fallback() {
 
   handle.await.expect("DNS server task");
 }
+
+/// A loopback TCP nameserver that ACCEPTS the query and then never answers: it
+/// drains the 2-byte length prefix and the query body so the resolver's write
+/// completes, then parks forever holding the connection open, so the resolver's
+/// response read blocks until its OWN configured timeout fires.
+async fn spawn_stalling_tcp_dns_server() -> (SocketAddr, compio::runtime::JoinHandle<()>) {
+  use compio::{buf::BufResult, io::AsyncReadExt, net::TcpListener};
+
+  let listener = TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind loopback DNS server");
+  let addr = listener.local_addr().expect("server local_addr");
+
+  let handle = compio::runtime::spawn(async move {
+    let Ok((mut stream, _)) = listener.accept().await else {
+      return;
+    };
+    let len_buf = vec![0u8; 2];
+    let BufResult(r, len_buf) = stream.read_exact(len_buf).await;
+    if r.is_err() {
+      return;
+    }
+    let qlen = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    // Ignoring Err: a truncated read just means the client hung up early; the
+    // assertion still holds because the resolver received no response either way.
+    let BufResult(_r, _q) = stream.read_exact(vec![0u8; qlen]).await;
+    // Park forever, keeping `stream` (and thus the open connection) alive. The
+    // test cancels this task by dropping its JoinHandle once the resolver has
+    // timed out.
+    core::future::pending::<()>().await;
+  });
+
+  (addr, handle)
+}
+
+/// A configured nameserver that ACCEPTS the TCP-DNS query and then STALLS (never
+/// writes a response) must not hang the caller: the per-query `timeout` bounds the
+/// WHOLE resolution, and the timeout is surfaced as an error rather than silently
+/// escalating into the unbounded OS-resolver fallback (which runs outside the
+/// deadline). A hostile resolver must not be able to burn the TCP budget and THEN
+/// hang bootstrap in OS DNS.
+#[compio::test]
+async fn stalling_server_times_out_without_os_fallback() {
+  let (server_addr, handle) = spawn_stalling_tcp_dns_server().await;
+
+  let timeout = Duration::from_millis(100);
+  let r = DnsResolver::from_servers(vec![server_addr]).with_timeout(timeout);
+  // A fully-qualified name (contains a `.`) so the TCP-first branch is taken; the
+  // reserved `.test` TLD (RFC 6761) never resolves, so were the OS fallback reached
+  // it would surface a DIFFERENT lookup error (or hang) rather than this synthetic
+  // timeout — the assertion below discriminates the two.
+  let addr: Address = "seed.cluster.test:8300".parse().expect("parse FQDN:port");
+  assert!(matches!(addr.host(), Host::Domain(_)));
+
+  let start = std::time::Instant::now();
+  let err = r
+    .resolve(&addr)
+    .await
+    .map(|_| ())
+    .expect_err("a stalling resolver must surface the timeout, not fall through to OS DNS");
+  let elapsed = start.elapsed();
+
+  // The synthetic TCP-DNS timeout is surfaced verbatim, proving the resolution did
+  // NOT escalate into the OS fallback (which does not produce a `TimedOut`).
+  assert!(
+    matches!(&err, DnsError::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut),
+    "expected a TimedOut error bounding the whole resolution, got: {err:?}"
+  );
+  // And it returned promptly — bounded by the configured timeout, not the unbounded
+  // OS resolver. A generous ceiling (20x the 100ms budget) stays robust under CI
+  // load while still separating a bounded timeout from a fall-through hang.
+  assert!(
+    elapsed < Duration::from_secs(2),
+    "resolve must return within the configured timeout budget, took {elapsed:?}"
+  );
+
+  // Dropping the handle cancels the parked server task.
+  drop(handle);
+}

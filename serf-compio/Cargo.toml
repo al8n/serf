@@ -11,8 +11,12 @@ description = "compio-based async driver for the Sans-I/O serf machine"
 default = ["tcp", "tag-regex"]
 # Plain-TCP reliable coordinator.
 tcp = ["serf-proto/tcp", "serf-driver/tcp"]
-# TLS-over-TCP reliable coordinator (implies tcp).
-tls = ["tcp", "serf-proto/tls", "compio/rustls"]
+# TLS-over-TCP reliable coordinator (implies tcp). The record layer comes from
+# serf-proto; a crypto-backend feature (tls-rustls-*) supplies the rustls
+# provider via memberlist-proto (serf-proto exposes no rustls provider itself).
+tls = ["tcp", "serf-proto/tls", "serf-driver/tls", "compio/rustls"]
+tls-rustls-ring = ["tls", "memberlist-proto/tls-rustls-ring"]
+tls-rustls-aws-lc-rs = ["tls", "memberlist-proto/tls-rustls-aws-lc-rs"]
 # QUIC coordinator.
 quic = ["serf-proto/quic", "serf-driver/quic"]
 quic-rustls-ring = ["quic", "serf-proto/quic-rustls-ring", "serf-driver/quic-rustls-ring"]
@@ -28,6 +32,10 @@ chacha20-poly1305 = [
 ]
 # Regex-backed tag-filter matching.
 tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
+# Test-only fault-injection surface (forwards serf-proto's `test` feature: a
+# `MessageDropper` installed via `VoidDelegate::with_message_dropper`). Compiled
+# out of every non-test build.
+test = ["serf-proto/test"]
 # Emit `tracing` spans around the public driver operations.
 tracing = ["dep:tracing", "serf-driver/tracing"]
 # Optional config layering: `serde` adds Serialize/Deserialize; `clap` adds CLI flags.
@@ -112,7 +120,7 @@ required-features = ["tcp"]
 # delegate, snapshot persistence, user event, query round-trip, graceful leave).
 [[test]]
 name = "tls"
-required-features = ["tls"]
+required-features = ["tls-rustls-ring"]
 
 # The real-node QUIC test suite: loopback nodes over a quinn config bundle
 # driving the QUIC pump's whole command surface (join/converge, user event, query
@@ -123,5 +131,19 @@ name = "quic"
 required-features = ["quic-rustls-ring"]
 
 [package.metadata.docs.rs]
-all-features = true
+# A single coherent crypto-provider set (ring, not aws-lc-rs) so the doc build
+# documents every gated item without pulling conflicting rustls providers.
+features = [
+  "tls-rustls-ring",
+  "quic-rustls-ring",
+  "coordinates",
+  "aes-gcm",
+  "chacha20-poly1305",
+  "tag-regex",
+  "tracing",
+  "serde",
+  "clap",
+  "dns",
+  "getifs",
+]
 rustdoc-args = ["--cfg", "docsrs"]

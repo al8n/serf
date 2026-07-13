@@ -11,11 +11,10 @@
 //! compio is thread-per-core and `!Send`, so the fixture is `Rc`/`RefCell`-based
 //! and every node, collector, and assertion runs on the one runtime thread.
 //!
-//! Unlike the reactor's transport options, serf-compio's `TcpTransportOptions`
-//! exposes no memberlist SWIM knobs, so the nodes run the coordinator's default
-//! probe / gossip / suspicion timing. [`ClusterTiming`] therefore tunes only the
-//! serf-level reaper, and the poll ceiling is sized for a default-timing failure
-//! detection.
+//! The nodes run fast SWIM failure-detection timing (the transport probe / gossip
+//! / suspicion overrides), so an abruptly-killed peer is detected as Failed in
+//! well under a second. [`ClusterTiming`] carries both those memberlist knobs and
+//! the serf-level reaper windows.
 
 use core::time::Duration;
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
@@ -23,8 +22,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 use futures_util::StreamExt;
 use memberlist_proto::MaybeResolved;
 use serf_compio::{
-  FirstAddrResolver, RuntimeOptions, Serf, SocketAddrResolver, TcpTransport, TcpTransportOptions,
-  VoidDelegate, gossip_rng,
+  FirstAddrResolver, RuntimeOptions, Serf, SocketAddrResolver, TcpTransportOptions, VoidDelegate,
 };
 use serf_proto::{
   event::{Event, MemberEventKind},
@@ -33,15 +31,13 @@ use serf_proto::{
 };
 use smol_str::SmolStr;
 
-/// A compio TCP node handle.
-pub type Node = Serf<SmolStr>;
+/// A compio TCP node handle. The advertise address is configured as a resolved
+/// `SocketAddr`, so that is the handle's address brand.
+pub type Node = Serf<SmolStr, SocketAddr>;
 
 /// Wall-clock ceiling for every fixture poll loop, so a convergence or detection
-/// regression surfaces as a bounded timeout rather than a hang. Sized for the
-/// coordinator's DEFAULT suspicion timing (a 1 s probe interval and a 4x
-/// suspicion multiplier put an abrupt kill's Failed transition several seconds
-/// out), which serf-compio's transport options cannot shorten.
-const POLL_TIMEOUT: Duration = Duration::from_secs(45);
+/// regression surfaces as a bounded timeout rather than a hang.
+const POLL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Poll granularity for the fixture's await loops.
 const POLL_STEP: Duration = Duration::from_millis(20);
 
@@ -50,17 +46,23 @@ pub fn loopback_ephemeral() -> SocketAddr {
   "127.0.0.1:0".parse().expect("loopback addr")
 }
 
-/// Serf-level reaper timing shared by every node in a fixture cluster.
+/// Failure-detection and reap timing shared by every node in a fixture cluster.
 ///
-/// [`fast`](Self::fast) reaps a failed member almost immediately after the
-/// coordinator declares it Failed (short reconnect timeout) and drops a
-/// gracefully-left member almost immediately after its Leave (short tombstone
-/// timeout). A test that wants to OBSERVE a member sitting in a Failed or Left
-/// state raises the matching window with
+/// The probe / gossip / suspicion knobs tune the memberlist SWIM layer (carried on
+/// the transport options); the reap / reconnect knobs tune the serf reaper (carried
+/// on the serf `Options`). [`fast`](Self::fast) yields CI-speed values that detect
+/// an abrupt kill in sub-second time and reap the failed member shortly after
+/// (short reconnect timeout), and drop a gracefully-left member shortly after its
+/// Leave (short tombstone timeout). A test that wants to OBSERVE a member sitting
+/// in a Failed or Left state raises the matching window with
 /// [`with_reconnect_timeout`](Self::with_reconnect_timeout) /
 /// [`with_tombstone_timeout`](Self::with_tombstone_timeout).
 #[derive(Clone)]
 pub struct ClusterTiming {
+  probe_interval: Duration,
+  probe_timeout: Duration,
+  gossip_interval: Duration,
+  suspicion_mult: u32,
   reap_interval: Duration,
   reconnect_interval: Duration,
   reconnect_timeout: Duration,
@@ -69,12 +71,21 @@ pub struct ClusterTiming {
 }
 
 impl ClusterTiming {
-  /// CI-speed serf reaper timing: the reaper ticks every 100 ms and holds a
-  /// failed or left member for ~nothing, so an abrupt kill converges to a
-  /// reaped-out cluster as soon as the coordinator's default suspicion timing
-  /// declares the peer Failed.
+  /// CI-speed timing: sub-second SWIM failure detection on loopback with the
+  /// failed member reaped shortly after.
+  ///
+  /// The probe timeout sits BELOW the probe interval so an unanswered probe still
+  /// has an indirect/fallback window inside its own cycle, and the suspicion
+  /// multiplier keeps the small-cluster suspicion floor at ~300 ms — a live peer
+  /// survives a couple hundred milliseconds of executor starvation on an
+  /// oversubscribed CI runner without being falsely declared Failed, while
+  /// detection of a real kill stays comfortably sub-second.
   pub fn fast() -> Self {
     Self {
+      probe_interval: Duration::from_millis(100),
+      probe_timeout: Duration::from_millis(50),
+      gossip_interval: Duration::from_millis(20),
+      suspicion_mult: 3,
       reap_interval: Duration::from_millis(100),
       reconnect_interval: Duration::from_millis(100),
       reconnect_timeout: Duration::from_millis(1),
@@ -112,6 +123,18 @@ impl ClusterTiming {
       .with_tombstone_timeout(self.tombstone_timeout)
       .with_leave_propagate_delay(self.leave_propagate_delay)
   }
+
+  /// Apply the memberlist SWIM knobs to a fixture node's transport options.
+  pub fn apply(
+    &self,
+    opts: TcpTransportOptions<SmolStr, SocketAddr>,
+  ) -> TcpTransportOptions<SmolStr, SocketAddr> {
+    opts
+      .with_probe_interval(self.probe_interval)
+      .with_probe_timeout(self.probe_timeout)
+      .with_gossip_interval(self.gossip_interval)
+      .with_suspicion_mult(self.suspicion_mult)
+  }
 }
 
 /// One observed member event: its kind and the member ids it names.
@@ -143,9 +166,7 @@ impl Cluster {
   pub async fn spawn(ids: &[&str], timing: ClusterTiming) -> Self {
     let mut slots = Vec::with_capacity(ids.len());
     for id in ids {
-      let serf = build_node(id, timing.serf_opts())
-        .await
-        .expect("spawn serf tcp node");
+      let serf = build_node(id, &timing).await.expect("spawn serf tcp node");
       let log: EventLog = Rc::new(RefCell::new(Vec::new()));
       // Attach the collector before the handle moves into the slot, so no member
       // event can slip past between construction and the first join.
@@ -305,19 +326,21 @@ impl Cluster {
   }
 }
 
-/// Spawn a fixture node on an ephemeral loopback port with `serf_opts`.
-async fn build_node(id: &str, serf_opts: SerfOptions) -> serf_compio::Result<Node> {
-  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
-    .with_local_id(SmolStr::new(id))
-    .with_advertise_addr(MaybeResolved::Resolved(loopback_ephemeral()));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+/// Spawn a fixture node on an ephemeral loopback port with `timing`'s memberlist
+/// SWIM knobs and serf reaper windows.
+async fn build_node(id: &str, timing: &ClusterTiming) -> serf_compio::Result<Node> {
+  let opts = timing.apply(
+    TcpTransportOptions::<SmolStr, SocketAddr>::new()
+      .with_local_id(SmolStr::new(id))
+      .with_advertise_addr(MaybeResolved::Resolved(loopback_ephemeral())),
+  );
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
-    serf_opts,
-    gossip_rng().expect("seed gossip rng"),
+    timing.serf_opts(),
     None,
     None,
     None,

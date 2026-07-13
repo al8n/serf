@@ -63,7 +63,8 @@ pub(crate) fn os_seeded_std_rng() -> crate::Result<StdRng> {
 }
 
 pub use error::{
-  GossipMtuTooSmall, InvalidAdvertiseAddr, InvalidGossipMtu, InvalidOption, Result, SerfError,
+  GossipMtuTooSmall, InvalidAdvertiseAddr, InvalidGossipMtu, InvalidOption, JoinFailed, Result,
+  SerfError,
 };
 
 /// The seed/advertise address form re-exported from `memberlist-proto`: either an
@@ -149,9 +150,9 @@ pub use events::EventStream;
 pub use driver::options::{
   Channel, DEFAULT_BRIDGE_INBOUND_CAP, DEFAULT_BRIDGE_RECV_BUF_LEN, DEFAULT_CLOSE_TIMEOUT,
   DEFAULT_DIAL_TIMEOUT, DEFAULT_EVENT_QUEUE_CAP, DEFAULT_IDLE_WAKE_INTERVAL,
-  DEFAULT_ITER_DRAIN_CAP, DEFAULT_LEAVE_TIMEOUT, DEFAULT_OBSERVATION_CHANNEL,
-  DEFAULT_SNAPSHOT_COMPACT_THRESHOLD, ParseChannelError, RuntimeOptions, SnapshotOptions,
-  StreamTransportOptions,
+  DEFAULT_ITER_DRAIN_CAP, DEFAULT_JOIN_DEADLINE, DEFAULT_LEAVE_TIMEOUT,
+  DEFAULT_OBSERVATION_CHANNEL, DEFAULT_SNAPSHOT_COMPACT_THRESHOLD, ParseChannelError,
+  RuntimeOptions, SnapshotOptions, StreamTransportOptions,
 };
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
