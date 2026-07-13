@@ -11,7 +11,7 @@
 //! ergonomics — typed query/response futures, builder-style construction — are a
 //! follow-up; the protocol surface here is complete.
 
-use core::time::Duration;
+use core::{marker::PhantomData, time::Duration};
 use std::{
   cell::{Cell, RefCell},
   net::SocketAddr,
@@ -35,13 +35,22 @@ use smol_str::SmolStr;
 
 #[cfg(encryption)]
 use crate::command::{KeyCmd, ListKeysCmd};
+#[cfg(feature = "quic")]
+use crate::quic::{QuicTransport, QuicTransportOptions};
+#[cfg(feature = "tcp")]
+use crate::tcp::{TcpTransport, TcpTransportOptions};
+#[cfg(feature = "tls")]
+use crate::tls::{TlsTransport, TlsTransportOptions};
 use crate::{
   command::{
     Command, ForceLeaveCmd, JoinCmd, JoinKind, JoinReply, LeaveCmd, QueryCmd, RespondCmd,
     SetTagsCmd, ShutdownCmd, UserEventCmd, WaitForCompletionArgs,
   },
   delegate::Delegate,
-  driver::options::RuntimeOptions,
+  driver::{
+    options::RuntimeOptions,
+    shared::{ShutdownWaiter, shutdown_latch},
+  },
   drop_counter::DropReader,
   error::{InvalidOption, JoinFailed, Result, SerfError},
   events::EventStream,
@@ -81,6 +90,11 @@ struct Shared<I> {
   coalesced_member_events_dropped: DropReader,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
+  /// Handle half of the driver's teardown-completion latch. A `shutdown()` the
+  /// driver can no longer accept (it is already tearing down, so `shutdown_flag`
+  /// is set or the command queue is gone) parks here rather than returning into a
+  /// still-bound port.
+  shutdown_complete: ShutdownWaiter,
   local_id: I,
   advertise: SocketAddr,
   /// Per-call deadline applied to await-result joins, cached from
@@ -95,20 +109,46 @@ struct Shared<I> {
 
 /// A cheaply-clonable handle to a running serf node.
 ///
-/// Construct one with [`Serf::new`]; clone it freely — every clone shares the
-/// single driver task. Requires a stream or QUIC transport feature.
+/// Construct one with a per-backend constructor — [`Serf::tcp`], [`Serf::tls`],
+/// [`Serf::quic`] — or with the generic [`Serf::new`]; clone it freely, since
+/// every clone shares the single driver task. Requires a stream or QUIC transport
+/// feature.
+///
+/// `Serf<I, A>` carries the wire id type `I` and the unresolved address type `A`
+/// the node's ADVERTISE address was configured in. `I` flows into the snapshot and
+/// the events channel (both `<I, SocketAddr>`). There is no runtime parameter:
+/// compio IS the runtime, so a compio handle is `!Send` and its driver is spawned
+/// on the current thread's compio runtime.
+///
+/// `A` is a brand, not a wire type: the advertise address is resolved to a
+/// [`SocketAddr`] once at construction, and every membership address from then on
+/// is a `SocketAddr`. It is therefore free to be a hostname type — e.g. the
+/// [`hostaddr::HostAddr<SmolStr>`](hostaddr::HostAddr) that
+/// [`OsResolver`](crate::OsResolver) consumes.
+///
+/// `A` does NOT constrain the seeds accepted by [`join`](Serf::join) /
+/// [`join_many`](Serf::join_many) / [`dispatch_join`](Serf::dispatch_join): each is
+/// generic over the [`Resolver`](crate::Resolver) it is handed and takes its seeds
+/// in THAT resolver's address domain. Joining by hostname while advertising a
+/// resolved `SocketAddr` (or the reverse) is deliberately allowed.
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
-pub struct Serf<I> {
+pub struct Serf<I, A> {
   shared: Rc<Shared<I>>,
+  /// Brands the handle with the unresolved address type the node's advertise
+  /// address was configured in. No `A` value survives construction (it is resolved
+  /// to a `SocketAddr` before the driver starts), and the `join` family is generic
+  /// over the resolver it is handed, so this constrains no seed.
+  _a: PhantomData<fn(A)>,
 }
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
-impl<I> Clone for Serf<I> {
+impl<I, A> Clone for Serf<I, A> {
   #[inline]
   fn clone(&self) -> Self {
     Self {
       shared: self.shared.clone(),
+      _a: PhantomData,
     }
   }
 }
@@ -136,7 +176,7 @@ where
 }
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
-impl<I> Serf<I>
+impl<I, A> Serf<I, A>
 where
   I: Clone + PartialEq + 'static,
 {
@@ -224,6 +264,10 @@ where
     let (user_drop_writer, user_drop_reader) = crate::drop_counter::drop_channel();
     let (member_drop_writer, member_drop_reader) = crate::drop_counter::drop_channel();
     let shutdown_flag = Rc::new(Cell::new(false));
+    // Mint the teardown-completion latch: the driver holds the sender until its
+    // bind sockets are released, and the handle keeps the waiter so a `shutdown()`
+    // the driver can no longer accept still returns only once the ports are free.
+    let (shutdown_complete, shutdown_waiter) = shutdown_latch();
     let snapshot: SnapshotCell<I> = Rc::new(RefCell::new(Rc::new(initial_snapshot(
       &local_id, advertise,
     ))));
@@ -250,6 +294,7 @@ where
       member_drop_writer,
       snapshot.clone(),
       shutdown_flag.clone(),
+      shutdown_complete,
       runtime_options,
       serf_options,
       reconnect_delegate,
@@ -274,11 +319,13 @@ where
         coalesced_member_events_dropped: member_drop_reader,
         snapshot,
         shutdown_flag,
+        shutdown_complete: shutdown_waiter,
         local_id,
         advertise,
         join_deadline,
         serf_options: serf_options_handle,
       }),
+      _a: PhantomData,
     })
   }
 
@@ -867,12 +914,325 @@ where
     await_reply(rx).await
   }
 
-  /// Gracefully shut the driver down, releasing the bound ports before this
-  /// resolves so an immediate rebind on the same address succeeds.
+  /// Stop the driver and release its bound ports, so an immediate rebind on the
+  /// same address succeeds with no grace period. Returns once those ports are
+  /// released; it aborts in-flight reliable-stream exchanges but does not block on
+  /// their connection cleanup.
+  ///
+  /// Idempotent: a second — or concurrent — call resolves `Ok(())` too, and it
+  /// resolves at the same instant the first one does. A caller whose command the
+  /// tearing-down driver can no longer accept parks on the driver's completion
+  /// latch instead of failing, so "returns once the ports are free" holds for
+  /// EVERY caller, not just the one the driver observed.
   pub async fn shutdown(&self) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    self.send(Command::Shutdown(ShutdownCmd { reply: tx }))?;
+    if self
+      .send(Command::Shutdown(ShutdownCmd { reply: tx }))
+      .is_err()
+    {
+      // The driver is already tearing down (or has finished), so it will never
+      // read this command. It may still hold its bind sockets, so await teardown
+      // completion before reporting success rather than returning into a
+      // still-bound port.
+      self.shared.shutdown_complete.wait().await;
+      return Ok(());
+    }
     await_reply(rx).await
+  }
+}
+
+// Ergonomic per-backend constructors: instantiate the transport for the caller so
+// a node can be built without naming the generic `Serf::new::<T, …>` machinery.
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+impl<I, A> Serf<I, A>
+where
+  I: memberlist_proto::Id,
+  A: Clone + Send + 'static,
+{
+  /// Build a TCP-backed serf node and spawn its driver on the compio runtime.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`TcpTransport`](crate::TcpTransport) for the caller: it binds a UDP gossip
+  /// socket and a TCP reliable listener on the advertise address (resolved once
+  /// via `resolver` / `advertise_resolver`), then spawns the stream driver. The
+  /// gossip RNG is drawn from OS entropy via [`gossip_rng`](crate::gossip_rng);
+  /// use [`tcp_with_rng`](Self::tcp_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Rc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Rc::new(VoidKeyringDelegate)` for a node that manages no keys).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tcp<RES, AR, D>(
+    options: TcpTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+  {
+    Self::tcp_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`tcp`](Self::tcp) but with a caller-supplied gossip RNG `G` — draw it
+  /// via [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tcp_with_rng<RES, AR, D, G>(
+    options: TcpTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<TcpTransport<I, A>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+}
+
+// Ergonomic TLS constructor. TLS rides the same stream driver as plain TCP,
+// differing only in the record layer.
+#[cfg(feature = "tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+impl<I, A> Serf<I, A>
+where
+  I: memberlist_proto::Id,
+  A: Clone + Send + 'static,
+{
+  /// Build a TLS-backed serf node and spawn its driver on the compio runtime.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`TlsTransport`](crate::TlsTransport) for the caller: it binds a UDP gossip
+  /// socket and a TCP reliable listener on the advertise address (resolved once via
+  /// `resolver` / `advertise_resolver`), then spawns the stream driver whose
+  /// reliable record layer drives rustls over the plain compio TCP stream. The
+  /// caller supplies the rustls server/client bundle and the per-peer SNI provider
+  /// through [`TlsTransportOptions`](crate::TlsTransportOptions). The gossip RNG is
+  /// drawn from OS entropy via [`gossip_rng`](crate::gossip_rng); use
+  /// [`tls_with_rng`](Self::tls_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Rc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Rc::new(VoidKeyringDelegate)` for a node that manages no keys); the keyring
+  /// AEAD-protects the gossip datagrams (the reliable plane rides the TLS session).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tls<RES, AR, D>(
+    options: TlsTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+  {
+    Self::tls_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`tls`](Self::tls) but with a caller-supplied gossip RNG `G` — draw it via
+  /// [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn tls_with_rng<RES, AR, D, G>(
+    options: TlsTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<TlsTransport<I, A>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+}
+
+// Ergonomic QUIC constructor.
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+impl<I, A> Serf<I, A>
+where
+  I: memberlist_proto::Id,
+  A: Clone + Send + 'static,
+{
+  /// Build a QUIC-backed serf node and spawn its driver on the compio runtime.
+  ///
+  /// The ergonomic wrapper over [`Serf::new`] that instantiates the
+  /// [`QuicTransport`](crate::QuicTransport) for the caller: it binds a single UDP
+  /// socket on the advertise address (resolved once via `resolver` /
+  /// `advertise_resolver`) over which the coordinator multiplexes the reliable
+  /// push/pull streams and serf's datagram gossip, then spawns the QUIC driver. The
+  /// caller supplies the quinn-proto config bundle through
+  /// [`QuicTransportOptions::with_quic_config`](crate::QuicTransportOptions::with_quic_config).
+  /// The gossip RNG is drawn from OS entropy via [`gossip_rng`](crate::gossip_rng);
+  /// use [`quic_with_rng`](Self::quic_with_rng) to supply your own.
+  ///
+  /// Under an encryption backend, pass an
+  /// [`Rc<dyn KeyringDelegate>`](crate::KeyringDelegate)
+  /// (`Rc::new(VoidKeyringDelegate)` for a node that manages no keys); the keyring
+  /// AEAD-protects the gossip datagrams (the reliable plane rides quinn's own TLS).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn quic<RES, AR, D>(
+    options: QuicTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+  {
+    Self::quic_with_rng(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      crate::gossip_rng()?,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
+  }
+
+  /// Like [`quic`](Self::quic) but with a caller-supplied gossip RNG `G` — draw it
+  /// via [`gossip_rng`](crate::gossip_rng) for fork-safe OS entropy.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn quic_with_rng<RES, AR, D, G>(
+    options: QuicTransportOptions<I, A>,
+    resolver: &RES,
+    advertise_resolver: &AR,
+    delegate: D,
+    runtime_options: RuntimeOptions,
+    serf_options: SerfOptions,
+    gossip_rng: G,
+    reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<I, SocketAddr>>>,
+    merge_delegate: Option<Box<dyn memberlist_proto::delegate::MergeDelegate<I, SocketAddr>>>,
+    snapshot: Option<crate::SnapshotOptions>,
+    #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+  ) -> Result<Self>
+  where
+    RES: Resolver<Address = A>,
+    AR: AdvertiseAddrResolver,
+    D: Delegate<Id = I, Address = SocketAddr> + 'static,
+    G: rand::Rng + Send + Unpin + 'static,
+  {
+    Self::new::<QuicTransport<I, A>, RES, AR, D, G>(
+      options,
+      resolver,
+      advertise_resolver,
+      delegate,
+      runtime_options,
+      serf_options,
+      gossip_rng,
+      reconnect_delegate,
+      merge_delegate,
+      snapshot,
+      #[cfg(encryption)]
+      keyring,
+    )
+    .await
   }
 }
 

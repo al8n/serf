@@ -28,7 +28,6 @@ use serf_compio::{
   Channel, Delegate, FirstAddrResolver, Ipv4PreferringResolver, MemberDelegate, MergeDelegate,
   QueryDelegate, QuicOptions, QuicTransport, QuicTransportOptions, Resolver, RuntimeOptions, Serf,
   SerfError, SnapshotOptions, SocketAddrResolver, Transport, UserEventDelegate, VoidDelegate,
-  gossip_rng,
 };
 use serf_proto::{
   Tags, UserEventMessage,
@@ -367,7 +366,7 @@ where
   }
 
   /// Build and spawn the node on an ephemeral loopback UDP port.
-  async fn spawn(self, id: &str) -> Serf<SmolStr> {
+  async fn spawn(self, id: &str) -> Serf<SmolStr, SocketAddr> {
     #[allow(unused_mut)]
     let mut opts = QuicTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
@@ -377,14 +376,13 @@ where
     {
       opts = opts.with_encryption(self.encryption);
     }
-    Serf::new::<QuicTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    Serf::quic(
       opts,
       &SocketAddrResolver,
       &FirstAddrResolver,
       self.delegate,
       self.runtime,
       self.serf,
-      gossip_rng().expect("seed gossip rng"),
       None,
       self.merge,
       self.snapshot,
@@ -397,12 +395,12 @@ where
 }
 
 /// Spawn a plain loopback QUIC node.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   NodeSpec::new().spawn(id).await
 }
 
 /// Poll both nodes until each reports the full two-member cluster.
-async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+async fn converge(a: &Serf<SmolStr, SocketAddr>, b: &Serf<SmolStr, SocketAddr>) {
   compio::time::timeout(WINDOW, async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
@@ -416,7 +414,7 @@ async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
 }
 
 /// Join `joiner` to `seed` over QUIC and wait for both to converge.
-async fn join_and_converge(joiner: &Serf<SmolStr>, seed: &Serf<SmolStr>) {
+async fn join_and_converge(joiner: &Serf<SmolStr, SocketAddr>, seed: &Serf<SmolStr, SocketAddr>) {
   joiner
     .join(
       &SocketAddrResolver,

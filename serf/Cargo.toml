@@ -61,8 +61,16 @@ embedded = ["dep:serf-embedded", "alloc", "serf-embedded/alloc"]
 # the `-aws-lc-rs` variant) — which turn on `tls` / `quic` transitively.
 tcp = ["serf-proto/tcp", "serf-reactor?/tcp", "serf-compio?/tcp"]
 tls = ["serf-proto/tls", "serf-reactor?/tls", "serf-compio?/tls"]
-tls-rustls-ring = ["tls", "serf-reactor?/tls-rustls-ring"]
-tls-rustls-aws-lc-rs = ["tls", "serf-reactor?/tls-rustls-aws-lc-rs"]
+tls-rustls-ring = [
+  "tls",
+  "serf-reactor?/tls-rustls-ring",
+  "serf-compio?/tls-rustls-ring",
+]
+tls-rustls-aws-lc-rs = [
+  "tls",
+  "serf-reactor?/tls-rustls-aws-lc-rs",
+  "serf-compio?/tls-rustls-aws-lc-rs",
+]
 quic = ["serf-proto/quic", "serf-reactor?/quic", "serf-compio?/quic"]
 quic-rustls-ring = [
   "quic",

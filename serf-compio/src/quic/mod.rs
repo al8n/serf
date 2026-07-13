@@ -573,6 +573,7 @@ where
       runtime.datagrams_sent,
       runtime.snapshot,
       runtime.shutdown_flag,
+      runtime.shutdown_complete,
       runtime.driver_options,
       runtime.delegate,
       None,

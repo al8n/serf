@@ -230,18 +230,17 @@ where
   }
 
   /// Build and spawn the node on an ephemeral loopback port.
-  async fn spawn(self, id: &str) -> Serf<SmolStr> {
+  async fn spawn(self, id: &str) -> Serf<SmolStr, SocketAddr> {
     let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
       .with_advertise_addr(MaybeResolved::Resolved(cluster::loopback_ephemeral()));
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    Serf::tcp(
       opts,
       &SocketAddrResolver,
       &FirstAddrResolver,
       self.delegate,
       self.runtime,
       self.serf,
-      gossip_rng().expect("seed gossip rng"),
       None,
       None,
       self.snapshot,
@@ -254,12 +253,12 @@ where
 }
 
 /// Spawn a plain loopback node.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   NodeSpec::new().spawn(id).await
 }
 
 /// Poll both nodes until each reports the full two-member cluster.
-async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+async fn converge(a: &Serf<SmolStr, SocketAddr>, b: &Serf<SmolStr, SocketAddr>) {
   compio::time::timeout(WINDOW, async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
@@ -273,7 +272,7 @@ async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
 }
 
 /// Join `joiner` to `seed` and wait for both to converge.
-async fn join_and_converge(joiner: &Serf<SmolStr>, seed: &Serf<SmolStr>) {
+async fn join_and_converge(joiner: &Serf<SmolStr, SocketAddr>, seed: &Serf<SmolStr, SocketAddr>) {
   joiner
     .join(
       &SocketAddrResolver,
@@ -1589,7 +1588,7 @@ async fn swim_knobs_reach_the_coordinator_and_speed_failure_detection() {
   const DETECT_WINDOW: Duration = Duration::from_secs(3);
 
   /// A node whose failure detector is tuned for sub-second detection.
-  async fn spawn_tuned(id: &str) -> Serf<SmolStr> {
+  async fn spawn_tuned(id: &str) -> Serf<SmolStr, SocketAddr> {
     let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
       .with_advertise_addr(MaybeResolved::Resolved(cluster::loopback_ephemeral()))
@@ -1601,7 +1600,7 @@ async fn swim_knobs_reach_the_coordinator_and_speed_failure_detection() {
       // both multipliers to 1 keeps it at the probe-scaled minimum.
       .with_suspicion_mult(1)
       .with_suspicion_max_timeout_mult(1);
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+    Serf::tcp(
       opts,
       &SocketAddrResolver,
       &FirstAddrResolver,
@@ -1610,7 +1609,6 @@ async fn swim_knobs_reach_the_coordinator_and_speed_failure_detection() {
       // Hold the Failed member rather than reaping it, so the status is
       // observable instead of racing the reaper.
       SerfOptions::new().with_reconnect_timeout(Duration::from_secs(3600)),
-      gossip_rng().expect("seed gossip rng"),
       None,
       None,
       None,
@@ -1672,7 +1670,7 @@ async fn swim_knobs_reach_the_coordinator_and_speed_failure_detection() {
 async fn an_unresolved_host_advertise_addr_resolves_through_the_os_resolver() {
   let host: hostaddr::HostAddr<SmolStr> = "localhost:0".parse().expect("a host:port address");
 
-  let node = Serf::new::<TcpTransport, OsResolver, Ipv4PreferringResolver, _, _>(
+  let node = Serf::tcp_with_rng(
     TcpTransportOptions::new()
       .with_local_id(SmolStr::new("hostaddr-node"))
       .with_advertise_addr(MaybeResolved::Unresolved(host)),

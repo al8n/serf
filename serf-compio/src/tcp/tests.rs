@@ -176,3 +176,82 @@ fn zero_push_pull_interval_is_set_not_unset() {
     .with_push_pull_interval(Duration::ZERO);
   assert_eq!(opts.push_pull_interval(), Some(Duration::ZERO));
 }
+
+/// An unresolved advertise input round-trips through the options block in its
+/// ORIGINAL form: resolution happens once at construction, not in the builder, so
+/// the accessor must not silently pre-resolve a hostname.
+#[test]
+fn unresolved_advertise_addr_round_trips_unresolved() {
+  let host: hostaddr::HostAddr<SmolStr> = "example.com:7946".parse().expect("host addr");
+  let opts = TcpTransportOptions::<SmolStr, hostaddr::HostAddr<SmolStr>>::new()
+    .with_advertise_addr(MaybeResolved::Unresolved(host.clone()));
+  match opts.advertise_addr() {
+    Some(MaybeResolved::Unresolved(h)) => assert_eq!(*h, host),
+    other => panic!("expected an unresolved advertise addr, got {other:?}"),
+  }
+}
+
+/// The gossip-and-reliable keyring reaches the options block through the builder.
+#[cfg(encryption)]
+#[test]
+fn encryption_policy_round_trips() {
+  use memberlist_proto::{EncryptionOptions, Keyring, SecretKey};
+
+  #[cfg(feature = "aes-gcm")]
+  let key = SecretKey::Aes256([0x21; 32]);
+  #[cfg(all(not(feature = "aes-gcm"), feature = "chacha20-poly1305"))]
+  let key = SecretKey::ChaCha20Poly1305([0x21; 32]);
+
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_encryption(EncryptionOptions::new().with_keyring(Keyring::new(key)));
+  let keyring = opts
+    .encryption()
+    .keyring()
+    .expect("the configured keyring reaches the options block");
+  assert_eq!(
+    keyring.primary_ref(),
+    &key,
+    "the primary key is the one that was configured"
+  );
+}
+
+/// `Default` is the `new()` state — one source of truth, so a node built from
+/// `Default` carries no accidental pre-set id, advertise address, or SWIM override.
+#[test]
+fn default_matches_new() {
+  let d = TcpTransportOptions::<SmolStr, SocketAddr>::default();
+  assert!(d.local_id().is_none());
+  assert!(d.advertise_addr().is_none());
+  assert!(d.probe_interval().is_none());
+}
+
+/// A constructed transport reports the identity it was built with: the local id,
+/// the advertise input in the ORIGINAL form the caller supplied (an unresolved
+/// input stays unresolved — resolution happens for the bind, not for this
+/// accessor), and the concrete bound contact the node will gossip.
+#[compio::test]
+async fn transport_reports_its_identity_and_bound_contact() {
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let transport = TcpTransport::<SmolStr, SocketAddr>::new(
+    TcpTransportOptions::new()
+      .with_local_id(SmolStr::new("ident"))
+      .with_advertise_addr(MaybeResolved::Unresolved(bind)),
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+  )
+  .await
+  .expect("the transport binds an ephemeral loopback port");
+
+  assert_eq!(transport.local_id(), &SmolStr::new("ident"));
+  match transport.local_address() {
+    MaybeResolved::Unresolved(a) => assert_eq!(*a, bind),
+    other => panic!("the advertise INPUT form must be retained, got {other:?}"),
+  }
+  let advertise = *transport.advertise_address();
+  assert!(advertise.ip().is_loopback());
+  assert_ne!(
+    advertise.port(),
+    0,
+    "the bound contact carries the OS-assigned port, not the ephemeral `:0`"
+  );
+}

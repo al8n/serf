@@ -140,3 +140,39 @@ fn a_scoped_or_flow_labelled_ipv6_is_refused() {
   ));
   validate_advertise_addr(&plain).expect("an unscoped IPv6 unicast contact is accepted");
 }
+
+/// A seed keyring whose keys collide across ciphers — the same raw bytes under
+/// two cipher variants — is refused at construction: the coordinator's rotation
+/// ops match on bytes alone, so such a ring would let a later `use`/`remove`
+/// promote or drop the wrong cipher's key. A same-cipher multi-key ring, and a
+/// cross-cipher ring with DISTINCT bytes, both stay admissible.
+#[cfg(all(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn cross_cipher_twin_keyring_is_rejected_at_construction() {
+  use memberlist_proto::{EncryptionOptions, Keyring, SecretKey};
+
+  use super::reject_cross_cipher_keyring;
+
+  let aes = |b: u8| SecretKey::Aes256([b; 32]);
+  let chacha = |b: u8| SecretKey::ChaCha20Poly1305([b; 32]);
+
+  let mut twinned = Keyring::new(aes(1));
+  twinned.insert_secondary(chacha(1));
+  let err = reject_cross_cipher_keyring(&EncryptionOptions::new().with_keyring(twinned))
+    .expect_err("a cross-cipher byte twin makes every later key op ambiguous");
+  assert!(
+    matches!(err, crate::SerfError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+    "the twin refusal is an InvalidInput, got {err:?}"
+  );
+
+  let clean = Keyring::with_secondaries(aes(1), [aes(2), chacha(3)]);
+  assert!(
+    reject_cross_cipher_keyring(&EncryptionOptions::new().with_keyring(clean)).is_ok(),
+    "distinct key bytes across ciphers are unambiguous and stay admissible"
+  );
+
+  assert!(
+    reject_cross_cipher_keyring(&EncryptionOptions::new()).is_ok(),
+    "a node with no keyring configured has nothing to refuse"
+  );
+}

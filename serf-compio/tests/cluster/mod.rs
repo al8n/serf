@@ -22,8 +22,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 use futures_util::StreamExt;
 use memberlist_proto::MaybeResolved;
 use serf_compio::{
-  FirstAddrResolver, RuntimeOptions, Serf, SocketAddrResolver, TcpTransport, TcpTransportOptions,
-  VoidDelegate, gossip_rng,
+  FirstAddrResolver, RuntimeOptions, Serf, SocketAddrResolver, TcpTransportOptions, VoidDelegate,
 };
 use serf_proto::{
   event::{Event, MemberEventKind},
@@ -32,8 +31,9 @@ use serf_proto::{
 };
 use smol_str::SmolStr;
 
-/// A compio TCP node handle.
-pub type Node = Serf<SmolStr>;
+/// A compio TCP node handle. The advertise address is configured as a resolved
+/// `SocketAddr`, so that is the handle's address brand.
+pub type Node = Serf<SmolStr, SocketAddr>;
 
 /// Wall-clock ceiling for every fixture poll loop, so a convergence or detection
 /// regression surfaces as a bounded timeout rather than a hang.
@@ -334,14 +334,13 @@ async fn build_node(id: &str, timing: &ClusterTiming) -> serf_compio::Result<Nod
       .with_local_id(SmolStr::new(id))
       .with_advertise_addr(MaybeResolved::Resolved(loopback_ephemeral())),
   );
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     timing.serf_opts(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,

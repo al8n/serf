@@ -337,3 +337,47 @@ async fn a_refused_pre_leave_gossip_send_does_not_poison_a_later_leave() {
   // Ignoring Err: test cleanup of the probe socket.
   let _ = socket.close().await;
 }
+
+/// The rotation-durability acknowledgement contract both pumps park a key
+/// response on: an unacknowledged rotation keeps the response parked; a persisted
+/// rotation sends it unchanged; a persistence failure — or a worker that vanished
+/// without acknowledging — downgrades it to `result = false` carrying the error,
+/// so a caller is never told a rotation was durable when it was not.
+#[cfg(encryption)]
+#[test]
+fn parked_key_responses_settle_by_acknowledgement_outcome() {
+  use std::sync::mpsc;
+
+  use serf_driver::settle_parked_key_response;
+
+  let ok_resp = serf_proto::event::KeyResponseArgs {
+    result: true,
+    message: "".into(),
+    ..Default::default()
+  };
+
+  // Still pending: stays parked.
+  let (tx, rx) = mpsc::channel();
+  assert!(settle_parked_key_response(&rx, &ok_resp).is_none());
+
+  // Persisted: the response goes out unchanged.
+  tx.send(Ok(())).expect("ack sends");
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(settled.result);
+  assert!(settled.message.is_empty());
+
+  // Persistence failure: downgraded, carrying the error.
+  let (tx, rx) = mpsc::channel();
+  tx.send(Err(std::io::Error::other("disk gone").into()))
+    .expect("ack sends");
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(!settled.result);
+  assert!(settled.message.contains("disk gone"));
+
+  // Worker vanished without acknowledging: a failure, not a silent success.
+  let (tx, rx) = mpsc::channel::<Result<(), crate::KeyringPersistError>>();
+  drop(tx);
+  let settled = settle_parked_key_response(&rx, &ok_resp).expect("resolved");
+  assert!(!settled.result);
+  assert!(settled.message.contains("without acknowledging"));
+}

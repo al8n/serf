@@ -18,7 +18,7 @@ use smol_str::SmolStr;
 
 use crate::{
   Channel, FirstAddrResolver, Resolver, RuntimeOptions, Serf, SerfError, SocketAddrResolver,
-  TcpTransport, TcpTransportOptions, VoidDelegate, gossip_rng,
+  TcpTransportOptions, VoidDelegate, gossip_rng,
 };
 
 /// A loopback address with a port nothing listens on — `connect()` returns
@@ -46,7 +46,7 @@ impl Resolver for EmptyResolver {
 use crate::{EncryptionOptions, Keyring, KeyringDelegate, SecretKey, VoidKeyringDelegate};
 
 /// Build and spawn a TCP serf node bound to an ephemeral loopback port.
-async fn spawn_node(id: &str) -> Serf<SmolStr> {
+async fn spawn_node(id: &str) -> Serf<SmolStr, SocketAddr> {
   try_spawn_node_at(id, "127.0.0.1:0".parse().expect("loopback addr"))
     .await
     .expect("spawn serf node")
@@ -55,18 +55,20 @@ async fn spawn_node(id: &str) -> Serf<SmolStr> {
 /// Build a TCP serf node bound to a specific advertise address, returning the
 /// construction result so the same-address rebind regression can assert a freed
 /// port accepts an immediate rebind.
-async fn try_spawn_node_at(id: &str, bind: SocketAddr) -> Result<Serf<SmolStr>, SerfError> {
+async fn try_spawn_node_at(
+  id: &str,
+  bind: SocketAddr,
+) -> Result<Serf<SmolStr, SocketAddr>, SerfError> {
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -97,6 +99,65 @@ async fn tcp_shutdown_releases_bound_address_for_rebind() {
     "the second node rebinds the exact freed address"
   );
   second.shutdown().await.expect("second node shuts down");
+}
+
+/// A second `shutdown()` — issued once the driver has already exited and closed
+/// its command queue — still resolves `Ok`, and only AFTER the bind address is
+/// actually free: the late caller parks on the teardown-completion latch rather
+/// than returning into a still-bound port. The freed address is proven rebindable
+/// immediately after.
+#[compio::test]
+async fn tcp_second_shutdown_awaits_teardown_completion() {
+  let node = spawn_node("twice-a").await;
+  let addr = node.advertise_address();
+
+  node.shutdown().await.expect("the first shutdown resolves");
+  node
+    .shutdown()
+    .await
+    .expect("a second shutdown after teardown still resolves Ok");
+
+  // Every other command path still fails fast once the queue is closed, rather
+  // than hanging: only `shutdown` is idempotent.
+  let err = node
+    .user_event("post", Bytes::from_static(b"x"), false)
+    .await
+    .expect_err("a shut-down node accepts no commands");
+  assert!(
+    matches!(err, SerfError::Shutdown),
+    "a post-shutdown command reports Shutdown, got {err:?}"
+  );
+
+  let reborn = try_spawn_node_at("twice-b", addr)
+    .await
+    .expect("the freed address rebinds after the awaited teardown");
+  assert_eq!(reborn.advertise_address(), addr);
+  reborn.shutdown().await.expect("twice-b shuts down");
+}
+
+/// Two `shutdown()` calls issued CONCURRENTLY both land in the command queue
+/// before the driver observes either. The pump dispatches the first and drains the
+/// second during teardown; both must resolve `Ok` — and both only once the bound
+/// ports are released, which the immediate same-address rebind proves. A straggler
+/// shutdown failed at the teardown drain would resolve `Err` while the listener
+/// and gossip socket were still bound.
+#[compio::test]
+async fn tcp_concurrent_shutdowns_resolve_ok_after_the_ports_are_freed() {
+  let node = spawn_node("concurrent-shutdown-a").await;
+  let addr = node.advertise_address();
+
+  let (first, second) = future::join(node.shutdown(), node.shutdown()).await;
+  first.expect("the observed shutdown resolves Ok");
+  second.expect("the shutdown drained during teardown also resolves Ok");
+
+  let reborn = try_spawn_node_at("concurrent-shutdown-b", addr)
+    .await
+    .expect("both shutdowns resolved only after the ports were freed");
+  assert_eq!(reborn.advertise_address(), addr);
+  reborn
+    .shutdown()
+    .await
+    .expect("concurrent-shutdown-b shuts down");
 }
 
 /// All `Serf` handles dropping under a continuous gossip flood must still shut the
@@ -177,22 +238,20 @@ async fn assert_tcp_new_rejects(runtime: RuntimeOptions) {
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new("bad-opt-node"))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  let res =
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-      opts,
-      &SocketAddrResolver,
-      &FirstAddrResolver,
-      VoidDelegate::<SmolStr, SocketAddr>::new(),
-      runtime,
-      SerfOptions::new(),
-      gossip_rng().expect("seed gossip rng"),
-      None,
-      None,
-      None,
-      #[cfg(encryption)]
-      std::rc::Rc::new(VoidKeyringDelegate),
-    )
-    .await;
+  let res = Serf::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    runtime,
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await;
   match res {
     Err(SerfError::InvalidOption(_)) => {}
     Err(other) => panic!("expected InvalidOption, got {other:?}"),
@@ -224,22 +283,20 @@ async fn tcp_new_rejects_over_ceiling_user_event_size() {
     .with_advertise_addr(MaybeResolved::Resolved(bind));
   let serf =
     SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1);
-  let res =
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-      opts,
-      &SocketAddrResolver,
-      &FirstAddrResolver,
-      VoidDelegate::<SmolStr, SocketAddr>::new(),
-      RuntimeOptions::new(),
-      serf,
-      gossip_rng().expect("seed gossip rng"),
-      None,
-      None,
-      None,
-      #[cfg(encryption)]
-      std::rc::Rc::new(VoidKeyringDelegate),
-    )
-    .await;
+  let res = Serf::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf,
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await;
   match res {
     Err(SerfError::InvalidOption(_)) => {}
     Err(other) => panic!("expected InvalidOption, got {other:?}"),
@@ -342,20 +399,22 @@ fn test_secret_key(fill: u8) -> SecretKey {
 /// Build and spawn a TCP serf node on an ephemeral loopback port with `encryption`
 /// installed as its gossip-and-reliable keyring policy.
 #[cfg(encryption)]
-async fn spawn_encrypted_node(id: &str, encryption: EncryptionOptions) -> Serf<SmolStr> {
+async fn spawn_encrypted_node(
+  id: &str,
+  encryption: EncryptionOptions,
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_encryption(encryption);
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -472,12 +531,15 @@ async fn mismatched_keyring_nodes_do_not_exchange_membership() {
 }
 
 /// Build a TCP serf node with a custom `RuntimeOptions`.
-async fn spawn_node_with_runtime(id: &str, runtime_options: RuntimeOptions) -> Serf<SmolStr> {
+async fn spawn_node_with_runtime(
+  id: &str,
+  runtime_options: RuntimeOptions,
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp_with_rng(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
@@ -565,19 +627,21 @@ async fn tcp_events_dropped_counter_observable_under_backpressure() {
 }
 
 /// Build a TCP serf node with a custom `SerfOptions` (runtime options at defaults).
-async fn spawn_node_with_serf_options(id: &str, serf_options: SerfOptions) -> Serf<SmolStr> {
+async fn spawn_node_with_serf_options(
+  id: &str,
+  serf_options: SerfOptions,
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     serf_options,
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -1075,20 +1139,19 @@ async fn spawn_encrypted_node_with_keyring(
   id: &str,
   encryption: EncryptionOptions,
   keyring: std::rc::Rc<dyn KeyringDelegate>,
-) -> Serf<SmolStr> {
+) -> Serf<SmolStr, SocketAddr> {
   let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(bind))
     .with_encryption(encryption);
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new(),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     None,
@@ -1297,20 +1360,19 @@ async fn spawn_node_with_snapshot(
   id: &str,
   snapshot: crate::SnapshotOptions,
   rejoin_after_leave: bool,
-) -> Serf<SmolStr> {
+) -> Serf<SmolStr, SocketAddr> {
   let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
     .with_local_id(SmolStr::new(id))
     .with_advertise_addr(MaybeResolved::Resolved(
       "127.0.0.1:0".parse().expect("loopback addr"),
     ));
-  Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
+  Serf::tcp(
     opts,
     &SocketAddrResolver,
     &FirstAddrResolver,
     VoidDelegate::<SmolStr, SocketAddr>::new(),
     RuntimeOptions::new(),
     SerfOptions::new().with_rejoin_after_leave(rejoin_after_leave),
-    gossip_rng().expect("seed gossip rng"),
     None,
     None,
     Some(snapshot),
@@ -1331,7 +1393,7 @@ fn snapshot_path(name: &str) -> std::path::PathBuf {
 }
 
 /// Poll both nodes until each reports the full two-member cluster.
-async fn converge(a: &Serf<SmolStr>, b: &Serf<SmolStr>) {
+async fn converge(a: &Serf<SmolStr, SocketAddr>, b: &Serf<SmolStr, SocketAddr>) {
   compio::time::timeout(Duration::from_secs(20), async {
     loop {
       if a.num_members() == 2 && b.num_members() == 2 {
@@ -1443,26 +1505,24 @@ async fn merge_delegate_is_consulted_on_join() {
     .with_advertise_addr(MaybeResolved::Resolved(
       "127.0.0.1:0".parse().expect("loopback addr"),
     ));
-  let b =
-    Serf::new::<TcpTransport<SmolStr, SocketAddr>, SocketAddrResolver, FirstAddrResolver, _, _>(
-      opts,
-      &SocketAddrResolver,
-      &FirstAddrResolver,
-      VoidDelegate::<SmolStr, SocketAddr>::new(),
-      RuntimeOptions::new(),
-      SerfOptions::new(),
-      gossip_rng().expect("seed gossip rng"),
-      None,
-      Some(Box::new(RecordingMerge {
-        hits: hits.clone(),
-        saw_peer: saw_peer.clone(),
-      })),
-      None,
-      #[cfg(encryption)]
-      std::rc::Rc::new(VoidKeyringDelegate),
-    )
-    .await
-    .expect("spawn merge-recording serf node");
+  let b = Serf::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    Some(Box::new(RecordingMerge {
+      hits: hits.clone(),
+      saw_peer: saw_peer.clone(),
+    })),
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn merge-recording serf node");
   let a = spawn_node("cmerge-a").await;
   let b_addr = b.advertise_address();
 
@@ -1590,4 +1650,253 @@ async fn file_backed_rotation_gates_the_response_on_persistence() {
   b.shutdown().await.expect("cfile-b shuts down");
   // Ignoring Err: best-effort test-file cleanup.
   let _ = std::fs::remove_file(&path);
+}
+
+/// Poll `cond` until it holds, failing the test on the fixture ceiling so a
+/// convergence regression surfaces as a bounded timeout rather than a hang.
+async fn await_condition(what: &str, mut cond: impl FnMut() -> bool) {
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      if cond() {
+        break;
+      }
+      compio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// The handle derives the default query timeout from its live snapshot member
+/// count without a driver round-trip, and `default_query_param` carries exactly
+/// that timeout with the neutral filter / relay / ack posture.
+#[compio::test]
+async fn tcp_default_query_param_defaults() {
+  let a = spawn_node("dqp-node").await;
+
+  let qt = a.default_query_timeout();
+  assert!(
+    qt > Duration::ZERO,
+    "default_query_timeout must be positive"
+  );
+
+  let qp = a.default_query_param();
+  assert_eq!(qp.timeout, qt, "default_query_param timeout matches");
+  assert!(qp.filters.is_empty(), "no filters");
+  assert!(!qp.request_ack, "no ack");
+  assert_eq!(qp.relay_factor, 0, "no relay");
+
+  a.shutdown().await.expect("node shuts down");
+}
+
+/// A node whose advertise address domain is `HostAddr<SmolStr>` — the type the
+/// built-in name resolvers produce — rather than a wire `SocketAddr`.
+type HostNode = Serf<SmolStr, hostaddr::HostAddr<SmolStr>>;
+
+/// Build a node whose advertise address is the UNRESOLVED host `host`, resolved
+/// through `resolver` at construction — so the node's address domain `A` is
+/// `HostAddr<SmolStr>`. The advertise candidate set is narrowed by
+/// [`Ipv4PreferringResolver`], which still falls back to the head of the set on an
+/// IPv6-only host.
+async fn try_spawn_host_node<RES>(
+  id: &str,
+  host: &str,
+  resolver: &RES,
+) -> Result<HostNode, SerfError>
+where
+  RES: Resolver<Address = hostaddr::HostAddr<SmolStr>>,
+{
+  let advertise: hostaddr::HostAddr<SmolStr> = host.parse().expect("host addr");
+  let opts = TcpTransportOptions::<SmolStr, hostaddr::HostAddr<SmolStr>>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Unresolved(advertise));
+  Serf::tcp(
+    opts,
+    resolver,
+    &crate::Ipv4PreferringResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::rc::Rc::new(VoidKeyringDelegate),
+  )
+  .await
+}
+
+/// A node can advertise a HOSTNAME: built over the `HostAddr` address domain and an
+/// [`OsResolver`](crate::OsResolver), it resolves `localhost:0` at construction,
+/// binds the resolved loopback address, and publishes the concrete `SocketAddr` it
+/// bound as its contact. A second such node then joins the first BY HOSTNAME through
+/// the same resolver — proving the address brand `A` constrains only the advertise
+/// domain, never the seeds `join` accepts.
+#[compio::test]
+async fn tcp_advertise_and_join_through_os_resolver() {
+  let resolver = crate::OsResolver;
+
+  let a = try_spawn_host_node("os-host-a", "localhost:0", &resolver)
+    .await
+    .expect("a hostname advertise address resolves and binds");
+  let a_addr = a.advertise_address();
+  assert!(
+    a_addr.ip().is_loopback(),
+    "the node advertises the RESOLVED loopback IP, not the hostname it was given: {a_addr}"
+  );
+  assert_ne!(
+    a_addr.port(),
+    0,
+    "the ephemeral `:0` resolved to the concrete port the listener bound"
+  );
+
+  let b = try_spawn_host_node("os-host-b", "localhost:0", &resolver)
+    .await
+    .expect("a second hostname-addressed node binds");
+  assert_ne!(
+    b.advertise_address(),
+    a_addr,
+    "the two nodes bind distinct ephemeral ports"
+  );
+
+  // The seed is a HOSTNAME (`localhost:<a-port>`), never a `SocketAddr`: `join`
+  // resolves it through the same resolver and reports the seed it actually reached.
+  let seed: hostaddr::HostAddr<SmolStr> = format!("localhost:{}", a_addr.port())
+    .parse()
+    .expect("hostname seed");
+  let reached = b
+    .join(&resolver, MaybeResolved::Unresolved(seed), false)
+    .await
+    .expect("the hostname seed resolves and its node is contacted");
+  assert_eq!(
+    reached, a_addr,
+    "the contacted seed is the first node's bound advertise address"
+  );
+
+  await_condition("both hostname-addressed nodes to see 2 members", || {
+    a.num_members() == 2 && b.num_members() == 2
+  })
+  .await;
+
+  a.shutdown().await.expect("node a shuts down");
+  b.shutdown().await.expect("node b shuts down");
+}
+
+/// The advertise name the fixture nameserver answers for. Its `.invalid` TLD is
+/// reserved never to resolve (RFC 6761 §6.4), so the OS fallback inside
+/// `DnsResolver` CANNOT produce an address for it — a node that comes up on
+/// loopback therefore did so on the nameserver's `A` record, not on a fallback.
+#[cfg(feature = "dns")]
+const ADVERTISE_NAME_FQDN: &str = "seed.cluster.invalid.";
+
+/// A loopback TCP nameserver answering exactly ONE query with a single `A` record
+/// for `127.0.0.1`. Speaks just enough of TCP-DNS (RFC 1035 §4.2.2: a 2-byte
+/// big-endian length prefix, then the message) for the resolver's TCP-first path;
+/// the resolver harvests A/AAAA answers without validating the question, so a fixed
+/// answer needs no query parsing. Returns the bound address to point a resolver at.
+/// Nothing leaves loopback.
+#[cfg(feature = "dns")]
+async fn spawn_loopback_nameserver() -> (SocketAddr, compio::runtime::JoinHandle<()>) {
+  use std::net::Ipv4Addr;
+
+  use compio::{
+    buf::BufResult,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+  };
+  use hickory_proto::{
+    op::{Message, OpCode},
+    rr::{Name, RData, Record, rdata::A},
+  };
+
+  let listener = TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind loopback nameserver");
+  let addr = listener.local_addr().expect("nameserver local_addr");
+
+  let handle = compio::runtime::spawn(async move {
+    let Ok((mut stream, _)) = listener.accept().await else {
+      return;
+    };
+    // The 2-byte big-endian length prefix, then the query body it announces.
+    let len_buf = vec![0u8; 2];
+    let BufResult(r, len_buf) = stream.read_exact(len_buf).await;
+    if r.is_err() {
+      return;
+    }
+    let qlen = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+    let BufResult(r, _q) = stream.read_exact(vec![0u8; qlen]).await;
+    if r.is_err() {
+      return;
+    }
+
+    let mut resp = Message::response(0, OpCode::Query);
+    resp.add_answer(Record::from_rdata(
+      Name::from_ascii(ADVERTISE_NAME_FQDN).expect("answer name"),
+      60,
+      RData::A(A(Ipv4Addr::LOCALHOST)),
+    ));
+    let body = resp.to_vec().expect("encode DNS response");
+    let mut framed = Vec::with_capacity(2 + body.len());
+    framed.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&body);
+    // Ignoring Err: a best-effort single write from a one-shot fixture; a client
+    // that hung up surfaces as the resolving node's construction failure instead.
+    let BufResult(_w, _b) = stream.write_all(framed).await;
+  });
+
+  (addr, handle)
+}
+
+/// A node can advertise a DNS name: built over the `HostAddr` address domain and a
+/// [`DnsResolver`](crate::DnsResolver) pointed at the loopback fixture nameserver,
+/// it resolves `seed.cluster.invalid:0` at construction and binds the `127.0.0.1`
+/// its `A` record carried. Because that name is unresolvable by the OS fallback,
+/// binding loopback proves the DNS answer drove the bind. A plain peer then joins
+/// the DNS-derived contact and both converge, proving it is genuinely reachable.
+#[cfg(feature = "dns")]
+#[compio::test]
+async fn tcp_advertise_resolved_through_dns_resolver() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  use crate::DnsResolver;
+
+  let (nameserver, server) = spawn_loopback_nameserver().await;
+  let resolver = DnsResolver::from_servers(vec![nameserver]).with_timeout(Duration::from_secs(5));
+
+  let a = try_spawn_host_node("dns-host-a", "seed.cluster.invalid:0", &resolver)
+    .await
+    .expect("the fixture nameserver's answer resolves the advertise address");
+  server.await.expect("the nameserver answered one query");
+
+  let a_addr = a.advertise_address();
+  assert_eq!(
+    a_addr.ip(),
+    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    "the node bound the IP its `A` record carried"
+  );
+  assert_ne!(
+    a_addr.port(),
+    0,
+    "the ephemeral `:0` resolved to the concrete port the listener bound"
+  );
+
+  // The DNS-derived contact is real: a peer dials it and the two converge.
+  let b = spawn_node("dns-peer-b").await;
+  let reached = b
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the DNS-advertised node is reachable at the address it published");
+  assert_eq!(reached, a_addr, "the peer contacted the advertised address");
+
+  await_condition(
+    "the DNS-advertised node and its peer to see 2 members",
+    || a.num_members() == 2 && b.num_members() == 2,
+  )
+  .await;
+
+  a.shutdown()
+    .await
+    .expect("the DNS-advertised node shuts down");
+  b.shutdown().await.expect("the peer shuts down");
 }

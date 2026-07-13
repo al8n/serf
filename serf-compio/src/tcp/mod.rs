@@ -607,6 +607,7 @@ where
       runtime.observation_dropped,
       runtime.snapshot,
       runtime.shutdown_flag,
+      runtime.shutdown_complete,
       runtime.driver_options,
       self.stream_options,
       runtime.delegate,

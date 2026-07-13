@@ -13,8 +13,12 @@ use flume::{Receiver, Sender};
 use serf_proto::{event::Event, options::Options as SerfOptions};
 
 use crate::{
-  command::Command, delegate::Delegate, driver::options::RuntimeOptions,
-  drop_counter::CompioDropCounter, snapshot::SnapshotCell, transport::Transport,
+  command::Command,
+  delegate::Delegate,
+  driver::{options::RuntimeOptions, shared::ShutdownComplete},
+  drop_counter::CompioDropCounter,
+  snapshot::SnapshotCell,
+  transport::Transport,
 };
 
 #[cfg(encryption)]
@@ -60,6 +64,11 @@ where
   pub(crate) member_drop: CompioDropCounter,
   pub(crate) snapshot: SnapshotCell<T::Id>,
   pub(crate) shutdown_flag: Rc<Cell<bool>>,
+  /// The driver half of the teardown-completion latch, dropped by the pump once
+  /// its bind sockets are released. A `shutdown()` the pump could no longer
+  /// accept parks on the matching waiter, so it returns only after the ports are
+  /// free.
+  pub(crate) shutdown_complete: ShutdownComplete,
   pub(crate) driver_options: RuntimeOptions,
   pub(crate) serf_options: SerfOptions,
   /// Optional per-member reconnect-timeout override (Go serf `ReconnectDelegate`),
@@ -100,6 +109,7 @@ where
     member_drop: CompioDropCounter,
     snapshot: SnapshotCell<T::Id>,
     shutdown_flag: Rc<Cell<bool>>,
+    shutdown_complete: ShutdownComplete,
     driver_options: RuntimeOptions,
     serf_options: SerfOptions,
     reconnect_delegate: Option<Box<dyn serf_proto::ReconnectDelegate<T::Id, SocketAddr>>>,
@@ -118,6 +128,7 @@ where
       member_drop,
       snapshot,
       shutdown_flag,
+      shutdown_complete,
       driver_options,
       serf_options,
       reconnect_delegate,

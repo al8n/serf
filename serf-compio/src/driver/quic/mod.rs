@@ -59,9 +59,9 @@ use crate::{
   driver::{
     options::RuntimeOptions,
     shared::{
-      ExchangeId, Farewell, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
-      leave_outcome, observation_payload_bytes, send_gossip_datagram, trace_leave_transform_error,
-      yield_once,
+      ExchangeId, Farewell, ShutdownComplete, add_obs_payload, dispatch_event_delegate,
+      drain_past_due_udp, leave_outcome, observation_payload_bytes, send_gossip_datagram,
+      trace_leave_transform_error, yield_once,
     },
   },
   drop_counter::CompioDropCounter,
@@ -310,6 +310,10 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   datagrams_sent: Rc<Cell<u64>>,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
+  // The driver half of the teardown-completion latch. Dropped at the very end of
+  // the cleanup below — once the gossip socket is closed — so a `shutdown()`
+  // caller parked on the waiter returns to a free bind address.
+  shutdown_complete: ShutdownComplete,
   driver_opts: RuntimeOptions,
   delegate: D,
   // Cluster label applied to both gossip encode and decode. `None` accepts
@@ -351,10 +355,13 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   ))
   .detach();
 
-  // Stash for the [`Command::Shutdown`] reply — acked AFTER the post-loop cleanup
-  // closes the gossip socket so the bound port is free when the caller resumes
-  // from `shutdown.await`.
-  let mut shutdown_reply: Option<oneshot::Sender<Result<()>>> = None;
+  // Stash for every [`Command::Shutdown`] reply — each acked AFTER the post-loop
+  // cleanup closes the gossip socket, so the bound port is free when the caller
+  // resumes from `shutdown.await`. A vector, not a single slot: `shutdown()` is
+  // idempotent, so racing callers (cloned handles, or a straggler command drained
+  // during teardown) all park here and all resolve `Ok(())` together once the port
+  // is released.
+  let mut shutdown_reply: Vec<oneshot::Sender<Result<()>>> = Vec::new();
   #[cfg(encryption)]
   let mut pending_key_responses: Vec<PendingKeyResponse<I>> = Vec::new();
   let mut pending = PendingCommands {
@@ -698,11 +705,18 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
 
   // Cleanup. Order: flip the shutdown flag so a racing clone observes it on
   // entry, drain queued commands with Err(Shutdown), drop the command receiver
-  // so a late send fails fast, resolve any parked leave, close the bound socket
-  // (awaited so its port is released), then ack the observed shutdown caller.
+  // so a late send parks on the completion latch instead, resolve any parked
+  // leave, close the bound socket (awaited so its port is released), then ack
+  // every parked shutdown caller and fire the latch.
   shutdown_flag.set(true);
   while let Ok(c) = commands.try_recv() {
-    reply_shutdown(c);
+    match c {
+      // A straggler `Shutdown` raced the teardown into the queue. Park it beside
+      // the caller the loop already observed rather than failing it: `shutdown()`
+      // is idempotent and must not resolve while the port is still bound.
+      Command::Shutdown(ShutdownCmd { reply }) => shutdown_reply.push(reply),
+      other => reply_shutdown(other),
+    }
   }
   drop(commands);
   // Reply Err(Shutdown) to every parked await-result join waiter whose reply has
@@ -729,10 +743,14 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   // asynchronously, so a plain drop could race a same-port rebind into AddrInUse).
   let _ = gossip_socket.close().await;
 
-  if let Some(reply) = shutdown_reply {
+  // The bind address is free. Ack every parked caller, then fire the completion
+  // latch so a `shutdown()` the closed queue turned away also returns — both
+  // paths therefore resolve only once an immediate rebind would succeed.
+  for reply in shutdown_reply {
     // Ignoring Err: caller dropped the reply receiver.
     let _ = reply.send(Ok(()));
   }
+  drop(shutdown_complete);
 }
 
 /// Reply `Err(Shutdown)` to a command drained during teardown.
@@ -781,12 +799,12 @@ fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
 /// the per-command reply channel — a dropped reply receiver means the caller
 /// gave up.
 ///
-/// The [`Command::Shutdown`] reply is NOT acked inline; it is stashed into
+/// The [`Command::Shutdown`] reply is NOT acked inline; it is parked in
 /// `shutdown_reply` so the pump acks the caller only AFTER the socket drops in
 /// the post-loop cleanup.
 async fn dispatch_command<I, G, R>(
   endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
-  shutdown_reply: &mut Option<oneshot::Sender<Result<()>>>,
+  shutdown_reply: &mut Vec<oneshot::Sender<Result<()>>>,
   pending: &mut PendingCommands,
   farewell: &mut Farewell,
   leave_timeout: Duration,
@@ -1046,9 +1064,9 @@ async fn dispatch_command<I, G, R>(
       let _ = reply.send(Ok(endpoint.cached_coordinate(&id)));
     }
     Command::Shutdown(ShutdownCmd { reply }) => {
-      // Do NOT ack the caller here — the socket is still bound; stash the reply
+      // Do NOT ack the caller here — the socket is still bound; park the reply
       // and let the post-loop cleanup ack AFTER it drops.
-      *shutdown_reply = Some(reply);
+      shutdown_reply.push(reply);
     }
   }
 }
