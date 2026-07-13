@@ -1,42 +1,5 @@
-//! The serf wire codec and Sans-I/O state machine — pure, no-I/O types shared
-//! by the serf driver crates.
-//!
-//! Depends on `memberlist-proto` for the `Data`/`DataRef` codec primitives; defines serf's
-//! own message set and framing on top of them.
-//!
-//! # Wire evolution
-//!
-//! The legacy serf carried two negotiation knobs — `protocol_version` and
-//! `delegate_version` — so mixed-version clusters could gate features at
-//! runtime. This stack deliberately carries neither; the wire forms new↔new
-//! clusters only, and there is no per-message version field to dispatch on.
-//! What replaces them:
-//!
-//! - **Additive evolution rides proto3 semantics.** Every message body is a
-//!   proto3 message, and the typed bridge enforces presence only for the
-//!   fields the protocol requires. A new optional field decodes as its
-//!   default on nodes that predate it and is skipped (not erred) by nodes
-//!   that do not know it, so a feature with a sound default posture for old
-//!   peers ships with no negotiation and no flag day. Never reuse or
-//!   renumber a field, change a field's wire type, or make an optional field
-//!   required — those are breaking changes and take the generation path
-//!   below. The framing envelope is additive the same way: an unknown
-//!   message tag is dropped with its body length consumed, so a new message
-//!   type degrades to a no-op on old nodes rather than a parse failure.
-//!
-//! - **Breaking changes are a new cluster generation, fenced by the cluster
-//!   label.** The gossip codec stamps every packet and stream with the
-//!   configured label and ingress drops anything mismatched. A change that
-//!   cannot be expressed additively ships as a new deployment under a new
-//!   label, stood up beside the old one and cut over blue/green: nodes of
-//!   different generations never exchange state, so incompatible layouts
-//!   never meet on a socket — the label check does the work version
-//!   negotiation used to approximate, without mixed-version protocol paths
-//!   to test and maintain.
-//!
-//! - **Delegates are a compile-time surface.** The delegate traits are Rust
-//!   API versioned by the crate's semver; there is nothing to negotiate on
-//!   the wire.
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/serf/main/art/logo_72x72.png")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

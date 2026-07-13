@@ -54,3 +54,8 @@ jobs:
         run: >
           cargo doc -p serf-compio --no-deps
           --features tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex,tracing,serde,clap,dns,getifs
+
+      # The umbrella's docs.rs metadata is `all-features`, so build exactly that:
+      # every driver facade and both rustls providers at once.
+      - name: Doc serf (umbrella)
+        run: cargo doc -p serf --no-deps --all-features

@@ -24,166 +24,186 @@ Port and improve [HashiCorp's serf](https://github.com/hashicorp/serf) to Rust.
 
 [<img alt="github" src="https://img.shields.io/discord/835936528140206122?style=for-the-badge&logo=discord&logoColor=white&label=Discord&color=7289da" height="22">][discord]
 
-English | [简体中文][zh-cn-url]
-
 </div>
 
 ## Introduction
 
-serf is a decentralized solution for service discovery and orchestration that is lightweight, highly available, and fault tolerant.
+`serf` is a facade over the serf crate family: depend on this one crate, pick a driver
+through Cargo features, and get a ready-to-use node — instead of wiring the protocol
+core, a transport, and a runtime together yourself. It mirrors the [`memberlist`]
+umbrella crate.
 
-The use cases for such a library are far-reaching: all distributed systems require membership, and serf is a re-usable solution to managing cluster membership and node failure detection.
+Its protocol logic composes serf's own event / query / tag super-machine
+([`serf-proto`]) over [`memberlist-proto`]'s SWIM coordinator: memberlist supplies
+gossip membership and failure detection, and serf layers per-node tags, custom user
+events, and a gossip-relayed query/response protocol — including live key rotation
+through the same query mechanism — on top of it. Thin async drivers adapt that pure
+core to `tokio` / `smol`, `compio`, and bare-metal `no_std` targets, so the same
+protocol logic runs on a server or a microcontroller.
 
-serf is eventually consistent but converges quickly on average. The speed at which it converges can be heavily tuned via various knobs on the protocol. Node failures are detected and network partitions are partially tolerated by attempting to communicate to potentially dead nodes through multiple routes.
+This is a Rust port of [HashiCorp's Serf], extended with a Sans-I/O architecture and
+`no_std` / bare-metal support.
 
-serf is WASM/WASI friendly, all crates can be compiled to `wasm-wasi` and `wasm-unknown-unknown` (need to configure the crate features).
+For the full project overview — protocol background, cross-crate design rationale,
+Q&A, and related projects — see the [project README].
+
+## Highlights
+
+- **Sans-I/O core.** All protocol logic lives in [`serf-proto`] as a pure super-machine
+  composed over [`memberlist-proto`]'s SWIM coordinator — no sockets, threads, or
+  clocks — making it deterministic and exhaustively unit-tested. The drivers only
+  shuttle bytes and time in and out.
+- **Runtime-agnostic.** Drive it from `tokio`, `smol`, or `compio` (thread-per-core)
+  with no change to protocol behavior.
+- **`no_std` and bare-metal.** The core runs on `alloc`, and [`serf-smoltcp`] /
+  [`serf-embassy`] bring full serf membership, events, and queries to embedded targets.
+- **Membership, events, and queries.** Inherits SWIM gossip membership and failure
+  detection from [`memberlist`], and adds per-node tags, custom user events, and a
+  gossip-relayed query/response protocol — including live key rotation through the
+  same query mechanism.
+- **Pluggable transports.** Plain TCP, TLS-over-TCP (`rustls`), or QUIC (`quinn-proto`)
+  reliable planes, each with a UDP / datagram gossip plane carrying opt-in AEAD
+  encryption.
+- **Customizable.** Bring your own `Id`, `Address`, `AddressResolver`, and delegates
+  (member / merge / query / user-event / reconnect).
+- **Observable, à la carte.** Opt into `tracing` — compiled out when unused.
+- **Config-file & CLI friendly.** Every `*Options` type optionally derives `serde` and
+  `clap`.
+
+## The family
+
+The crates split protocol logic from I/O, mirroring the `memberlist` layering:
+
+| Crate | Role |
+|-------|------|
+| [`serf`] | this crate — batteries-included facade (core + default `tokio` driver) |
+| [`serf-proto`] | Sans-I/O protocol super-machine + wire codec (`no_std`-capable) |
+| [`serf-driver`] | runtime-agnostic glue shared by the reactor and compio drivers |
+| [`serf-reactor`] | runtime-agnostic async driver (`tokio` & `smol`), TCP/TLS/QUIC |
+| [`serf-compio`] | `compio` (thread-per-core, io_uring / IOCP) async driver |
+| [`serf-embedded`] | shared `no_std` driving core for the embedded drivers |
+| [`serf-smoltcp`] | executor-free `no_std` driver over smoltcp (caller-poll) |
+| [`serf-embassy`] | embassy-net async `no_std` driver, built on [`serf-embedded`] |
 
 ## Installation
 
-- By using `TCP/UDP`, `TLS/UDP` transport
+> **Build requirement:** `serf-proto` and its [`memberlist-proto`] dependency invoke
+> [`protoc`][protoc] at build time to generate the wire codec, so the Protocol Buffers
+> compiler must be on `PATH` (e.g. `apt install protobuf-compiler`, `brew install
+> protobuf`).
 
-  ```toml
-  serf = { version = "0.5", features = [
-    "tcp",
-    # Enable a checksum, as UDP is not reliable.
-    # Built in supports are: "crc32", "xxhash64", "xxhash32", "xxhash3", "murmur3"
-    "crc32",
-    # Enable a compression, this is optional,
-    # and possible values are `snappy`, `brotli`, `zstd` and `lz4`.
-    # You can enable all.
-    "snappy",
-    # Enable encryption, this is optional,
-    "encryption",
-    # Enable a async runtime
-    # Builtin supports are `tokio`, `smol`
-    "tokio",
-    # Enable one tls implementation. This is optional.
-    # Users can just use encryption feature with plain TCP.
-    #
-    # "tls",
-  ] }
-  ```
+```toml
+[dependencies]
+serf = "0.5" # tokio runtime + tcp transport by default
+```
 
-- By using `QUIC/QUIC` transport
+For `smol` instead of `tokio`:
 
-  For `QUIC/QUIC` transport, as QUIC is secure and reliable, so enable checksum or encryption makes no sense.
+```toml
+[dependencies]
+serf = { version = "0.5", default-features = false, features = ["smol", "tcp"] }
+```
 
-  ```toml
-  serf = { version = "0.5", features = [
-    # Enable a compression, this is optional,
-    # and possible values are `snappy`, `brotli`, `zstd` and `lz4`.
-    # You can enable all.
-    "snappy",
-    # Enable a async runtime
-    # Builtin supports are `tokio`, `smol`
-    "tokio",
-    # Enable one of the QUIC implementation
-    # Builtin support is `quinn`
-    "quinn",
-  ] }
-  ```
+For the `compio` (completion-based, thread-per-core) runtime:
 
-## Examples
+```toml
+[dependencies]
+serf = { version = "0.5", default-features = false, features = ["compio", "tcp"] }
+```
 
-See [examples/toyconsul](https://github.com/al8n/serf/tree/main/examples/toyconsul), a toy eventually consistent distributed registry.
+For bare-metal (`no_std`) targets, enable `smoltcp` (the executor-free engine) or
+`embassy` (the embassy-net async driver) — neither pulls in `std`:
 
-## Protocol
+```toml
+[dependencies]
+serf = { version = "0.5", default-features = false, features = ["embassy", "tcp"] }
+```
 
-serf is based on ["SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"](http://ieeexplore.ieee.org/document/1028914/). However, Hashicorp developers extends the protocol in a number of ways:
+The minimum supported Rust version (MSRV) is **1.85.0** (edition 2024); the `smoltcp`,
+`embassy`, and `embedded` drivers require **1.96.0**.
 
-Several extensions are made to increase propagation speed and convergence rate.
-Another set of extensions, that Hashicorp developers call Lifeguard, are made to make serf more robust in the presence of slow message processing (due to factors such as CPU starvation, and network delay or loss).
-For details on all of these extensions, please read Hashicorp's paper ["Lifeguard : SWIM-ing with Situational Awareness"](https://arxiv.org/abs/1707.00788), along with the serf source.
+## Example
 
-## Q & A
+Common types (`Options` variants, delegates, resolvers, …) are re-exported from the
+per-driver module, which also pins the runtime, so a `tokio` build reaches its handle
+through `serf::tokio` and never names the runtime generic:
 
-- ***Does Rust's serf implemenetation compatible to Go's serf?***
+```rust,ignore
+use serf::tokio::{Serf, SerfOptions, SocketAddrResolver, TcpTransportOptions, VoidDelegate};
 
-  No! Rust implementation use protobuf-like encoding/decoding whereas Go's implementation uses message pack.
+// `serf::tokio::Serf` is the reactor handle with its runtime already pinned to tokio,
+// so the runtime generic never appears in your code. Build a node with the inherent
+// constructors — `Serf::tcp`, `Serf::tls`, `Serf::quic`, and their `*_with_rng`
+// variants — then drive the cluster through the returned handle's `join` / `leave` /
+// `user_event` / `query` / `install_key` methods.
+```
 
-- ***If Go's serf adds more functionalities, will this project also support?***
-  
-  Yes! And this project may also add more functionalities whereas the Go's serf does not have. e.g. wasmer support, bindings to other languages and etc.
+`serf::reactor` re-exports the same driver unpinned (generic over an [`agnostic`]
+runtime); `serf::compio`, `serf::smoltcp`, `serf::embassy`, and `serf::embedded` expose
+their respective driver crates the same way. The pure protocol core is always available
+as `serf::proto` (a re-export of [`serf-proto`]), regardless of which driver feature is
+enabled.
+
+## Feature flags
+
+Pick **one** driver, **one or more** transports, and any optional extensions you need.
+
+- **Drivers** — `tokio` *(default)*, `smol`, `compio` (thread-per-core), `reactor`
+  (generic over an [`agnostic`] runtime), `smoltcp` / `embassy` / `embedded` (`no_std`).
+- **Transports** — `tcp` *(default)*; `tls` + a backend (`tls-rustls-ring`,
+  `tls-rustls-aws-lc-rs`); `quic` + a backend (`quic-rustls-ring`).
+- **Capability tiers** — `std` and `alloc` are independent; the `no_std` drivers select
+  `alloc` instead of `std`.
+- **Protocol extensions** — `coordinates` (Vivaldi network coordinate estimation),
+  `aes-gcm` / `chacha20-poly1305` (gossip + plain-TCP reliable AEAD encryption, plus
+  serf's gossip-driven key-management queries), `encryption` (umbrella for both
+  backends).
+- **Config** — `serde` (config-file round-trips) and `clap` (CLI flags + env) on the
+  `*Options` types; std-only.
+- **Other** — `tag-regex` (regex-backed tag-filter matching; falls back to exact-match
+  without it), `dns` (DNS address resolver), `getifs` (auto-detect the advertise
+  address from local interfaces), `cidr` (CIDR peer-admission allow-list, `no_std`
+  drivers), `tracing` (spans around the driver operations) — each forwarded to
+  whichever driver is selected.
 
 ## Design
 
-Unlike the original Go implementation, Rust's serf use highly generic and layered architecture, users can easily implement a component by themselves and plug it to the serf. Users can even custom their own `Id` and `Address`.
+Every driver wraps the same pure core: [`serf-proto`] runs entirely without sockets,
+threads, or clocks of its own, so protocol behavior is identical no matter which driver
+you pick. Drivers only shuttle bytes and time in and out and translate the machine's
+outputs into delegate callbacks and an event stream. Swap `tokio` for `smoltcp` and the
+membership, failure-detection, tag, event, and query semantics do not change — only the
+I/O underneath does.
 
-Here are the layers:
-
-- **Transport Layer**
-
-  By default, Rust's serf provides two kinds of transport -- [`QuicTransport`](https://docs.rs/serf-quic/struct.QuicTransport.html) and [`NetTransport`](https://docs.rs/serf-net/struct.NetTransport.html).
-
-  - **Runtime Layer**
-
-    Async runtime agnostic are provided by [`agnostic`'s Runtime](https://docs.rs/agnostic/trait.Runtime.html) trait, `tokio`, and `smol` are supported by default. Users can implement their own [`Runtime`](https://docs.rs/agnostic/trait.Runtime.html) and plug it into the serf.
-
-  - **Address Resolver Layer**
-
-    The address resolver layer is supported by [`nodecraft`'s AddressResolver](https://docs.rs/nodecraft/latest/nodecraft/resolver/trait.AddressResolver.html) trait.
-
-  - **[`NetTransport`](https://docs.rs/serf-net/struct.NetTransport.html)**
-
-    Builtin stream layers for `NetTransport`:
-
-    - [`Tcp`](https://docs.rs/serf-net/stream_layer/tcp/struct.Tcp.html): based on TCP and UDP
-    - [`Tls`](https://docs.rs/serf-net/stream_layer/tls/struct.Tls.html): based on [`rustls`](https://docs.rs/rustls) and UDP
-
-  - **[`QuicTransport`](https://docs.rs/serf-quic/struct.QuicTransport.html)**
-
-    QUIC transport is an experimental transport implementation, it is well tested but still experimental.
-
-    Builtin stream layers for `QuicTransport`:
-    - [`Quinn`](https://docs.rs/serf-quic/stream_layer/quinn/struct.Quinn.html): based on [`quinn`](https://docs.rs/quinn)
-
-  Users can still implement their own stream layer for different kinds of transport implementations.
-
-- **Delegate Layer**
-  
-  This layer is used as a reactor for different kinds of messages.
-
-  - **`Delegate`**
-  
-    Delegate is the trait that clients must implement if they want to hook into the gossip layer of Serf. All the methods must be thread-safe, as they can and generally will be called concurrently.
-
-    Here are the sub delegate traits:
-
-    - **`MergeDelegate`**
-
-      Used to involve a client in a potential cluster merge operation. Namely, when a node does a promised push/pull (as part of a join), the delegate is involved and allowed to cancel the join based on custom logic. The merge delegate is NOT invoked as part of the push-pull anti-entropy.
-
-    - **`ReconnectDelegate`**
-
-      Used to custom reconnect behavior, users can implement to allow overriding the reconnect timeout for individual members.
-
-  - **`CompositeDelegate`**
-
-    CompositeDelegate is a helpful struct to split the `Delegate` into multiple small delegates, so that users do not need to implement full `Delegate` when they only want to custom some methods in the Delegate.
-
-## Related Projects
-
-- [`agnostic`](https://github.com/al8n/agnostic): Helps you to develop runtime agnostic crates
-- [`agnostic-mdns`](https://github.com/al8n/agnostic-mdns): Simple and lightweight mDNS client/server library for any async runtime.
-- [`getifs`](https://github.com/al8n/getifs): A bunch of cross platform network tools for fetching interfaces, multicast addresses, local ip addresses, private ip addresses, public ip addresses and etc.
-- [`nodecraft`](https://github.com/al8n/nodecraft): Crafting seamless node operations for distributed systems, which provides foundational traits for node identification and address resolution.
-- [`peekable`](https://github.com/al8n/peekable): Peekable reader and async reader.
-- [`memberlist`](https://github.com/al8n/memberlist): A highly customable, adaptable, runtime agnostic and WASM/WASI friendly Gossip protocol which helps manage cluster membership and member failure detection.
-
-#### License
+## License
 
 `serf` is under the terms of the MPL-2.0 license.
 
-See [LICENSE](./LICENSE) for details.
+See [LICENSE] for details.
 
 Copyright (c) 2025 Al Liu.
 
 Copyright (c) 2013 HashiCorp, Inc.
 
+[HashiCorp's Serf]: https://github.com/hashicorp/serf
+[project README]: https://github.com/al8n/serf/blob/main/README.md
+
+[`memberlist`]: https://crates.io/crates/memberlist
+[`memberlist-proto`]: https://crates.io/crates/memberlist-proto
+[`agnostic`]: https://github.com/al8n/agnostic
+[`serf`]: https://crates.io/crates/serf
+[`serf-proto`]: https://crates.io/crates/serf-proto
+[`serf-driver`]: https://crates.io/crates/serf-driver
+[`serf-reactor`]: https://crates.io/crates/serf-reactor
+[`serf-compio`]: https://crates.io/crates/serf-compio
+[`serf-embedded`]: https://crates.io/crates/serf-embedded
+[`serf-smoltcp`]: https://crates.io/crates/serf-smoltcp
+[`serf-embassy`]: https://crates.io/crates/serf-embassy
+[protoc]: https://grpc.io/docs/protoc-installation/
+[LICENSE]: https://github.com/al8n/serf/blob/main/LICENSE
 [Github-url]: https://github.com/al8n/serf/
 [CI-url]: https://github.com/al8n/serf/actions/workflows/coverage.yml
 [doc-url]: https://docs.rs/serf
 [crates-url]: https://crates.io/crates/serf
 [codecov-url]: https://app.codecov.io/gh/al8n/serf/
-[zh-cn-url]: https://github.com/al8n/serf/tree/main/README-zh_CN.md
 [discord]: https://discord.gg/4JyVhKFcrt

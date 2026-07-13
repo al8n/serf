@@ -1,35 +1,5 @@
-//! compio-based async driver for the Sans-I/O serf machine.
-//!
-//! `serf-compio` binds the pure [`serf-proto`] Sans-I/O serf machine to the
-//! [compio](https://github.com/compio-rs/compio) async runtime. It owns the
-//! driver task, the command channel, the observation delegate dispatch, and the
-//! transport plumbing — everything that connects the stateless machine to real
-//! I/O. The machine itself (`serf-proto`) carries no runtime reference and runs
-//! identically regardless of which driver crate wraps it.
-//!
-//! # Feature flags
-//!
-//! Transport (at least one required):
-//! - `tcp` (default) — plain-TCP reliable coordinator.
-//! - `tls` — TLS-over-TCP reliable coordinator (implies `tcp`).
-//! - `quic` — QUIC coordinator.
-//! - `quic-rustls-ring` — QUIC with the rustls+ring TLS backend (implies `quic`).
-//!
-//! Optional protocol extensions:
-//! - `coordinates` — Vivaldi network coordinate estimation.
-//! - `aes-gcm` — AES-256-GCM encryption backend.
-//! - `chacha20-poly1305` — ChaCha20-Poly1305 encryption backend.
-//! - `tag-regex` (default) — regex-backed tag-filter matching.
-//!
-//! Optional config layering:
-//! - `serde` — `Serialize`/`Deserialize` on `*Options` types.
-//! - `clap` — `clap::Args` on `*Options` types (CLI flags + env vars).
-//! - `tracing` — emit `tracing` spans around public driver operations.
-//!
-//! Optional resolver support:
-//! - `dns` — `DnsResolver` backed by `hickory-proto`.
-//! - `getifs` — auto-detect the advertise address from host interfaces.
-
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/serf/main/art/logo_72x72.png")]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]

@@ -43,7 +43,7 @@ jobs:
           set -euo pipefail
           tokeit
           mv tokeit.json loc-serf.json
-          for c in serf-proto serf-driver serf-compio serf-reactor; do
+          for c in serf-proto serf-driver serf-compio serf-reactor serf-smoltcp serf-embassy serf-embedded; do
             ( cd "$c" && tokeit )
             mv "$c/tokeit.json" "loc-$c.json"
           done
@@ -55,15 +55,19 @@ jobs:
           script: |
             const fs = require('fs');
             const gistId = 'd29ceff54c025fe4e8b144a51efb9324';
-            // Gist file `serf` is the workspace total (the main README's LoC
-            // badge reads …/raw/serf); the rest are per-crate, ready for
-            // per-crate READMEs. The gists API accepts every file in one PATCH,
-            // so one request avoids the per-crate rate-limit storm.
+            // Gist file `serf` is the workspace total — both the project README
+            // and the `serf` umbrella crate's README read …/raw/serf; the rest
+            // are per-crate and back the per-crate READMEs' LoC badges. The
+            // gists API accepts every file in one PATCH, so one request avoids
+            // the per-crate rate-limit storm.
             const crates = [
               'serf-proto',
               'serf-driver',
               'serf-compio',
               'serf-reactor',
+              'serf-smoltcp',
+              'serf-embassy',
+              'serf-embedded',
             ];
             const files = {
               serf: { content: fs.readFileSync('loc-serf.json', 'utf8') },

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "serf",
   "serf-proto",
   "serf-embedded",
   "serf-driver",
@@ -67,7 +68,6 @@ memberlist-proto = { version = "0.3", default-features = false }
 memberlist-core = { version = "0.8.5", default-features = false }
 memberlist = { version = "0.8.5", default-features = false }
 
-serf-core = { path = "serf-core", version = "0.5", default-features = false }
 serf = { path = "serf", version = "0.5", default-features = false }
 serf-proto = { path = "serf-proto", default-features = false }
 serf-driver = { path = "serf-driver", default-features = false }

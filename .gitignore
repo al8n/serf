@@ -2,3 +2,7 @@
 /Cargo.lock
 /docs/
 /legacy/Cargo.lock
+
+# cargo-llvm-cov artifacts from a local reproduction of the coverage workflow.
+**.profraw
+lcov.info
