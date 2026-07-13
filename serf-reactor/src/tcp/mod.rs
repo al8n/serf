@@ -573,7 +573,7 @@ where
       endpoint.set_merge_delegate(md);
     }
     // Test-only: install the delegate's inbound message-dropper on the machine.
-    #[cfg(any(test, feature = "test"))]
+    #[cfg(feature = "test")]
     if let Some(dropper) = runtime.delegate.message_dropper() {
       endpoint.set_message_dropper(dropper);
     }

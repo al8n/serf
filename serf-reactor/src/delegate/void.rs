@@ -23,7 +23,7 @@ pub struct VoidDelegate<I, A> {
   _phantom: PhantomData<fn(I, A)>,
   /// Test-only inbound message-drop hook returned via
   /// [`Delegate::message_dropper`]; `None` in every real build.
-  #[cfg(any(test, feature = "test"))]
+  #[cfg(feature = "test")]
   message_dropper: Option<std::sync::Arc<dyn serf_proto::MessageDropper>>,
 }
 
@@ -34,7 +34,7 @@ impl<I, A> VoidDelegate<I, A> {
   pub const fn new() -> Self {
     Self {
       _phantom: PhantomData,
-      #[cfg(any(test, feature = "test"))]
+      #[cfg(feature = "test")]
       message_dropper: None,
     }
   }
@@ -42,7 +42,7 @@ impl<I, A> VoidDelegate<I, A> {
   /// Attach a test-only [`MessageDropper`](serf_proto::MessageDropper) surfaced
   /// through [`Delegate::message_dropper`], so a test node drops selected
   /// inbound membership messages. Test fault injection only.
-  #[cfg(any(test, feature = "test"))]
+  #[cfg(feature = "test")]
   #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
   #[must_use]
   pub fn with_message_dropper(
@@ -98,7 +98,7 @@ where
   type Id = I;
   type Address = A;
 
-  #[cfg(any(test, feature = "test"))]
+  #[cfg(feature = "test")]
   fn message_dropper(&self) -> Option<std::sync::Arc<dyn serf_proto::MessageDropper>> {
     self.message_dropper.clone()
   }
