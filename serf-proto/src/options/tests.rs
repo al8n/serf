@@ -1,4 +1,5 @@
 use core::time::Duration;
+use std::string::ToString;
 
 use super::{InvalidOptions, Options};
 

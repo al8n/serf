@@ -1,5 +1,7 @@
 //! Unit tests for the crate-root vocabulary types.
 
+use std::string::ToString;
+
 use super::LamportTime;
 
 /// A Lamport time renders as its bare counter — the form every log line, error
