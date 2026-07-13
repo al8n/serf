@@ -55,9 +55,10 @@ jobs:
           --no-default-features --features alloc
           --target thumbv7em-none-eabihf
 
-  # Host test gate: the smoltcp and embassy drivers carry host-runnable test
-  # suites (block_on + bounded virtual time) that the bare-metal check above does
-  # not exercise. Run them on a std host, plus fmt + clippy for both libs.
+  # Host test gate: the embedded core and both its drivers carry host-runnable
+  # test suites (block_on + bounded virtual time) that the bare-metal check above
+  # does not exercise — a bare `cargo check` never builds a test target. Run them
+  # on a std host, plus fmt + clippy for all three libs.
   host-tests:
     runs-on: ubuntu-latest
     steps:
@@ -72,11 +73,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Format
-        run: cargo fmt -p serf-smoltcp -p serf-embassy --check
+        run: cargo fmt -p serf-embedded -p serf-smoltcp -p serf-embassy --check
       - name: Clippy
-        run: cargo clippy -p serf-smoltcp -p serf-embassy --all-targets --features aes-gcm,cidr --no-deps -- -D warnings
+        run: cargo clippy -p serf-embedded -p serf-smoltcp -p serf-embassy --all-targets --features aes-gcm,cidr --no-deps -- -D warnings
       - name: Test
-        run: cargo test -p serf-smoltcp -p serf-embassy --features aes-gcm,cidr
+        run: cargo test -p serf-embedded -p serf-smoltcp -p serf-embassy --features aes-gcm,cidr
 
   # Execution proof: build the `serf-embassy-qemu` firmware and run it under QEMU.
   # The crate's `.cargo/config.toml` supplies the target, the linker script, the
