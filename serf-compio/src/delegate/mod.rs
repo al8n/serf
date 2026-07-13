@@ -212,45 +212,4 @@ pub trait KeyringDelegate: 'static {
 pub use memberlist_proto::delegate::MergeDelegate;
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  use smol_str::SmolStr;
-  use std::net::SocketAddr;
-
-  #[cfg(any(feature = "tcp", feature = "quic"))]
-  #[test]
-  fn void_delegate_satisfies_observation_composite() {
-    fn assert_delegate<D>(_d: &D)
-    where
-      D: Delegate<Id = SmolStr, Address = SocketAddr>,
-    {
-    }
-    let v: VoidDelegate<SmolStr, SocketAddr> = VoidDelegate::default();
-    assert_delegate(&v);
-  }
-
-  /// The re-exported merge predicate is the machine's synchronous push/pull
-  /// filter — a type-level check that a plain permit-all impl satisfies it.
-  #[cfg(any(feature = "tcp", feature = "quic"))]
-  #[test]
-  fn a_sync_predicate_satisfies_the_merge_delegate() {
-    struct PermitAll;
-    impl MergeDelegate<SmolStr, SocketAddr> for PermitAll {
-      fn notify_merge(
-        &self,
-        _peers: memberlist_proto::MaybeOwned<
-          '_,
-          [memberlist_proto::typed::NodeState<SmolStr, SocketAddr>],
-        >,
-      ) -> bool {
-        true
-      }
-    }
-    fn assert_merge<T>(_: &T)
-    where
-      T: MergeDelegate<SmolStr, SocketAddr>,
-    {
-    }
-    assert_merge(&PermitAll);
-  }
-}
+mod tests;
