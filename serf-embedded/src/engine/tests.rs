@@ -7,7 +7,10 @@ use core::{
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use memberlist_proto::{SeedableRng, SmallRng};
+use memberlist_proto::{
+  Node, PushPullKind, SeedableRng, SmallRng,
+  typed::{Alive, Message, Ping},
+};
 use smol_str::SmolStr;
 
 #[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
@@ -483,8 +486,10 @@ fn failed_ignore_old_join_resolves_err_and_clears_ignore_streams() {
 // engine's core-owned join folds into its reached set. One end's `connect`
 // registers a pending SYN on the shared fabric; the destination's listener
 // completes the passive open when its `accepted_peer` is polled, after which bytes
-// ferry both ways over the matched pipe. The link acks instantly (`send_queue`
-// is always 0), so a graceful close FINs without a `Closing` drain.
+// ferry both ways over the matched pipe. The link acks instantly by default
+// (`send_queue` is 0), so a graceful close FINs without a `Closing` drain;
+// [`LinkPair::hold_b_tx`] withholds B's acknowledgements so the drain-before-close
+// path can be driven.
 
 /// The two directional byte streams of one established pipe plus its FIN/reset
 /// flags. The dialer writes `d2a` (the acceptor reads it) and vice versa.
@@ -496,6 +501,14 @@ struct Pipe {
   a_fin: bool,
   reset: bool,
   established: bool,
+  /// Bytes the dialer end handed to `send` that the peer has not yet acknowledged —
+  /// what `send_queue` reports for that end. The bytes are DELIVERED to the peer's rx
+  /// immediately (so the FSM still completes); only the acknowledgement lingers, so a
+  /// graceful close over this end parks in `Closing` until a test acks it. Zero unless
+  /// the end's `hold_tx` is set.
+  d_unacked: usize,
+  /// As `d_unacked`, for the acceptor end.
+  a_unacked: usize,
 }
 
 /// A SYN parked on the fabric by a dialer's `connect`, awaiting the destination's
@@ -548,6 +561,11 @@ struct LinkRel {
   me: SocketAddr,
   free: std::vec::Vec<u32>,
   role: RefCell<BTreeMap<u32, SlotRole>>,
+  /// When set, a `send` on this end ALSO accrues unacked tx (`send_queue` > 0),
+  /// modelling a peer slow to acknowledge. A graceful close over such a connection
+  /// parks in `Closing` until the tx drains, exercising the drain-before-close path.
+  /// Off by default (the link acks instantly).
+  hold_tx: bool,
 }
 
 impl LinkRel {
@@ -561,6 +579,7 @@ impl LinkRel {
       me,
       free: handles.to_vec(),
       role: RefCell::new(role),
+      hold_tx: false,
     }
   }
 
@@ -737,6 +756,7 @@ impl StreamIo for LinkRel {
       Some(SlotRole::Bound(pipe, end)) => (pipe, end),
       _ => return 0,
     };
+    let hold = self.hold_tx;
     let mut fab = self.fabric.borrow_mut();
     let Some(p) = fab.pipes.get_mut(&pipe) else {
       return 0;
@@ -745,16 +765,39 @@ impl StreamIo for LinkRel {
       return 0;
     }
     // Deliver to the peer's rx immediately (the FSM sees the bytes); the link acks
-    // instantly so nothing lingers as unacked tx.
+    // instantly unless this end is holding, in which case the acknowledgement lingers
+    // as unacked tx so a later graceful close parks in `Closing`.
     match end {
-      End::Dialer => p.d2a.extend(bytes.iter().copied()),
-      End::Acceptor => p.a2d.extend(bytes.iter().copied()),
+      End::Dialer => {
+        p.d2a.extend(bytes.iter().copied());
+        if hold {
+          p.d_unacked += bytes.len();
+        }
+      }
+      End::Acceptor => {
+        p.a2d.extend(bytes.iter().copied());
+        if hold {
+          p.a_unacked += bytes.len();
+        }
+      }
     }
     bytes.len()
   }
 
-  fn send_queue(&self, _c: u32) -> usize {
-    0
+  fn send_queue(&self, c: u32) -> usize {
+    match self.role_of(c) {
+      Some(SlotRole::Bound(pipe, end)) => {
+        let fab = self.fabric.borrow();
+        match fab.pipes.get(&pipe) {
+          Some(p) => match end {
+            End::Dialer => p.d_unacked,
+            End::Acceptor => p.a_unacked,
+          },
+          None => 0,
+        }
+      }
+      _ => 0,
+    }
   }
 
   fn close(&mut self, c: u32) {
@@ -894,6 +937,29 @@ impl LinkPair {
       b_gossip,
       a_addr,
       b_addr,
+    }
+  }
+
+  /// Make B (the acceptor) accrue unacked tx on every `send`, so when B's bridge
+  /// gracefully closes with its push/pull reply still unacknowledged the connection
+  /// parks in `Closing` rather than FIN-ing at once — the drain-before-close path.
+  fn hold_b_tx(&mut self) {
+    self.b_rel.hold_tx = true;
+  }
+
+  /// Acknowledge up to `amount` of B's accrued unacked tx across its pipes, modelling
+  /// the peer draining B's reply. Steps the `Closing` drain through its progress
+  /// (partial ack) and terminal-FIN (fully drained) branches.
+  fn ack_b(&mut self, amount: usize) {
+    let mut fab = self.b_rel.fabric.borrow_mut();
+    let mut left = amount;
+    for p in fab.pipes.values_mut() {
+      let take = p.a_unacked.min(left);
+      p.a_unacked -= take;
+      left -= take;
+      if left == 0 {
+        break;
+      }
     }
   }
 
@@ -2309,4 +2375,1288 @@ fn construction_rejects_a_keyring_with_cross_cipher_byte_twins() {
     }
     Ok(_) => panic!("construction must reject a keyring carrying cross-cipher byte twins"),
   }
+}
+
+// ── panicking convenience constructors ───────────────────────────────────────
+
+/// The first query id a running engine issues — a `u32` drawn straight from serf's
+/// core RNG, so with every other input held fixed it is a pure function of that
+/// RNG's seed.
+fn first_query_id_of(engine: &mut SerfEngine<SmolStr, u32>, now: Instant) -> u32 {
+  engine
+    .query(
+      "probe",
+      Bytes::from_static(b"payload"),
+      QueryParams::default(),
+      now,
+    )
+    .expect("a query is issued while running")
+    .id
+}
+
+/// `new_at_with_rng` — the panicking form of `try_new_at_with_rng` — builds on a
+/// valid configuration AND injects serf's core RNG: with the gossip RNG held fixed,
+/// distinct serf seeds yield distinct first query ids and the same seed reproduces
+/// one. So the production constructor's entropy actually reaches query-id
+/// generation through the panicking wrapper too.
+#[test]
+fn new_at_with_rng_builds_and_injects_the_serf_rng() {
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let build = |serf_seed: u64| -> SerfEngine<SmolStr, u32> {
+    let cfg = Options::new()
+      .with_port(7946)
+      .with_close_timeout(Duration::from_secs(10));
+    let ep_cfg = EndpointOptions::new(SmolStr::new("q"), node_addr(7946));
+    let mut engine = SerfEngine::new_at_with_rng(
+      cfg,
+      TransformOptions::default(),
+      ep_cfg,
+      SerfOptions::new(),
+      now,
+      SmallRng::seed_from_u64(1),
+      SmallRng::seed_from_u64(serf_seed),
+    );
+    engine.start(now);
+    engine
+  };
+
+  let mut engine = build(100);
+  assert_eq!(
+    engine.port(),
+    7946,
+    "port() reports the configured bind port"
+  );
+  assert_eq!(
+    engine.state(),
+    SerfState::Alive,
+    "an engine built by the panicking constructor is running"
+  );
+  assert_eq!(engine.num_members(), 1, "a fresh engine tracks only itself");
+  assert_eq!(engine.local_id(), &SmolStr::new("q"));
+
+  let seeded_100 = first_query_id_of(&mut engine, now);
+  assert_ne!(
+    seeded_100,
+    first_query_id_of(&mut build(200), now),
+    "distinct serf RNG seeds must produce distinct first query ids"
+  );
+  assert_eq!(
+    seeded_100,
+    first_query_id_of(&mut build(100), now),
+    "the same serf RNG seed must reproduce the same first query id"
+  );
+}
+
+/// `new_at` — the panicking form of `try_new_at` — builds on a valid configuration
+/// with serf's core RNG ZERO-SEEDED. That is the documented determinism caveat: two
+/// fresh engines built this way emit the SAME first query id, which is exactly why a
+/// production driver must construct via `try_new_at_with_rng` instead.
+#[test]
+fn new_at_builds_with_a_zero_seeded_serf_rng() {
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let build = || -> SerfEngine<SmolStr, u32> {
+    let cfg = Options::new()
+      .with_port(7946)
+      .with_close_timeout(Duration::from_secs(10));
+    let ep_cfg = EndpointOptions::new(SmolStr::new("z"), node_addr(7946));
+    let mut engine = SerfEngine::new_at(
+      cfg,
+      TransformOptions::default(),
+      ep_cfg,
+      SerfOptions::new(),
+      now,
+      test_rng(),
+    );
+    engine.start(now);
+    engine
+  };
+
+  let mut one = build();
+  assert_eq!(one.port(), 7946, "port() reports the configured bind port");
+  assert_eq!(
+    one.state(),
+    SerfState::Alive,
+    "an engine built by the panicking constructor is running"
+  );
+  assert_eq!(
+    first_query_id_of(&mut one, now),
+    first_query_id_of(&mut build(), now),
+    "a zero-seeded serf RNG makes two fresh engines share one query-id sequence"
+  );
+}
+
+/// `new_at_with_rng` panics on an invalid configuration rather than building a node
+/// past the construction-time checks — the documented contract steering a fallible
+/// caller to `try_new_at_with_rng`.
+#[test]
+#[should_panic(expected = "invalid configuration")]
+fn new_at_with_rng_panics_on_an_invalid_configuration() {
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new("bad"), node_addr(7946));
+  let serf_opts =
+    SerfOptions::new().with_max_user_event_size(SerfOptions::DEFAULT_USER_EVENT_SIZE_LIMIT + 1);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let _engine: SerfEngine<SmolStr, u32> = SerfEngine::new_at_with_rng(
+    cfg,
+    TransformOptions::default(),
+    ep_cfg,
+    serf_opts,
+    now,
+    test_rng(),
+    SmallRng::seed_from_u64(7),
+  );
+}
+
+/// `new_at` panics on an invalid configuration rather than building a node past the
+/// construction-time checks — the documented contract steering a fallible caller to
+/// `try_new_at`.
+#[test]
+#[should_panic(expected = "invalid configuration")]
+fn new_at_panics_on_an_invalid_configuration() {
+  // A non-routable advertise address: a node must advertise an address its peers can
+  // route a reply to.
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7946);
+  let ep_cfg = EndpointOptions::new(SmolStr::new("bad"), bad);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let _engine: SerfEngine<SmolStr, u32> = SerfEngine::new_at(
+    cfg,
+    TransformOptions::default(),
+    ep_cfg,
+    SerfOptions::new(),
+    now,
+    test_rng(),
+  );
+}
+
+// ── running-state gate ───────────────────────────────────────────────────────
+
+/// `ensure_running` — the gate every operation that would queue work no peer could
+/// observe consults — passes while the node is `Alive` and, once it has left, fails
+/// with `BadJoinState` CARRYING the current serf state (so a caller can report why
+/// it was refused rather than guessing).
+#[test]
+fn ensure_running_rejects_once_the_node_has_left() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  // Let the construction self-join sieve settle before leaving.
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(2);
+  engine.pump(now, &mut gossip, &mut stream);
+  assert!(
+    engine.ensure_running().is_ok(),
+    "a running node must pass the gate"
+  );
+
+  engine
+    .leave(now)
+    .expect("leave from a running node succeeds");
+  match engine.ensure_running() {
+    Err(SerfError::BadJoinState(state)) => assert_eq!(
+      state,
+      engine.state(),
+      "the rejection must carry the node's current serf state"
+    ),
+    other => panic!("expected Err(BadJoinState) once the node has left, got {other:?}"),
+  }
+}
+
+// ── join-handle allocation and per-join exchange binding ─────────────────────
+
+/// Two concurrent joins mint DISTINCT handles from a monotonic sequence, and each
+/// dispatched `Connect` binds its exchange to the join that actually started its
+/// stream — never to the other in-flight join. Once a slot frees, each parked dial is
+/// serviced and each join terminalizes on its OWN exchange, so their outcomes never
+/// cross-resolve. A binding that credited the first waiter it found (rather than
+/// matching the START `StreamId`) would leave both exchanges in one join's pending set.
+#[test]
+fn concurrent_joins_mint_distinct_handles_and_bind_their_own_exchanges() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  // A listener but an EMPTY dial pool: each `Connect` parks as `PendingDial`, so both
+  // exchanges stay in flight while their bindings are inspected.
+  engine.set_listener(9);
+
+  let first = engine
+    .join(&[node_addr(7002)], false, now)
+    .expect("join announces intent and mints a handle");
+  let second = engine
+    .join(&[node_addr(7003)], false, now)
+    .expect("a second concurrent join mints its own handle");
+  assert_ne!(
+    first, second,
+    "two concurrent joins must mint distinct handles"
+  );
+  assert_eq!(
+    second.get(),
+    first.get() + 1,
+    "handles are minted from a monotonic sequence"
+  );
+
+  let mut gossip = NoGossip;
+  let mut stream = NoStream::with_pool(0);
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.pending_dial_count(),
+    2,
+    "both seeds dispatched a push/pull that parked on the exhausted pool"
+  );
+
+  {
+    let one = &engine.pending_joins[&first];
+    let two = &engine.pending_joins[&second];
+    assert_eq!(
+      one.started.len(),
+      1,
+      "each join records only its own stream"
+    );
+    assert_eq!(
+      two.started.len(),
+      1,
+      "each join records only its own stream"
+    );
+    assert!(
+      one.started.is_disjoint(&two.started),
+      "two joins never share a start stream"
+    );
+    assert_eq!(
+      one.pending.len(),
+      1,
+      "exactly the exchange this join started is bound to it"
+    );
+    assert_eq!(
+      two.pending.len(),
+      1,
+      "exactly the exchange this join started is bound to it"
+    );
+    assert!(
+      one.pending.is_disjoint(&two.pending),
+      "a Connect binds only the join whose start stream it carries"
+    );
+  }
+
+  // Free two reuse-ready slots: the rebalance assigns them to the parked dials, which
+  // `NoStream::connect` rejects — so each join terminalizes on its OWN exchange.
+  engine.plane_mut().pool.push(5);
+  engine.plane_mut().pool.push(6);
+
+  let mut outcomes = (None, None);
+  for _ in 0..8 {
+    engine.pump(now, &mut gossip, &mut stream);
+    if outcomes.0.is_none() {
+      outcomes.0 = engine.poll_join(first);
+    }
+    if outcomes.1.is_none() {
+      outcomes.1 = engine.poll_join(second);
+    }
+    if outcomes.0.is_some() && outcomes.1.is_some() {
+      break;
+    }
+  }
+  assert_eq!(
+    engine.pending_dial_count(),
+    0,
+    "each deferred dial must be assigned a freed slot and leave PendingDial"
+  );
+
+  for outcome in [outcomes.0, outcomes.1] {
+    match outcome {
+      Some(Err(jf)) => {
+        assert_eq!(
+          jf.requested(),
+          1,
+          "each join dispatched exactly its own seed"
+        );
+        assert_eq!(jf.contacted(), 0, "its failed dial contacted no seed");
+      }
+      other => panic!("each join must resolve independently as Err(JoinFailed), got {other:?}"),
+    }
+  }
+  assert_eq!(
+    engine.pending_join_count(),
+    0,
+    "both resolved joins are reaped once delivered"
+  );
+}
+
+// ── programmable single-engine reliable mock ─────────────────────────────────
+//
+// The reliable-plane lifecycle (dial → promote → flush → half-close → teardown →
+// reap) is link-layer-independent engine code: the machine emits the `StreamAction`s
+// and the engine pumps them over `StreamIo`. `ProgRel` stands in for a driver's
+// socket pool so a single engine can be walked through those paths — a test flips a
+// slot's state between pumps and reads back exactly what reached the wire.
+
+/// The simulated TCP state of one mock reliable socket, as the engine observes it
+/// through [`StreamIo`].
+#[derive(Clone)]
+struct SockState {
+  /// The handshake is modelled complete: `may_send` is true and writes are accepted.
+  /// A test flips this to promote a dial.
+  established: bool,
+  /// The socket has not reached `Closed`/`TimeWait` — `is_open` is true. `connect`
+  /// opens it, a `close` leaves it open (our FIN in flight), and an `abort` drops it.
+  open: bool,
+  /// Cap on the bytes one `send` accepts, modelling partial-write backpressure: the
+  /// remainder stays parked in the connection's `out` queue. `usize::MAX` accepts
+  /// the whole buffer.
+  send_cap: usize,
+}
+
+impl SockState {
+  fn idle() -> Self {
+    Self {
+      established: false,
+      open: false,
+      send_cap: usize::MAX,
+    }
+  }
+}
+
+/// A directly-programmable single-engine reliable mock: a test mutates each slot's
+/// [`SockState`] between pumps and asserts on the recorded sends / closes / aborts.
+struct ProgRel {
+  free: std::vec::Vec<u32>,
+  socks: BTreeMap<u32, SockState>,
+  /// Every `(handle, bytes)` a `send` accepted, in order.
+  sent: std::vec::Vec<(u32, std::vec::Vec<u8>)>,
+  /// Handles `close` (a graceful FIN) was called on.
+  closed: std::vec::Vec<u32>,
+  /// Handles `abort` (an RST) was called on.
+  aborted: std::vec::Vec<u32>,
+}
+
+impl ProgRel {
+  /// A mock realizing sockets for `handles`. The engine's own `plane_mut().pool` is
+  /// the authority its reliable handlers consult, so a test pushes the same handles
+  /// there (or installs one via `set_listener`).
+  fn new(handles: &[u32]) -> Self {
+    let mut socks = BTreeMap::new();
+    for &h in handles {
+      socks.insert(h, SockState::idle());
+    }
+    Self {
+      free: handles.to_vec(),
+      socks,
+      sent: std::vec::Vec::new(),
+      closed: std::vec::Vec::new(),
+      aborted: std::vec::Vec::new(),
+    }
+  }
+
+  fn sock(&self, c: u32) -> &SockState {
+    self.socks.get(&c).expect("handle exists")
+  }
+
+  fn sock_mut(&mut self, c: u32) -> &mut SockState {
+    self.socks.get_mut(&c).expect("handle exists")
+  }
+}
+
+impl StreamIo for ProgRel {
+  type Conn = u32;
+
+  fn take_free(&mut self) -> Option<u32> {
+    self.free.pop()
+  }
+
+  fn give(&mut self, c: u32) {
+    self.free.push(c);
+  }
+
+  fn free_count(&self) -> usize {
+    self.free.len()
+  }
+
+  fn listen(&mut self, c: u32, _port: u16) -> Result<(), crate::StreamIoError> {
+    // A listening socket is open and awaiting a passive open; clear any per-slot
+    // residue so a reclaimed-then-relistened handle starts clean.
+    *self.sock_mut(c) = SockState::idle();
+    self.sock_mut(c).open = true;
+    Ok(())
+  }
+
+  fn accepted_peer(&self, _c: u32) -> Option<SocketAddr> {
+    None
+  }
+
+  fn connect(
+    &mut self,
+    c: u32,
+    _remote: SocketAddr,
+    _local_port: u16,
+  ) -> Result<(), crate::StreamIoError> {
+    // A dial opens the socket; the test flips `established` to model the handshake
+    // completing on a later tick.
+    self.sock_mut(c).open = true;
+    Ok(())
+  }
+
+  fn may_send(&self, c: u32) -> bool {
+    let s = self.sock(c);
+    s.established && s.open
+  }
+
+  fn may_recv(&self, _c: u32) -> bool {
+    false
+  }
+
+  fn is_open(&self, c: u32) -> bool {
+    self.sock(c).open
+  }
+
+  fn is_established(&self, c: u32) -> bool {
+    self.sock(c).established
+  }
+
+  fn recv(&mut self, _c: u32, _buf: &mut [u8]) -> Option<usize> {
+    None
+  }
+
+  fn recv_finished(&self, _c: u32) -> bool {
+    false
+  }
+
+  fn send(&mut self, c: u32, bytes: &[u8]) -> usize {
+    let n = bytes.len().min(self.sock(c).send_cap);
+    self.sent.push((c, bytes[..n].to_vec()));
+    n
+  }
+
+  fn send_queue(&self, _c: u32) -> usize {
+    0
+  }
+
+  fn close(&mut self, c: u32) {
+    // A graceful close leaves the socket open (our FIN in flight) until the peer
+    // FINs back or the reap backstop forces it closed.
+    self.closed.push(c);
+  }
+
+  fn abort(&mut self, c: u32) {
+    self.aborted.push(c);
+    let s = self.sock_mut(c);
+    s.open = false;
+    s.established = false;
+  }
+}
+
+/// A running single-node engine with the given reliable-exchange (`stream_timeout`)
+/// deadline, plus the clock it was started at.
+fn engine_with_stream_timeout(stream_timeout: Duration) -> (SerfEngine<SmolStr, u32>, Instant) {
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg =
+    EndpointOptions::new(SmolStr::new("test"), node_addr(7946)).with_stream_timeout(stream_timeout);
+  let mut engine: SerfEngine<SmolStr, u32> = SerfEngine::try_new_at(
+    cfg,
+    TransformOptions::default(),
+    ep_cfg,
+    SerfOptions::new(),
+    now,
+    test_rng(),
+  )
+  .expect("valid configuration must construct without error");
+  engine.start(now);
+  (engine, now)
+}
+
+/// The sole reliable exchange currently mapped on the engine's plane.
+fn sole_exchange(engine: &mut SerfEngine<SmolStr, u32>) -> ExchangeId {
+  let mut ids = engine.plane_mut().connections.keys().copied();
+  let eid = ids.next().expect("exactly one exchange is mapped");
+  assert!(ids.next().is_none(), "exactly one exchange is mapped");
+  eid
+}
+
+// ── reliable-plane reap / teardown by socket state ───────────────────────────
+
+/// The reap pass reclaims a gracefully-closing handle the moment its socket reaches a
+/// reusable (`!is_open`) state, and FORCE-ABORTS one whose close has outlived
+/// `close_timeout` — so a peer that vanished mid-FIN can never permanently shrink the
+/// pool. Without the force-abort backstop the stalled handle stays parked forever and
+/// the pool loses a slot for good.
+#[test]
+fn reap_closing_reclaims_a_finished_close_and_force_aborts_a_vanished_peer() {
+  let (mut engine, now) = engine_with_stream_timeout(Duration::from_secs(30));
+  let mut stream = ProgRel::new(&[0, 1]);
+  // Slot 0: a clean close that already reached `Closed`. Slot 1: a peer that vanished
+  // mid-FIN — still open, and past its close deadline.
+  stream.sock_mut(0).open = false;
+  stream.sock_mut(1).open = true;
+  engine
+    .plane_mut()
+    .closing
+    .insert(0, now + Duration::from_secs(10));
+  engine.plane_mut().closing.insert(1, now);
+  assert_eq!(
+    engine.closing_count(),
+    2,
+    "two handles are parked mid-close"
+  );
+
+  let mut gossip = NoGossip;
+  engine.pump(now, &mut gossip, &mut stream);
+
+  assert_eq!(
+    engine.closing_count(),
+    0,
+    "both parked handles must be reaped — one cleanly, one force-aborted"
+  );
+  assert!(
+    stream.aborted.contains(&1),
+    "the handle past its close deadline must be force-aborted so its slot is reclaimable"
+  );
+  assert!(
+    !stream.aborted.contains(&0),
+    "an already-closed handle must be reclaimed without an abort"
+  );
+  assert_eq!(
+    engine.pool_free_count() + engine.listener_present() as usize,
+    2,
+    "both reaped handles must return to the pool, never leak"
+  );
+}
+
+/// Tearing down a `PendingDial` — an exchange whose dial was deferred and which
+/// therefore holds NO socket — removes it outright, so the deferred dial is never
+/// later issued for a retired exchange, and reclaims nothing (there is no slot to
+/// reclaim). Tearing down an exchange that is no longer mapped is inert: it must not
+/// panic, reclaim a phantom slot, or touch the link.
+#[test]
+fn teardown_of_a_socketless_pending_dial_removes_it_and_reclaims_nothing() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+  // A listener but an empty dial pool: the join's Connect parks as PendingDial.
+  engine.set_listener(9);
+  let mut stream = ProgRel::new(&[9]);
+
+  engine
+    .join(&[node_addr(7002)], false, now)
+    .expect("join announces intent and queues the routable seed");
+  let mut gossip = NoGossip;
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.pending_dial_count(),
+    1,
+    "the exhausted-pool seed parked as a socketless PendingDial"
+  );
+
+  let eid = sole_exchange(&mut engine);
+  let free_before = engine.pool_free_count();
+  engine.teardown(eid, now, &mut stream);
+
+  assert_eq!(
+    engine.pending_dial_count(),
+    0,
+    "the retired exchange must be removed so a later rebalance never dials it"
+  );
+  assert_eq!(
+    engine.pool_free_count(),
+    free_before,
+    "a socketless exchange reclaims no slot"
+  );
+  assert_eq!(engine.closing_count(), 0, "nothing is parked mid-close");
+  assert!(
+    stream.aborted.is_empty() && stream.closed.is_empty(),
+    "a socketless teardown must not touch the link"
+  );
+
+  // The same exchange is now unknown: a repeat teardown is a no-op.
+  engine.teardown(eid, now, &mut stream);
+  assert_eq!(
+    engine.pool_free_count(),
+    free_before,
+    "tearing down an unknown exchange must reclaim no slot"
+  );
+  assert!(
+    stream.aborted.is_empty() && stream.closed.is_empty(),
+    "tearing down an unknown exchange must not touch the link"
+  );
+}
+
+/// Tearing down a HALF-CLOSED connection — our FIN already emitted, the peer's not yet
+/// received — parks its handle for the reap backstop instead of returning it to the
+/// pool: the socket is still open, so reusing the slot now would clobber a connection
+/// that is still finishing its close. The handle comes back only once the reap sees it
+/// closed (or its close deadline elapses).
+#[test]
+fn teardown_of_a_half_closed_connection_parks_it_for_the_reap() {
+  let (mut engine, now) = engine_with_stream_timeout(Duration::from_secs(30));
+  engine.plane_mut().pool.push(0);
+  engine.set_listener(1);
+  let mut stream = ProgRel::new(&[0, 1]);
+
+  engine
+    .join(&[node_addr(7002)], false, now)
+    .expect("join announces intent and queues the routable seed");
+  let mut gossip = NoGossip;
+  // Tick 1: the Connect dials slot 0; the mock leaves the handshake incomplete.
+  engine.pump(now, &mut gossip, &mut stream);
+  // Complete the handshake: the request flushes and the machine's deferred FIN is
+  // emitted once the write queue has drained, half-closing the connection.
+  stream.sock_mut(0).established = true;
+  let mut half_closed = false;
+  for _ in 0..8 {
+    engine.pump(now, &mut gossip, &mut stream);
+    if engine.half_closed_count() == 1 {
+      half_closed = true;
+      break;
+    }
+  }
+  assert!(
+    half_closed,
+    "the push/pull initiator half-closes its write half once the request is written"
+  );
+  assert!(
+    stream.closed.contains(&0),
+    "the deferred FIN reached the socket"
+  );
+
+  let eid = sole_exchange(&mut engine);
+  let free_before = engine.pool_free_count();
+  engine.teardown(eid, now, &mut stream);
+
+  assert_eq!(
+    engine.closing_count(),
+    1,
+    "a half-closed connection's handle must be parked for the reap backstop"
+  );
+  assert_eq!(
+    engine.pool_free_count(),
+    free_before,
+    "its handle must NOT return to the pool while the socket is still closing"
+  );
+  assert!(
+    !stream.aborted.contains(&0),
+    "a half-closed teardown must not RST a socket whose FIN is already in flight"
+  );
+}
+
+/// Tearing down a dial the peer NEVER established — the socket is open but not
+/// send-capable — RST-aborts it and returns the slot straight to the pool. FIN-ing a
+/// connection the peer never opened would strand the slot in the close backstop for a
+/// close that can never complete.
+#[test]
+fn teardown_of_a_never_established_dial_aborts_and_reclaims_the_slot() {
+  let (mut engine, now) = engine_with_stream_timeout(Duration::from_secs(30));
+  engine.plane_mut().pool.push(0);
+  engine.set_listener(1);
+  let mut stream = ProgRel::new(&[0, 1]);
+
+  engine
+    .join(&[node_addr(7002)], false, now)
+    .expect("join announces intent and queues the routable seed");
+  let mut gossip = NoGossip;
+  engine.pump(now, &mut gossip, &mut stream);
+  assert!(
+    StreamIo::is_open(&stream, 0),
+    "the dial issued connect on the pooled slot"
+  );
+  assert!(
+    !StreamIo::may_send(&stream, 0),
+    "the mock leaves the handshake incomplete, so the socket is not send-capable"
+  );
+
+  let eid = sole_exchange(&mut engine);
+  let free_before = engine.pool_free_count();
+  engine.teardown(eid, now, &mut stream);
+
+  assert!(
+    stream.aborted.contains(&0),
+    "a socket the peer never established must be RST, not FIN'd"
+  );
+  assert_eq!(
+    engine.pool_free_count(),
+    free_before + 1,
+    "its slot must return straight to the pool"
+  );
+  assert_eq!(
+    engine.closing_count(),
+    0,
+    "nothing is parked mid-close for a connection that never opened"
+  );
+  assert!(
+    engine.plane_mut().connections.is_empty(),
+    "the torn-down exchange is unmapped"
+  );
+}
+
+// ── reliable egress under partial-write backpressure ─────────────────────────
+
+/// Flush a join push/pull's request bytes over a link whose `send` accepts at most
+/// `send_cap` bytes at a time, returning the byte stream that reached the socket plus
+/// the length of each accepted write.
+fn push_pull_bytes_written(send_cap: usize) -> (std::vec::Vec<u8>, std::vec::Vec<usize>) {
+  let (mut engine, now) = engine_with_stream_timeout(Duration::from_secs(30));
+  engine.plane_mut().pool.push(0);
+  engine.set_listener(1);
+  let mut stream = ProgRel::new(&[0, 1]);
+  stream.sock_mut(0).send_cap = send_cap;
+
+  engine
+    .join(&[node_addr(7004)], false, now)
+    .expect("join announces intent and queues the routable seed");
+
+  let mut gossip = NoGossip;
+  // Tick 1: the Connect dials slot 0. The mock leaves it un-established, so the egress
+  // pump skips the `!may_send` socket and nothing flushes yet.
+  engine.pump(now, &mut gossip, &mut stream);
+  assert!(
+    stream.sent.is_empty(),
+    "a still-handshaking socket must not be written to"
+  );
+  // Establish it and pump until the queue has drained. The clock is held, so no
+  // deadline elapses and only the capped writes limit progress.
+  stream.sock_mut(0).established = true;
+  for _ in 0..400 {
+    engine.pump(now, &mut gossip, &mut stream);
+  }
+
+  let writes: std::vec::Vec<usize> = stream
+    .sent
+    .iter()
+    .filter(|(c, _)| *c == 0)
+    .map(|(_, b)| b.len())
+    .collect();
+  let bytes: std::vec::Vec<u8> = stream
+    .sent
+    .iter()
+    .filter(|(c, _)| *c == 0)
+    .flat_map(|(_, b)| b.iter().copied())
+    .collect();
+  (bytes, writes)
+}
+
+/// A `send` that accepts fewer bytes than offered leaves the UNSENT TAIL at the front
+/// of the connection's out queue, so a later tick delivers exactly the remainder: the
+/// reassembled stream is byte-identical to the one an uncapped link receives — nothing
+/// dropped, duplicated, or reordered. Popping the front on a partial write would
+/// truncate the request; re-sending the whole front would duplicate its prefix. Either
+/// corrupts the push/pull framing.
+#[test]
+fn partial_writes_park_the_remainder_and_preserve_byte_order() {
+  let (whole, _) = push_pull_bytes_written(usize::MAX);
+  assert!(
+    !whole.is_empty(),
+    "the join push/pull must write its request to the dialed socket"
+  );
+
+  let (chunked, writes) = push_pull_bytes_written(4);
+  assert!(
+    writes.len() >= 2,
+    "the capped link must force the request across multiple writes, got {writes:?}"
+  );
+  assert!(
+    writes.iter().all(|&n| n <= 4),
+    "no write may exceed the link's per-send cap, got {writes:?}"
+  );
+  assert_eq!(
+    chunked, whole,
+    "the partial-write remainder must reassemble to exactly the bytes an uncapped link \
+     receives — no byte dropped, duplicated, or reordered"
+  );
+}
+
+// ── gossip ingress screens and the egress destination screen ─────────────────
+
+/// A [`GossipIo`] with a programmable inbound queue and a capture of every emitted
+/// datagram, so a test can feed one exact datagram from one exact source and assert
+/// precisely what — if anything — went back on the wire.
+struct QueueGossip {
+  inbound: std::vec::Vec<(SocketAddr, std::vec::Vec<u8>)>,
+  outbound: std::vec::Vec<(std::vec::Vec<u8>, SocketAddr)>,
+}
+
+impl QueueGossip {
+  fn new() -> Self {
+    Self {
+      inbound: std::vec::Vec::new(),
+      outbound: std::vec::Vec::new(),
+    }
+  }
+
+  fn push(&mut self, src: SocketAddr, bytes: std::vec::Vec<u8>) {
+    self.inbound.push((src, bytes));
+  }
+}
+
+impl GossipIo for QueueGossip {
+  fn recv(&mut self, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
+    if self.inbound.is_empty() {
+      return None;
+    }
+    let (src, bytes) = self.inbound.remove(0);
+    let n = bytes.len().min(buf.len());
+    buf[..n].copy_from_slice(&bytes[..n]);
+    Some((src, n))
+  }
+
+  fn send(&mut self, bytes: &[u8], dest: SocketAddr) {
+    self.outbound.push((bytes.to_vec(), dest));
+  }
+}
+
+/// A peer address on the test subnet.
+fn peer_addr(host: u8, port: u16) -> SocketAddr {
+  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, host)), port)
+}
+
+/// A plaintext gossip datagram carrying an `Alive` for `ghost`, encoded with `label`.
+/// Incarnation 1 passes SWIM's freshness check for a node the receiver has never seen.
+fn alive_datagram(ghost: &Node<SmolStr, SocketAddr>, label: Option<Bytes>) -> Bytes {
+  encode_outgoing::<SmolStr, SocketAddr>(
+    &Message::Alive(Alive::new(1, ghost.clone())),
+    &EncodeOptions::new(label),
+  )
+  .expect("a well-formed Alive encodes")
+}
+
+/// A malformed inbound gossip datagram is dropped at the decode step: bad network
+/// input must never panic the node or mutate membership. The SAME source then lands a
+/// well-formed `Alive` and IS admitted, so the drop is the codec rejecting the garbage
+/// rather than the ingress path being inert.
+#[test]
+fn malformed_gossip_datagram_is_dropped_without_membership_change() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  let src = peer_addr(3, 7946);
+  let mut gossip = QueueGossip::new();
+  let mut stream = NoStream::with_pool(2);
+  // No byte of this is a valid message frame.
+  gossip.push(src, std::vec![0xffu8; 32]);
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    1,
+    "a malformed datagram must be dropped — no member may be learned from it"
+  );
+
+  let ghost = Node::new(SmolStr::new("ghost"), peer_addr(2, 7946));
+  gossip.push(src, alive_datagram(&ghost, None).to_vec());
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    2,
+    "a well-formed Alive from the same source must still be admitted"
+  );
+}
+
+/// A node with a cluster label REJECTS an inbound gossip datagram that does not carry
+/// it — the label check drops the frame before the machine sees it, so a neighbouring
+/// cluster's chatter can never inject a member. The same `Alive` stamped with the
+/// node's own label is admitted.
+#[test]
+fn a_labeled_node_rejects_gossip_without_its_cluster_label() {
+  let cfg = Options::new()
+    .with_port(7946)
+    .with_close_timeout(Duration::from_secs(10));
+  let ep_cfg = EndpointOptions::new(SmolStr::new("alpha"), node_addr(7946));
+  let transform = TransformOptions::default()
+    .with_label(Some(b"alpha".to_vec()))
+    .expect("a valid cluster label");
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  let mut engine: SerfEngine<SmolStr, u32> =
+    SerfEngine::try_new_at(cfg, transform, ep_cfg, SerfOptions::new(), now, test_rng())
+      .expect("valid configuration must construct without error");
+  engine.start(now);
+
+  let ghost = Node::new(SmolStr::new("ghost"), peer_addr(2, 7946));
+  let src = peer_addr(3, 7946);
+  let mut gossip = QueueGossip::new();
+  let mut stream = NoStream::with_pool(2);
+
+  gossip.push(src, alive_datagram(&ghost, None).to_vec());
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    1,
+    "an unlabeled datagram must be rejected by a labeled node"
+  );
+
+  gossip.push(
+    src,
+    alive_datagram(&ghost, Some(Bytes::from_static(b"beta"))).to_vec(),
+  );
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    1,
+    "a wrong-label datagram must be rejected by a labeled node"
+  );
+
+  gossip.push(
+    src,
+    alive_datagram(&ghost, Some(Bytes::from_static(b"alpha"))).to_vec(),
+  );
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    2,
+    "the same Alive stamped with the node's own label must be admitted"
+  );
+}
+
+/// The last-line egress screen: the engine never writes a gossip datagram to a
+/// destination no packet could reach. A Ping addressed to this node but arriving from
+/// a NON-ROUTABLE source would have its ack reflected straight back to that source, so
+/// the ack is screened at egress and nothing goes on the wire. The identical Ping from
+/// a routable source IS acked, so the drop is the destination screen and not a rejected
+/// Ping.
+#[test]
+fn no_gossip_datagram_is_emitted_to_a_non_routable_destination() {
+  let mut engine = make_engine();
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  // A Ping must name this node as its target to be answered at all.
+  let me = Node::new(SmolStr::new("test"), node_addr(7946));
+  let prober = Node::new(SmolStr::new("prober"), peer_addr(9, 7002));
+  let ping = encode_outgoing::<SmolStr, SocketAddr>(
+    &Message::Ping(Ping::new(7, prober, me)),
+    &EncodeOptions::new(None),
+  )
+  .expect("a well-formed Ping encodes");
+
+  let mut gossip = QueueGossip::new();
+  let mut stream = NoStream::with_pool(2);
+
+  // Port 0 is non-routable: an ack sent there could never arrive.
+  gossip.push(peer_addr(9, 0), ping.to_vec());
+  engine.pump(now, &mut gossip, &mut stream);
+  assert!(
+    gossip.outbound.is_empty(),
+    "an ack to a non-routable source must be screened at egress, not written to the wire"
+  );
+
+  let routable = peer_addr(9, 7002);
+  gossip.push(routable, ping.to_vec());
+  engine.pump(now, &mut gossip, &mut stream);
+  assert!(
+    gossip.outbound.iter().any(|(_, dest)| *dest == routable),
+    "the identical Ping from a routable source must be acked"
+  );
+}
+
+/// An encrypted node DROPS an inbound plaintext gossip datagram at the decrypt step: a
+/// node on an encrypted cluster must never admit an unauthenticated frame. The same
+/// `Alive`, sealed under the node's live keyring, IS admitted — so the drop is the
+/// decrypt guard rejecting an unauthenticated frame, not a malformed one.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn an_encrypted_node_drops_plaintext_inbound_gossip() {
+  let mut engine = make_encrypted_engine("enc", 7946, Keyring::new(secret_key(0x11)));
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  engine.start(now);
+
+  let ghost = Node::new(SmolStr::new("ghost"), peer_addr(2, 7946));
+  let plaintext = alive_datagram(&ghost, None);
+  let src = peer_addr(3, 7946);
+  let mut gossip = QueueGossip::new();
+  let mut stream = NoStream::with_pool(2);
+
+  gossip.push(src, plaintext.to_vec());
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    1,
+    "an unauthenticated plaintext datagram must be dropped by an encrypted node"
+  );
+
+  let sealed = engine
+    .endpoint
+    .encrypt_gossip(&plaintext)
+    .expect("the live keyring seals the frame");
+  gossip.push(src, sealed);
+  engine.pump(now, &mut gossip, &mut stream);
+  assert_eq!(
+    engine.num_members(),
+    2,
+    "the same Alive, sealed under the node's keyring, must be admitted"
+  );
+}
+
+// ── key-management requests missing their key ────────────────────────────────
+
+/// A keyed key-management op (`install` / `use` / `remove`) that arrives WITHOUT its
+/// key is refused with a message naming the omission, and the live keyring is left
+/// exactly as it was — a malformed request can neither mutate the wire keyring nor be
+/// reported as a success. `list`, which needs no key, is unaffected: it still reports
+/// the live state.
+#[cfg(any(feature = "aes-gcm", feature = "chacha20-poly1305"))]
+#[test]
+fn a_keyed_op_without_its_key_is_refused_and_leaves_the_ring_untouched() {
+  let k1 = secret_key(0x11);
+  let k2 = secret_key(0x22);
+  let mut engine = make_encrypted_engine("a", 7946, Keyring::with_secondaries(k1, [k2]));
+  let primary_before = *engine.keyring().expect("encrypted").primary_ref();
+  let secondaries_before = engine.keyring().expect("encrypted").secondaries().to_vec();
+
+  for op in [
+    KeyRequestOperation::Install,
+    KeyRequestOperation::Use,
+    KeyRequestOperation::Remove,
+  ] {
+    let resp = engine.apply_key_request(&key_op(op, None));
+    assert!(
+      !resp.result,
+      "a keyed op carrying no key must be refused, never reported as applied"
+    );
+    assert!(
+      resp.message.contains("missing"),
+      "the refusal must name the omitted key, got {:?}",
+      resp.message
+    );
+    let kr = engine.keyring().expect("encrypted");
+    assert_eq!(
+      *kr.primary_ref(),
+      primary_before,
+      "a refused op must not move the primary"
+    );
+    assert_eq!(
+      kr.secondaries(),
+      secondaries_before.as_slice(),
+      "a refused op must not change the ring"
+    );
+  }
+
+  // `list` needs no key, so the keyless refusal must not swallow it.
+  let resp = engine.apply_key_request(&key_op(KeyRequestOperation::List, None));
+  assert!(resp.result, "list carries no key and must still succeed");
+  assert_eq!(
+    resp.primary_key,
+    Some(primary_before),
+    "list reports the live primary"
+  );
+}
+
+// ── the Closing drain: progress re-arms, a stall force-aborts ────────────────
+
+/// Whether the engine holds a reliable connection in the `Closing` drain state.
+/// `closing_count` counts the DETACHED handles, not the still-mapped draining
+/// connections, so this scans the live connections for the drain state.
+fn has_closing_connection(engine: &mut SerfEngine<SmolStr, u32>) -> bool {
+  engine
+    .plane_mut()
+    .connections
+    .values()
+    .any(|c| c.state == ConnState::Closing)
+}
+
+/// The undelivered-byte mark of the engine's sole draining (`Closing`) connection.
+fn closing_drain_mark(engine: &mut SerfEngine<SmolStr, u32>) -> Option<usize> {
+  engine
+    .plane_mut()
+    .connections
+    .values()
+    .find(|c| c.state == ConnState::Closing)
+    .map(|c| c.close_drain_mark)
+}
+
+/// A graceful close whose reply is still unacknowledged must NOT truncate it: the
+/// connection parks in `Closing` (keeping its slot) while the egress pump keeps
+/// draining. Each acknowledged byte is progress, which re-arms the drain rather than
+/// letting the close deadline fire — `close_timeout` bounds a STALL, not the total
+/// drain — and once the reply is fully acked the terminal FIN goes out and the slot is
+/// reclaimed.
+#[test]
+fn closing_drain_re_arms_on_progress_then_fins_once_the_reply_is_acked() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  // B withholds its acknowledgements, so its push/pull reply is still unacked when its
+  // bridge gracefully closes.
+  link.hold_b_tx();
+
+  link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  let mut parked = false;
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if has_closing_connection(&mut link.b) {
+      parked = true;
+      break;
+    }
+  }
+  assert!(
+    parked,
+    "a graceful close with an unacked reply must park in Closing, not FIN at once"
+  );
+  assert!(
+    (link.b.pool_free_count() + link.b.listener_present() as usize) < 2,
+    "the draining connection still pins its slot until the reply is acked"
+  );
+
+  // Acknowledge part of the reply: the undelivered count shrinks, so the drain re-arms
+  // and the connection stays mapped rather than being force-closed.
+  let mark_before = closing_drain_mark(&mut link.b).expect("the draining connection is mapped");
+  link.ack_b(1);
+  link.step(now);
+  while link.b.poll_event().is_some() {}
+  let mark_after =
+    closing_drain_mark(&mut link.b).expect("progress keeps the draining connection mapped");
+  assert!(
+    mark_after < mark_before,
+    "an acknowledged byte is progress: the drain mark must shrink ({mark_before} -> {mark_after})"
+  );
+
+  // Acknowledge the remainder: the drain completes, the terminal FIN goes out, and the
+  // reap returns the slot.
+  link.ack_b(usize::MAX);
+  let mut t = now;
+  for _ in 0..20 {
+    link.step(t);
+    while link.b.poll_event().is_some() {}
+    if link.b.pool_free_count() + link.b.listener_present() as usize == 2 {
+      break;
+    }
+    t += Duration::from_millis(200);
+  }
+  assert!(
+    !has_closing_connection(&mut link.b),
+    "the fully-drained connection must FIN and leave the Closing state"
+  );
+  assert_eq!(
+    link.b.pool_free_count() + link.b.listener_present() as usize,
+    2,
+    "once the reply is fully acked, the drained connection's slot is reclaimed"
+  );
+}
+
+/// The `Closing` drain's force-abort backstop: a peer that never acknowledges the reply
+/// makes no progress, so at the close deadline the engine gives up on the remainder,
+/// RSTs the socket, and reclaims the slot — a stalled peer can never permanently wedge
+/// a pooled slot mid-drain.
+#[test]
+fn closing_drain_force_aborts_a_stalled_peer_at_the_deadline() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+  // B's reply is never acknowledged, so its drain makes no progress at all.
+  link.hold_b_tx();
+
+  link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  let mut parked = false;
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if has_closing_connection(&mut link.b) {
+      parked = true;
+      break;
+    }
+  }
+  assert!(parked, "the unacked reply parked the connection in Closing");
+
+  // Never acknowledge. Advance past the 10 s close timeout: with no progress, the
+  // no-progress bound elapses and the drain is force-aborted.
+  let mut t = now + Duration::from_secs(15);
+  for _ in 0..10 {
+    link.step(t);
+    while link.b.poll_event().is_some() {}
+    if !has_closing_connection(&mut link.b)
+      && link.b.pool_free_count() + link.b.listener_present() as usize == 2
+    {
+      break;
+    }
+    t += Duration::from_secs(15);
+  }
+  assert!(
+    !has_closing_connection(&mut link.b),
+    "a stalled drain must be force-aborted off the connection map at its deadline"
+  );
+  assert_eq!(
+    link.b.pool_free_count() + link.b.listener_present() as usize,
+    2,
+    "the force-aborted slot must be reclaimed so the pool cannot wedge"
+  );
+}
+
+// ── push/pull completions the engine did not start for a join ────────────────
+
+/// An anti-entropy push/pull — one the engine started for a state REFRESH, not for an
+/// await-result join — is never credited to a join: its terminal `ExchangeCompleted`
+/// folds into no waiter, so an already-delivered join is not re-resolved and no waiter
+/// is resurrected. A fold keyed on the peer ADDRESS rather than the exchange id would
+/// re-resolve the join that reached the very same peer.
+#[test]
+fn a_refresh_push_pull_completion_is_credited_to_no_join() {
+  let mut link = LinkPair::new(&[10, 11], &[20, 21]);
+  let now = Instant::from_origin(Duration::from_secs(86_400));
+
+  let handle = link
+    .a
+    .join(&[link.b_addr], false, now)
+    .expect("join announces intent and mints a handle");
+
+  let mut outcome = None;
+  for _ in 0..40 {
+    link.step(now);
+    while link.a.poll_event().is_some() {}
+    while link.b.poll_event().is_some() {}
+    if let Some(res) = link.a.poll_join(handle) {
+      outcome = Some(res);
+      break;
+    }
+  }
+  assert!(
+    matches!(outcome, Some(Ok(_))),
+    "the join must resolve Ok before the refresh, got {outcome:?}"
+  );
+  assert_eq!(
+    link.a.pending_join_count(),
+    0,
+    "the delivered join is reaped"
+  );
+
+  // A push/pull started for anti-entropy, owned by no join.
+  link
+    .a
+    .endpoint
+    .start_push_pull(link.b_addr, PushPullKind::Refresh, now);
+
+  let mut completed = false;
+  for _ in 0..40 {
+    link.step(now);
+    while link.b.poll_event().is_some() {}
+    while let Some(ev) = link.a.poll_event() {
+      if matches!(&ev, Event::ExchangeCompleted(ec) if ec.kind() == ExchangeKind::PushPull) {
+        completed = true;
+      }
+    }
+    if completed {
+      break;
+    }
+  }
+  assert!(
+    completed,
+    "the refresh push/pull must reach its terminal ExchangeCompleted"
+  );
+  assert_eq!(
+    link.a.pending_join_count(),
+    0,
+    "a completion owned by no join must not resurrect a waiter"
+  );
+  assert!(
+    link.a.poll_join(handle).is_none(),
+    "the already-delivered join must not be re-resolved by an unrelated completion"
+  );
 }
