@@ -98,6 +98,27 @@ struct Observed {
   user_events: RefCell<Vec<SmolStr>>,
 }
 
+impl Observed {
+  /// Poll `recorded` until it contains `id`, bounded by `window`; returns
+  /// whether it landed in time. Each observation hook is delivered on a path
+  /// separate from the membership snapshot, so a hook can land a moment after
+  /// the snapshot a test has already awaited — poll for it rather than sampling
+  /// the hook once.
+  async fn recorded_within(recorded: &RefCell<Vec<SmolStr>>, id: &str, window: Duration) -> bool {
+    compio::time::timeout(window, async {
+      loop {
+        let present = recorded.borrow().iter().any(|got| got.as_str() == id);
+        if present {
+          break;
+        }
+        compio::time::sleep(Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .is_ok()
+  }
+}
+
 /// A [`Delegate`] that records which observation hooks the driver fired.
 struct RecordingDelegate(Rc<Observed>);
 
@@ -409,7 +430,7 @@ async fn user_event_reaches_the_peer_stream_and_delegate() {
   assert_eq!(got, payload, "the payload survives the broadcast");
 
   assert!(
-    seen.user_events.borrow().iter().any(|n| n == "deploy"),
+    Observed::recorded_within(&seen.user_events, "deploy", WINDOW).await,
     "the driver fired A's notify_user_event hook for the broadcast"
   );
 
@@ -453,7 +474,7 @@ async fn set_tags_propagates_as_a_member_update() {
   assert_eq!(got.as_str(), "worker", "A's view of B carries the new tag");
 
   assert!(
-    seen.updated.borrow().iter().any(|id| id == "tag-b"),
+    Observed::recorded_within(&seen.updated, "tag-b", WINDOW).await,
     "the driver fired A's notify_update hook for the re-tagged peer"
   );
 
@@ -910,7 +931,7 @@ async fn an_abrupt_kill_surfaces_failed_then_reap() {
   .expect("A detects the killed peer Failed and reaps it out of the membership");
 
   assert!(
-    seen.failed.borrow().iter().any(|id| id == "kill-b"),
+    Observed::recorded_within(&seen.failed, "kill-b", WINDOW).await,
     "the driver fired notify_failed for the abruptly-killed peer (saw {:?})",
     seen.failed.borrow()
   );

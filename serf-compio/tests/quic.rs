@@ -184,6 +184,27 @@ struct Observed {
   user_events: RefCell<Vec<SmolStr>>,
 }
 
+impl Observed {
+  /// Poll `recorded` until it contains `id`, bounded by `window`; returns
+  /// whether it landed in time. Each observation hook is delivered on a path
+  /// separate from the membership snapshot, so a hook can land a moment after
+  /// the snapshot a test has already awaited — poll for it rather than sampling
+  /// the hook once.
+  async fn recorded_within(recorded: &RefCell<Vec<SmolStr>>, id: &str, window: Duration) -> bool {
+    compio::time::timeout(window, async {
+      loop {
+        let present = recorded.borrow().iter().any(|got| got.as_str() == id);
+        if present {
+          break;
+        }
+        compio::time::sleep(Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .is_ok()
+  }
+}
+
 /// A [`Delegate`] that records which observation hooks the QUIC driver fired.
 struct RecordingDelegate(Rc<Observed>);
 
@@ -622,7 +643,7 @@ async fn a_quic_user_event_reaches_the_peer_stream_and_delegate() {
   assert_eq!(got, payload, "the payload survives the QUIC broadcast");
 
   assert!(
-    seen.user_events.borrow().iter().any(|n| n == "deploy"),
+    Observed::recorded_within(&seen.user_events, "deploy", WINDOW).await,
     "the QUIC driver fired A's notify_user_event hook"
   );
 
@@ -729,7 +750,7 @@ async fn quic_set_tags_propagates_as_a_member_update() {
   assert_eq!(got.as_str(), "worker", "A's view of B carries the new tag");
 
   assert!(
-    seen.updated.borrow().iter().any(|id| id == "qt-b"),
+    Observed::recorded_within(&seen.updated, "qt-b", WINDOW).await,
     "the QUIC driver fired A's notify_update hook for the re-tagged peer"
   );
 
@@ -1476,39 +1497,31 @@ async fn quic_key_rotation_rotates_both_live_keyrings() {
   b.shutdown().await.expect("qrot-b shuts down");
 }
 
-/// The sending half of the driver's rotation-durability acknowledgement channel
-/// ([`serf_driver::KeyringPersistRx`] is its receiver).
+/// A keyring delegate whose persistence resolves OUT OF BAND, the way a real
+/// persistence worker does: `keyring_updated` hands the acknowledgement to a
+/// detached completer that resolves it on the next runtime turn — after the pump
+/// has parked the key response, but tied to the rotation itself rather than any
+/// wall-clock delay. The pump must hold the key response until the
+/// acknowledgement lands and only then route it, so the originator still
+/// collects BOTH nodes' successes.
 #[cfg(encryption)]
-type PersistTx = std::sync::mpsc::Sender<Result<(), serf_driver::KeyringPersistError>>;
-
-/// A keyring delegate whose persistence resolves OUT OF BAND: `keyring_updated`
-/// hands back a pending receiver, and the test releases it after a delay. The
-/// pump must park the key response until the acknowledgement lands and only then
-/// route it — so the originator still collects BOTH nodes' successes.
-#[cfg(encryption)]
-#[derive(Default)]
-struct DeferredKeyring {
-  /// Acknowledgement senders for every rotation this delegate parked, in order.
-  parked: RefCell<Vec<PersistTx>>,
-}
-
-#[cfg(encryption)]
-impl DeferredKeyring {
-  /// Acknowledge every parked rotation as durable.
-  fn release_all(&self) {
-    for tx in self.parked.borrow_mut().drain(..) {
-      // Ignoring Err: the pump dropped the receiver (its key request already
-      // timed out); nothing to acknowledge.
-      let _ = tx.send(Ok(()));
-    }
-  }
-}
+struct DeferredKeyring;
 
 #[cfg(encryption)]
 impl KeyringDelegate for DeferredKeyring {
   fn keyring_updated(&self, _keyring: &Keyring) -> serf_driver::KeyringPersistence {
     let (tx, rx) = std::sync::mpsc::channel();
-    self.parked.borrow_mut().push(tx);
+    // Complete the acknowledgement from a detached task, as an out-of-band
+    // persistence worker would: it runs on the next runtime turn — after the
+    // pump has parked the response on `rx` — so the parked response is released
+    // and routed as soon as the pump next polls it, always inside the key
+    // query's response window and never gated on a fixed delay.
+    compio::runtime::spawn(async move {
+      // Ignoring Err: the pump dropped the receiver (its key request already
+      // timed out); nothing to acknowledge.
+      let _ = tx.send(Ok(()));
+    })
+    .detach();
     serf_driver::KeyringPersistence::Pending(rx)
   }
 }
@@ -1525,10 +1538,9 @@ async fn a_parked_key_response_is_routed_once_persistence_acknowledges() {
   let k2 = test_secret_key(0x44);
   let enc = || EncryptionOptions::new().with_keyring(Keyring::new(k1));
 
-  let deferred = Rc::new(DeferredKeyring::default());
   let b = NodeSpec::new()
     .with_encryption(enc())
-    .with_keyring(deferred.clone())
+    .with_keyring(Rc::new(DeferredKeyring))
     .spawn("qdef-b")
     .await;
   // A keeps the DEFAULT keyring delegate: its own live-ring rotation still
@@ -1539,15 +1551,6 @@ async fn a_parked_key_response_is_routed_once_persistence_acknowledges() {
 
   let mut a_events = a.events();
   a.install_key(k2).await.expect("install_key dispatched");
-
-  // Release B's parked acknowledgement shortly after the rotation lands, well
-  // inside the key query's response window.
-  let releaser = deferred.clone();
-  compio::runtime::spawn(async move {
-    compio::time::sleep(Duration::from_millis(300)).await;
-    releaser.release_all();
-  })
-  .detach();
 
   let kr = next_key_response(&mut a_events).await;
   assert!(
