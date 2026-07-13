@@ -1,0 +1,88 @@
+name: coverage
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # serf-proto's build.rs runs protoc (via buffa-build) for the wire codegen,
+      # and its memberlist-proto dependency's build.rs does too.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Collect coverage
+        run: |
+          # Accumulate per-crate runs into a shared profile, then emit one lcov
+          # report. Each crate runs the same feature combo its own CI workflow
+          # gates, so the coverage build is a combination already known to compile
+          # and pass. A per-crate `--all-features` sweep is not usable: the rustls
+          # backends (ring / aws-lc-rs) are alternatives, not additives.
+          #
+          # serf-embedded carries no host test suite of its own — it is exercised
+          # through the smoltcp and embassy drivers' host suites, which is why it
+          # has no run of its own here. The `serf` umbrella is pure re-exports with
+          # no coverable logic; ci-tokio gates its smoke test instead.
+          cargo llvm-cov --no-report -p serf-proto \
+            --features "tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex"
+          cargo llvm-cov --no-report -p serf-driver --all-features
+          cargo llvm-cov --no-report -p serf-reactor \
+            --features "tokio,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs,test"
+          cargo llvm-cov --no-report -p serf-compio \
+            --features "tcp,tls,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs"
+          cargo llvm-cov --no-report -p serf-smoltcp -p serf-embassy \
+            --features "aes-gcm,cidr"
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          slug: ${{ github.repository }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

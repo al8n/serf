@@ -14,7 +14,7 @@ Port and improve [HashiCorp's serf](https://github.com/hashicorp/serf) to Rust.
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/serf-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2Fd29ceff54c025fe4e8b144a51efb9324%2Fraw%2Fserf" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/serf/ci-tokio.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/serf/coverage.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/al8n/serf?style=for-the-badge&token=6R3QFWRWHL&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-serf-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">][doc-url]
@@ -202,7 +202,7 @@ Copyright (c) 2013 HashiCorp, Inc.
 [protoc]: https://grpc.io/docs/protoc-installation/
 [LICENSE]: https://github.com/al8n/serf/blob/main/LICENSE
 [Github-url]: https://github.com/al8n/serf/
-[CI-url]: https://github.com/al8n/serf/actions/workflows/ci-tokio.yml
+[CI-url]: https://github.com/al8n/serf/actions/workflows/coverage.yml
 [doc-url]: https://docs.rs/serf
 [crates-url]: https://crates.io/crates/serf
 [codecov-url]: https://app.codecov.io/gh/al8n/serf/
