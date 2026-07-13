@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - refactor/sansio
     paths-ignore:
       - "README.md"
       - "COPYRIGHT"
@@ -25,55 +26,60 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  coverage-report:
-    name: Generate Coverage for ${{ matrix.crate }}-${{ matrix.name }}
+  coverage:
+    name: coverage
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - crate: serf-core
-            features: "test,metrics,quickcheck,encryption"
-            name: "serf-core"
-          - crate: serf
-            features: "test,tokio,tcp,encryption,metrics"
-            name: "serf-tcp-encryption"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
-      - name: Install latest nightly
-        uses: actions-rs/toolchain@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          override: true
-      - name: Setup loopback interface
-        run: ci/setup_subnet_ubuntu.sh
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Run Coverage and Generate Report
-        run: |
-          cargo tarpaulin --out xml --no-default-features --features ${{ matrix.features }} --no-fail-fast --output-dir $PWD -j 1
-        working-directory: ${{ matrix.crate }}
-        continue-on-error: true
-      - name: Upload Coverage Report as Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.crate }}/cobertura.xml
+          components: llvm-tools-preview
 
-  upload-codecov:
-    needs: coverage-report
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Download all coverage reports
-        uses: actions/download-artifact@v8
+      - uses: Swatinem/rust-cache@v2
+
+      # serf-proto's build.rs runs protoc (via buffa-build) for the wire codegen,
+      # and its memberlist-proto dependency's build.rs does too.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
         with:
-          path: reports/
-      - name: List contents of the reports directory
-        run: ls -a reports
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Collect coverage
+        run: |
+          # Accumulate per-crate runs into a shared profile, then emit one lcov
+          # report. Each crate runs the same feature combo its own CI workflow
+          # gates, so the coverage build is a combination already known to compile
+          # and pass. A per-crate `--all-features` sweep is not usable: the rustls
+          # backends (ring / aws-lc-rs) are alternatives, not additives.
+          #
+          # The `serf` umbrella is pure re-exports with no coverable logic; ci-tokio
+          # gates its smoke test instead.
+          cargo llvm-cov --no-report -p serf-proto \
+            --features "tcp,tls,quic-rustls-ring,coordinates,aes-gcm,chacha20-poly1305,tag-regex"
+          cargo llvm-cov --no-report -p serf-driver --all-features
+          cargo llvm-cov --no-report -p serf-reactor \
+            --features "tokio,tcp,tls-rustls-ring,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs,test"
+          cargo llvm-cov --no-report -p serf-compio \
+            --features "tcp,tls,quic-rustls-ring,aes-gcm,chacha20-poly1305,coordinates,tag-regex,tracing,serde,clap,dns,getifs"
+          cargo llvm-cov --no-report -p serf-embedded -p serf-smoltcp -p serf-embassy \
+            --features "aes-gcm,cidr"
+          cargo llvm-cov report --lcov --output-path lcov.info
+
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
-          directory: reports
+          files: lcov.info
           fail_ci_if_error: false
           slug: ${{ github.repository }}
         env:

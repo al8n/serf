@@ -1,0 +1,180 @@
+// Wire message schemas for the serf gossip protocol.
+//
+// Wire format is standard protobuf (buffa) — not byte-compatible with serf's old hand-rolled codec; new↔new clusters only.
+
+syntax = "proto3";
+
+package serf.v1;
+
+// UserEventMessage is broadcast when a user-generated event is emitted.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+message UserEventMessage {
+  optional uint64 ltime   = 1;
+  bool            cc      = 2;
+  string          name    = 3;
+  bytes           payload = 4;
+}
+
+// Coordinate is the Vivaldi network-coordinate wire point.
+// All values are in units of seconds.
+// `portion` is the Euclidean part (variable-length vector of f64).
+message Coordinate {
+  repeated double portion    = 1;
+  double          error      = 2;
+  double          adjustment = 3;
+  double          height     = 4;
+}
+
+// Tags encodes node metadata as a string→string map gossiped via node meta.
+message Tags {
+  map<string, string> entries = 1;
+}
+
+// TagFilter matches nodes whose tag value satisfies an optional regex.
+message TagFilter {
+  string tag  = 1;
+  // expr is omitted when no regex constraint is needed (match-any).
+  optional string expr = 2;
+}
+
+// Filter is a single query-scoping predicate.
+// Exactly one of the oneof alternatives is set per Filter message.
+message Filter {
+  oneof kind {
+    // node_ids is a list of opaque byte-encoded node ids; only those nodes respond.
+    NodeIdList node_ids = 1;
+    // tag is a tag-name / optional-regex pair.
+    TagFilter  tag      = 2;
+  }
+}
+
+// NodeIdList is the payload for a node-id filter.
+// Each `id` entry is a node-id encoded via memberlist_proto::Data (opaque bytes).
+message NodeIdList {
+  repeated bytes ids = 1;
+}
+
+// QueryMessage is a query broadcast to the cluster, optionally scoped by filters.
+// Field numbers match the legacy serf-core tag constants.
+// `optional` on the legacy-required fields (ltime, id, from, flags, relay_factor,
+// timeout_nanos) so the decoder can reject any being absent — proto3 plain
+// bytes/scalars have no presence bit. `from` carries the Node<I,A> via Data.
+message QueryMessage {
+  optional uint64 ltime        = 1;
+  optional uint32 id           = 2;
+  optional bytes  from         = 3;
+  repeated Filter filters      = 4;
+  optional uint32 flags        = 5;
+  optional uint32 relay_factor = 6;
+  optional uint64 timeout_nanos = 7;
+  string          name         = 8;
+  bytes           payload      = 9;
+}
+
+// QueryResponseMessage is sent back to the query originator.
+// Field numbers match the legacy serf-core tag constants.
+// `optional` on the legacy-required fields (ltime, id, from, flags) so the
+// decoder can reject any being absent — proto3 plain bytes/scalars have no
+// presence bit. `from` carries the Node<I,A> via Data.
+message QueryResponseMessage {
+  optional uint64 ltime   = 1;
+  optional uint32 id      = 2;
+  optional bytes  from    = 3;
+  optional uint32 flags   = 4;
+  bytes           payload = 5;
+}
+
+// JoinMessage is broadcast after a node joins to associate it with a lamport clock.
+// `optional` on ltime and id because the decoder must reject either being absent
+// (proto3 plain bytes/scalars have no presence bit).
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+message JoinMessage {
+  optional uint64 ltime = 1;
+  optional bytes  id    = 2;
+}
+
+// LeaveMessage is broadcast to signal the intent to leave.
+// `optional` on ltime and id because the decoder must reject either being absent
+// (proto3 plain bytes/scalars have no presence bit).
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+message LeaveMessage {
+  optional uint64 ltime = 1;
+  bool            prune = 2;
+  optional bytes  id    = 3;
+}
+
+// ConflictResponseMessage carries the winning member in a node-name conflict.
+// `optional` on member so the decoder can reject its absence (proto3 plain bytes
+// has no presence bit).
+// `member` carries the memberlist_proto::Node<I,A> encoded via Data (opaque bytes).
+message ConflictResponseMessage {
+  optional bytes member = 1;
+}
+
+// NodeStatusTime is one entry in the PushPullMessage.status_ltimes repeated field.
+// proto3 map<bytes,...> is not allowed (bytes keys are forbidden), so the
+// status-times map is transmitted as a repeated message instead.
+// `id` carries the node-id encoded via memberlist_proto::Data (opaque bytes).
+// `optional` on id and ltime because the decoder must reject either being absent
+// (proto3 plain bytes/scalars have no presence bit).
+message NodeStatusTime {
+  optional bytes  id    = 1;
+  optional uint64 ltime = 2;
+}
+
+// UserEvent is a single named event with an optional payload.
+// Mirrors legacy serf-core UserEvent (name + payload only).
+// The "can coalesce" flag lives on the broadcast UserEventMessage wrapper,
+// not on individual buffered entries.
+message UserEvent {
+  string name    = 1;
+  bytes  payload = 2;
+}
+
+// UserEvents is a batch of user events associated with a single lamport clock.
+// Mirrors legacy serf-core UserEvents.
+// `optional` on ltime because the decoder must reject a missing lamport clock.
+message UserEvents {
+  optional uint64        ltime  = 1;
+  repeated UserEvent     events = 2;
+}
+
+// PushPullMessage carries the full cluster state during a state-sync exchange.
+// `optional` on the three lamport clocks because the decoder must reject missing values.
+// `status_ltimes` is a repeated NodeStatusTime rather than map<bytes,...> because
+// proto3 map keys cannot be bytes.
+message PushPullMessage {
+  optional uint64            ltime         = 1;
+  repeated NodeStatusTime    status_ltimes = 2;
+  repeated bytes             left_members  = 3;
+  optional uint64            event_ltime   = 4;
+  repeated UserEvents        events        = 5;
+  optional uint64            query_ltime   = 6;
+}
+
+// KeyRequestMessage is broadcast to all nodes as part of a key query operation.
+// `key` is absent for list-keys requests; present for install/use/remove operations.
+message KeyRequestMessage {
+  optional bytes key = 1;
+}
+
+// KeyResponseMessage carries the result of a key operation from one node.
+// `keys` carries encoded SecretKey values (each as opaque bytes).
+// `primary_key` is absent when the primary key is not being reported.
+message KeyResponseMessage {
+  bool             result      = 1;
+  string           message     = 2;
+  repeated bytes   keys        = 3;
+  optional bytes   primary_key = 4;
+}
+
+// RelayMessage wraps a serf message for forwarding to a destination node.
+// `optional` on destination so the decoder can reject its absence (proto3 plain
+// bytes has no presence bit).
+// `destination` carries the Node<I,A> encoded via memberlist_proto::Data (opaque bytes).
+// `payload` carries the inner serf framed message verbatim (tag + varint-len + buffa body);
+// the relay target re-decodes it with decode_message.
+message RelayMessage {
+  optional bytes destination = 1;
+  bytes          payload     = 2;
+}

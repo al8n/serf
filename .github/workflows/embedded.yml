@@ -1,0 +1,110 @@
+name: embedded
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/sansio
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
+  workflow_dispatch:
+
+jobs:
+  # Bare-metal compile gate: the `no_std` + `alloc` engine and both embedded
+  # drivers must build for a real Cortex-M target. A `no_std` lib also compiles on
+  # a `std` host, so the host jobs don't exercise the no_std path; this does.
+  # `cargo check` doesn't link, so no embedded runtime or cross-linker is needed.
+  # The gossip RNG's default entropy draw needs a backend on a bare-metal target,
+  # so the custom-backend cfg is set (the symbol itself is only required when an
+  # actual binary links — the qemu job below).
+  embedded-check:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings --cfg getrandom_backend="custom"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      # serf-proto's build.rs runs protoc for the wire codegen, so protoc is
+      # needed even for a bare-metal `cargo check` (build scripts run on the host).
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - run: >
+          cargo check
+          -p serf-embedded
+          -p serf-smoltcp
+          -p serf-embassy
+          --no-default-features --features alloc
+          --target thumbv7em-none-eabihf
+
+  # Host test gate: the embedded core and both its drivers carry host-runnable
+  # test suites (block_on + bounded virtual time) that the bare-metal check above
+  # does not exercise — a bare `cargo check` never builds a test target. Run them
+  # on a std host, plus fmt + clippy for all three libs.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Format
+        run: cargo fmt -p serf-embedded -p serf-smoltcp -p serf-embassy --check
+      - name: Clippy
+        run: cargo clippy -p serf-embedded -p serf-smoltcp -p serf-embassy --all-targets --features aes-gcm,cidr --no-deps -- -D warnings
+      - name: Test
+        run: cargo test -p serf-embedded -p serf-smoltcp -p serf-embassy --features aes-gcm,cidr
+
+  # Execution proof: build the `serf-embassy-qemu` firmware and run it under QEMU.
+  # The crate's `.cargo/config.toml` supplies the target, the linker script, the
+  # custom getrandom cfg, and a `qemu-system-arm` runner with semihosting on, so
+  # `cargo run` boots two serf nodes on an emulated Cortex-M4 and the firmware's
+  # `semihosting::process::exit` code becomes the job's pass/fail.
+  #
+  # No workflow `RUSTFLAGS` is set here: a `RUSTFLAGS` env var replaces (does not
+  # append to) the crate's `.cargo/config.toml` rustflags, which would drop the
+  # linker script and the getrandom cfg and break the link. The crate is excluded
+  # from the workspace, so it is built only by this `cargo run`.
+  qemu:
+    runs-on: ubuntu-latest
+    # Backstop for a firmware hang the in-image watchdog cannot catch (e.g. a dead
+    # SysTick stops the watchdog timer itself): bound the job, don't hang the runner.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU and protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm protobuf-compiler
+      - name: Two nodes join under QEMU
+        run: cargo run
+        working-directory: tests/serf-embassy-qemu

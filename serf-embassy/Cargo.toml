@@ -1,0 +1,89 @@
+[package]
+name = "serf-embassy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version = "1.96"
+description = "Async no_std serf driver over the embassy-net network stack."
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+# `std` and `alloc` are INDEPENDENT capability tiers (std does NOT pull alloc):
+# under `std` the real `std` crate supplies the heap; under `alloc` the
+# no_std+alloc path aliases `alloc`. Each layers the matching feature on every
+# dependency that has one.
+std = ["serf-embedded/std", "serf-proto/std", "memberlist-proto/std", "bytes/std"]
+alloc = ["serf-embedded/alloc", "serf-proto/alloc", "memberlist-proto/alloc"]
+
+# CIDR peer-admission allow-list. A `CidrPolicy` set via `Options::with_cidr_policy`
+# filters inbound gossip by datagram source and inbound reliable connections by
+# peer address at the transport boundary, AND inbound alives by the peer's
+# self-advertised address at membership admission. no_std+alloc (pulls the heap tier).
+cidr = ["alloc", "serf-embedded/cidr", "memberlist-proto/cidr"]
+
+# Gossip + reliable-plane AEAD encryption backends. Each pass-through enables the
+# matching serf-embedded and machine backend so a `TransformOptions` carrying a
+# `Keyring` for that cipher can actually encrypt, and serf's key-management queries
+# (install/use/remove/list) plus the driver-side `KeyRequest` response become
+# available. Both AEAD backends are no_std+alloc.
+aes-gcm = ["alloc", "serf-embedded/aes-gcm", "serf-proto/aes-gcm", "memberlist-proto/aes-gcm"]
+chacha20-poly1305 = [
+  "alloc",
+  "serf-embedded/chacha20-poly1305",
+  "serf-proto/chacha20-poly1305",
+  "memberlist-proto/chacha20-poly1305",
+]
+# Umbrella that activates both AEAD backends (convenient for tests / CI).
+encryption = ["aes-gcm", "chacha20-poly1305"]
+
+[dependencies]
+# The transport-agnostic no_std serf driving core (SerfEngine + the reused
+# memberlist-embedded glue it re-exports); depended on alone for the driving
+# surface, mirroring how memberlist-embassy depends on memberlist-embedded.
+serf-embedded = { path = "../serf-embedded", default-features = false }
+# serf's own protocol types named in the `Serf` command signatures
+# (`QueryParams` / `QueryEvent` / `Tags` / `Member` / the key-management types).
+serf-proto = { path = "../serf-proto", default-features = false, features = [
+  "tcp",
+] }
+# The Sans-I/O machine types named in the construction / command signatures
+# (`Instant` / `EndpointOptions` / `Node` / `SmallRng` / `StreamId`). Pinned to the
+# same git+branch as serf-embedded so the graph holds one copy.
+memberlist-proto = { git = "https://github.com/al8n/memberlist", branch = "main", default-features = false, features = [
+  "tcp",
+] }
+embassy-net = { version = "0.9", default-features = false, features = [
+  "udp",
+  "tcp",
+  "proto-ipv4",
+  "proto-ipv6",
+  "medium-ethernet",
+] }
+embassy-time = { version = "0.5", default-features = false }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = { version = "0.1", default-features = false }
+bytes = { version = "1", default-features = false }
+getrandom = "0.4"
+# Named in the `user_event` / `query` forwarder signatures (`impl Into<SmolStr>`),
+# matching serf-embedded's command surface.
+smol_str = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# A time driver so `embassy_time::Instant::now()` works in the host tests (the
+# production build leaves the driver to the embedded app). `std` is test-only;
+# `generic-queue-8` is the self-contained timer queue.
+embassy-time = { version = "0.5", default-features = false, features = [
+  "std",
+  "generic-queue-8",
+] }
+# `block_on` to drive the async harness inline in tests.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+# A concrete node-id type for the loopback tests.
+smol_str = { version = "0.3", default-features = false, features = ["std"] }

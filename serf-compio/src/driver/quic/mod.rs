@@ -1,0 +1,1709 @@
+//! QUIC-plane driver pump — single owner of the serf `QuicEndpoint` and the
+//! shared UDP socket.
+//!
+//! Unlike the stream plane, QUIC carries no per-exchange bridge table: quinn-proto
+//! (inside the coordinator) multiplexes the reliable push-pull streams over the
+//! single UDP socket, and serf's datagram gossip rides the same socket. The pump
+//! therefore owns exactly one socket and runs a `select_biased` loop over three
+//! arms in priority order: gossip/QUIC UDP recv, the coordinator-supplied wake
+//! timer, and the command channel. After each fired arm it drains every outbound
+//! surface (`poll_memberlist_ingress` decode → `handle_message`,
+//! `poll_memberlist_transmit` encode → encrypt → UDP send, `poll_transmit` raw
+//! QUIC UDP send, `poll_event` accounting + observation hand-off) until no method
+//! makes progress, republishes a fresh [`SerfSnapshot`] when state changed, and
+//! re-enters the select. The pump owns the `QuicEndpoint` outright; user-facing
+//! handles communicate exclusively via the command channel and read state through
+//! the lock-free snapshot. The socket drops when the loop exits so the bound port
+//! is released before shutdown returns.
+//!
+//! The endpoint holds a write-capable [`CompioDropCounter`] over the same
+//! `Rc<Cell<u64>>` a `Serf` handle reads through its read-only counterpart, so
+//! the cumulative coalescer drop counts are observed directly with no publish
+//! step — a shed on the pump is visible on the next handle read.
+
+#![cfg(feature = "quic")]
+
+use std::{cell::Cell, collections::HashSet, net::SocketAddr, rc::Rc};
+
+use core::time::Duration;
+
+use bytes::Bytes;
+use compio::{buf::BufResult, net::UdpSocket};
+use flume::{Receiver, Sender};
+use futures_channel::oneshot;
+use futures_util::{FutureExt, pin_mut, select_biased};
+use lochan::mpsc;
+use memberlist_proto::{
+  Instant, Rng, SeedableRng, StreamId, Transmit,
+  codec::{
+    DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
+    parse_messages,
+  },
+};
+use serf_proto::{
+  ExchangeKind, ExchangeStatus, LamportTime, QuicEndpoint, event::Event, members::SerfState,
+};
+use smallvec::SmallVec;
+
+#[cfg(encryption)]
+use crate::command::{KeyCmd, ListKeysCmd};
+#[cfg(encryption)]
+use crate::delegate::KeyringDelegate;
+use crate::{
+  Channel,
+  command::{
+    Command, ForceLeaveCmd, JoinCmd, JoinKind, JoinReply, LeaveCmd, QueryCmd, RespondCmd,
+    SetTagsCmd, ShutdownCmd, WaitForCompletionArgs,
+  },
+  delegate::Delegate,
+  driver::{
+    options::RuntimeOptions,
+    shared::{
+      ExchangeId, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
+      observation_payload_bytes, yield_once,
+    },
+  },
+  drop_counter::CompioDropCounter,
+  error::{JoinFailed, Result, SerfError},
+  snapshot::{SerfSnapshot, SnapshotCell},
+};
+#[cfg(encryption)]
+use serf_driver::{
+  AppliedKeyRequest, KEYRING_PERSIST_POLL_INTERVAL, PendingKeyResponse, settle_parked_key_response,
+};
+#[cfg(encryption)]
+use serf_proto::{KeyResponseArgs, event::KeyRequest};
+
+/// Driver-side state for one outstanding await-result join call.
+///
+/// Mirrors the stream driver's `PendingJoin`. A [`Command::Join`] carrying
+/// [`JoinKind::WaitForCompletion`] dispatches one push/pull per resolved seed
+/// and parks the per-call state here. The QUIC coordinator services the dial
+/// in-band, so each `start_push_pull`'s returned machine `StreamId` coerces
+/// directly into the [`ExchangeId`] domain (via `From<StreamId>`) — the same
+/// value the bridge-reap path stamps onto its [`Event::ExchangeCompleted`].
+/// Contact accounting is per-OUTBOUND-EXCHANGE, filtered to
+/// [`ExchangeKind::PushPull`]: each successful exchange pushes its peer into
+/// `contacted`; duplicate seeds count independently.
+///
+/// Reply resolution and ignore-stream cleanup are SEPARATE terminal states. The
+/// caller's reply resolves on all-exchanges-done OR `deadline` (whichever first),
+/// consuming `reply`. The ignore-stream cleanup must wait until every dispatched
+/// exchange has completed — i.e. `pending` is empty — because a `StreamId`
+/// recorded for a still-live exchange must stay in the machine's ignore set so a
+/// late merge still suppresses the peer's pre-join user events. The waiter is
+/// removed from `joins` only once BOTH terminals are reached (reply sent and
+/// `pending` empty); on a deadline that fires with exchanges still live it
+/// replies and LINGERS, holding its `ignore_streams` until they complete.
+struct PendingJoin {
+  /// Outbound exchange ids this waiter dispatched and is still awaiting a
+  /// terminal `ExchangeCompleted` for. Removed on completion; when empty the
+  /// ignore-stream cleanup runs and the waiter is reaped.
+  pending: HashSet<ExchangeId>,
+  /// Peer addresses of the dispatched exchanges that terminated `Succeeded`.
+  contacted: SmallVec<[SocketAddr; 1]>,
+  /// The `StreamId`s this join recorded in the machine's per-exchange ignore set
+  /// (non-empty only for an `ignore_old` join). Each is consumed by its own merge
+  /// on the success path; any that did NOT merge are cleared via
+  /// `clear_ignore_join_stream` only once every dispatched exchange has completed
+  /// (`pending` empty), so a failed `ignore_old` exchange never leaks its
+  /// `StreamId` and a still-live one is never prematurely cleared.
+  ignore_streams: SmallVec<[StreamId; 1]>,
+  /// Total outbound-exchange count this call dispatched — the `JoinAllFailed`
+  /// denominator on a zero-contact resolution.
+  requested: usize,
+  /// Wall-clock instant past which the driver replies with whatever `contacted`
+  /// set it has accumulated even if `pending` is non-empty.
+  deadline: Instant,
+  /// One-shot reply channel back to the caller, taken when the reply resolves
+  /// (all-exchanges-done or `deadline`). `None` once resolved; the waiter then
+  /// lingers — only to drive ignore-stream cleanup — until `pending` empties.
+  /// See [`JoinReply`].
+  reply: Option<oneshot::Sender<JoinReply>>,
+}
+
+impl PendingJoin {
+  /// Resolve the caller's reply once, from the current `contacted` set. Idempotent:
+  /// after the first call `reply` is `None` and this is a no-op, so the deadline
+  /// path and the all-exchanges-done path never double-send. A zero-contact
+  /// resolution is the `JoinAllFailed` the reaper would otherwise have produced.
+  fn resolve_reply(&mut self) {
+    if let Some(reply) = self.reply.take() {
+      let result = if self.contacted.is_empty() {
+        Err((
+          SmallVec::new(),
+          SerfError::JoinAllFailed(JoinFailed::new(self.requested, 0)),
+        ))
+      } else {
+        Ok(self.contacted.clone())
+      };
+      // Ignoring Err: caller dropped the reply receiver (the join future was
+      // cancelled).
+      let _ = reply.send(result);
+    }
+  }
+
+  /// This waiter has reached both terminal states — its reply resolved AND every
+  /// dispatched exchange completed — so it can be removed and its ignore-stream
+  /// cleanup run.
+  fn is_done(&self) -> bool {
+    self.reply.is_none() && self.pending.is_empty()
+  }
+}
+
+/// Apply one terminal `ExchangeCompleted` to its await-result join waiter (if
+/// any), driving both decoupled terminals: remove `eid` from the waiter's
+/// `pending` and, on success, push the peer into `contacted`; resolve the
+/// caller's reply the instant `pending` empties (ahead of the observation
+/// hand-off, so a slow delegate cannot delay it); and once the waiter is fully
+/// done (reply sent AND `pending` empty) clear its still-recorded ignore-join
+/// streams and reap it. A `StreamId` the success-path merge already consumed is
+/// absent, so the clear removes only the streams whose exchange did not merge.
+///
+/// Shared by the live drain and unit tests; takes the decoded
+/// `(eid, peer, succeeded)` rather than the `Event` so it is callable without
+/// constructing a coordinator-internal `ExchangeCompleted`.
+fn complete_join_exchange<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  pending_joins: &mut Vec<PendingJoin>,
+  eid: ExchangeId,
+  peer: SocketAddr,
+  succeeded: bool,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let Some(idx) = pending_joins
+    .iter()
+    .position(|pj| pj.pending.contains(&eid))
+  else {
+    return;
+  };
+  let pj = &mut pending_joins[idx];
+  pj.pending.remove(&eid);
+  if succeeded {
+    pj.contacted.push(peer);
+  }
+  // Resolve the reply the moment every dispatched exchange has terminated. If the
+  // deadline already replied, `reply` is `None` and this is a no-op.
+  if pj.pending.is_empty() {
+    pj.resolve_reply();
+  }
+  if pending_joins[idx].is_done() {
+    let pj = pending_joins.swap_remove(idx);
+    for s in &pj.ignore_streams {
+      endpoint.clear_ignore_join_stream(*s);
+    }
+  }
+}
+
+/// Driver-side state for the single in-flight graceful-leave operation.
+///
+/// A [`Command::Leave`] that finds the endpoint `Alive` initiates the machine's
+/// `leave()`, which queues the leave intent + direct notices to peers and
+/// withholds [`Event::LeftCluster`] until they have drained. The pump parks this
+/// here and replies only once that `LeftCluster` arrives (success) or `deadline`
+/// elapses ([`SerfError::LeaveTimeout`]) — so a returned `Ok(())` means the leave
+/// actually reached the wire, never merely that it was queued.
+///
+/// Leave is a SHARED operation: a second `Command::Leave` racing an in-flight one
+/// (cloned handles can both call `leave()`) does NOT re-invoke `endpoint.leave()`
+/// (a repeated leave once already `Leaving`/`Left` is a terminal no-op that emits
+/// no completion event, so a fresh waiter would hang). Instead it joins this
+/// in-flight operation by pushing its reply onto `repliers`. Every terminal path —
+/// `LeftCluster` success, timeout reap, shutdown — drains EVERY replier.
+struct PendingLeave {
+  /// Reply channels of every `leave()` caller that joined this in-flight leave —
+  /// the initiator plus any racing clones. Drained together on the single
+  /// terminal outcome (`Ok` on `LeftCluster`, `LeaveTimeout` on deadline,
+  /// `Shutdown` on teardown).
+  repliers: Vec<oneshot::Sender<Result<()>>>,
+  /// Wall-clock instant past which the pump replies [`SerfError::LeaveTimeout`]
+  /// to every replier even if `LeftCluster` has not yet fired.
+  deadline: Instant,
+}
+
+impl PendingLeave {
+  /// Reply to every joined `leave()` caller with a fresh `Result<()>` from
+  /// `make_result`. A constructor closure (rather than a single cloned value)
+  /// sidesteps `SerfError` not being `Clone` — every terminal outcome here
+  /// (`Ok(())`, `LeaveTimeout`, `Shutdown`) is trivially reconstructible.
+  async fn resolve_all(self, mut make_result: impl FnMut() -> Result<()>) {
+    for replier in self.repliers {
+      // Ignoring Err: a `leave()` caller dropped its reply receiver (its
+      // user-facing future was cancelled); nothing to surface.
+      let _ = replier.send(make_result());
+    }
+  }
+}
+
+/// Pump-loop-local state tracking outstanding commands awaiting completion.
+struct PendingCommands {
+  /// Outstanding await-result join waiters. See [`PendingJoin`].
+  joins: Vec<PendingJoin>,
+  /// Outstanding graceful-leave waiter (at most one at a time). See [`PendingLeave`].
+  leave: Option<PendingLeave>,
+}
+
+/// Hard ceiling on the gossip-plane contribution to the per-recv UDP buffer —
+/// UDP's IPv4 wire payload is capped at 65507 bytes once the IP/UDP headers are
+/// deducted, so inflating the gossip path past it just wastes an allocation. The
+/// raw-QUIC plane is bounded independently by quinn's `max_udp_payload_size`
+/// (≤ 65527) and is intentionally not subject to this gossip cap.
+const GOSSIP_RECV_BUF_MAX: usize = 65507;
+
+/// The largest the encrypted wrapper can inflate a gossip datagram, or `0` when
+/// no encryption backend is built in. The wrapper carries the algorithm tag,
+/// nonce, and AEAD auth tag; sizing the recv buffer to include it keeps an
+/// encrypted gossip datagram from being silently truncated by the kernel.
+#[cfg(encryption)]
+const ENCRYPTED_WRAPPER_OVERHEAD: usize = memberlist_proto::ENCRYPTED_WRAPPER_OVERHEAD;
+#[cfg(not(encryption))]
+const ENCRYPTED_WRAPPER_OVERHEAD: usize = 0;
+
+/// Size the per-recv UDP buffer to the larger of the two planes that share this
+/// one socket.
+///
+/// The gossip plane needs `gossip_mtu` inflated by the encrypted-wrapper overhead
+/// (algorithm tag + nonce + AEAD auth tag), clamped at [`GOSSIP_RECV_BUF_MAX`].
+/// The raw-QUIC plane needs whatever max UDP payload the quinn `EndpointConfig`
+/// accepts — which a valid caller can set above the gossip MTU (quinn's default
+/// 1472 already exceeds the 1400 default `gossip_mtu`, and callers can raise it
+/// further). Sizing below either lets the kernel truncate that plane's largest
+/// datagram before the coordinator's first-byte demux sees it, corrupting QUIC
+/// handshakes/streams while leaving construction silently successful.
+///
+/// `quic_max_udp_payload` is quinn-bounded to `[1200, 65527]`, so it always fits
+/// `usize`; the conversion fallback is purely defensive. The QUIC plane is NOT
+/// clamped at [`GOSSIP_RECV_BUF_MAX`] — quinn already bounds it, and clamping
+/// would shrink the buffer below a configured 65508..=65527 ceiling.
+fn recv_buf_len_for(gossip_mtu: usize, quic_max_udp_payload: u64) -> usize {
+  let gossip_path = gossip_mtu
+    .saturating_add(ENCRYPTED_WRAPPER_OVERHEAD)
+    .min(GOSSIP_RECV_BUF_MAX);
+  let quic_path = usize::try_from(quic_max_udp_payload).unwrap_or(GOSSIP_RECV_BUF_MAX);
+  gossip_path.max(quic_path)
+}
+
+/// Single-owner pump task.
+///
+/// Drives the serf `QuicEndpoint` until the command channel closes (all handles
+/// dropped) or a [`Command::Shutdown`] is received. All mutations on the endpoint
+/// happen here; reads happen via the published [`SerfSnapshot`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn quic_driver_loop<I, D, G, R>(
+  mut endpoint: QuicEndpoint<I, G, R, CompioDropCounter>,
+  gossip_socket: UdpSocket,
+  // The quinn `EndpointConfig`'s accepted max UDP payload, read off the
+  // `QuicOptions` in `QuicTransport::run` (the driver cannot reach the quinn
+  // config through the `QuicEndpoint`). Sizes the recv buffer's QUIC plane.
+  quic_max_udp_payload: u64,
+  commands: Receiver<Command<I, SocketAddr>>,
+  events_tx: Sender<Event<I, SocketAddr>>,
+  events_dropped: Rc<Cell<u64>>,
+  observation_dropped: Rc<Cell<u64>>,
+  snapshot: SnapshotCell<I>,
+  shutdown_flag: Rc<Cell<bool>>,
+  driver_opts: RuntimeOptions,
+  delegate: D,
+  // Cluster label applied to both gossip encode and decode. `None` accepts
+  // datagrams from any cluster.
+  label: Option<Bytes>,
+  // The driver's keyring delegate: applies inbound key-management ops and
+  // produces the `respond_key` answer. Present only under an encryption backend.
+  // The snapshot writer the pump appends membership records to; `None`
+  // disables persistence.
+  mut snapshotter: Option<serf_driver::Snapshotter<I>>,
+  #[cfg(encryption)] keyring: Rc<dyn KeyringDelegate>,
+) where
+  D: Delegate<Id = I, Address = SocketAddr>,
+  I: memberlist_proto::Id + Clone,
+  G: rand::Rng + Unpin,
+  R: rand::Rng + SeedableRng,
+{
+  // Spawn the per-driver observation task — it owns the user `Delegate` and the
+  // `EventStream` sender and runs OFF this pump task: the pump `try_send`s every
+  // surfaced event onto `obs_tx`, the task dispatches the matching observation
+  // hook then forwards to subscribers. Decoupling keeps a slow `notify_*` /
+  // `merge_remote_state` from stalling protocol advancement — and therefore a
+  // parked leave reply that depends on a follow-up input the pump must service.
+  let (obs_tx, obs_rx) = match driver_opts.observation_channel() {
+    Channel::Unbounded => mpsc::unbounded::<Event<I, SocketAddr>>(),
+    Channel::Bounded(n) => mpsc::bounded::<Event<I, SocketAddr>>(n),
+  };
+  // `obs_payload_bytes` tracks the bytes of payload-bearing events (`User`)
+  // currently queued in `obs_tx`: the pump adds on enqueue, the obs task
+  // subtracts on dequeue. The byte backstop bounds the memory a large payload
+  // occupies while a delegate falls behind.
+  let obs_payload_bytes = Rc::new(Cell::new(0u64));
+  compio::runtime::spawn(observation_task::<I, D>(
+    obs_rx,
+    delegate,
+    events_tx,
+    events_dropped.clone(),
+    obs_payload_bytes.clone(),
+  ))
+  .detach();
+
+  // Stash for the [`Command::Shutdown`] reply — acked AFTER the post-loop cleanup
+  // closes the gossip socket so the bound port is free when the caller resumes
+  // from `shutdown.await`.
+  let mut shutdown_reply: Option<oneshot::Sender<Result<()>>> = None;
+  #[cfg(encryption)]
+  let mut pending_key_responses: Vec<PendingKeyResponse<I>> = Vec::new();
+  let mut pending = PendingCommands {
+    joins: Vec::new(),
+    leave: None,
+  };
+
+  // Per-pump UDP recv buffer size, derived once at entry as the larger of the
+  // gossip plane (`gossip_mtu` + AEAD wrapper) and the raw-QUIC plane (quinn's
+  // accepted max UDP payload) — both ride this one socket. Fixed for the
+  // endpoint lifetime.
+  let recv_buf_len = recv_buf_len_for(endpoint.gossip_mtu(), quic_max_udp_payload);
+
+  // Observation-channel payload byte backstop. `Bounded(n)`'s count cap bounds
+  // the NUMBER of queued events, but one `User` event can own up to
+  // `max_stream_frame_size` bytes; cap the queued payload bytes at four frames'
+  // worth. `Unbounded` opts out of dropping, so it opts out of the byte backstop.
+  let obs_payload_budget: Option<u64> = match driver_opts.observation_channel() {
+    Channel::Bounded(_) => Some((endpoint.max_stream_frame_size() as u64).saturating_mul(4)),
+    Channel::Unbounded => None,
+  };
+
+  // Arm the periodic probe / gossip / push-pull schedulers. Without this the
+  // coordinator's schedulers stay unset, so failure detection, dissemination,
+  // and anti-entropy never run.
+  endpoint.start_scheduling(Instant::now());
+  refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
+
+  loop {
+    let mut dirty = false;
+    let mut exit = false;
+
+    // Iter-top command fairness drain so a network flood does not starve user
+    // commands (the `cmd` select arm sits below the network arms).
+    let mut cmd_drained = 0;
+    while cmd_drained < driver_opts.cmd_fairness_budget() {
+      match commands.try_recv() {
+        Ok(c) => {
+          let now = Instant::now();
+          let is_shutdown = matches!(c, Command::Shutdown(_));
+          if is_shutdown {
+            exit = true;
+          }
+          dispatch_command::<I, G, R>(
+            &mut endpoint,
+            &mut shutdown_reply,
+            &mut pending,
+            driver_opts.leave_timeout(),
+            c,
+            now,
+          )
+          .await;
+          cmd_drained += 1;
+          dirty = true;
+          if is_shutdown {
+            break;
+          }
+        }
+        // All `Serf` handles dropped: tear down exactly as a `Command::Shutdown`
+        // would. Under a continuous UDP flood the main select's command arm is
+        // starved by the higher-priority recv arm, so this iter-top drain is the
+        // only path that observes the disconnect; collapsing it into `Empty`
+        // would spin the pump forever and leak the bound socket.
+        Err(flume::TryRecvError::Disconnected) => {
+          exit = true;
+          break;
+        }
+        // No command queued right now — end the fairness drain.
+        Err(flume::TryRecvError::Empty) => break,
+      }
+    }
+
+    // Honor `exit` from the iter-top cmd drain before the select so a quiet
+    // shutdown lands promptly. Flush (a preceding `leave()` directly enqueues
+    // `Dead`-self notices that must reach the wire before the socket drops),
+    // reap, publish, break.
+    if exit {
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
+      drain_outputs::<I, G, R>(
+        &mut endpoint,
+        &gossip_socket,
+        &label,
+        &obs_tx,
+        &observation_dropped,
+        &obs_payload_bytes,
+        obs_payload_budget,
+        &mut pending,
+        &mut snapshotter,
+        #[cfg(encryption)]
+        &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
+      )
+      .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
+      reap_pending_leave(&mut pending.leave, Instant::now()).await;
+      refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
+      break;
+    }
+
+    // Re-poll the deadline AFTER applying drained commands (which may have
+    // advanced or cleared it). Fold in the earliest pending-leave deadline so
+    // the timer arm fires by a graceful leave's timeout even when the
+    // coordinator has no nearer deadline.
+    let setup_now = Instant::now();
+    let endpoint_deadline = endpoint
+      .poll_timeout()
+      .unwrap_or(setup_now + driver_opts.idle_wake_interval());
+    let timeout_deadline = [
+      Some(endpoint_deadline),
+      min_pending_join_deadline(&pending.joins),
+      min_pending_leave_deadline(&pending.leave),
+      #[cfg(encryption)]
+      next_key_ack_check(&pending_key_responses, setup_now),
+      #[cfg(not(encryption))]
+      None,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(endpoint_deadline);
+
+    // BOUNDED past-due preemption. Under a continuous UDP-recv flood the main
+    // select's recv arm always wins over the timer, so `handle_timeout` would
+    // never fire and stale connections / overdue probes would never be reaped.
+    // Route through the `fire_quic_timeout` chokepoint: it drains every
+    // immediately-ready datagram (decoding each) before firing `handle_timeout`
+    // only if the deadline is still past, so a buffered Ack that sits BEHIND an
+    // unrelated datagram in the shared socket's queue still resolves its probe
+    // ahead of the suspicion sweep. This is a safe site to build the drain's
+    // `recv_from` SQEs — the main loop's `recv_fut` is not yet in flight, so
+    // there is no second-SQE race.
+    if setup_now >= timeout_deadline {
+      if fire_quic_timeout::<I, G, R>(
+        &mut endpoint,
+        &gossip_socket,
+        recv_buf_len,
+        driver_opts,
+        &label,
+      )
+      .await
+      {
+        dirty = true;
+      }
+
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
+
+      let terminal = drain_outputs::<I, G, R>(
+        &mut endpoint,
+        &gossip_socket,
+        &label,
+        &obs_tx,
+        &observation_dropped,
+        &obs_payload_bytes,
+        obs_payload_budget,
+        &mut pending,
+        &mut snapshotter,
+        #[cfg(encryption)]
+        &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
+      )
+      .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
+      reap_pending_leave(&mut pending.leave, Instant::now()).await;
+      if dirty {
+        refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
+      }
+      // A conflict `Event::Shutdown` observed during the drain is terminal: break
+      // into teardown rather than re-entering the loop.
+      if terminal {
+        break;
+      }
+      continue;
+    }
+
+    // Drained commands may have advanced state without past-due timer pressure —
+    // flush their outputs before entering the select so a snapshot observer sees
+    // the post-input state promptly.
+    if dirty {
+      #[cfg(encryption)]
+      reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
+      let terminal = drain_outputs::<I, G, R>(
+        &mut endpoint,
+        &gossip_socket,
+        &label,
+        &obs_tx,
+        &observation_dropped,
+        &obs_payload_bytes,
+        obs_payload_budget,
+        &mut pending,
+        &mut snapshotter,
+        #[cfg(encryption)]
+        &*keyring,
+        #[cfg(encryption)]
+        &mut pending_key_responses,
+      )
+      .await;
+      reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
+      reap_pending_leave(&mut pending.leave, Instant::now()).await;
+      refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
+      dirty = false;
+      // A conflict `Event::Shutdown` observed during the flush is terminal.
+      if terminal {
+        break;
+      }
+    }
+
+    let mut timer_fired = false;
+    {
+      let recv_buf = vec![0u8; recv_buf_len];
+      let recv_fut = gossip_socket.recv_from(recv_buf).fuse();
+      let cmd_fut = commands.recv_async().fuse();
+      let timer_fut = compio::time::sleep_until(timeout_deadline.into_std()).fuse();
+      pin_mut!(recv_fut, cmd_fut, timer_fut);
+
+      // Arm priority (top → bottom):
+      //   1. recv  — kernel-buffered UDP (QUIC handshake/stream data + gossip). An
+      //              Ack resolves a probe deadline before handle_timeout marks the
+      //              peer suspect.
+      //   2. timer — past-due deadline (quinn's connection timers + serf's periodic
+      //              reapers).
+      //   3. cmd   — user commands (demoted below the network arms so a cloned-
+      //              handle command flood cannot starve them).
+      select_biased! {
+        gossip = recv_fut => {
+          let BufResult(res, buf) = gossip;
+          if let Ok((n, src)) = res {
+            let now = Instant::now();
+            // The single socket carries both QUIC packets and plain-UDP gossip; the
+            // coordinator's first-byte demux routes each datagram. Raw gossip is
+            // buffered for the drain below to decode; QUIC packets are processed
+            // in-band.
+            endpoint.handle_udp(src, &buf[..n], now);
+            dirty = true;
+          }
+          // Ignoring Err: a transient recv error is non-fatal — the next iteration
+          // re-arms recv with a fresh buffer.
+        }
+        _ = timer_fut => {
+          // Defer the timeout to the `fire_quic_timeout` chokepoint AFTER this
+          // scope drops the in-flight `recv_fut`: a freshly-submitted recv can be
+          // pending on its first poll on a completion backend, so the timer arm
+          // winning does NOT prove a would-block — a near-deadline Ack may be
+          // queued. The chokepoint drains the socket before deciding on
+          // `handle_timeout`, and dropping `recv_fut` first avoids a second
+          // concurrent `recv_from` SQE on the shared socket.
+          timer_fired = true;
+        }
+        cmd = cmd_fut => {
+          match cmd {
+            Ok(c) => {
+              exit = matches!(c, Command::Shutdown(_));
+              let now = Instant::now();
+              dispatch_command::<I, G, R>(
+                &mut endpoint,
+                &mut shutdown_reply,
+                &mut pending,
+                driver_opts.leave_timeout(),
+                c,
+                now,
+              ).await;
+              dirty = true;
+            }
+            // All handles dropped → channel closed. Treat as shutdown.
+            Err(_) => exit = true,
+          }
+        }
+      }
+    }
+
+    // Past-due deadline, deferred from the timer arm so the in-flight `recv_fut`
+    // SQE is dropped before the chokepoint builds its own recv SQEs. Routes
+    // through the SAME `fire_quic_timeout` as the past-due branch so a
+    // near-deadline queued Ack is consumed before any suspicion.
+    if timer_fired
+      && fire_quic_timeout::<I, G, R>(
+        &mut endpoint,
+        &gossip_socket,
+        recv_buf_len,
+        driver_opts,
+        &label,
+      )
+      .await
+    {
+      dirty = true;
+    }
+
+    // Post-select drain (sends + sync accounting only — no second recv SQE). A
+    // conflict `Event::Shutdown` drained here is terminal — fold it into `exit`.
+    #[cfg(encryption)]
+    reap_pending_key_responses(&mut endpoint, &mut pending_key_responses, Instant::now());
+    if drain_outputs::<I, G, R>(
+      &mut endpoint,
+      &gossip_socket,
+      &label,
+      &obs_tx,
+      &observation_dropped,
+      &obs_payload_bytes,
+      obs_payload_budget,
+      &mut pending,
+      &mut snapshotter,
+      #[cfg(encryption)]
+      &*keyring,
+      #[cfg(encryption)]
+      &mut pending_key_responses,
+    )
+    .await
+    {
+      exit = true;
+    }
+    reap_pending_joins(&mut endpoint, &mut pending.joins, Instant::now()).await;
+    reap_pending_leave(&mut pending.leave, Instant::now()).await;
+
+    if dirty {
+      refresh_snapshot::<I, G, R>(&endpoint, &snapshot);
+    }
+
+    if exit {
+      break;
+    }
+  }
+
+  // Cleanup. Order: flip the shutdown flag so a racing clone observes it on
+  // entry, drain queued commands with Err(Shutdown), drop the command receiver
+  // so a late send fails fast, resolve any parked leave, close the bound socket
+  // (awaited so its port is released), then ack the observed shutdown caller.
+  shutdown_flag.set(true);
+  while let Ok(c) = commands.try_recv() {
+    reply_shutdown(c);
+  }
+  drop(commands);
+  // Reply Err(Shutdown) to every parked await-result join waiter whose reply has
+  // not yet resolved — their reply receivers would otherwise hang forever (the
+  // loop's reap path is gone and the task is exiting). Clear EVERY remaining
+  // waiter's ignore-join streams (including a lingering waiter that already
+  // replied on its deadline but was awaiting exchange completion): after shutdown
+  // no late merge can arrive, so nothing is left to suppress.
+  for pj in pending.joins.drain(..) {
+    for s in &pj.ignore_streams {
+      endpoint.clear_ignore_join_stream(*s);
+    }
+    if let Some(reply) = pj.reply {
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(Err((SmallVec::new(), SerfError::Shutdown)));
+    }
+  }
+  if let Some(pl) = pending.leave.take() {
+    pl.resolve_all(|| Err(SerfError::Shutdown)).await;
+  }
+  // Ignoring Err: socket close on shutdown — the runtime tears down fds anyway.
+  // Awaiting the close (rather than a plain drop) drains it to completion so the
+  // kernel slot is released before the stashed reply fires (Windows IOCP closes
+  // asynchronously, so a plain drop could race a same-port rebind into AddrInUse).
+  let _ = gossip_socket.close().await;
+
+  if let Some(reply) = shutdown_reply {
+    // Ignoring Err: caller dropped the reply receiver.
+    let _ = reply.send(Ok(()));
+  }
+}
+
+/// Reply `Err(Shutdown)` to a command drained during teardown.
+fn reply_shutdown<I>(c: Command<I, SocketAddr>) {
+  // Ignoring Err on each send: caller dropped the reply receiver.
+  match c {
+    Command::Join(JoinCmd { reply, .. }) => {
+      let _ = reply.send(Err((SmallVec::new(), SerfError::Shutdown)));
+    }
+    Command::Leave(LeaveCmd { reply }) | Command::Shutdown(ShutdownCmd { reply }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    Command::ForceLeave(ForceLeaveCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    Command::UserEvent(cmd) => {
+      let _ = cmd.reply.send(Err(SerfError::Shutdown));
+    }
+    Command::Query(QueryCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    Command::Respond(RespondCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    Command::SetTags(SetTagsCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    #[cfg(encryption)]
+    Command::InstallKey(KeyCmd { reply, .. })
+    | Command::UseKey(KeyCmd { reply, .. })
+    | Command::RemoveKey(KeyCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    #[cfg(encryption)]
+    Command::ListKeys(ListKeysCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+    #[cfg(feature = "coordinates")]
+    Command::CachedCoordinate(crate::command::CachedCoordinateCmd { reply, .. }) => {
+      let _ = reply.send(Err(SerfError::Shutdown));
+    }
+  }
+}
+
+/// Dispatch one [`Command`] onto the serf endpoint. Replies are best-effort via
+/// the per-command reply channel — a dropped reply receiver means the caller
+/// gave up.
+///
+/// The [`Command::Shutdown`] reply is NOT acked inline; it is stashed into
+/// `shutdown_reply` so the pump acks the caller only AFTER the socket drops in
+/// the post-loop cleanup.
+async fn dispatch_command<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  shutdown_reply: &mut Option<oneshot::Sender<Result<()>>>,
+  pending: &mut PendingCommands,
+  leave_timeout: Duration,
+  cmd: Command<I, SocketAddr>,
+  now: Instant,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let running = endpoint.state() == SerfState::Alive;
+  match cmd {
+    Command::Join(JoinCmd {
+      seeds,
+      kind,
+      ignore_old,
+      reply,
+    }) => {
+      // Gate on a running node: `leave()` is terminal (it stops the periodic
+      // schedulers), so a join after leave would leave the node non-participating.
+      if !running {
+        // Ignoring Err: caller dropped the reply receiver.
+        let _ = reply.send(Err((SmallVec::new(), SerfError::NotRunning)));
+        return;
+      }
+      // Announce the serf-level join intent so peers learn the local join ltime
+      // without waiting for the next anti-entropy round.
+      if let Err(e) = endpoint.join() {
+        // Ignoring Err: caller dropped the reply receiver.
+        let _ = reply.send(Err((SmallVec::new(), SerfError::from(e))));
+        return;
+      }
+      // The QUIC coordinator services the dial + flushes the outbound queue
+      // in-band, so each `start_push_pull`'s returned machine `StreamId` coerces
+      // directly into the `ExchangeId` the bridge-reap path will stamp onto its
+      // `ExchangeCompleted` — no inline action drain / capture is needed.
+      match kind {
+        JoinKind::Dispatch => {
+          let mut dispatched: SmallVec<[SocketAddr; 1]> = SmallVec::new();
+          for seed in seeds {
+            // Ignoring StreamId return: the Dispatch arm tracks no per-exchange
+            // waiter state — completion / failure surfaces through `poll_event`.
+            let _sid = endpoint.start_join_push_pull(seed, ignore_old, now);
+            dispatched.push(seed);
+          }
+          // Ignoring Err: caller dropped the reply receiver (the fire-and-forget
+          // `dispatch_join` future was cancelled).
+          let _ = reply.send(Ok(dispatched));
+        }
+        JoinKind::WaitForCompletion(WaitForCompletionArgs { deadline }) => {
+          let requested = seeds.len();
+          let mut exchange_ids: HashSet<ExchangeId> = HashSet::with_capacity(requested);
+          // An `ignore_old` join records every seed's `StreamId` in the machine;
+          // the driver owns clearing any that fail to merge. A plain join records
+          // nothing, so this stays empty.
+          let mut ignore_streams: SmallVec<[StreamId; 1]> = SmallVec::new();
+          for seed in seeds {
+            let sid = endpoint.start_join_push_pull(seed, ignore_old, now);
+            if ignore_old {
+              ignore_streams.push(sid);
+            }
+            exchange_ids.insert(ExchangeId::from(sid));
+          }
+          if exchange_ids.is_empty() {
+            // No seed produced an exchange (only reachable with a zero-length
+            // `seeds`, which the handle never sends for an await join). Resolve
+            // now — parking would hang with no terminal event incoming.
+            for s in &ignore_streams {
+              endpoint.clear_ignore_join_stream(*s);
+            }
+            // Ignoring Err: caller dropped the reply receiver.
+            let _ = reply.send(Err((
+              SmallVec::new(),
+              SerfError::JoinAllFailed(JoinFailed::new(requested, 0)),
+            )));
+          } else {
+            pending.joins.push(PendingJoin {
+              pending: exchange_ids,
+              contacted: SmallVec::new(),
+              ignore_streams,
+              requested,
+              deadline,
+              reply: Some(reply),
+            });
+          }
+        }
+      }
+    }
+    Command::Leave(LeaveCmd { reply }) => {
+      // Leave is a SHARED in-flight operation. If one is in flight, JOIN it (do
+      // not re-invoke `leave()`, which once `Leaving`/`Left` is a terminal no-op
+      // emitting no second `LeftCluster`). Otherwise INITIATE: snapshot `Alive`
+      // before the call (it decides whether a `LeftCluster` will fire), then park
+      // (was Alive) or reply immediately (idempotent no-op / error).
+      if let Some(pl) = pending.leave.as_mut() {
+        pl.repliers.push(reply);
+      } else {
+        let was_alive = running;
+        let res: Result<()> = endpoint.leave(now).map_err(SerfError::from);
+        match res {
+          Ok(()) if was_alive => {
+            pending.leave = Some(PendingLeave {
+              repliers: vec![reply],
+              deadline: now + leave_timeout,
+            });
+          }
+          // Idempotent no-op (not Alive) ⇒ no `LeftCluster` will fire, or the
+          // call errored. Reply immediately; parking would hang.
+          other => {
+            // Ignoring Err: caller dropped the reply receiver.
+            let _ = reply.send(other);
+          }
+        }
+      }
+    }
+    Command::ForceLeave(ForceLeaveCmd {
+      id,
+      prune,
+      now: at,
+      reply,
+    }) => {
+      let res = if running {
+        endpoint.force_leave(id, prune, at).map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    Command::UserEvent(cmd) => {
+      let res = if running {
+        let name = cmd.name().clone();
+        let payload = cmd.payload().clone();
+        endpoint
+          .user_event(name, payload, cmd.coalesce, now)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = cmd.reply.send(res);
+    }
+    Command::Query(cmd) => {
+      let res = if running {
+        let name = cmd.name().clone();
+        let payload = cmd.payload().clone();
+        let QueryCmd {
+          params, now: at, ..
+        } = &cmd;
+        endpoint
+          .query(name, payload, params.clone(), *at)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = cmd.reply.send(res);
+    }
+    Command::Respond(cmd) => {
+      let res = if running {
+        let payload = cmd.payload().clone();
+        endpoint
+          .respond(&cmd.token, payload, cmd.now)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = cmd.reply.send(res);
+    }
+    Command::SetTags(SetTagsCmd { tags, reply }) => {
+      let res = if running {
+        endpoint.set_tags(tags, now).map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    #[cfg(encryption)]
+    Command::InstallKey(KeyCmd {
+      key,
+      relay_factor,
+      now: at,
+      reply,
+    }) => {
+      let res = if running {
+        endpoint
+          .install_key(key, relay_factor, at)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    #[cfg(encryption)]
+    Command::UseKey(KeyCmd {
+      key,
+      relay_factor,
+      now: at,
+      reply,
+    }) => {
+      let res = if running {
+        endpoint
+          .use_key(key, relay_factor, at)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    #[cfg(encryption)]
+    Command::RemoveKey(KeyCmd {
+      key,
+      relay_factor,
+      now: at,
+      reply,
+    }) => {
+      let res = if running {
+        endpoint
+          .remove_key(key, relay_factor, at)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    #[cfg(encryption)]
+    Command::ListKeys(ListKeysCmd {
+      relay_factor,
+      now: at,
+      reply,
+    }) => {
+      let res = if running {
+        endpoint
+          .list_keys(relay_factor, at)
+          .map_err(SerfError::from)
+      } else {
+        Err(SerfError::NotRunning)
+      };
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(res);
+    }
+    #[cfg(feature = "coordinates")]
+    Command::CachedCoordinate(crate::command::CachedCoordinateCmd { id, reply }) => {
+      // A read-only probe of the coordinate cache: answerable in every
+      // lifecycle state (post-leave introspection stays valid).
+      // Ignoring Err: caller dropped the reply receiver.
+      let _ = reply.send(Ok(endpoint.cached_coordinate(&id)));
+    }
+    Command::Shutdown(ShutdownCmd { reply }) => {
+      // Do NOT ack the caller here — the socket is still bound; stash the reply
+      // and let the post-loop cleanup ack AFTER it drops.
+      *shutdown_reply = Some(reply);
+    }
+  }
+}
+
+/// Drain-first timeout chokepoint for the QUIC pump — the single site that calls
+/// `handle_timeout` on this plane.
+///
+/// Both the past-due preemption branch and the main select's timer arm route
+/// through here. A freshly-submitted `recv` can be pending on its first poll on a
+/// completion backend (io_uring), so a biased select's timer arm winning does NOT
+/// prove a genuine would-block: a near-deadline Ack may be queued or immediately
+/// readable when the timer fires. The bounded `drain_past_due_udp` reads every
+/// immediately-ready datagram (decoding each via `drain_ingress` so a drained Ack
+/// resolves its probe deadline ahead of the suspicion sweep), then `handle_timeout`
+/// fires ONLY if the coordinator's deadline is still past after the drain. Returns
+/// `true` iff any work was applied.
+///
+/// The caller MUST ensure no other `recv_from` SQE on `gossip_socket` is in flight
+/// (the main loop drops its `recv_fut` before invoking this), so the bounded drain
+/// is the sole builder of recv SQEs here.
+async fn fire_quic_timeout<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  gossip_socket: &UdpSocket,
+  recv_buf_len: usize,
+  driver_opts: RuntimeOptions,
+  label: &Option<Bytes>,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut dirty = false;
+  // The budget reuses the per-iteration inbound drain cap (`.max(1)` so recv
+  // always gets at least one shot even at a zero cap). Emptiness is reaped via
+  // `poll_with(ZERO)` inside the drain, not a time window.
+  let drained = drain_past_due_udp(
+    gossip_socket,
+    recv_buf_len,
+    driver_opts.iter_drain_cap().max(1),
+    |src, datagram| {
+      let now = Instant::now();
+      endpoint.handle_udp(src, datagram, now);
+      // On QUIC `handle_udp` only BUFFERS the raw gossip frame; it is decoded and
+      // fed back through `handle_message` by `drain_ingress` (the stream pump
+      // decodes inline in `dispatch_gossip`, QUIC does not). Decode each drained
+      // frame NOW — before the deadline recheck below decides whether to fire
+      // `handle_timeout` — so a drained Ack resolves its probe deadline ahead of
+      // the suspicion sweep. The remaining outbound surfaces are flushed by the
+      // caller's `drain_outputs` after the timeout decision.
+      drain_ingress::<I, G, R>(endpoint, label);
+      // Report whether the coordinator deadline is STILL past: a drained Ack that
+      // resolved it ends the drain so the main select regains fairness.
+      now
+        >= endpoint
+          .poll_timeout()
+          .unwrap_or(now + driver_opts.idle_wake_interval())
+    },
+  )
+  .await;
+  if drained {
+    dirty = true;
+  }
+
+  // Re-poll the deadline after the drain — a consumed Ack may have resolved it.
+  // Fire `handle_timeout` iff the deadline is still past: when the socket drained
+  // empty a buffered Ack was already decoded above (so the deadline is no longer
+  // past), and when a flood capped the drain, firing for liveness is at worst a
+  // transient SWIM-refutable false Suspect rather than a frozen-timer stall.
+  let now = Instant::now();
+  let after_drain = endpoint
+    .poll_timeout()
+    .unwrap_or(now + driver_opts.idle_wake_interval());
+  if now >= after_drain {
+    endpoint.handle_timeout(now);
+    dirty = true;
+  }
+  dirty
+}
+
+/// Decode the coordinator's buffered inbound gossip frames and feed each decoded
+/// message back through `handle_message`. Returns `true` iff any frame was drained.
+///
+/// The codec hop is `decrypt → label-strip → decode`: with an encryption backend
+/// built in, the encryption wrapper is stripped (and authenticated) before the
+/// cluster label is verified; with none built in the serf gossip plane carries no
+/// wire transforms, so the raw bytes ARE the label frame. A compound datagram is
+/// split into its ordered messages by `parse_messages`, each fed as a typed message.
+fn drain_ingress<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  label: &Option<Bytes>,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let now = Instant::now();
+  let decode_opts = DecodeOptions::new(label.clone());
+  let mut progress = false;
+  while let Some((from, raw)) = endpoint.poll_memberlist_ingress() {
+    progress = true;
+    // Reverse the wire transform stack the peer applied before decoding. With an
+    // encryption backend built in, `decrypt_gossip` strips (and authenticates)
+    // the encryption wrapper — returning the frame unchanged when no keyring is
+    // configured, and dropping a frame the keyring cannot decrypt. With none
+    // built in the serf gossip plane carries no transforms, so the raw bytes are
+    // the plain label frame. A dropped datagram is recovered on the next gossip
+    // round (gossip is lossy and self-healing).
+    #[cfg(encryption)]
+    let plain = match endpoint.decrypt_gossip(&raw) {
+      Ok(p) => Bytes::from(p),
+      Err(_) => continue,
+    };
+    #[cfg(not(encryption))]
+    let plain = raw;
+    // Strip the optional cluster label and verify it matches; a mismatched or
+    // absent label on a labeled cluster (or vice versa) is dropped here.
+    let inner = match decode_incoming(plain, &decode_opts) {
+      Ok(b) => b,
+      Err(_) => continue,
+    };
+    // Demux plain vs compound and feed each decoded message to the coordinator.
+    let msgs = match parse_messages::<I, SocketAddr>(inner) {
+      Ok(m) => m,
+      Err(_) => continue,
+    };
+    for msg in msgs {
+      endpoint.handle_message(from, msg, now);
+    }
+  }
+  progress
+}
+
+/// Drain every queued unreliable (gossip-plane) [`Transmit`] and send it on the
+/// shared UDP socket. Outbound gossip is label-stamped (`encode_outgoing` /
+/// `encode_outgoing_compound`), then — with an encryption backend built in —
+/// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
+async fn drain_transmits<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  gossip_socket: &UdpSocket,
+  label: Option<Bytes>,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let encode_opts = EncodeOptions::new(label);
+  let mut progress = false;
+  while let Some(transmit) = endpoint.poll_memberlist_transmit() {
+    progress = true;
+    let (peer, plain): (SocketAddr, Bytes) = match transmit {
+      Transmit::Packet(pkt) => {
+        let (to, msg) = pkt.into_parts();
+        match encode_outgoing(&msg, &encode_opts) {
+          Ok(b) => (to, b),
+          // A locally-built message that fails to encode is dropped so one bad
+          // codec invocation cannot wedge the pump.
+          Err(_) => continue,
+        }
+      }
+      Transmit::Compound(cmp) => {
+        let (to, msgs) = cmp.into_parts();
+        match encode_outgoing_compound(&msgs, &encode_opts) {
+          Ok(b) => (to, b),
+          Err(_) => continue,
+        }
+      }
+    };
+    // Wrap the label frame in the encryption layer when an encryption backend is
+    // built in: `encrypt_gossip` is identity when no keyring is configured, and
+    // drops the datagram if a configured backend rejects it rather than emitting
+    // plaintext on an encrypted-cluster path. With none built in the frame goes
+    // out as-is.
+    #[allow(unused_mut)]
+    let mut on_wire: Vec<u8> = plain.to_vec();
+    #[cfg(encryption)]
+    {
+      on_wire = match endpoint.encrypt_gossip(&on_wire) {
+        Ok(bytes) => bytes,
+        Err(_) => continue,
+      };
+    }
+    let BufResult(res, _buf) = gossip_socket.send_to(on_wire, peer).await;
+    // Ignoring Err: a transient send error is non-fatal — gossip is lossy and
+    // the next probe/gossip round recovers.
+    let _ = res;
+  }
+  progress
+}
+
+/// Drain every raw outbound QUIC datagram (handshake, acks, reliable stream data)
+/// the coordinator queued, and send it on the shared UDP socket. These are
+/// already framed by quinn-proto, so no codec wrap is applied.
+async fn drain_quic_transmits<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  gossip_socket: &UdpSocket,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut progress = false;
+  while let Some((dest, bytes)) = endpoint.poll_transmit() {
+    progress = true;
+    let BufResult(res, _buf) = gossip_socket.send_to(bytes, dest).await;
+    // Ignoring Err: a transient send error is non-fatal — QUIC retransmits
+    // unacked frames on its own timer.
+    let _ = res;
+  }
+  progress
+}
+
+/// Drain every queued serf [`Event`]: synchronous protocol accounting (leave
+/// completion, conflict-shutdown, key requests), then hand off to the observation
+/// task. NO `.await` on user delegate code. Returns `true` iff any event was
+/// drained.
+///
+/// Sets `*terminal` to `true` if a terminal [`Event::Shutdown`] was observed —
+/// the local node lost an id-conflict vote and the pump MUST tear down. The event
+/// is still delivered to subscribers before the main loop breaks.
+#[allow(clippy::too_many_arguments)]
+async fn drain_events<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
+  observation_dropped: &Cell<u64>,
+  obs_payload_bytes: &Cell<u64>,
+  obs_payload_budget: Option<u64>,
+  pending: &mut PendingCommands,
+  snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
+  terminal: &mut bool,
+  #[cfg(encryption)] keyring: &dyn KeyringDelegate,
+  #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut drained = false;
+  while let Some(ev) = endpoint.poll_event() {
+    drained = true;
+    // Snapshot persistence: append the surfaced membership change, the
+    // advancing clock floors, and the clean-leave marker, then flush (and
+    // compact past the threshold) — a change is durable once this drain
+    // returns. Restart replay + `load_snapshot` recovers the state.
+    if let Some(snap) = snapshotter.as_mut() {
+      if let Event::Member(me) = &ev {
+        use serf_proto::event::MemberEventKind as MK;
+        let alive = matches!(me.kind(), MK::Join | MK::Update);
+        for m in me.members() {
+          snap.append_member(alive, m.node());
+        }
+      }
+      if matches!(ev, Event::Member(_) | Event::LeftCluster) {
+        snap.append_clocks(
+          LamportTime::from(endpoint.member_time()),
+          LamportTime::from(endpoint.event_time()),
+          LamportTime::from(endpoint.query_time()),
+        );
+        // The leave marker is written AFTER the clocks so a clean shutdown
+        // ends the file at the Leave record — the terminal shape compaction
+        // preserves and replay expects: under the default no-rejoin posture
+        // the Leave wipes the accumulated state, and a clock record written
+        // after it would resurrect a clock the reference implementation
+        // zeroes.
+        if matches!(ev, Event::LeftCluster) {
+          snap.append_leave();
+        }
+        snap.flush_and_maybe_compact(|| {
+          endpoint
+            .members_snapshot()
+            .iter()
+            .filter(|m| m.status() == serf_proto::members::MemberStatus::Alive)
+            .map(|m| m.node().clone())
+            .collect()
+        });
+      }
+    }
+    // Await-result join resolution. `ExchangeCompleted` fires for every outbound
+    // bridge kind; an await-join waiter consumes only `PushPull` completions.
+    // `complete_join_exchange` drives both decoupled terminals: it resolves the
+    // caller's reply the moment `pending` empties (here on the pump task, ahead of
+    // the observation hand-off, so a slow delegate cannot delay it) and clears the
+    // ignore-join streams only once the waiter is fully done.
+    if let Event::ExchangeCompleted(ref c) = ev
+      && c.kind() == ExchangeKind::PushPull
+    {
+      complete_join_exchange(
+        endpoint,
+        &mut pending.joins,
+        c.eid(),
+        *c.peer(),
+        matches!(c.outcome(), ExchangeStatus::Succeeded),
+      );
+    }
+    // Leave-completion resolution. `LeftCluster` fires once the leave notices
+    // have drained to the wire; resolving the parked waiter here — on this pump
+    // task, ahead of the observation task's `notify_leave` — is what makes
+    // `leave()` return promptly once the flush is done.
+    if matches!(ev, Event::LeftCluster)
+      && let Some(pl) = pending.leave.take()
+    {
+      pl.resolve_all(|| Ok(())).await;
+    }
+    // Conflict-shutdown enforcement. `Event::Shutdown` means the local node lost
+    // an id-conflict vote and MUST stop, exactly as for a `Command::Shutdown`.
+    // Flag it for the main loop (which breaks into teardown after this drain)
+    // while still delivering the event to subscribers below.
+    if matches!(ev, Event::Shutdown) {
+      *terminal = true;
+    }
+    // Key-management request enforcement. `Event::KeyRequest` requires the driver
+    // to apply the install/use/remove/list op to its keyring and answer the
+    // originator; without this the inbound key op times out and local key state
+    // never changes. Applied here on the pump (it mutates the endpoint through
+    // `respond_key`) ahead of the observation hand-off below.
+    #[cfg(encryption)]
+    if let Event::KeyRequest(req) = &ev {
+      match apply_key_request_live(endpoint, keyring, req) {
+        AppliedKeyRequest::Ready(resp) => {
+          // Ignoring Err: `respond_key` fails only when the response cannot be
+          // routed (originator gone / relay dropped); the key op has already
+          // applied to the live wire keyring.
+          let _ = endpoint.respond_key(req, resp, Instant::now());
+        }
+        AppliedKeyRequest::AwaitingPersistence(resp, rx) => {
+          pending_key_responses.push(PendingKeyResponse {
+            req: req.clone(),
+            resp,
+            rx,
+          });
+        }
+      }
+    }
+
+    let payload_bytes = observation_payload_bytes(&ev);
+
+    // Byte backstop (bounded channels only): the count cap does not bound memory
+    // when an event carries a large user payload. If enqueueing would push the
+    // queued payload bytes over budget, yield once so the obs task can drain,
+    // re-check, and drop + count if still over.
+    if let (Some(budget), Some(bytes)) = (obs_payload_budget, payload_bytes) {
+      if obs_payload_bytes.get().saturating_add(bytes) > budget {
+        yield_once().await;
+      }
+      if obs_payload_bytes.get().saturating_add(bytes) > budget {
+        observation_dropped.set(observation_dropped.get() + 1);
+        continue;
+      }
+    }
+
+    // Hand off to the observation task (delegate dispatch + EventStream forward,
+    // off this pump task), non-blocking. `Full` yields once then retries; drop +
+    // count only if still full.
+    match obs_tx.try_send(ev) {
+      Ok(()) => add_obs_payload(obs_payload_bytes, payload_bytes),
+      Err(mpsc::TrySendError::Closed(_)) => {}
+      Err(mpsc::TrySendError::Full(ev)) => {
+        yield_once().await;
+        match obs_tx.try_send(ev) {
+          Ok(()) => add_obs_payload(obs_payload_bytes, payload_bytes),
+          Err(_) => observation_dropped.set(observation_dropped.get() + 1),
+        }
+      }
+    }
+  }
+  drained
+}
+
+/// Drain every outbound surface to quiescence in the documented order: ingress
+/// decode, gossip transmits, raw QUIC transmits, events; repeat until no method
+/// makes progress (a fed inbound message can enqueue an outbound transmit and an
+/// event the next pass surfaces).
+///
+/// Returns `true` iff a terminal [`Event::Shutdown`] was observed while draining —
+/// the local node lost an id-conflict vote and the main loop MUST break into
+/// teardown.
+#[allow(clippy::too_many_arguments)]
+async fn drain_outputs<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  gossip_socket: &UdpSocket,
+  label: &Option<Bytes>,
+  obs_tx: &mpsc::Sender<Event<I, SocketAddr>>,
+  observation_dropped: &Cell<u64>,
+  obs_payload_bytes: &Cell<u64>,
+  obs_payload_budget: Option<u64>,
+  pending: &mut PendingCommands,
+  snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
+  #[cfg(encryption)] keyring: &dyn KeyringDelegate,
+  #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
+) -> bool
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut terminal = false;
+  loop {
+    let did_ingress = drain_ingress::<I, G, R>(endpoint, label);
+    let did_transmits = drain_transmits::<I, G, R>(endpoint, gossip_socket, label.clone()).await;
+    let did_quic = drain_quic_transmits::<I, G, R>(endpoint, gossip_socket).await;
+    let did_events = drain_events::<I, G, R>(
+      endpoint,
+      obs_tx,
+      observation_dropped,
+      obs_payload_bytes,
+      obs_payload_budget,
+      pending,
+      snapshotter,
+      &mut terminal,
+      #[cfg(encryption)]
+      keyring,
+      #[cfg(encryption)]
+      pending_key_responses,
+    )
+    .await;
+    if !(did_ingress || did_transmits || did_quic || did_events) {
+      break;
+    }
+  }
+  terminal
+}
+
+/// Read-modify-write `endpoint`'s LIVE wire keyring for one inbound [`KeyRequest`],
+/// returning the [`KeyResponseArgs`] built from the post-op live state.
+///
+/// The endpoint-facing wrapper over [`serf_driver::apply_key_request`]: it reads
+/// the coordinator's live `encryption_options`, applies the op variant-exactly
+/// against the live ring, and on a real mutation publishes the rotated ring back
+/// via `set_encryption_options` — re-keying the gossip datagram plane (the QUIC
+/// reliable path always skips, quinn encrypts the stream) — then notifies the
+/// keyring delegate: a durable-inline answer responds immediately, while
+/// out-of-band persistence parks the response until its acknowledgement
+/// resolves. A node with no keyring configured answers `result = false` and
+/// makes no wire change; a read-only `list` or a refused op leaves the wire
+/// untouched.
+#[cfg(encryption)]
+fn apply_key_request_live<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  delegate: &dyn KeyringDelegate,
+  req: &KeyRequest<I, SocketAddr>,
+) -> AppliedKeyRequest
+where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut encryption = endpoint.encryption_options().clone();
+  let Some(current) = encryption.keyring() else {
+    return AppliedKeyRequest::Ready(KeyResponseArgs {
+      result: false,
+      message: "no keyring configured on this node".into(),
+      ..Default::default()
+    });
+  };
+  let (resp, rotated) = serf_driver::apply_key_request(current, req.op(), req.key()).into_parts();
+  match rotated {
+    Some(new_ring) => {
+      encryption.set_keyring(new_ring.clone());
+      endpoint.set_encryption_options(encryption);
+      match delegate.keyring_updated(&new_ring) {
+        serf_driver::KeyringPersistence::Durable => AppliedKeyRequest::Ready(resp),
+        serf_driver::KeyringPersistence::Pending(rx) => {
+          AppliedKeyRequest::AwaitingPersistence(resp, rx)
+        }
+      }
+    }
+    None => AppliedKeyRequest::Ready(resp),
+  }
+}
+
+/// Per-driver observation task: dispatch each event's [`Delegate`] hook, then fan
+/// the event out to the `EventStream`, OFF the pump loop.
+///
+/// Every serf [`Event`] (member transitions, user events, queries, responses) is
+/// the application's observation surface, so all events are forwarded to
+/// subscribers. The forward is best-effort: a full queue (slow subscriber) drops
+/// the event and counts it into `events_dropped`, never blocking. The task exits
+/// when `obs_rx` closes (pump dropped `obs_tx`).
+async fn observation_task<I, D>(
+  mut obs_rx: mpsc::Receiver<Event<I, SocketAddr>>,
+  delegate: D,
+  events_tx: Sender<Event<I, SocketAddr>>,
+  events_dropped: Rc<Cell<u64>>,
+  obs_payload_bytes: Rc<Cell<u64>>,
+) where
+  D: Delegate<Id = I, Address = SocketAddr>,
+  I: Clone,
+{
+  while let Some(ev) = obs_rx.recv().await {
+    // Free the byte-backstop budget this event occupied as soon as it leaves the
+    // channel — before the (possibly slow) delegate hook — so the pump's enqueue
+    // side sees the reclaimed budget promptly.
+    let payload = observation_payload_bytes(&ev);
+    if let Some(b) = payload {
+      obs_payload_bytes.set(obs_payload_bytes.get().saturating_sub(b));
+    }
+    // Contain a panicking delegate hook so the task SURVIVES and keeps releasing
+    // the byte-backstop reservations of still-queued events. Ignoring the unwind
+    // result: the panic is contained and this event is simply dropped.
+    let _ = std::panic::AssertUnwindSafe(dispatch_event_delegate(&delegate, &ev))
+      .catch_unwind()
+      .await;
+    if events_tx
+      .try_send(ev)
+      .is_err_and(|e| matches!(e, flume::TrySendError::Full(_)))
+    {
+      events_dropped.set(events_dropped.get() + 1);
+    }
+  }
+}
+
+/// Reap await-result join waiters on the deadline timer. This drives ONLY the
+/// reply terminal: a waiter whose `deadline` has elapsed replies its partial
+/// `contacted` (the same timeout semantics the caller always had). Reply
+/// resolution is decoupled from ignore-stream cleanup — on a deadline that fires
+/// with exchanges still live (`pending` non-empty) the waiter replies and
+/// LINGERS, keeping its `ignore_streams` recorded so a late merge for a still-live
+/// exchange still suppresses; the lingering waiter is then reaped by
+/// [`complete_join_exchange`] when its last exchange completes. The all-exchanges-
+/// done case (including a zero-exchange degenerate waiter) is reaped there too.
+///
+/// A waiter is removed (and its still-recorded ignore-join streams cleared) here
+/// only once BOTH terminals are reached — reply resolved AND `pending` empty —
+/// covering any timer/event ordering. A stream the success-path merge already
+/// consumed is absent, so the clear removes only the streams whose exchange did
+/// not merge. Mirrors the stream driver's `reap_pending_joins`; `swap_remove` is
+/// sound because `joins` has no ordering.
+async fn reap_pending_joins<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  pending_joins: &mut Vec<PendingJoin>,
+  now: Instant,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut i = 0;
+  while i < pending_joins.len() {
+    if now >= pending_joins[i].deadline {
+      // Deadline reached: resolve the reply with the partial `contacted`. This is
+      // a no-op if the all-exchanges-done path already replied.
+      pending_joins[i].resolve_reply();
+    }
+    if pending_joins[i].is_done() {
+      // Reply resolved AND every dispatched exchange completed — clear the
+      // ignore-join streams that did not merge and reap the waiter.
+      let pj = pending_joins.swap_remove(i);
+      for s in &pj.ignore_streams {
+        endpoint.clear_ignore_join_stream(*s);
+      }
+    } else {
+      i += 1;
+    }
+  }
+}
+
+/// Earliest pending-join deadline, if any — folded into the per-iteration
+/// `timeout_deadline` so the timer fires by the first expiring join's deadline.
+/// Settle parked key responses: send those whose persistence acknowledgement
+/// resolved (as-is on success, downgraded to a failure carrying the error
+/// otherwise), drop those whose requester's response deadline passed while
+/// the acknowledgement was still pending (nothing useful can be routed), keep
+/// the rest parked. Called ahead of each output drain so a sent response
+/// flushes in the same pass.
+#[cfg(encryption)]
+fn reap_pending_key_responses<I, G, R>(
+  endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
+  parked: &mut Vec<PendingKeyResponse<I>>,
+  now: Instant,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let mut i = 0;
+  while i < parked.len() {
+    let entry = &parked[i];
+    match settle_parked_key_response(&entry.rx, &entry.resp) {
+      Some(resp) => {
+        let entry = parked.swap_remove(i);
+        // Ignoring Err: `respond_key` fails only when the response cannot be
+        // routed; the key op has already applied to the live wire keyring.
+        let _ = endpoint.respond_key(&entry.req, resp, now);
+      }
+      None if now >= entry.req.deadline() => {
+        drop(parked.swap_remove(i));
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+          "a keyring persistence acknowledgement outlived the key request's response deadline; the response was dropped"
+        );
+      }
+      None => i += 1,
+    }
+  }
+}
+
+/// Next instant a parked key response should be re-polled, folded into the
+/// loop's timer target; `None` when nothing is parked. The persistence
+/// acknowledgement arrives on a plain channel with no waker integration, so
+/// the interval bounds the wait.
+#[cfg(encryption)]
+fn next_key_ack_check<I>(parked: &[PendingKeyResponse<I>], now: Instant) -> Option<Instant> {
+  if parked.is_empty() {
+    None
+  } else {
+    Some(now + KEYRING_PERSIST_POLL_INTERVAL)
+  }
+}
+
+fn min_pending_join_deadline(pending_joins: &[PendingJoin]) -> Option<Instant> {
+  pending_joins
+    .iter()
+    .filter(|pj| pj.reply.is_some())
+    .map(|pj| pj.deadline)
+    .min()
+}
+
+/// Reap a deadline-expired graceful-leave waiter. If `pending_leave`'s deadline
+/// has elapsed without `Event::LeftCluster` having resolved it, reply
+/// [`SerfError::LeaveTimeout`] to every joined replier and clear the slot.
+async fn reap_pending_leave(pending_leave: &mut Option<PendingLeave>, now: Instant) {
+  if let Some(pl) = pending_leave.as_ref()
+    && now >= pl.deadline
+  {
+    let pl = pending_leave.take().expect("checked Some above");
+    pl.resolve_all(|| Err(SerfError::LeaveTimeout)).await;
+  }
+}
+
+/// Earliest pending-leave deadline, if any — folded into the per-iteration
+/// `timeout_deadline` so the timer fires even under a continuous network flood.
+fn min_pending_leave_deadline(pending_leave: &Option<PendingLeave>) -> Option<Instant> {
+  pending_leave.as_ref().map(|pl| pl.deadline)
+}
+
+/// Publish a fresh [`SerfSnapshot`] of the endpoint's observable membership to
+/// the snapshot cell.
+///
+/// Skips the publish when the local node is not yet present in the serf
+/// membership store (the local `NodeJoined` sieve has not fired): the prior
+/// snapshot — seeded at construction — stays current, and `SerfSnapshot::new`
+/// (which requires the local node) is never called with it absent.
+fn refresh_snapshot<I, G, R>(
+  endpoint: &QuicEndpoint<I, G, R, CompioDropCounter>,
+  snapshot: &SnapshotCell<I>,
+) where
+  I: memberlist_proto::Id + Clone,
+  G: Rng,
+  R: Rng + SeedableRng,
+{
+  let members = endpoint.members_snapshot();
+  let local_id = endpoint.local_id();
+  if !members.iter().any(|m| m.node().id_ref() == local_id) {
+    return;
+  }
+  let snap = SerfSnapshot::new(
+    members,
+    local_id,
+    endpoint.state(),
+    LamportTime::from(endpoint.member_time()),
+    LamportTime::from(endpoint.event_time()),
+    LamportTime::from(endpoint.query_time()),
+  );
+  #[cfg(feature = "coordinates")]
+  let snap = snap
+    .with_coordinate(endpoint.get_coordinate())
+    .with_coordinate_resets(endpoint.coordinate_resets());
+  #[cfg(encryption)]
+  let encrypted = endpoint.encryption_options().keyring().is_some();
+  #[cfg(not(encryption))]
+  let encrypted = false;
+  let snap = snap.with_ops_stats(
+    endpoint.health_score(),
+    endpoint.user_broadcast_queue_len(),
+    encrypted,
+  );
+  *snapshot.borrow_mut() = Rc::new(snap);
+}
+
+#[cfg(test)]
+mod tests;

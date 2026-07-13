@@ -181,7 +181,7 @@ Copyright (c) 2025 Al Liu.
 Copyright (c) 2013 HashiCorp, Inc.
 
 [Github-url]: https://github.com/al8n/serf/
-[CI-url]: https://github.com/al8n/serf/actions/workflows/ci.yml
+[CI-url]: https://github.com/al8n/serf/actions/workflows/coverage.yml
 [doc-url]: https://docs.rs/serf
 [crates-url]: https://crates.io/crates/serf
 [codecov-url]: https://app.codecov.io/gh/al8n/serf/

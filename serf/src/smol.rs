@@ -1,19 +1,17 @@
-pub use memberlist::smol::*;
+//! serf on the smol runtime (via the runtime-agnostic reactor driver).
+//!
+//! Re-exports the full [`serf_reactor`] surface with the runtime pinned to smol,
+//! so callers never name `R`. Build a node with the inherent constructors on the
+//! runtime-pinned `Serf` alias — `tcp`, `tls`, `quic`, and their `*_with_rng`
+//! variants. The unpinned three-parameter handle stays available as
+//! [`crate::reactor`].
+pub use serf_reactor::*;
 
-/// [`Serf`](super::Serf) type alias for using [`NetTransport`](memberlist::net::NetTransport) and [`Tcp`](memberlist::net::stream_layer::tcp::Tcp) stream layer with `smol` runtime.
-#[cfg(all(any(feature = "tcp", feature = "tls",), not(target_family = "wasm")))]
-#[cfg_attr(
-  docsrs,
-  doc(cfg(all(any(feature = "tcp", feature = "tls",), not(target_family = "wasm"))))
-)]
-pub type SmolTcpSerf<I, A, D> = serf_core::Serf<SmolNetTransport<I, A, SmolTcp>, D>;
+/// The runtime these handles bind.
+pub type Runtime = agnostic::smol::SmolRuntime;
 
-/// [`Serf`](super::Serf) type alias for using [`NetTransport`](memberlist::net::NetTransport) and [`Tls`](memberlist::net::stream_layer::tls::Tls) stream layer with `smol` runtime.
-#[cfg(all(feature = "tls", not(target_family = "wasm")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "tls", not(target_family = "wasm")))))]
-pub type SmolTlsSerf<I, A, D> = serf_core::Serf<SmolNetTransport<I, A, SmolTls>, D>;
-
-/// [`Serf`](super::Serf) type alias for using [`QuicTransport`](memberlist::quic::QuicTransport) and [`Quinn`](memberlist::quic::stream_layer::quinn::Quinn) stream layer with `smol` runtime.
-#[cfg(all(feature = "quinn", not(target_family = "wasm")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "quinn", not(target_family = "wasm")))))]
-pub type SmolQuicSerf<I, A, D> = serf_core::Serf<SmolQuicTransport<I, A, SmolQuinn>, D>;
+/// A smol-backed serf handle — [`serf_reactor::Serf`] with its runtime pinned to
+/// smol, so callers never name `R`.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
+pub type Serf<I, A> = serf_reactor::Serf<I, A, Runtime>;
