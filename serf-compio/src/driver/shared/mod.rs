@@ -36,11 +36,55 @@ pub(crate) async fn yield_once() {
 
 /// Coordinator-allocated handle for one in-flight reliable exchange.
 ///
-/// Shared by the TCP driver and the per-bridge task so they agree on the
-/// same opaque id without the rest of the crate naming the machine's
-/// streams module.
-#[cfg(feature = "tcp")]
+/// Shared by both reliable planes — the TCP driver with its per-bridge tasks, and
+/// the QUIC driver with its per-connection streams — so each agrees on the same
+/// opaque id without the rest of the crate naming the machine's streams module.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) type ExchangeId = memberlist_proto::event::ExchangeId;
+
+/// Driver half of the teardown-completion latch.
+///
+/// The pump owns this for its whole life and drops it — firing the latch — only
+/// once it has released its bind sockets and acked every parked
+/// [`shutdown`](crate::Serf::shutdown) caller. Nothing is ever sent on it: the
+/// latch fires by sender-disconnect, so a pump that is torn down without
+/// reaching its cleanup still releases every waiter rather than stranding it.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) struct ShutdownComplete {
+  /// Held solely for its `Drop`; a value is never sent.
+  _tx: flume::Sender<()>,
+}
+
+/// Handle half of the teardown-completion latch.
+///
+/// A `shutdown()` whose command the driver can no longer accept (the pump is
+/// already tearing down, so the flag is set or the queue is gone) parks here
+/// instead of returning into a still-bound port.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) struct ShutdownWaiter {
+  rx: flume::Receiver<()>,
+}
+
+#[cfg(any(feature = "tcp", feature = "quic"))]
+impl ShutdownWaiter {
+  /// Resolve once the driver has released its bind sockets — i.e. once the bind
+  /// address is free for an immediate rebind, NOT once every connected stream fd
+  /// has closed. Resolves immediately if the driver has already finished.
+  pub(crate) async fn wait(&self) {
+    // Ignoring Err: the latch fires by sender-disconnect, never by a sent value,
+    // so `recv_async` resolves to `Err` exactly once teardown completes.
+    let _ = self.rx.recv_async().await;
+  }
+}
+
+/// Mint a teardown-completion latch: the [`ShutdownComplete`] the driver holds
+/// until its bind sockets are released, and the [`ShutdownWaiter`] every `Serf`
+/// clone shares.
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub(crate) fn shutdown_latch() -> (ShutdownComplete, ShutdownWaiter) {
+  let (tx, rx) = flume::bounded(0);
+  (ShutdownComplete { _tx: tx }, ShutdownWaiter { rx })
+}
 
 /// Dispatch the matching [`Delegate`] hook for one drained serf [`Event`].
 ///
