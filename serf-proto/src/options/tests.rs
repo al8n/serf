@@ -316,3 +316,81 @@ fn user_event_size_limit_builder_pair_round_trips() {
   set.set_user_event_size_limit(10 * 1024);
   assert_eq!(set.user_event_size_limit(), 10 * 1024);
 }
+
+/// Every builder writes the field it names.  A transposed setter (a copy-paste
+/// slip in a long builder chain) is invisible to a defaults test and silently
+/// mis-configures the machine, so each setter is pinned to its own getter with a
+/// value distinct from every default.
+#[test]
+fn each_builder_writes_its_own_field() {
+  let o = Options::new()
+    .with_recent_intent_timeout(Duration::from_secs(11))
+    .with_leave_propagate_delay(Duration::from_secs(12))
+    .with_query_buffer_size(13)
+    .with_queue_depth_warning(14)
+    .with_flap_timeout(Duration::from_secs(15));
+
+  assert_eq!(o.recent_intent_timeout(), Duration::from_secs(11));
+  assert_eq!(o.leave_propagate_delay(), Duration::from_secs(12));
+  assert_eq!(o.query_buffer_size(), 13);
+  assert_eq!(o.queue_depth_warning(), 14);
+  assert_eq!(o.flap_timeout(), Duration::from_secs(15));
+
+  // The untouched neighbours keep their defaults — no setter bleeds into another.
+  let d = Options::new();
+  assert_eq!(o.reap_interval(), d.reap_interval());
+  assert_eq!(o.event_buffer_size(), d.event_buffer_size());
+  assert_eq!(o.max_queue_depth(), d.max_queue_depth());
+}
+
+/// A rejected coalescing window reports BOTH periods, so an operator can see the
+/// exact pair that violates `quiescent < coalesce` without re-reading the config.
+#[test]
+fn invalid_coalesce_window_names_both_periods() {
+  let err = Options::new()
+    .with_coalesce_period(Duration::from_secs(1))
+    .with_quiescent_period(Duration::from_secs(5))
+    .validate()
+    .expect_err("a quiescent period past the coalesce period is invalid");
+
+  let msg = err.to_string();
+  assert!(
+    matches!(err, InvalidOptions::MemberCoalesce(_)),
+    "expected the member-coalescing-window variant, got {err:?}"
+  );
+  assert!(
+    msg.contains("5s") && msg.contains("1s"),
+    "the message must name both periods, got: {msg}"
+  );
+}
+
+/// A `max_user_event_size` over the ceiling reports both numbers; a zero ceiling
+/// is reported as its own distinct message, since "must not exceed 0" would read
+/// as nonsense.
+#[test]
+fn invalid_user_event_size_names_the_size_and_the_ceiling() {
+  let err = Options::new()
+    .with_user_event_size_limit(100)
+    .with_max_user_event_size(200)
+    .validate()
+    .expect_err("a max_user_event_size over the ceiling is invalid");
+
+  let msg = err.to_string();
+  assert!(
+    matches!(err, InvalidOptions::UserEventSize(_)),
+    "expected the user-event-size variant, got {err:?}"
+  );
+  assert!(
+    msg.contains("200") && msg.contains("100"),
+    "the message must name the size and the ceiling, got: {msg}"
+  );
+
+  let zero = Options::new()
+    .with_user_event_size_limit(0)
+    .validate()
+    .expect_err("a zero ceiling is invalid");
+  assert!(
+    zero.to_string().contains("nonzero"),
+    "a zero ceiling is reported on its own terms, got: {zero}"
+  );
+}

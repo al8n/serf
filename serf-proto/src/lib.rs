@@ -182,3 +182,6 @@ pub use memberlist_proto::event::{ExchangeCompleted, ExchangeId, ExchangeKind, E
 /// Fx hasher — rustc-hash's own `Fx*` map aliases are std-only.
 pub(crate) type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
 pub(crate) type FxHashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;
+
+#[cfg(test)]
+mod tests;
