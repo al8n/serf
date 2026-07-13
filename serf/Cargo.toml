@@ -1,0 +1,121 @@
+[package]
+name = "serf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sans-I/O serf: decentralized service discovery and orchestration — a gossip membership, user-event and query layer over memberlist."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+serf-proto = { path = "../serf-proto", version = "0.5.2", default-features = false }
+serf-reactor = { path = "../serf-reactor", version = "0.5.2", optional = true, default-features = false }
+serf-compio = { path = "../serf-compio", version = "0.5.2", optional = true, default-features = false }
+serf-smoltcp = { path = "../serf-smoltcp", version = "0.5.2", optional = true, default-features = false }
+serf-embassy = { path = "../serf-embassy", version = "0.5.2", optional = true, default-features = false }
+serf-embedded = { path = "../serf-embedded", version = "0.5.2", optional = true, default-features = false }
+agnostic = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The facade smoke test drives two loopback nodes on a concrete runtime: `#[tokio::test]`
+# needs the tokio macros plus a multi-thread runtime with timers. The `TokioRuntime`
+# itself arrives through the crate's own `tokio` feature.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+smol_str.workspace = true
+
+# The umbrella facade otherwise has no test target; this exercises the runtime-pinned
+# handle end to end (build → join → converge → leave) through `serf::tokio`.
+[[test]]
+name = "smoke"
+required-features = ["tokio", "tcp"]
+
+[features]
+default = ["tokio", "tcp"]
+alloc = ["serf-proto/alloc"]
+std = ["alloc", "serf-proto/std"]
+
+# Driver selection. `tokio` / `smol` pin the agnostic reactor driver to a concrete
+# runtime so callers never name `R`; `reactor` leaves it generic.
+reactor = ["dep:serf-reactor", "std"]
+tokio = ["reactor", "dep:agnostic", "agnostic/tokio", "serf-reactor/tokio"]
+smol = ["reactor", "dep:agnostic", "agnostic/smol", "serf-reactor/smol"]
+compio = ["dep:serf-compio", "std"]
+# Bare-metal / no_std drivers: the `alloc` tier (they never pull `std` here).
+smoltcp = ["dep:serf-smoltcp", "alloc", "serf-smoltcp/alloc"]
+embassy = ["dep:serf-embassy", "alloc", "serf-embassy/alloc"]
+embedded = ["dep:serf-embedded", "alloc", "serf-embedded/alloc"]
+
+# Transports.
+#
+# Bare `tls` / `quic` enable the record-layer types only; they do not pick a
+# crypto provider, so a build with just `tls` (or `quic`) has no usable backend.
+# Select a backend feature instead — `tls-rustls-ring` / `quic-rustls-ring` (or
+# the `-aws-lc-rs` variant) — which turn on `tls` / `quic` transitively.
+tcp = ["serf-proto/tcp", "serf-reactor?/tcp", "serf-compio?/tcp"]
+tls = ["serf-proto/tls", "serf-reactor?/tls", "serf-compio?/tls"]
+tls-rustls-ring = ["tls", "serf-reactor?/tls-rustls-ring"]
+tls-rustls-aws-lc-rs = ["tls", "serf-reactor?/tls-rustls-aws-lc-rs"]
+quic = ["serf-proto/quic", "serf-reactor?/quic", "serf-compio?/quic"]
+quic-rustls-ring = [
+  "quic",
+  "serf-proto/quic-rustls-ring",
+  "serf-reactor?/quic-rustls-ring",
+  "serf-compio?/quic-rustls-ring",
+]
+
+# Encryption backends — the key-management messages plus the coordinator's gossip
+# keyring. Every driver defines these.
+aes-gcm = [
+  "serf-proto/aes-gcm",
+  "serf-reactor?/aes-gcm",
+  "serf-compio?/aes-gcm",
+  "serf-smoltcp?/aes-gcm",
+  "serf-embassy?/aes-gcm",
+  "serf-embedded?/aes-gcm",
+]
+chacha20-poly1305 = [
+  "serf-proto/chacha20-poly1305",
+  "serf-reactor?/chacha20-poly1305",
+  "serf-compio?/chacha20-poly1305",
+  "serf-smoltcp?/chacha20-poly1305",
+  "serf-embassy?/chacha20-poly1305",
+  "serf-embedded?/chacha20-poly1305",
+]
+# Convenience: both AEAD backends at once, matching the same feature on the
+# underlying crates.
+encryption = ["aes-gcm", "chacha20-poly1305"]
+
+# Vivaldi network coordinate estimation.
+coordinates = [
+  "serf-proto/coordinates",
+  "serf-reactor?/coordinates",
+  "serf-compio?/coordinates",
+]
+# Regex-backed tag-filter matching.
+tag-regex = [
+  "serf-proto/tag-regex",
+  "serf-reactor?/tag-regex",
+  "serf-compio?/tag-regex",
+]
+# CIDR peer-admission allow-list (the bare-metal drivers define it).
+cidr = ["serf-smoltcp?/cidr", "serf-embassy?/cidr", "serf-embedded?/cidr"]
+
+# Config-options layering, propagated to whichever std drivers are enabled. std-only
+# (clap is std-only, and the `Duration` fields use humantime-serde), so the no_std
+# drivers are intentionally excluded.
+serde = ["std", "serf-reactor?/serde", "serf-compio?/serde"]
+clap = ["std", "serf-reactor?/clap", "serf-compio?/clap"]
+
+# Misc.
+dns = ["serf-reactor?/dns", "serf-compio?/dns"]
+# Auto-detect the advertise address from the host's own interfaces (std drivers only).
+getifs = ["serf-reactor?/getifs", "serf-compio?/getifs"]
+tracing = ["serf-reactor?/tracing", "serf-compio?/tracing"]

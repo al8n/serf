@@ -80,3 +80,12 @@ jobs:
 
       - name: Test
         run: cargo test -p serf-reactor --features "$FEATURES"
+
+      # The umbrella facade crate otherwise has no CI; exercise its smoke test,
+      # which drives two loopback nodes through the runtime-pinned `serf::tokio`
+      # handle.
+      - name: Clippy umbrella (serf)
+        run: cargo clippy -p serf --all-targets --features tokio,tcp --no-deps -- -D warnings
+
+      - name: Test umbrella (serf)
+        run: cargo test -p serf --features tokio,tcp
