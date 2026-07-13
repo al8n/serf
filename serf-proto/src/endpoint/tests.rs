@@ -4238,6 +4238,46 @@ fn query_buffer_slot_capped_at_max_query_ids_per_ltime() {
 }
 
 #[test]
+fn query_ring_wraparound_reowns_slot_and_still_dedups() {
+  // The subtle half of serf#56: two ltimes a ring-size apart map to the SAME
+  // slot. A query at the newer ltime that wraps onto a slot still holding the
+  // OLDER ltime must start a FRESH record (own the slot at the new ltime), not
+  // append its id onto the stale entry — appending would leave the slot's ltime
+  // stale, so a re-gossip of the new query would never dedup and would be
+  // reprocessed forever.
+  let mut buf = QueryBuffer::new(4);
+
+  // ltime=1 → idx 1. First sight is fresh.
+  assert!(
+    buf.witness_query(2, 1, 100),
+    "first query at ltime 1 is fresh"
+  );
+
+  // ltime=5 → idx 5 % 4 = 1 (same slot, different ltime). Not too old
+  // (cur_time 6 - ring 4 = 2; ltime 5 is well above), so it must be admitted as
+  // FRESH and re-own the slot — never mistaken for the stale ltime-1 entry.
+  assert!(
+    buf.witness_query(6, 5, 100),
+    "a query at a wrapped ltime must be fresh, not a dup of the stale slot"
+  );
+  match buf.buffer[1].as_ref() {
+    Some(q) => assert_eq!(
+      q.ltime.0, 5,
+      "the wrapped slot must be re-owned by the new ltime"
+    ),
+    None => panic!("expected a slot at idx 1"),
+  }
+
+  // A re-gossip of (ltime=5, id=100) must now be deduped — which only holds if
+  // the slot was re-owned by ltime=5 above (the pre-#56 append-onto-stale bug
+  // would leave the slot at ltime=1 and reprocess this).
+  assert!(
+    !buf.witness_query(6, 5, 100),
+    "a re-gossiped query at the wrapped ltime must be deduped"
+  );
+}
+
+#[test]
 fn endpoint_query_buffer_slot_capped_via_adapter() {
   // Same check via the Endpoint adapter to confirm the cap is enforced in the
   // full machine path (witness_query called from handle_query).
