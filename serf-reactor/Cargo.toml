@@ -36,6 +36,10 @@ chacha20-poly1305 = [
 ]
 # Regex-backed tag-filter matching.
 tag-regex = ["serf-proto/tag-regex", "serf-driver/tag-regex"]
+# Test-only fault-injection surface (forwards serf-proto's `test` feature: a
+# `MessageDropper` installed via `VoidDelegate::with_message_dropper`). Compiled
+# out of every non-test build.
+test = ["serf-proto/test"]
 # Emit `tracing` spans around the public driver operations.
 tracing = ["dep:tracing", "serf-driver/tracing"]
 # Runtime conveniences: pull in the concrete agnostic runtime impls.

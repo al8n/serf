@@ -650,13 +650,13 @@ where
 /// so failure detection inside the scenario window stays sub-second).
 async fn spawn_node_with_snapshot<R>(
   id: &str,
+  bind: SocketAddr,
   snapshot: serf_reactor::SnapshotOptions,
   rejoin_after_leave: bool,
-) -> Node<R>
+) -> Result<Node<R>, serf_reactor::SerfError>
 where
   R: Runtime,
 {
-  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
   Serf::<SmolStr, SocketAddr, R>::tcp(
     TcpTransportOptions::<SmolStr, SocketAddr>::new()
       .with_local_id(SmolStr::new(id))
@@ -673,7 +673,11 @@ where
     std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
   )
   .await
-  .expect("spawn snapshot-backed serf tcp node")
+}
+
+/// An ephemeral loopback bind (`127.0.0.1:0`).
+fn ephemeral_bind() -> SocketAddr {
+  "127.0.0.1:0".parse().expect("loopback addr")
 }
 
 /// A unique snapshot path under the system temp dir.
@@ -704,8 +708,14 @@ where
 {
   let path = snapshot_path::<R>("rejoin");
   let a = spawn_node::<R>("snap-a").await;
-  let b =
-    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b = spawn_node_with_snapshot::<R>(
+    "snap-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   let a_addr = a.advertise_address();
 
   b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
@@ -717,8 +727,14 @@ where
   b.shutdown().await.expect("snap-b shuts down");
 
   // A fresh B from the same snapshot auto-rejoins A (no join call).
-  let b2 =
-    spawn_node_with_snapshot::<R>("snap-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b2 = spawn_node_with_snapshot::<R>(
+    "snap-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   converge(&a, &b2).await;
   assert_eq!(
     b2.num_members(),
@@ -742,8 +758,14 @@ where
 {
   let path = snapshot_path::<R>("leave-gate");
   let a = spawn_node::<R>("gate-a").await;
-  let b =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   let a_addr = a.advertise_address();
 
   b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
@@ -780,8 +802,14 @@ where
   }
 
   // Default posture: the leave clears the recovered state — no auto-rejoin.
-  let b2 =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), false).await;
+  let b2 = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   R::sleep(Duration::from_millis(1500)).await;
   assert_eq!(
     b2.num_members(),
@@ -791,8 +819,14 @@ where
   b2.shutdown().await.expect("gate-b2 shuts down");
 
   // Opt-in posture: the Leave marker is ignored and the membership recovers.
-  let b3 =
-    spawn_node_with_snapshot::<R>("gate-b", serf_reactor::SnapshotOptions::new(&path), true).await;
+  let b3 = spawn_node_with_snapshot::<R>(
+    "gate-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    true,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
   converge(&a, &b3).await;
 
   a.shutdown().await.expect("gate-a shuts down");
@@ -1825,16 +1859,16 @@ where
 /// default-tombstone reap that none of them cover, and — like the legacy body —
 /// checks the leaver's own side, not just the observer's.
 ///
-/// The leaver is kept running rather than shut down so its convergence is
-/// observable, but its side must be read from the EVENT LOG, not the membership
-/// snapshot. The leaver reaps its own self Left tombstone (matching the legacy
-/// leaver) — `handle_node_leave` adds self to `left_members` and `fire_reap`
-/// removes it — but once self is gone from the machine, `refresh_snapshot`
-/// refuses to publish a view missing the local id, so `members()` /
-/// `num_members()` FREEZE at the pre-reap `[peer, self:Left]` state. The event
-/// stream stays truthful: the leaver emits `Leave` then `Reap` for itself and
-/// only a `Join` for the peer. (The frozen-snapshot-vs-event divergence for a
-/// left-in-place node is tracked as a separate machine-side issue, al8n/serf#88.)
+/// The leaver is kept running rather than shut down so its own convergence is
+/// observable. The local node is exempt from reaping (a running node always
+/// knows itself), so the leaver HOLDS its self `Left` tombstone rather than
+/// reaping it: its own event log is exactly `Join → Leave` — no self `Reap` —
+/// and its live membership view still shows itself `Left` beside the `Alive`
+/// peer. This is the al8n/serf#88 fix: before the exemption the machine reaped
+/// self and `refresh_snapshot` then froze the view (it will not publish a
+/// snapshot missing the local id). The ABSENCE of the self `Reap` is what
+/// distinguishes the held (correct) case from the reaped-then-frozen (buggy)
+/// one — the frozen view carried the same member values.
 async fn serf_join_leave<R>()
 where
   R: Runtime,
@@ -1848,25 +1882,24 @@ where
   cluster.leave_in_place(1).await;
 
   // A (observer) reaps the departed B under the fast profile's 1ms tombstone +
-  // 100ms reap ticks, returning to just itself (A's own snapshot stays live).
+  // 100ms reap ticks, returning to just itself. This also fences past the reap
+  // window, so any (regressed) self-reap on B would have surfaced by now.
   cluster.await_num_members(0, 1).await;
 
-  // B (the leaver) processes its own departure end to end: its event log shows
-  // Join → Leave → Reap for itself — self IS reaped under the default tombstone.
+  // B (the leaver) holds its self tombstone: its own event log is exactly
+  // Join → Leave, with NO self Reap.
+  assert_eq!(
+    cluster.member_event_kinds(1, leaver.as_str()),
+    vec![MemberEventKind::Join, MemberEventKind::Leave],
+    "the leaver holds its self tombstone: Join then Leave, never a self Reap"
+  );
+  // Its live view still shows itself Left beside the still-Alive peer — never
+  // frozen, never dropping the live peer.
   cluster
-    .assert_member_events(
-      1,
-      leaver.as_str(),
-      &[
-        MemberEventKind::Join,
-        MemberEventKind::Leave,
-        MemberEventKind::Reap,
-      ],
-    )
+    .await_member_status(1, leaver.as_str(), MemberStatus::Left)
     .await;
-  // And it never fails or reaps the still-live peer — only the Join.
   cluster
-    .assert_member_events(1, peer.as_str(), &[MemberEventKind::Join])
+    .await_member_status(1, peer.as_str(), MemberStatus::Alive)
     .await;
 
   cluster.shutdown_all().await;
@@ -1964,6 +1997,437 @@ where
   .expect("A never sees the rejoined B as Alive carrying role=bar");
 
   cluster.shutdown_all().await;
+}
+
+/// Port of legacy `serf_per_node_reconnect_timeout` (Go
+/// `TestSerf_PerNodeReconnectTimeout`): a per-member `ReconnectDelegate`
+/// override drives the FAILED-member reap timeout, not just the graceful-LEFT
+/// tombstone. Node A carries a delegate that zeroes node B's reconnect timeout
+/// while A's flat `reconnect_timeout` stays at 24h; after B is abruptly killed
+/// and A detects it Failed, A reaps B early — which can only happen if the
+/// reaper consulted the delegate on the FAILED path (the flat 24h timeout would
+/// otherwise hold B for the whole test). The companion
+/// `reconnect_delegate_reaps_left_member` covers the LEFT/tombstone path; this
+/// covers the FAILED/reconnect path.
+async fn serf_per_node_reconnect_timeout<R>()
+where
+  R: Runtime,
+{
+  let b = spawn_node::<R>("prt-b").await;
+  let b_addr = b.advertise_address();
+
+  // A: fast SWIM so it detects B's kill sub-second, a long flat reconnect
+  // timeout so a default reap never fires within the test, and a delegate
+  // zeroing ONLY B's reconnect timeout.
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new("prt-a"))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  let serf_opts = SerfOptions::new()
+    .with_reap_interval(Duration::from_millis(100))
+    .with_reconnect_timeout(Duration::from_secs(86_400));
+  let a = Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    serf_opts,
+    Some(Box::new(ReapImmediately {
+      target: SmolStr::new("prt-b"),
+    })),
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn serf tcp node A with a reconnect delegate");
+
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("join reaches node B");
+  converge(&a, &b).await;
+
+  // Abruptly kill B (no farewell) so A detects a probe-timeout Failed rather
+  // than a graceful Leave.
+  b.shutdown().await.expect("prt-b shuts down abruptly");
+
+  // A detects B Failed, then the delegate zeroes B's reconnect timeout so A's
+  // next reap tick drops B — back to a single member. Without the delegate
+  // consult, A would hold the failed B for the flat 24h.
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      if a.num_members() == 1 {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A reaps the failed member B early via the reconnect-delegate override");
+
+  a.shutdown().await.expect("prt-a shuts down");
+}
+
+/// Port of legacy `serf_snapshot_recovery` (Go `TestSerf_SnapshotRecovery`): a
+/// snapshot-backed node that fails, is force-removed by the survivor, then
+/// restarts from its snapshot and rejoins — WITHOUT replaying the pre-failure
+/// user event onto its fresh event channel. Distinguishes itself from
+/// `snapshot_restart_rejoins_the_cluster` by the explicit `remove_failed_node`
+/// before the restart (the survivor tombstones B as Left, not merely Failed)
+/// and by asserting the recovered node surfaces zero user/query events.
+async fn serf_snapshot_recovery<R>()
+where
+  R: Runtime,
+{
+  let path = snapshot_path::<R>("recovery");
+  let a = spawn_node::<R>("sr-a").await;
+  let b = spawn_node_with_snapshot::<R>(
+    "sr-b",
+    ephemeral_bind(),
+    serf_reactor::SnapshotOptions::new(&path),
+    false,
+  )
+  .await
+  .expect("spawn snapshot-backed serf tcp node");
+  let a_addr = a.advertise_address();
+  let b_id = b.local_id();
+  // Capture B's address: the restart must rebind it EXACTLY, because A holds B
+  // as a tombstone at this address (no dead-node reclaim window is configured),
+  // so a restart at a fresh port would be a same-id-new-address name conflict —
+  // exercising conflict resolution instead of snapshot recovery.
+  let b_addr = b.advertise_address();
+
+  let mut b_events = b.events();
+  b.join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("join reaches node A");
+  converge(&a, &b).await;
+
+  // A fires a user event; fence on the pre-failure B receiving it, so the
+  // recovery below is genuinely tested for NOT replaying it.
+  a.user_event("event!", Bytes::from_static(b"test"), false)
+    .await
+    .expect("user event dispatched");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      match b_events.next().await {
+        Some(Event::User(u)) if u.name.as_str() == "event!" => break,
+        Some(_) => {}
+        None => break,
+      }
+    }
+  })
+  .await
+  .expect("pre-failure B observes A's user event");
+
+  // Abruptly kill B; A detects it Failed.
+  b.shutdown().await.expect("sr-b shuts down");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let failed = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &b_id && m.status() == MemberStatus::Failed);
+      if failed {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A detects B failed");
+
+  // Force-remove the failed B: A tombstones it Left (not merely Failed), so the
+  // restart below revives against a Left tombstone.
+  a.remove_failed_node(b_id.clone())
+    .await
+    .expect("A force-removes the failed B");
+  R::timeout(Duration::from_secs(20), async {
+    loop {
+      let left = a
+        .members()
+        .iter()
+        .any(|m| m.node().id_ref() == &b_id && m.status() == MemberStatus::Left);
+      if left {
+        break;
+      }
+      R::sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await
+  .expect("A holds B as a Left tombstone after the force-remove");
+
+  // Restart B from the snapshot with a FRESH event channel, at its ORIGINAL
+  // address so the revival is a clean recovery, not an address conflict. The
+  // freed port may not be instantly rebindable, so retry a bounded number of
+  // times.
+  let b2 = {
+    let mut attempt = 0usize;
+    loop {
+      match spawn_node_with_snapshot::<R>(
+        "sr-b",
+        b_addr,
+        serf_reactor::SnapshotOptions::new(&path),
+        false,
+      )
+      .await
+      {
+        Ok(node) => break node,
+        // Ignoring Err: a transient rebind race on the just-freed port is
+        // retried; only the final attempt's failure is fatal.
+        Err(_) if attempt + 1 < 25 => {
+          attempt += 1;
+          R::sleep(Duration::from_millis(20)).await;
+        }
+        Err(e) => panic!("restart rebind for sr-b at {b_addr} failed: {e}"),
+      }
+    }
+  };
+  let mut b2_events = b2.events();
+  converge(&a, &b2).await;
+
+  // The recovery must NOT replay the pre-failure user event (nor any query) onto
+  // the restarted node's channel — only membership events are permitted. Drain a
+  // settle window and fail on any surfaced user/query event.
+  let quiet = R::timeout(Duration::from_secs(2), async {
+    loop {
+      match b2_events.next().await {
+        Some(Event::User(u)) => break Some(format!("user:{}", u.name)),
+        Some(Event::Query(q)) => break Some(format!("query:{}", q.name())),
+        Some(_) => {}
+        None => break None,
+      }
+    }
+  })
+  .await;
+  assert!(
+    quiet.is_err(),
+    "the recovered node must replay no user/query events, saw {quiet:?}"
+  );
+
+  a.shutdown().await.expect("sr-a shuts down");
+  b2.shutdown().await.expect("sr-b2 shuts down");
+  // Ignoring Err: best-effort test-file cleanup.
+  let _ = std::fs::remove_file(&path);
+}
+
+/// Spawn a standalone reactor TCP node with fast SWIM timing, so failure
+/// detection and query resolution run sub-second (the plain [`spawn_node`] uses
+/// default, slower timing).
+async fn spawn_fast_node<R>(id: &str) -> Node<R>
+where
+  R: Runtime,
+{
+  let bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr");
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+  .expect("spawn fast serf tcp node")
+}
+
+/// Port of legacy `serf_name_resolution` (Go `TestSerf_NameResolution`): a
+/// third node claiming an id already held in the cluster loses the conflict
+/// vote and shuts down, while the incumbent survives. `nr-dup` is spawned with
+/// the SAME id as the incumbent `nr-1`; after both are joined, the incumbent
+/// (which the rest of the cluster already knows) wins the name-resolution query
+/// and the newcomer transitions itself to Shutdown.
+async fn serf_name_resolution<R>()
+where
+  R: Runtime,
+{
+  let s1 = spawn_fast_node::<R>("nr-1").await;
+  let s2 = spawn_fast_node::<R>("nr-2").await;
+  let s3 = spawn_fast_node::<R>("nr-1").await; // duplicate of s1's id
+  let s2_addr = s2.advertise_address();
+  let s3_addr = s3.advertise_address();
+
+  // Join the incumbent to s2 first, so the cluster knows nr-1 at s1's address
+  // and will vote for it in the conflict.
+  s1.join(&SocketAddrResolver, MaybeResolved::Resolved(s2_addr), false)
+    .await
+    .expect("s1 joins s2");
+  converge(&s1, &s2).await;
+
+  // Introduce the duplicate: joining nr-1@s3 into a cluster that already holds
+  // nr-1@s1 triggers the name-resolution conflict.
+  // Ignoring Err: the join may itself surface the conflict as an error; the
+  // resolution below is what the test asserts.
+  let _ = s1
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(s3_addr), false)
+    .await;
+
+  // The newcomer loses the vote and shuts itself down; the incumbent survives.
+  R::timeout(Duration::from_secs(30), async {
+    loop {
+      if s3.state() == SerfState::Shutdown {
+        break;
+      }
+      R::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await
+  .expect("the duplicate-id newcomer loses the conflict and shuts down");
+  assert_eq!(
+    s1.state(),
+    SerfState::Alive,
+    "the incumbent survives the conflict"
+  );
+
+  s1.shutdown().await.expect("nr-1 shuts down");
+  s2.shutdown().await.expect("nr-2 shuts down");
+  // s3 already shut itself down on the conflict loss.
+}
+
+/// A test-only [`MessageDropper`](serf_proto::MessageDropper) that drops inbound
+/// joins and push/pulls while its shared flag is set — the reactor analog of
+/// the legacy `DropJoins`.
+#[cfg(feature = "test")]
+#[derive(Clone)]
+struct DropJoins {
+  drop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "test")]
+impl serf_proto::MessageDropper for DropJoins {
+  fn should_drop(&self, kind: serf_proto::DropKind) -> bool {
+    matches!(
+      kind,
+      serf_proto::DropKind::Join | serf_proto::DropKind::PushPull
+    ) && self.drop.load(std::sync::atomic::Ordering::SeqCst)
+  }
+}
+
+/// Spawn a fast-SWIM node bound to `bind`, holding Left tombstones for the whole
+/// test, and — when `drop_flag` is `Some` — dropping inbound joins/push-pulls
+/// while that flag is set.
+#[cfg(feature = "test")]
+async fn spawn_air_node<R>(
+  id: &str,
+  bind: SocketAddr,
+  drop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Node<R>, serf_reactor::SerfError>
+where
+  R: Runtime,
+{
+  let opts = TcpTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Resolved(bind))
+    .with_probe_interval(Duration::from_millis(100))
+    .with_probe_timeout(Duration::from_millis(50))
+    .with_gossip_interval(Duration::from_millis(20))
+    .with_suspicion_mult(3);
+  let delegate = match drop_flag {
+    Some(flag) => VoidDelegate::<SmolStr, SocketAddr>::new()
+      .with_message_dropper(std::sync::Arc::new(DropJoins { drop: flag })),
+    None => VoidDelegate::<SmolStr, SocketAddr>::new(),
+  };
+  Serf::<SmolStr, SocketAddr, R>::tcp(
+    opts,
+    &SocketAddrResolver,
+    &FirstAddrResolver,
+    delegate,
+    RuntimeOptions::new(),
+    // Hold Left tombstones so every node's post-leave view is observable, and
+    // never auto-reap during the double-leave.
+    SerfOptions::new().with_tombstone_timeout(Duration::from_secs(30)),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(serf_reactor::VoidKeyringDelegate),
+  )
+  .await
+}
+
+/// Poll until every node in `nodes` reports `expect` members, or panic on the
+/// bound.
+#[cfg(feature = "test")]
+async fn await_all_num_members<R>(nodes: &[&Node<R>], expect: usize)
+where
+  R: Runtime,
+{
+  R::timeout(Duration::from_secs(30), async {
+    loop {
+      if nodes.iter().all(|n| n.num_members() == expect) {
+        break;
+      }
+      R::sleep(Duration::from_millis(25)).await;
+    }
+  })
+  .await
+  .expect("all nodes reach the expected member count");
+}
+
+/// Exercises the test-only [`MessageDropper`](serf_proto::MessageDropper)
+/// infrastructure end to end: a node whose delegate drops every inbound join /
+/// push-pull never learns its peer, while the peer — dropping nothing — learns
+/// it. This proves the reactor installs the delegate's dropper on the machine
+/// and the machine consults it at ingress. (It is NOT the legacy
+/// avoid-infinite-rebroadcast scenario, whose anti-rebroadcast property is
+/// pinned deterministically at the machine layer by
+/// `handle_node_leave_intent_updates_status_time_for_leaving` +
+/// `stale_leave_intent_is_dropped`; the reactor cannot observe that property
+/// non-vacuously.)
+#[cfg(feature = "test")]
+async fn message_dropper_drops_inbound_joins<R>()
+where
+  R: Runtime,
+{
+  // B drops every inbound join/push-pull from the start.
+  let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+  let a = spawn_air_node::<R>("md-a", ephemeral_bind(), None)
+    .await
+    .expect("spawn md-a");
+  let b = spawn_air_node::<R>("md-b", ephemeral_bind(), Some(flag.clone()))
+    .await
+    .expect("spawn md-b");
+  let b_addr = b.advertise_address();
+
+  // A joins B: A dials B and learns it from the exchange. B drops A's inbound
+  // push-pull AND every gossip-induced NodeJoined, so B never learns A.
+  a.join(&SocketAddrResolver, MaybeResolved::Resolved(b_addr), false)
+    .await
+    .expect("md-a joins md-b");
+
+  // A converges to the 2-member cluster (it sees B).
+  await_all_num_members(&[&a], 2).await;
+
+  // B stays at a single member across a settle window spanning many gossip
+  // rounds — it drops every inbound join, so it never learns A. Without the
+  // dropper B would reach 2.
+  R::sleep(Duration::from_secs(2)).await;
+  assert_eq!(
+    b.num_members(),
+    1,
+    "the dropper node never learns its peer — every inbound join is dropped"
+  );
+
+  a.shutdown().await.expect("md-a shuts down");
+  b.shutdown().await.expect("md-b shuts down");
 }
 
 /// A deterministic test secret key, selecting whichever AEAD cipher this build
@@ -2279,6 +2743,27 @@ mod tokio_cells {
     super::serf_leave_rejoin_different_role::<TokioRuntime>().await;
   }
 
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_per_node_reconnect_timeout() {
+    super::serf_per_node_reconnect_timeout::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_snapshot_recovery() {
+    super::serf_snapshot_recovery::<TokioRuntime>().await;
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn serf_name_resolution() {
+    super::serf_name_resolution::<TokioRuntime>().await;
+  }
+
+  #[cfg(feature = "test")]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn message_dropper_drops_inbound_joins() {
+    super::message_dropper_drops_inbound_joins::<TokioRuntime>().await;
+  }
+
   #[cfg(encryption)]
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn two_node_join_converges_encrypted() {
@@ -2461,6 +2946,27 @@ mod smol_cells {
   #[test]
   fn serf_leave_rejoin_different_role_smol() {
     SmolRuntime::block_on(super::serf_leave_rejoin_different_role::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_per_node_reconnect_timeout_smol() {
+    SmolRuntime::block_on(super::serf_per_node_reconnect_timeout::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_snapshot_recovery_smol() {
+    SmolRuntime::block_on(super::serf_snapshot_recovery::<SmolRuntime>());
+  }
+
+  #[test]
+  fn serf_name_resolution_smol() {
+    SmolRuntime::block_on(super::serf_name_resolution::<SmolRuntime>());
+  }
+
+  #[cfg(feature = "test")]
+  #[test]
+  fn message_dropper_drops_inbound_joins_smol() {
+    SmolRuntime::block_on(super::message_dropper_drops_inbound_joins::<SmolRuntime>());
   }
 
   #[cfg(encryption)]

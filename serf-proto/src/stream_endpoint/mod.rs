@@ -103,8 +103,9 @@ where
   where
     D: Default,
   {
+    let local_id = transport.endpoint_ref().local_id_ref().clone();
     Self {
-      core: Endpoint::new_with_rng(opts, rng),
+      core: Endpoint::new_with_rng(local_id, opts, rng),
       transport,
     }
   }
@@ -121,8 +122,9 @@ where
     user_drop: D,
     member_drop: D,
   ) -> Self {
+    let local_id = transport.endpoint_ref().local_id_ref().clone();
     Self {
-      core: Endpoint::new_with_rng_in(opts, rng, user_drop, member_drop),
+      core: Endpoint::new_with_rng_in(local_id, opts, rng, user_drop, member_drop),
       transport,
     }
   }
@@ -351,6 +353,14 @@ where
     delegate: impl memberlist_proto::delegate::MergeDelegate<I, A>,
   ) {
     self.transport.set_merge_delegate(delegate);
+  }
+
+  /// Install a test-only [`MessageDropper`](crate::MessageDropper) on the inner
+  /// serf machine. Test fault injection only — see [`Endpoint::set_message_dropper`].
+  #[cfg(any(test, feature = "test"))]
+  #[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+  pub fn set_message_dropper(&mut self, dropper: std::sync::Arc<dyn crate::MessageDropper>) {
+    self.core.set_message_dropper(dropper);
   }
 
   /// Forwards to [`Endpoint::coordinate_resets`].

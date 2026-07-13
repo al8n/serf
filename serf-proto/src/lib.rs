@@ -150,6 +150,9 @@ pub(crate) mod coalesce;
 pub use coalesce::DropCounter;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod reconnect_delegate;
+#[cfg(all(any(feature = "tcp", feature = "quic"), any(test, feature = "test")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test")))]
+pub use endpoint::{DropKind, MessageDropper};
 #[cfg(any(feature = "tcp", feature = "quic"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tcp", feature = "quic"))))]
 pub use reconnect_delegate::ReconnectDelegate;

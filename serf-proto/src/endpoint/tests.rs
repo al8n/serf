@@ -876,6 +876,32 @@ fn reap_left_removes_after_tombstone_timeout() {
   assert!(reaped, "a Member(Reap) event should have been emitted");
 }
 
+/// The local node is never reaped from its own view. A node that leaves in
+/// place tombstones itself as `Left`; reaping that self tombstone would drop
+/// the local member from the published snapshot (which requires it) and freeze
+/// the view. Seed both the local id (`1`, the `ep()` local) and a peer (`2`) as
+/// `Left`, then reap well past the tombstone timeout: the peer is reaped, the
+/// local node is held.
+#[test]
+fn reap_left_never_reaps_the_local_node() {
+  let mut e = ep();
+  let t0 = memberlist_proto::Instant::ORIGIN;
+  e.test_seed_left_member_by_status(1, LamportTime::new(3), t0);
+  e.test_seed_left_member_by_status(2, LamportTime::new(3), t0);
+  let past_timeout = t0 + core::time::Duration::from_secs(3600 * 25);
+  e.test_fire_reap(past_timeout);
+  assert_eq!(
+    e.test_member_status(2),
+    None,
+    "the peer's Left tombstone is reaped past the tombstone timeout"
+  );
+  assert_eq!(
+    e.test_member_status(1),
+    Some(MemberStatus::Left),
+    "the local node is never reaped from its own view"
+  );
+}
+
 #[test]
 fn reap_intents_removes_stale_intents() {
   let mut e = ep();
@@ -1244,6 +1270,51 @@ fn user_event_arrives_over_user_packet_and_surfaces() {
   assert!(
     matches!(ev, Event::User(ref u) if u.name == "deploy"),
     "expected Event::User with name 'deploy', got: {ev:?}"
+  );
+}
+
+/// An installed [`MessageDropper`](crate::MessageDropper) dropping
+/// [`DropKind::Join`](crate::DropKind) drops an inbound gossiped join INTENT
+/// before it witnesses the clock — the intent path (`AnyMessage::Join` in
+/// `handle_user_packet`), distinct from the `IE::NodeJoined` membership gate. A
+/// dropped intent must not advance the member's `status_time`; the same intent
+/// without the dropper advances it.
+#[test]
+fn message_dropper_drops_inbound_join_intent() {
+  struct DropJoins;
+  impl crate::MessageDropper for DropJoins {
+    fn should_drop(&self, kind: crate::DropKind) -> bool {
+      matches!(kind, crate::DropKind::Join)
+    }
+  }
+
+  let join_bytes = AnyMessage::<u32, core::net::SocketAddr>::Join(crate::typed::JoinMessage::new(
+    8u64.into(),
+    2u32,
+  ))
+  .encode()
+  .unwrap();
+  let from: core::net::SocketAddr = "127.0.0.1:1002".parse().unwrap();
+
+  // With the dropper the join intent is dropped: status_time stays at 5.
+  let mut dropped = ep();
+  dropped.test_seed_member(2, MemberStatus::Alive, LamportTime::new(5));
+  dropped.set_message_dropper(std::sync::Arc::new(DropJoins));
+  dropped.test_inject_user_packet(from, join_bytes.clone(), memberlist_proto::Instant::ORIGIN);
+  assert_eq!(
+    dropped.test_member_status_time(2),
+    Some(LamportTime::new(5)),
+    "a dropped join intent must not advance status_time"
+  );
+
+  // Without the dropper the same intent advances status_time to 8.
+  let mut kept = ep();
+  kept.test_seed_member(2, MemberStatus::Alive, LamportTime::new(5));
+  kept.test_inject_user_packet(from, join_bytes, memberlist_proto::Instant::ORIGIN);
+  assert_eq!(
+    kept.test_member_status_time(2),
+    Some(LamportTime::new(8)),
+    "an un-dropped join intent advances status_time"
   );
 }
 
