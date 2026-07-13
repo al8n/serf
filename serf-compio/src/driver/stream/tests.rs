@@ -326,3 +326,59 @@ async fn all_exchanges_done_resolves_and_reaps() {
     other => panic!("a successful exchange must reply Ok(contacted), got {other:?}"),
   }
 }
+
+// ── await-result join deadline reconciliation ─────────────────────────────────
+
+/// A caller join deadline LATER than the coordinator's per-exchange deadline is
+/// clamped down to the exchange deadline.
+///
+/// The two clocks are independent: the driver's fallback deadline and the
+/// coordinator's `now + stream_timeout` exchange deadline. Left unclamped, an
+/// elapsed exchange emits a terminal `ExchangeCompleted(Failed)` while the
+/// caller's deadline has NOT elapsed, so the join reaps a premature
+/// `JoinAllFailed`. Clamping keeps the driver deadline from ever outliving the
+/// exchange that would fail it.
+#[test]
+fn a_caller_deadline_past_the_exchange_deadline_is_clamped() {
+  let now = Instant::now();
+  let stream_timeout = Duration::from_secs(10);
+  let caller = now + Duration::from_secs(60);
+
+  let effective = clamp_join_deadline(caller, now, stream_timeout);
+
+  assert_eq!(
+    effective,
+    now + stream_timeout,
+    "a caller deadline beyond the exchange deadline must clamp to the exchange deadline"
+  );
+  assert!(
+    effective < caller,
+    "the clamp must actually pull the deadline in"
+  );
+}
+
+/// A caller join deadline EARLIER than the exchange deadline is the binding one
+/// and passes through untouched — the clamp is a ceiling, not a floor, so a short
+/// `join_deadline` still resolves on the caller's own schedule.
+#[test]
+fn a_caller_deadline_inside_the_exchange_window_is_kept() {
+  let now = Instant::now();
+  let stream_timeout = Duration::from_secs(10);
+  let caller = now + Duration::from_secs(2);
+
+  assert_eq!(
+    clamp_join_deadline(caller, now, stream_timeout),
+    caller,
+    "a caller deadline inside the exchange window is kept as-is"
+  );
+}
+
+/// The two clocks coinciding is the boundary case: the clamp is idempotent there.
+#[test]
+fn a_caller_deadline_equal_to_the_exchange_deadline_is_stable() {
+  let now = Instant::now();
+  let stream_timeout = Duration::from_secs(10);
+  let caller = now + stream_timeout;
+
+  assert_eq!(clamp_join_deadline(caller, now, stream_timeout), caller);
+}

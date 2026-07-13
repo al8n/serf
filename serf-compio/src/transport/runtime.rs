@@ -49,6 +49,10 @@ where
   /// Counter for events dropped at the delegate observation channel when the
   /// delegate fell behind — may include unrecoverable app-data.
   pub(crate) observation_dropped: Rc<Cell<u64>>,
+  /// Counter for gossip payloads accepted onto the QUIC datagram plane (as
+  /// opposed to the plain-UDP fallback). Only the QUIC driver increments it; the
+  /// stream backends leave it at zero.
+  pub(crate) datagrams_sent: Rc<Cell<u64>>,
   /// The write half of the user-coalescer shed counter, injected into the
   /// endpoint by `T::run` so its increments land in the cell the handle reads.
   pub(crate) user_drop: CompioDropCounter,
@@ -91,6 +95,7 @@ where
     events_tx: Sender<Event<T::Id, SocketAddr>>,
     events_dropped: Rc<Cell<u64>>,
     observation_dropped: Rc<Cell<u64>>,
+    datagrams_sent: Rc<Cell<u64>>,
     user_drop: CompioDropCounter,
     member_drop: CompioDropCounter,
     snapshot: SnapshotCell<T::Id>,
@@ -108,6 +113,7 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      datagrams_sent,
       user_drop,
       member_drop,
       snapshot,

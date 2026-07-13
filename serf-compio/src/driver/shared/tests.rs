@@ -153,3 +153,187 @@ async fn empty_socket_drains_nothing() {
   // Ignoring Err: test cleanup of the probe socket.
   let _ = driver.close().await;
 }
+
+// ── leave-farewell classification ─────────────────────────────────────────────
+
+/// A fresh pump has not initiated a leave and has recorded no failure, so its
+/// leave outcome is a clean success.
+#[test]
+fn a_fresh_farewell_is_clean() {
+  let acct = Farewell::new();
+  assert!(!acct.initiated);
+  assert!(!acct.send_failed);
+  assert!(leave_outcome(acct.send_failed).is_ok());
+}
+
+/// A local send or transform failure during the fan-out resolves the leave with
+/// `LeaveFarewellUndelivered`, never a false `Ok` — the caller learns that at
+/// least one peer will read the departure as a failure.
+#[test]
+fn a_local_failure_fails_the_leave() {
+  let err = leave_outcome(true).expect_err("a local send failure must fail the leave");
+  assert!(matches!(
+    err,
+    crate::error::SerfError::LeaveFarewellUndelivered
+  ));
+}
+
+/// The ICMP-reflection class (`ConnectionReset` / `ConnectionRefused`) is
+/// AMBIGUOUS on a shared unconnected UDP socket — the error slot may hold a stale
+/// asynchronous answer to an earlier packet for a DIFFERENT peer — so the first
+/// errors are absorbed and the datagram is re-sent, each re-send both draining the
+/// stale slot and re-handing the datagram to the socket.
+#[test]
+fn an_icmp_class_error_under_the_limit_is_resent() {
+  for kind in [
+    std::io::ErrorKind::ConnectionReset,
+    std::io::ErrorKind::ConnectionRefused,
+  ] {
+    assert_eq!(
+      classify_errored_farewell(0, &std::io::Error::from(kind)),
+      ErroredFarewell::Resend(1),
+      "the first {kind:?} is ambiguous and is re-sent"
+    );
+    assert_eq!(
+      classify_errored_farewell(1, &std::io::Error::from(kind)),
+      ErroredFarewell::Resend(2),
+    );
+  }
+}
+
+/// ICMP-class errors that PERSIST to the absorb limit are credibly this
+/// destination's own answer (a peer that is itself gone). The reference
+/// implementation logs such peers and proceeds, so the datagram is dropped and the
+/// leave still succeeds — a departing node is not held back by peers that already
+/// left.
+#[test]
+fn persistent_icmp_class_errors_are_the_peer_answering() {
+  assert_eq!(
+    classify_errored_farewell(
+      FAREWELL_ICMP_ERROR_LIMIT - 1,
+      &std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+    ),
+    ErroredFarewell::PeerAnswered,
+  );
+  // PeerAnswered does not record a failure, so the leave still resolves `Ok`.
+  assert!(leave_outcome(false).is_ok());
+}
+
+/// Every non-ICMP error kind is a LOCAL delivery failure — the farewell never left
+/// this host — so it fails the leave. `ConnectionAborted` is a local software abort
+/// on Windows, the unreachables usually report the LOCAL routing table's answer,
+/// and a closed/invalid socket or broken pipe is unambiguously local.
+#[test]
+fn every_other_error_kind_is_a_local_failure() {
+  for kind in [
+    std::io::ErrorKind::ConnectionAborted,
+    std::io::ErrorKind::HostUnreachable,
+    std::io::ErrorKind::NetworkUnreachable,
+    std::io::ErrorKind::BrokenPipe,
+    std::io::ErrorKind::NotConnected,
+    std::io::ErrorKind::InvalidInput,
+    std::io::ErrorKind::PermissionDenied,
+  ] {
+    assert_eq!(
+      classify_errored_farewell(0, &std::io::Error::from(kind)),
+      ErroredFarewell::LocalFailure,
+      "{kind:?} is a local delivery failure and must fail the leave"
+    );
+  }
+}
+
+/// A periodic-gossip send (no leave in flight) is best-effort: a send to an
+/// unroutable destination records NO failure, so a later leave is not poisoned by
+/// an unrelated dropped gossip datagram.
+#[compio::test]
+async fn a_pre_leave_gossip_send_never_records_a_failure() {
+  let (driver, _peer, dst) = socket_pair().await;
+  let mut acct = Farewell::new();
+
+  send_gossip_datagram(&driver, dst, b"gossip".to_vec(), &mut acct).await;
+
+  assert!(
+    !acct.send_failed,
+    "periodic gossip is best-effort and must never record a farewell failure"
+  );
+  assert!(leave_outcome(acct.send_failed).is_ok());
+
+  // Ignoring Err: test cleanup of the probe socket.
+  let _ = driver.close().await;
+}
+
+/// Once `leave()` is initiated, a farewell datagram that the local socket ACCEPTS
+/// records no failure, so the leave resolves `Ok`.
+#[compio::test]
+async fn a_delivered_farewell_keeps_the_leave_ok() {
+  let (driver, _peer, dst) = socket_pair().await;
+  let mut acct = Farewell::new();
+  acct.initiated = true;
+
+  send_gossip_datagram(&driver, dst, b"farewell".to_vec(), &mut acct).await;
+
+  assert!(
+    !acct.send_failed,
+    "a farewell the socket accepted must not fail the leave"
+  );
+  assert!(leave_outcome(acct.send_failed).is_ok());
+
+  // Ignoring Err: test cleanup of the probe socket.
+  let _ = driver.close().await;
+}
+
+/// A farewell the local socket REFUSES records the failure, so the parked leave
+/// resolves `LeaveFarewellUndelivered` instead of a false `Ok`.
+///
+/// The refusal is forced deterministically by an address-family mismatch: an
+/// IPv4-bound socket cannot send to an IPv6 destination, and the OS rejects it
+/// locally (never an ICMP-class reflection), which is exactly the "the farewell
+/// never left this host" class. This is the raise path end to end: socket error →
+/// classification → `send_failed` → the leave's error.
+#[compio::test]
+async fn a_refused_farewell_raises_leave_farewell_undelivered() {
+  let v4: SocketAddr = "127.0.0.1:0".parse().expect("v4 loopback");
+  let socket = UdpSocket::bind(v4).await.expect("bind a v4 gossip socket");
+  let v6_dst: SocketAddr = "[::1]:9".parse().expect("v6 destination");
+
+  let mut acct = Farewell::new();
+  acct.initiated = true;
+
+  send_gossip_datagram(&socket, v6_dst, b"farewell".to_vec(), &mut acct).await;
+
+  assert!(
+    acct.send_failed,
+    "a farewell the local socket refused must record the delivery failure"
+  );
+  let err = leave_outcome(acct.send_failed).expect_err("the leave must not report a false success");
+  assert!(matches!(
+    err,
+    crate::error::SerfError::LeaveFarewellUndelivered
+  ));
+
+  // Ignoring Err: test cleanup of the probe socket.
+  let _ = socket.close().await;
+}
+
+/// The SAME refused send on a pump that has NOT initiated a leave is best-effort:
+/// it records nothing, so an unrelated gossip failure can never poison a later
+/// leave into a false `LeaveFarewellUndelivered`.
+#[compio::test]
+async fn a_refused_pre_leave_gossip_send_does_not_poison_a_later_leave() {
+  let v4: SocketAddr = "127.0.0.1:0".parse().expect("v4 loopback");
+  let socket = UdpSocket::bind(v4).await.expect("bind a v4 gossip socket");
+  let v6_dst: SocketAddr = "[::1]:9".parse().expect("v6 destination");
+
+  let mut acct = Farewell::new();
+
+  send_gossip_datagram(&socket, v6_dst, b"gossip".to_vec(), &mut acct).await;
+
+  assert!(
+    !acct.send_failed,
+    "periodic gossip is best-effort; a failed send must not be charged to a leave"
+  );
+  assert!(leave_outcome(acct.send_failed).is_ok());
+
+  // Ignoring Err: test cleanup of the probe socket.
+  let _ = socket.close().await;
+}

@@ -34,7 +34,7 @@ use futures_channel::oneshot;
 use futures_util::{FutureExt, pin_mut, select_biased};
 use lochan::mpsc;
 use memberlist_proto::{
-  Instant, Rng, SeedableRng, StreamId, Transmit,
+  DatagramSendStatus, Instant, Rng, SeedableRng, StreamId, Transmit, UnreliableTransport,
   codec::{
     DecodeOptions, EncodeOptions, decode_incoming, encode_outgoing, encode_outgoing_compound,
     parse_messages,
@@ -59,8 +59,9 @@ use crate::{
   driver::{
     options::RuntimeOptions,
     shared::{
-      ExchangeId, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
-      observation_payload_bytes, yield_once,
+      ExchangeId, Farewell, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
+      leave_outcome, observation_payload_bytes, send_gossip_datagram, trace_leave_transform_error,
+      yield_once,
     },
   },
   drop_counter::CompioDropCounter,
@@ -303,6 +304,10 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
   events_tx: Sender<Event<I, SocketAddr>>,
   events_dropped: Rc<Cell<u64>>,
   observation_dropped: Rc<Cell<u64>>,
+  // Cumulative gossip payloads accepted onto the QUIC datagram plane. Shares the
+  // cell a `Serf` handle reads through `datagrams_sent()`, so the count is visible
+  // with no publish step.
+  datagrams_sent: Rc<Cell<u64>>,
   snapshot: SnapshotCell<I>,
   shutdown_flag: Rc<Cell<bool>>,
   driver_opts: RuntimeOptions,
@@ -356,6 +361,12 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
     joins: Vec::new(),
     leave: None,
   };
+  // Graceful-leave fan-out accounting. Until `leave()` is initiated the gossip
+  // egress rides the configured unreliable transport best-effort; from then on the
+  // fan-out is routed over plain UDP and every send is classified, so a local
+  // delivery failure resolves the parked leave with an error rather than a false
+  // `Ok`.
+  let mut farewell = Farewell::new();
 
   // Per-pump UDP recv buffer size, derived once at entry as the larger of the
   // gossip plane (`gossip_mtu` + AEAD wrapper) and the raw-QUIC plane (quinn's
@@ -397,6 +408,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
             &mut endpoint,
             &mut shutdown_reply,
             &mut pending,
+            &mut farewell,
             driver_opts.leave_timeout(),
             c,
             now,
@@ -439,6 +451,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
+        &datagrams_sent,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -509,6 +523,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
+        &datagrams_sent,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -544,6 +560,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
+        &datagrams_sent,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -610,6 +628,7 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
                 &mut endpoint,
                 &mut shutdown_reply,
                 &mut pending,
+                &mut farewell,
                 driver_opts.leave_timeout(),
                 c,
                 now,
@@ -654,6 +673,8 @@ pub(crate) async fn quic_driver_loop<I, D, G, R>(
       obs_payload_budget,
       &mut pending,
       &mut snapshotter,
+      &mut farewell,
+      &datagrams_sent,
       #[cfg(encryption)]
       &*keyring,
       #[cfg(encryption)]
@@ -767,6 +788,7 @@ async fn dispatch_command<I, G, R>(
   endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   shutdown_reply: &mut Option<oneshot::Sender<Result<()>>>,
   pending: &mut PendingCommands,
+  farewell: &mut Farewell,
   leave_timeout: Duration,
   cmd: Command<I, SocketAddr>,
   now: Instant,
@@ -866,6 +888,11 @@ async fn dispatch_command<I, G, R>(
         let res: Result<()> = endpoint.leave(now).map_err(SerfError::from);
         match res {
           Ok(()) if was_alive => {
+            // The leave mutated and the fan-out is queued: route it over plain UDP
+            // (exact socket-handoff semantics, even in `Datagram` mode) and classify
+            // every send, so a farewell the local socket refuses fails the leave
+            // instead of vanishing.
+            farewell.initiated = true;
             pending.leave = Some(PendingLeave {
               repliers: vec![reply],
               deadline: now + leave_timeout,
@@ -1156,14 +1183,36 @@ where
   progress
 }
 
-/// Drain every queued unreliable (gossip-plane) [`Transmit`] and send it on the
-/// shared UDP socket. Outbound gossip is label-stamped (`encode_outgoing` /
-/// `encode_outgoing_compound`), then — with an encryption backend built in —
-/// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
+/// Drain every queued unreliable (gossip-plane) [`Transmit`], encode it
+/// (`encode_outgoing` / `encode_outgoing_compound`) and — with an encryption
+/// backend built in — seal it (`encrypt_gossip`), then route it onto the
+/// unreliable wire the endpoint is CONFIGURED for: a QUIC datagram over the
+/// peer's pooled (quinn-TLS-protected) connection in
+/// [`Datagram`](UnreliableTransport::Datagram) mode, or the shared UDP socket in
+/// [`Udp`](UnreliableTransport::Udp) mode.
+///
+/// A datagram that quinn cannot take right now — the connection is not yet
+/// established ([`NotReady`](DatagramSendStatus::NotReady)) or the payload
+/// exceeds the peer's negotiated datagram limit
+/// ([`TooLarge`](DatagramSendStatus::TooLarge)) — falls back to the plain-UDP
+/// path, which every peer demuxes in both modes. `NotReady` may mean the queue
+/// just initiated a cold dial, so it also flushes quinn's outbound this pass to
+/// get the connection's Initial onto the wire.
+///
+/// Popping the last transmit is the endpoint's leave-completion fence (it emits
+/// `LeftCluster`), so the leave fan-out reaches the wire before that fence fires.
+/// Once `leave()` has been initiated the fan-out rides plain UDP in BOTH modes: a
+/// frame queued into quinn is emitted only when congestion control and pacing
+/// allow, so an accepted queue-handoff would not prove the farewell reached the
+/// socket — and the fan-out has no retry round to absorb that loss. The plain-UDP
+/// send gives exact socket-handoff semantics (completed, or error-classified into
+/// `farewell`).
 async fn drain_transmits<I, G, R>(
   endpoint: &mut QuicEndpoint<I, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: Option<Bytes>,
+  farewell: &mut Farewell,
+  datagrams_sent: &Cell<u64>,
 ) -> bool
 where
   I: memberlist_proto::Id + Clone,
@@ -1171,7 +1220,13 @@ where
   R: Rng + SeedableRng,
 {
   let encode_opts = EncodeOptions::new(label);
+  let unreliable = endpoint.unreliable_transport();
+  // One timestamp for the whole pass: every datagram this drain queues into quinn
+  // is stamped with the same instant the flush below advances to, so a
+  // datagram-borne probe's queue time and its flush cannot straddle a clock read.
+  let now = Instant::now();
   let mut progress = false;
+  let mut needs_flush = false;
   while let Some(transmit) = endpoint.poll_memberlist_transmit() {
     progress = true;
     let (peer, plain): (SocketAddr, Bytes) = match transmit {
@@ -1181,14 +1236,20 @@ where
           Ok(b) => (to, b),
           // A locally-built message that fails to encode is dropped so one bad
           // codec invocation cannot wedge the pump.
-          Err(_) => continue,
+          Err(_) => {
+            note_farewell_transform_error(farewell, to);
+            continue;
+          }
         }
       }
       Transmit::Compound(cmp) => {
         let (to, msgs) = cmp.into_parts();
         match encode_outgoing_compound(&msgs, &encode_opts) {
           Ok(b) => (to, b),
-          Err(_) => continue,
+          Err(_) => {
+            note_farewell_transform_error(farewell, to);
+            continue;
+          }
         }
       }
     };
@@ -1203,15 +1264,74 @@ where
     {
       on_wire = match endpoint.encrypt_gossip(&on_wire) {
         Ok(bytes) => bytes,
-        Err(_) => continue,
+        Err(_) => {
+          note_farewell_transform_error(farewell, peer);
+          continue;
+        }
       };
     }
-    let BufResult(res, _buf) = gossip_socket.send_to(on_wire, peer).await;
-    // Ignoring Err: a transient send error is non-fatal — gossip is lossy and
-    // the next probe/gossip round recovers.
-    let _ = res;
+    match unreliable {
+      // Plain-UDP gossip: best-effort for periodic rounds, classified once the
+      // leave fan-out is in flight.
+      UnreliableTransport::Udp => {
+        send_gossip_datagram(gossip_socket, peer, on_wire, farewell).await;
+      }
+      // The leave carve-out (see the doc comment): the departure fan-out takes
+      // the plain-UDP path even in `Datagram` mode, for exact socket-handoff
+      // semantics. Peers demux plain gossip datagrams in every mode — the
+      // `NotReady` / `TooLarge` fallbacks below rely on exactly that.
+      UnreliableTransport::Datagram if farewell.initiated => {
+        send_gossip_datagram(gossip_socket, peer, on_wire, farewell).await;
+      }
+      UnreliableTransport::Datagram => {
+        // `Vec<u8>` → `Bytes` moves the allocation; the fallback arms below pay a
+        // copy only when quinn declines the datagram.
+        let on_wire = Bytes::from(on_wire);
+        match endpoint.queue_unreliable_datagram(peer, on_wire.clone(), now) {
+          // Accepted onto an established QUIC connection: flush it into
+          // `poll_transmit` this pass (below) so a datagram-borne probe leaves on
+          // the tick its timeout is armed.
+          DatagramSendStatus::Queued => {
+            needs_flush = true;
+            datagrams_sent.set(datagrams_sent.get().saturating_add(1));
+          }
+          // NotReady may mean the queue just initiated a cold dial: flush this
+          // pass so the connection's Initial is emitted now (else it does not warm
+          // until the next driver wake). The gossip itself still goes out
+          // immediately over the plain-UDP fallback.
+          DatagramSendStatus::NotReady => {
+            needs_flush = true;
+            send_gossip_datagram(gossip_socket, peer, on_wire.to_vec(), farewell).await;
+          }
+          // TooLarge: the connection is already Established (its datagram limit is
+          // known), so there is no pending Initial to flush; fall back to plain UDP.
+          DatagramSendStatus::TooLarge => {
+            send_gossip_datagram(gossip_socket, peer, on_wire.to_vec(), farewell).await;
+          }
+        }
+      }
+    }
+  }
+  // Flush the datagrams queued above into `poll_transmit` NOW, so the raw-QUIC
+  // drain that runs next in `drain_outputs` sends them this pass — a
+  // datagram-borne probe whose timeout is armed on this same tick must not wait
+  // for the next driver wake (that wake can be the timeout). `needs_flush` is
+  // only ever set from inside the loop above, which has already reported progress.
+  if needs_flush {
+    endpoint.flush_outbound_transmits(now);
   }
   progress
+}
+
+/// Record a gossip datagram that could not be encoded or encrypted. Best-effort
+/// periodic gossip drops it silently (the next round rebuilds it); a datagram of
+/// the leave fan-out has no next round, so the failure is logged and fails the
+/// parked leave.
+fn note_farewell_transform_error(farewell: &mut Farewell, peer: SocketAddr) {
+  if farewell.initiated {
+    trace_leave_transform_error(peer);
+    farewell.send_failed = true;
+  }
 }
 
 /// Drain every raw outbound QUIC datagram (handshake, acks, reliable stream data)
@@ -1255,6 +1375,7 @@ async fn drain_events<I, G, R>(
   pending: &mut PendingCommands,
   snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
   terminal: &mut bool,
+  farewell: &Farewell,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
@@ -1323,11 +1444,16 @@ where
     // Leave-completion resolution. `LeftCluster` fires once the leave notices
     // have drained to the wire; resolving the parked waiter here — on this pump
     // task, ahead of the observation task's `notify_leave` — is what makes
-    // `leave()` return promptly once the flush is done.
+    // `leave()` return promptly once the flush is done. `Ok` means every farewell
+    // datagram reached the socket: the fan-out was popped (and awaited over plain
+    // UDP) by the gossip drain that runs ahead of this one, so a local send or
+    // transform failure has already been recorded and downgrades the reply to
+    // `LeaveFarewellUndelivered` rather than a false success.
     if matches!(ev, Event::LeftCluster)
       && let Some(pl) = pending.leave.take()
     {
-      pl.resolve_all(|| Ok(())).await;
+      let failed = farewell.send_failed;
+      pl.resolve_all(|| leave_outcome(failed)).await;
     }
     // Conflict-shutdown enforcement. `Event::Shutdown` means the local node lost
     // an id-conflict vote and MUST stop, exactly as for a `Command::Shutdown`.
@@ -1413,6 +1539,8 @@ async fn drain_outputs<I, G, R>(
   obs_payload_budget: Option<u64>,
   pending: &mut PendingCommands,
   snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
+  farewell: &mut Farewell,
+  datagrams_sent: &Cell<u64>,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
@@ -1424,7 +1552,18 @@ where
   let mut terminal = false;
   loop {
     let did_ingress = drain_ingress::<I, G, R>(endpoint, label);
-    let did_transmits = drain_transmits::<I, G, R>(endpoint, gossip_socket, label.clone()).await;
+    // Gossip egress runs BEFORE the raw-QUIC drain (so a datagram queued into
+    // quinn leaves this pass) and before the event drain (so a leave fan-out has
+    // reached the socket, and recorded any failure in `farewell`, by the time the
+    // `LeftCluster` fence it releases is drained below).
+    let did_transmits = drain_transmits::<I, G, R>(
+      endpoint,
+      gossip_socket,
+      label.clone(),
+      farewell,
+      datagrams_sent,
+    )
+    .await;
     let did_quic = drain_quic_transmits::<I, G, R>(endpoint, gossip_socket).await;
     let did_events = drain_events::<I, G, R>(
       endpoint,
@@ -1435,6 +1574,7 @@ where
       pending,
       snapshotter,
       &mut terminal,
+      farewell,
       #[cfg(encryption)]
       keyring,
       #[cfg(encryption)]

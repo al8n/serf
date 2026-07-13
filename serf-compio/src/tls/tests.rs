@@ -470,3 +470,56 @@ async fn two_node_tls_join_observes_membership_encrypted() {
   a.shutdown().await.expect("node A shuts down");
   b.shutdown().await.expect("node B shuts down");
 }
+
+// ── SWIM / timing knobs ───────────────────────────────────────────────────────
+
+/// Every SWIM knob starts UNSET, so a caller that sets none keeps the
+/// coordinator's own defaults — `Transport::run` applies an override only when
+/// it is `Some`.
+#[test]
+fn swim_knobs_start_unset() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new();
+  assert!(opts.push_pull_interval().is_none());
+  assert!(opts.probe_interval().is_none());
+  assert!(opts.probe_timeout().is_none());
+  assert!(opts.gossip_interval().is_none());
+  assert!(opts.suspicion_mult().is_none());
+  assert!(opts.dead_node_reclaim_time().is_none());
+  assert!(opts.suspicion_max_timeout_mult().is_none());
+}
+
+/// Every builder writes its OWN field: the accessors read back exactly what was
+/// set, with distinct values per knob so a crossed assignment surfaces.
+#[test]
+fn swim_knob_builders_round_trip_each_knob() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::from_millis(1))
+    .with_probe_interval(Duration::from_millis(2))
+    .with_probe_timeout(Duration::from_millis(3))
+    .with_gossip_interval(Duration::from_millis(4))
+    .with_suspicion_mult(5)
+    .with_dead_node_reclaim_time(Duration::from_millis(6))
+    .with_suspicion_max_timeout_mult(7);
+
+  assert_eq!(opts.push_pull_interval(), Some(Duration::from_millis(1)));
+  assert_eq!(opts.probe_interval(), Some(Duration::from_millis(2)));
+  assert_eq!(opts.probe_timeout(), Some(Duration::from_millis(3)));
+  assert_eq!(opts.gossip_interval(), Some(Duration::from_millis(4)));
+  assert_eq!(opts.suspicion_mult(), Some(5));
+  assert_eq!(
+    opts.dead_node_reclaim_time(),
+    Some(Duration::from_millis(6))
+  );
+  assert_eq!(opts.suspicion_max_timeout_mult(), Some(7));
+}
+
+/// A zero push/pull interval is a MEANINGFUL setting (it disables periodic
+/// anti-entropy, isolating the gossip plane), so it must round-trip as
+/// `Some(ZERO)` — never collapse back to the `None` that means "keep the
+/// coordinator default".
+#[test]
+fn zero_push_pull_interval_is_set_not_unset() {
+  let opts = crate::TlsTransportOptions::<SmolStr, SocketAddr>::new()
+    .with_push_pull_interval(Duration::ZERO);
+  assert_eq!(opts.push_pull_interval(), Some(Duration::ZERO));
+}

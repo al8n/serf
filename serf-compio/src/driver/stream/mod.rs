@@ -67,8 +67,9 @@ use crate::{
   driver::{
     options::{RuntimeOptions, StreamTransportOptions},
     shared::{
-      ExchangeId, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
-      observation_payload_bytes, yield_once,
+      ExchangeId, Farewell, add_obs_payload, dispatch_event_delegate, drain_past_due_udp,
+      leave_outcome, observation_payload_bytes, send_gossip_datagram, trace_leave_transform_error,
+      yield_once,
     },
   },
   drop_counter::CompioDropCounter,
@@ -123,13 +124,36 @@ struct PendingJoin {
   /// denominator on a zero-contact resolution.
   requested: usize,
   /// Wall-clock instant past which the driver replies with whatever `contacted`
-  /// set it has accumulated even if `pending` is non-empty.
+  /// set it has accumulated even if `pending` is non-empty. Reconciled against the
+  /// coordinator's own per-exchange deadline at construction via
+  /// [`clamp_join_deadline`], which caps it at the exchange deadline.
   deadline: Instant,
   /// One-shot reply channel back to the caller, taken when the reply resolves
   /// (all-exchanges-done or `deadline`). `None` once resolved; the waiter then
   /// lingers — only to drive ignore-stream cleanup — until `pending` empties.
   /// See [`JoinReply`].
   reply: Option<futures_channel::oneshot::Sender<JoinReply>>,
+}
+
+/// Reconcile a caller's await-result join deadline with the machine's push/pull
+/// exchange deadline (`now + stream_timeout`), returning the effective
+/// [`PendingJoin::deadline`].
+///
+/// A join we initiate carries two clocks: this driver-local fallback deadline and
+/// the coordinator's own per-exchange deadline (`now + stream_timeout`). A caller
+/// deadline LATER than the exchange deadline lets an elapsed exchange emit a
+/// terminal `ExchangeCompleted(Failed)` — reaping a `JoinAllFailed` for a
+/// `join_deadline` that has not elapsed. Clamping the driver deadline so it never
+/// exceeds the exchange deadline keeps the two clocks consistent: the join can
+/// only resolve all-failed once the exchange that would fail it has actually run
+/// out of time. Plumbing the caller deadline INTO the exchange (collapsing the two
+/// clocks) is a serf-proto follow-up.
+fn clamp_join_deadline(
+  caller_deadline: Instant,
+  now: Instant,
+  stream_timeout: Duration,
+) -> Instant {
+  caller_deadline.min(now + stream_timeout)
 }
 
 impl PendingJoin {
@@ -433,6 +457,11 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
   // Cluster label applied to both gossip encode and decode. `None` accepts
   // datagrams from any cluster.
   label: Option<Bytes>,
+  // The coordinator's per-exchange push/pull deadline window, snapshotted in
+  // `Transport::run` from the SAME `EndpointOptions` the coordinator was built
+  // from. An await-result join's caller deadline is reconciled against it in
+  // `clamp_join_deadline`.
+  stream_timeout: Duration,
   // The snapshot writer the pump appends membership records to; `None`
   // disables persistence.
   mut snapshotter: Option<serf_driver::Snapshotter<I>>,
@@ -485,6 +514,11 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
     joins: Vec::new(),
     leave: None,
   };
+  // Graceful-leave fan-out accounting. Until `leave()` is initiated the gossip
+  // egress is best-effort; from then on every farewell send is classified, so a
+  // local delivery failure resolves the parked leave with an error rather than a
+  // false `Ok`.
+  let mut farewell = Farewell::new();
 
   // Per-pump UDP recv buffer size, derived once at entry from the coordinator's
   // `gossip_mtu` (fixed for the endpoint lifetime).
@@ -563,7 +597,9 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
             stream_opts,
             &mut shutdown_reply,
             &mut pending,
+            &mut farewell,
             driver_opts.leave_timeout(),
+            stream_timeout,
             c,
             now,
           )
@@ -641,6 +677,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -719,6 +756,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -757,6 +795,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
         obs_payload_budget,
         &mut pending,
         &mut snapshotter,
+        &mut farewell,
         #[cfg(encryption)]
         &*keyring,
         #[cfg(encryption)]
@@ -836,7 +875,9 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
                 stream_opts,
                 &mut shutdown_reply,
                 &mut pending,
+                &mut farewell,
                 driver_opts.leave_timeout(),
+                stream_timeout,
                 c,
                 now,
               ).await;
@@ -912,6 +953,7 @@ pub(crate) async fn stream_driver_loop<I, RT, D, G, R>(
       obs_payload_budget,
       &mut pending,
       &mut snapshotter,
+      &mut farewell,
       #[cfg(encryption)]
       &*keyring,
       #[cfg(encryption)]
@@ -1045,7 +1087,9 @@ async fn dispatch_command<I, RT, G, R>(
   stream_opts: StreamTransportOptions,
   shutdown_reply: &mut Option<futures_channel::oneshot::Sender<Result<()>>>,
   pending: &mut PendingCommands,
+  farewell: &mut Farewell,
   leave_timeout: Duration,
+  stream_timeout: Duration,
   cmd: Command<I, SocketAddr>,
   now: Instant,
 ) where
@@ -1147,7 +1191,7 @@ async fn dispatch_command<I, RT, G, R>(
               contacted: SmallVec::new(),
               ignore_streams,
               requested,
-              deadline,
+              deadline: clamp_join_deadline(deadline, now, stream_timeout),
               reply: Some(reply),
             });
           }
@@ -1167,6 +1211,10 @@ async fn dispatch_command<I, RT, G, R>(
         let res: Result<()> = endpoint.leave(now).map_err(SerfError::from);
         match res {
           Ok(()) if was_alive => {
+            // The leave mutated and the fan-out is queued: switch the gossip
+            // egress from best-effort to classified, so a farewell the local
+            // socket refuses fails the leave instead of vanishing.
+            farewell.initiated = true;
             pending.leave = Some(PendingLeave {
               repliers: vec![reply],
               deadline: now + leave_timeout,
@@ -1575,10 +1623,18 @@ where
 /// gossip socket. Outbound gossip is label-stamped (`encode_outgoing` /
 /// `encode_outgoing_compound`), then — with an encryption backend built in —
 /// wrapped in the encryption layer (`encrypt_gossip`) before it hits the wire.
+///
+/// Popping the last transmit is the endpoint's leave-completion fence (it emits
+/// `LeftCluster`), so once `leave()` has been initiated these are the departure
+/// fan-out and it reaches the socket before that fence fires. `farewell` carries
+/// that state: a transform or LOCAL send failure on the fan-out is recorded there
+/// (rather than dropped best-effort) so the parked leave resolves
+/// [`SerfError::LeaveFarewellUndelivered`] instead of a false `Ok`.
 async fn drain_transmits<I, RT, G, R>(
   endpoint: &mut StreamEndpoint<I, SocketAddr, RT, G, R, CompioDropCounter>,
   gossip_socket: &UdpSocket,
   label: Option<Bytes>,
+  farewell: &mut Farewell,
 ) -> bool
 where
   I: memberlist_proto::Id + Clone,
@@ -1597,14 +1653,20 @@ where
           Ok(b) => (to, b),
           // A locally-built message that fails to encode is dropped so one bad
           // codec invocation cannot wedge the pump.
-          Err(_) => continue,
+          Err(_) => {
+            note_farewell_transform_error(farewell, to);
+            continue;
+          }
         }
       }
       Transmit::Compound(cmp) => {
         let (to, msgs) = cmp.into_parts();
         match encode_outgoing_compound(&msgs, &encode_opts) {
           Ok(b) => (to, b),
-          Err(_) => continue,
+          Err(_) => {
+            note_farewell_transform_error(farewell, to);
+            continue;
+          }
         }
       }
     };
@@ -1619,15 +1681,26 @@ where
     {
       on_wire = match endpoint.encrypt_gossip(&on_wire) {
         Ok(bytes) => bytes,
-        Err(_) => continue,
+        Err(_) => {
+          note_farewell_transform_error(farewell, peer);
+          continue;
+        }
       };
     }
-    let BufResult(res, _buf) = gossip_socket.send_to(on_wire, peer).await;
-    // Ignoring Err: a transient send error is non-fatal — gossip is lossy and
-    // the next probe/gossip round recovers.
-    let _ = res;
+    send_gossip_datagram(gossip_socket, peer, on_wire, farewell).await;
   }
   progress
+}
+
+/// Record a gossip datagram that could not be encoded or encrypted. Best-effort
+/// periodic gossip drops it silently (the next round rebuilds it); a datagram of
+/// the leave fan-out has no next round, so the failure is logged and fails the
+/// parked leave.
+fn note_farewell_transform_error(farewell: &mut Farewell, peer: SocketAddr) {
+  if farewell.initiated {
+    trace_leave_transform_error(peer);
+    farewell.send_failed = true;
+  }
 }
 
 /// Read-modify-write `endpoint`'s LIVE wire keyring for one inbound [`KeyRequest`],
@@ -1696,6 +1769,7 @@ async fn drain_events<I, RT, G, R>(
   pending: &mut PendingCommands,
   snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
   terminal: &mut bool,
+  farewell: &Farewell,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
@@ -1765,11 +1839,16 @@ where
     // Leave-completion resolution. `LeftCluster` fires once the leave notices
     // have drained to the wire; resolving the parked waiter here — on this pump
     // task, ahead of the observation task's `notify_leave` — is what makes
-    // `leave()` return promptly once the flush is done.
+    // `leave()` return promptly once the flush is done. `Ok` means every farewell
+    // datagram reached the socket: the fan-out was popped (and awaited) by the
+    // gossip drain that runs ahead of this one, so a local send or transform
+    // failure has already been recorded and downgrades the reply to
+    // `LeaveFarewellUndelivered` rather than a false success.
     if matches!(ev, Event::LeftCluster)
       && let Some(pl) = pending.leave.take()
     {
-      pl.resolve_all(|| Ok(())).await;
+      let failed = farewell.send_failed;
+      pl.resolve_all(|| leave_outcome(failed)).await;
     }
     // Conflict-shutdown enforcement. `Event::Shutdown` means the local node lost
     // an id-conflict vote and MUST stop, exactly as for a `Command::Shutdown`.
@@ -1858,6 +1937,7 @@ async fn drain_outputs<I, RT, G, R>(
   obs_payload_budget: Option<u64>,
   pending: &mut PendingCommands,
   snapshotter: &mut Option<serf_driver::Snapshotter<I>>,
+  farewell: &mut Farewell,
   #[cfg(encryption)] keyring: &dyn KeyringDelegate,
   #[cfg(encryption)] pending_key_responses: &mut Vec<PendingKeyResponse<I>>,
 ) -> bool
@@ -1871,8 +1951,11 @@ where
   loop {
     let did_actions = drain_actions::<I, RT, G, R>(endpoint, bridges, bridge_ready_tx, stream_opts);
     let did_transports = drain_transport_transmits::<I, RT, G, R>(endpoint, bridges);
+    // Gossip egress runs BEFORE the event drain, so a leave fan-out has reached
+    // the socket (and recorded any failure in `farewell`) by the time the
+    // `LeftCluster` fence it releases is drained below.
     let did_transmits =
-      drain_transmits::<I, RT, G, R>(endpoint, gossip_socket, label.clone()).await;
+      drain_transmits::<I, RT, G, R>(endpoint, gossip_socket, label.clone(), farewell).await;
     let did_events = drain_events::<I, RT, G, R>(
       endpoint,
       obs_tx,
@@ -1882,6 +1965,7 @@ where
       pending,
       snapshotter,
       &mut terminal,
+      farewell,
       #[cfg(encryption)]
       keyring,
       #[cfg(encryption)]

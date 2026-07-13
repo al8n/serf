@@ -68,6 +68,11 @@ struct Shared<I> {
   /// at the bounded internal observation channel when the delegate dispatch
   /// loop falls behind. Monotonically increasing.
   observation_dropped: Rc<Cell<u64>>,
+  /// Shares the same `Rc` the QUIC driver pump increments. Counts gossip payloads
+  /// that rode the QUIC datagram plane (a `DatagramSendStatus::Queued`), as
+  /// opposed to the plain-UDP fallback. Stays zero on the stream transports and on
+  /// a QUIC endpoint in `UnreliableTransport::Udp` mode.
+  datagrams_sent: Rc<Cell<u64>>,
   /// Read-only view of the endpoint's cumulative user-coalescer drop count, over
   /// the SAME cell the endpoint's writer increments. The driver owns the
   /// endpoint, so a handle reads the shed count here with no publish step.
@@ -212,6 +217,7 @@ where
       flume::bounded::<Event<I, SocketAddr>>(runtime_options.event_queue_cap());
     let events_dropped = Rc::new(Cell::new(0u64));
     let observation_dropped = Rc::new(Cell::new(0u64));
+    let datagrams_sent = Rc::new(Cell::new(0u64));
     // Mint the two shed counters as (writer, reader) pairs: the driver injects the
     // writers into the endpoint, the handle keeps the readers, both over the same
     // backing cell so no publish step exists.
@@ -227,6 +233,7 @@ where
     // always reflect the driver's live count.
     let events_dropped_handle = events_dropped.clone();
     let observation_dropped_handle = observation_dropped.clone();
+    let datagrams_sent_handle = datagrams_sent.clone();
     // Clone the serf options before they are moved into the driver so the
     // handle can compute `default_query_timeout` / `default_query_param`
     // without a driver round-trip.
@@ -238,6 +245,7 @@ where
       events_tx,
       events_dropped,
       observation_dropped,
+      datagrams_sent,
       user_drop_writer,
       member_drop_writer,
       snapshot.clone(),
@@ -261,6 +269,7 @@ where
         events_rx,
         events_dropped: events_dropped_handle,
         observation_dropped: observation_dropped_handle,
+        datagrams_sent: datagrams_sent_handle,
         coalesced_user_events_dropped: user_drop_reader,
         coalesced_member_events_dropped: member_drop_reader,
         snapshot,
@@ -487,6 +496,17 @@ where
   #[inline]
   pub fn coalesced_member_events_dropped(&self) -> u64 {
     self.shared.coalesced_member_events_dropped.get()
+  }
+
+  /// Cumulative number of gossip payloads sent over the QUIC datagram plane (a
+  /// datagram queued onto the peer's pooled, TLS-protected connection) rather than
+  /// the plain-UDP fallback.
+  ///
+  /// Always `0` on the stream transports and on a QUIC endpoint configured for
+  /// `UnreliableTransport::Udp`. Lifetime total, saturating.
+  #[inline]
+  pub fn datagrams_sent(&self) -> u64 {
+    self.shared.datagrams_sent.get()
   }
 
   /// Subscribe to the serf [`Event`] stream. Multiple subscribers round-robin

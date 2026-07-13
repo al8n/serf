@@ -32,7 +32,7 @@ pub use socket_addr::SocketAddrResolver;
 
 #[cfg(feature = "dns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-pub use dns::{DEFAULT_DNS_TIMEOUT, DnsResolver};
+pub use dns::{DEFAULT_DNS_TIMEOUT, DnsError, DnsResolver};
 
 #[cfg(feature = "getifs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "getifs")))]
