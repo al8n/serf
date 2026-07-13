@@ -1,22 +1,48 @@
 //! Handle-level unit tests for the reactor `Serf` on tokio: the ergonomic
-//! `Serf::tcp` constructor's option validation, single-node shutdown/rebind, and
-//! the fast join-failure paths. The multi-node convergence / event / query /
-//! leave behavior is covered by the real-node suite in `tests/tcp.rs`.
+//! `Serf::tcp` constructor's option validation, single-node shutdown/rebind, the
+//! fast join-failure paths, and the hostname-addressed advertise path (a node whose
+//! `A` is the `HostAddr` domain the built-in name resolvers consume). The multi-node
+//! convergence / event / query / leave behavior is covered by the real-node suite in
+//! `tests/tcp.rs`.
 
 use core::{future::Future, time::Duration};
 use std::net::SocketAddr;
 
 use agnostic::tokio::TokioRuntime;
+use hostaddr::HostAddr;
 
 use crate::{
-  Channel, FirstAddrResolver, MaybeResolved, Resolver, RuntimeOptions, Serf, SerfError,
-  SocketAddrResolver, TcpTransportOptions, VoidDelegate,
+  Channel, FirstAddrResolver, Ipv4PreferringResolver, MaybeResolved, OsResolver, Resolver,
+  RuntimeOptions, Serf, SerfError, SocketAddrResolver, TcpTransportOptions, VoidDelegate,
 };
 use serf_proto::options::Options as SerfOptions;
 use smol_str::SmolStr;
 
 /// A tokio-backed reactor TCP node handle.
 type Node = Serf<SmolStr, SocketAddr, TokioRuntime>;
+
+/// A tokio-backed reactor TCP node whose advertise address is supplied UNRESOLVED,
+/// in the `HostAddr` domain that [`OsResolver`] and [`DnsResolver`](crate::DnsResolver)
+/// consume — the address type a node can be built with only because the transport
+/// puts no wire-codec bound on `A`.
+type HostNode = Serf<SmolStr, HostAddr<SmolStr>, TokioRuntime>;
+
+/// Wall-clock ceiling for the poll loops below, so a convergence regression fails
+/// with a diagnosis instead of hanging.
+const POLL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Poll granularity for the await loops below.
+const POLL_STEP: Duration = Duration::from_millis(20);
+
+/// Poll `cond` until it holds, bounded by [`POLL_TIMEOUT`].
+async fn await_condition(what: &str, cond: impl Fn() -> bool) {
+  tokio::time::timeout(POLL_TIMEOUT, async {
+    while !cond() {
+      tokio::time::sleep(POLL_STEP).await;
+    }
+  })
+  .await
+  .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
 
 /// A loopback address with a port nothing listens on — `connect()` returns
 /// `ECONNREFUSED` immediately, so its push/pull exchange fails fast. The port is
@@ -412,4 +438,212 @@ async fn tcp_default_query_param_defaults() {
   assert_eq!(qp.relay_factor, 0, "no relay");
 
   a.shutdown().await.expect("node shuts down");
+}
+
+/// Build a node whose advertise address is the UNRESOLVED host `host`, resolved
+/// through `resolver` at construction — so the node's address domain `A` is
+/// `HostAddr<SmolStr>`, what the built-in name resolvers produce, rather than a
+/// wire `SocketAddr`. The advertise candidate set is narrowed by
+/// [`Ipv4PreferringResolver`], which still falls back to the head of the set on an
+/// IPv6-only host.
+async fn try_spawn_host_node<RES>(
+  id: &str,
+  host: &str,
+  resolver: &RES,
+) -> Result<HostNode, SerfError>
+where
+  RES: Resolver<Address = HostAddr<SmolStr>>,
+{
+  let advertise: HostAddr<SmolStr> = host.parse().expect("host addr");
+  let opts = TcpTransportOptions::<SmolStr, HostAddr<SmolStr>>::new()
+    .with_local_id(SmolStr::new(id))
+    .with_advertise_addr(MaybeResolved::Unresolved(advertise));
+  Serf::<SmolStr, HostAddr<SmolStr>, TokioRuntime>::tcp(
+    opts,
+    resolver,
+    &Ipv4PreferringResolver,
+    VoidDelegate::<SmolStr, SocketAddr>::new(),
+    RuntimeOptions::new(),
+    SerfOptions::new(),
+    None,
+    None,
+    None,
+    #[cfg(encryption)]
+    std::sync::Arc::new(crate::VoidKeyringDelegate),
+  )
+  .await
+}
+
+/// A node can advertise a HOSTNAME: built over the `HostAddr` address domain and an
+/// [`OsResolver`], it resolves `localhost:0` at construction, binds the resolved
+/// loopback address, and publishes the concrete `SocketAddr` it bound as its
+/// contact. A second such node then joins the first BY HOSTNAME through the same
+/// resolver and both converge — so the resolved address is a real, reachable
+/// contact, not merely a value that type-checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_advertise_and_join_through_os_resolver() {
+  let resolver = OsResolver::<TokioRuntime>::default();
+
+  let a = try_spawn_host_node("os-host-a", "localhost:0", &resolver)
+    .await
+    .expect("a hostname advertise address resolves and binds");
+  let a_addr = a.advertise_address();
+  assert!(
+    a_addr.ip().is_loopback(),
+    "the node advertises the RESOLVED loopback IP, not the hostname it was given: {a_addr}"
+  );
+  assert_ne!(
+    a_addr.port(),
+    0,
+    "the ephemeral `:0` resolved to the concrete port the listener bound"
+  );
+
+  let b = try_spawn_host_node("os-host-b", "localhost:0", &resolver)
+    .await
+    .expect("a second hostname-addressed node binds");
+  assert_ne!(
+    b.advertise_address(),
+    a_addr,
+    "the two nodes bind distinct ephemeral ports"
+  );
+
+  // The seed is a HOSTNAME (`localhost:<a-port>`), never a `SocketAddr`: `join`
+  // resolves it through the same resolver and reports the seed it actually reached.
+  let seed: HostAddr<SmolStr> = format!("localhost:{}", a_addr.port())
+    .parse()
+    .expect("hostname seed");
+  let reached = b
+    .join(&resolver, MaybeResolved::Unresolved(seed), false)
+    .await
+    .expect("the hostname seed resolves and its node is contacted");
+  assert_eq!(
+    reached, a_addr,
+    "the contacted seed is the first node's bound advertise address"
+  );
+
+  await_condition("both hostname-addressed nodes to see 2 members", || {
+    a.num_members() == 2 && b.num_members() == 2
+  })
+  .await;
+
+  a.shutdown().await.expect("node a shuts down");
+  b.shutdown().await.expect("node b shuts down");
+}
+
+/// A loopback TCP nameserver answering exactly ONE query with a single `A` record
+/// for `127.0.0.1`. Speaks just enough of TCP-DNS (RFC 1035 §4.2.2: a 2-byte
+/// big-endian length prefix, then the message) for the resolver's TCP-first path;
+/// the resolver harvests A/AAAA answers without validating the question, so a fixed
+/// answer needs no query parsing. Returns the bound address to point a resolver at.
+/// Nothing leaves loopback.
+#[cfg(feature = "dns")]
+async fn spawn_loopback_nameserver() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+  use std::net::Ipv4Addr;
+
+  use agnostic::{
+    Runtime,
+    net::{Net, TcpListener},
+  };
+  use futures_util::{AsyncReadExt, AsyncWriteExt};
+  use hickory_proto::{
+    op::{Message, OpCode},
+    rr::{Name, RData, Record, rdata::A},
+  };
+
+  let listener = <<TokioRuntime as Runtime>::Net as Net>::TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind loopback nameserver");
+  let addr = listener.local_addr().expect("nameserver local_addr");
+
+  let handle = tokio::spawn(async move {
+    let Ok((mut stream, _)) = listener.accept().await else {
+      return;
+    };
+    // The 2-byte big-endian length prefix, then the query body it announces.
+    let mut len_buf = [0u8; 2];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+      return;
+    }
+    let mut query = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+    if stream.read_exact(&mut query).await.is_err() {
+      return;
+    }
+
+    let mut resp = Message::response(0, OpCode::Query);
+    resp.add_answer(Record::from_rdata(
+      Name::from_ascii(ADVERTISE_NAME_FQDN).expect("answer name"),
+      60,
+      RData::A(A(Ipv4Addr::LOCALHOST)),
+    ));
+    let body = resp.to_vec().expect("encode DNS response");
+    let mut framed = Vec::with_capacity(2 + body.len());
+    framed.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&body);
+    // Ignoring Err: a best-effort single write from a one-shot fixture; a client
+    // that hung up surfaces as the resolving node's construction failure instead.
+    let _ = stream.write_all(&framed).await;
+  });
+
+  (addr, handle)
+}
+
+/// The advertise name the fixture nameserver answers for. Its `.invalid` TLD is
+/// reserved never to resolve (RFC 6761 §6.4), so the OS fallback inside
+/// `DnsResolver` CANNOT produce an address for it — a node that comes up on
+/// loopback therefore did so on the nameserver's `A` record, not on a fallback.
+#[cfg(feature = "dns")]
+const ADVERTISE_NAME_FQDN: &str = "seed.cluster.invalid.";
+
+/// A node can advertise a DNS name: built over the `HostAddr` address domain and a
+/// [`DnsResolver`](crate::DnsResolver) pointed at the loopback fixture nameserver,
+/// it resolves `seed.cluster.invalid:0` at construction and binds the `127.0.0.1`
+/// its `A` record carried. Because that name is unresolvable by the OS fallback,
+/// binding loopback proves the DNS answer drove the bind. A plain peer then joins
+/// the DNS-derived contact and both converge, proving it is genuinely reachable.
+#[cfg(feature = "dns")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_advertise_resolved_through_dns_resolver() {
+  use std::net::{IpAddr, Ipv4Addr};
+
+  use crate::DnsResolver;
+
+  let (nameserver, server) = spawn_loopback_nameserver().await;
+  let resolver = DnsResolver::<TokioRuntime>::from_servers(vec![nameserver])
+    .with_timeout(Duration::from_secs(5));
+
+  let a = try_spawn_host_node("dns-host-a", "seed.cluster.invalid:0", &resolver)
+    .await
+    .expect("the fixture nameserver's answer resolves the advertise address");
+  server.await.expect("the nameserver answered one query");
+
+  let a_addr = a.advertise_address();
+  assert_eq!(
+    a_addr.ip(),
+    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    "the node bound the IP its `A` record carried"
+  );
+  assert_ne!(
+    a_addr.port(),
+    0,
+    "the ephemeral `:0` resolved to the concrete port the listener bound"
+  );
+
+  // The DNS-derived contact is real: a peer dials it and the two converge.
+  let b = spawn_node("dns-peer-b").await;
+  let reached = b
+    .join(&SocketAddrResolver, MaybeResolved::Resolved(a_addr), false)
+    .await
+    .expect("the DNS-advertised node is reachable at the address it published");
+  assert_eq!(reached, a_addr, "the peer contacted the advertised address");
+
+  await_condition(
+    "the DNS-advertised node and its peer to see 2 members",
+    || a.num_members() == 2 && b.num_members() == 2,
+  )
+  .await;
+
+  a.shutdown()
+    .await
+    .expect("the DNS-advertised node shuts down");
+  b.shutdown().await.expect("the peer shuts down");
 }

@@ -41,7 +41,7 @@ use agnostic::{
 };
 use hostaddr::HostAddr;
 use memberlist_proto::{
-  CheapClone, Data, Endpoint, EndpointOptions, Id, MaybeResolved, TlsRecords,
+  CheapClone, Endpoint, EndpointOptions, Id, MaybeResolved, TlsRecords,
   streams::{LabelOptions, Labeled, StreamEndpoint as Coordinator},
 };
 use rand::rngs::StdRng;
@@ -454,12 +454,21 @@ where
   encryption: EncryptionOptions,
 }
 
+// `A` is the caller's UNRESOLVED address domain, and it takes no codec bound: `new`
+// resolves it to a `SocketAddr` once, and nothing downstream encodes it — the TLS
+// record layer, the coordinator, and every membership address are `SocketAddr`. A
+// `Data` bound here would instead exclude the very address type the built-in
+// resolvers produce, since `OsResolver` / `DnsResolver` yield
+// `hostaddr::HostAddr<SmolStr>`, which this crate cannot implement `Data` for (both
+// the trait and the type are foreign to it). `Send + 'static` are structural: the
+// `MaybeResolved<A, SocketAddr>` field must keep the transport `Send + 'static` for
+// the detached driver pump.
 impl<I, A, R> Transport<R> for TlsTransport<I, A, R>
 where
   R: Runtime,
   I:
     Id + CheapClone + Clone + core::fmt::Debug + core::fmt::Display + Send + Sync + Unpin + 'static,
-  A: Data + Clone + Send + Sync + 'static,
+  A: Clone + Send + Sync + 'static,
 {
   type Error = SerfError;
   type Id = I;
